@@ -1,0 +1,46 @@
+# AI Proxy Service Configuration
+# 
+# For Linux (systemd):
+#   1. Copy to /etc/systemd/system/ai_proxy.service
+#   2. Edit paths for your user/directory
+#   3. Run: sudo systemctl daemon-reload && sudo systemctl enable --now ai_proxy
+#
+# For Windows (PowerShell as Administrator):
+#   New-Service -Name "AIProxy" `
+#     -BinaryPathName "C:\path\to\python.exe C:\path\to\ai_proxy\proxy.py" `
+#     -DisplayName "AI Proxy" `
+#     -StartupType Automatic
+#
+# Environment Variables:
+#   OLLAMA_URL      - Upstream Ollama server (default: http://localhost:11434)
+#   PROXY_HOST      - Proxy bind address (default: 127.0.0.1)
+#   PROXY_PORT      - Proxy port (default: 8000)
+#   PROXY_DB        - Database path (default: ./proxy.db)
+#   PROXY_RULES_FILE- Rules config path (optional)
+
+[Unit]
+Description=AI Proxy (Ollama OpenAI traffic inspector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Edit these for your system
+User=your_username
+Group=your_group
+WorkingDirectory=/path/to/ai_proxy
+Environment=PROXY_PORT=8000
+Environment=PROXY_HOST=127.0.0.1
+Environment=OLLAMA_URL=http://localhost:11434
+Environment=PROXY_DB=./proxy.db
+ExecStart=/path/to/python /path/to/ai_proxy/proxy.py
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+
+[Install]
+WantedBy=multi-user.target
