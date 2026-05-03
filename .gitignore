@@ -57,3 +57,6 @@ logs/
 *.temp
 tmp/
 temp/
+
+# Local export dumps from /__proxy/api/export
+ai-proxy-export-*.json

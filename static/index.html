@@ -4,6 +4,8 @@
 <meta charset="utf-8">
 <title>AI Proxy</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%231a1d26'/%3E%3Cpath d='M12 22h32m-8-8 8 8-8 8' stroke='%2388c0d0' stroke-width='5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M52 42H20m8-8-8 8 8 8' stroke='%23a3be8c' stroke-width='5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%231a1d26'/%3E%3Cpath d='M12 22h32m-8-8 8 8-8 8' stroke='%2388c0d0' stroke-width='5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3Cpath d='M52 42H20m8-8-8 8 8 8' stroke='%23a3be8c' stroke-width='5' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -25,8 +27,70 @@
   tbody td { padding: 5px 8px; border-bottom: 1px solid #1f232c; font-size: 12px; vertical-align: top; }
   tbody tr { cursor: pointer; }
   tbody tr:hover td { background: #161922; }
-  tbody tr.selected td { background: #243049; }
+  tbody tr.selected td { background: #243049 !important; color: #ffffff; }
+  tbody tr.selected td:first-child { box-shadow: inset 4px 0 0 #88c0d0; padding-left: 12px; }
   td.path { font-family: ui-monospace, "SF Mono", Consolas, monospace; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .app-badge { display: inline-block; padding: 1px 6px; margin-top: 2px; border-radius: 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; }
+  .app-badge.app-claude-code { background: #4a3a2a; color: #ebcb8b; border-color: #6a5a3a; }
+  .app-badge.app-vscode-copilot, .app-badge.app-github-copilot, .app-badge.app-vscode { background: #1a3050; color: #88c0d0; border-color: #2a4060; }
+  .app-badge.app-cursor { background: #3a2a4a; color: #c8a8d8; border-color: #5a3a6a; }
+  .app-badge.app-anthropic-sdk, .app-badge.app-anthropic-python, .app-badge.app-anthropic-node { background: #4a2e3a; color: #d8a8b8; border-color: #6a3e4a; }
+  .app-badge.app-openai-sdk, .app-badge.app-openai-python, .app-badge.app-openai-node { background: #2a4a3a; color: #a3be8c; border-color: #3a6a4a; }
+  .app-badge.app-langchain, .app-badge.app-llamaindex { background: #2a3a4a; color: #b8c8d8; border-color: #3a4a5a; }
+  .app-badge.app-unknown { background: #2a2e3a; color: #666; }
+  .app-badge.app-shadow { background: #2a3a2a; color: #a3be8c; border-color: #3a4a3a; }
+  .app-badge.app-browser-firefox, .app-badge.app-browser-chrome, .app-badge.app-browser-edge, .app-badge.app-browser-safari, .app-badge.app-browser-other { background: #2a2630; color: #b8a8d0; border-color: #3a3640; }
+  .shadow-section { background: #1a1d26; border: 1px solid #2a4a3a; border-left: 3px solid #5e8c66; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
+  .shadow-section h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; color: #88c0d0; letter-spacing: 0.5px; }
+  .shadow-row { padding: 8px 0; border-top: 1px solid #2a2e3a; }
+  .shadow-row:first-of-type { border-top: none; }
+  .shadow-meta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 12px; }
+  .shadow-meta strong { color: #ebcb8b; }
+  .shadow-status-pending { color: #ebcb8b; }
+  .shadow-status-ok { color: #a3be8c; }
+  .shadow-status-err { color: #bf616a; }
+  .shadow-back-banner { background: #1a2a1f; border: 1px solid #2e4a3a; border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; font-size: 12px; }
+  .shadow-back-banner a { color: #88c0d0; text-decoration: none; }
+  .shadow-back-banner a:hover { text-decoration: underline; }
+  .shadow-cmp { margin-top: 8px; padding: 8px 10px; background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; font-size: 11px; }
+  .cmp-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0 3px 8px; border-left: 2px solid #3a3e4a; align-items: baseline; }
+  .cmp-row + .cmp-row { margin-top: 2px; }
+  .cmp-row .cmp-label { color: #888; min-width: 110px; }
+  .cmp-row strong { color: #d8dee9; font-weight: 600; }
+  .cmp-row.cmp-good { border-left-color: #5e8c66; }
+  .cmp-row.cmp-warn { border-left-color: #ebcb8b; }
+  .cmp-row.cmp-bad  { border-left-color: #bf616a; }
+  .compare-view { padding: 14px 18px; }
+  .compare-view .compare-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
+  .compare-view .compare-header button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .compare-view .compare-header h2 { margin: 0; font-size: 14px; color: #e6e6e6; }
+  .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 1100px) { .compare-grid { grid-template-columns: 1fr; } }
+  .compare-col { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; min-width: 0; }
+  .compare-col.compare-primary { border-left: 3px solid #88c0d0; }
+  .compare-col.compare-shadow { border-left: 3px solid #5e8c66; }
+  .compare-col h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #aaa; }
+  .compare-col .col-title { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+  .compare-col .col-title strong { font-size: 14px; color: #e6e6e6; }
+  .compare-col .col-meta { color: #888; font-size: 11px; margin-bottom: 8px; }
+  .compare-col .col-meta span { margin-right: 10px; }
+  .compare-col .text-pane { background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; padding: 10px 12px; font: 12px/1.5 ui-monospace, monospace; max-height: 480px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .compare-col .text-pane.empty { color: #666; font-style: italic; }
+  .compare-col .tool-card { background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px 10px; margin: 6px 0; }
+  .compare-col .tool-card .tool-name { color: #88c0d0; font-weight: 600; font-size: 12px; }
+  .compare-col .tool-card pre { background: #1a1d26; border: 1px solid #2a2e3a; padding: 6px 8px; border-radius: 3px; margin-top: 4px; max-height: 180px; font-size: 11px; }
+  .compare-tools { margin-top: 14px; background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; }
+  .compare-tools h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #aaa; }
+  .compare-tool-pair { padding: 8px 0; border-top: 1px solid #2a2e3a; }
+  .compare-tool-pair:first-of-type { border-top: none; }
+  .compare-tool-pair .pair-name { color: #88c0d0; font-weight: 600; margin-bottom: 4px; font-size: 12px; }
+  .compare-tool-pair .pair-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: #2a2e3a; color: #aaa; margin-left: 6px; vertical-align: middle; }
+  .compare-tool-pair .pair-tag.tag-match { background: #2e4a2e; color: #a3be8c; }
+  .compare-tool-pair .pair-tag.tag-diff { background: #4a4020; color: #ebcb8b; }
+  .compare-tool-pair .pair-tag.tag-only { background: #4a2e2e; color: #e08080; }
+  .compare-tool-pair .pair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
+  .compare-tool-pair .pair-grid pre { background: #0f1116; border: 1px solid #2a2e3a; padding: 6px 8px; border-radius: 3px; font-size: 11px; max-height: 200px; }
+  .compare-tool-pair .pair-grid .empty { color: #666; font-style: italic; padding: 6px 8px; }
   td.method { font-weight: 600; color: #88c0d0; }
   td.ms, td.num { text-align: right; color: #888; font-variant-numeric: tabular-nums; }
   #stats { flex: 1; overflow: auto; padding: 18px; display: none; }
@@ -65,14 +129,30 @@
   .verdict.block { background: #4a2e2e; color: #e08080; }
   .verdict.warn { background: #4a4020; color: #ebcb8b; }
   .verdict.rewrite { background: #2e3e5a; color: #88c0d0; }
+  .verdict.intercept { background: #4a3a5a; color: #c8a8d8; }
   tr.row-block td { background: #2a1818 !important; }
   tr.row-warn td { background: #2a2418 !important; }
   tr.row-rewrite td { background: #1a2030 !important; }
-  #audit, #convs, #system { flex: 1; overflow: auto; padding: 18px; display: none; }
-  #audit.show, #convs.show, #system.show { display: block; }
-  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system { display: none; }
-  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system { display: none; }
-  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs { display: none; }
+  tr.row-intercept td { background: #251a30 !important; }
+  #audit, #convs, #system, #setup { flex: 1; overflow: auto; padding: 18px; display: none; }
+  #audit.show, #convs.show, #system.show, #setup.show { display: block; }
+  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup { display: none; }
+  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup { display: none; }
+  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup { display: none; }
+  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system { display: none; }
+  .setup-vars { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; }
+  .setup-vars > div { margin: 4px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .setup-vars .label { width: 110px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
+  .setup-vars code { background: #0f1116; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
+  .setup-vars select { background: #0f1116; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 8px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 12px; min-width: 200px; }
+  .snippet { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; margin-bottom: 14px; overflow: hidden; }
+  .snippet-head { padding: 8px 14px; background: #14171f; border-bottom: 1px solid #2a2e3a; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .snippet-head h4 { margin: 0; font-size: 13px; }
+  .snippet-head .desc { color: #888; font-size: 11px; flex: 1; }
+  .snippet-head button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 3px 10px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+  .snippet-head button:hover { background: #3a3e4a; }
+  .snippet-head button.ok { background: #2e4a2e; border-color: #4a6a4a; }
+  .snippet pre { margin: 0; padding: 12px 14px; max-height: 360px; }
   .gauge { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; }
   .gauge .l { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.6px; }
   .gauge .v { font-size: 22px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
@@ -98,13 +178,24 @@
   .suggestion .detail { color: #aaa; font-size: 12px; margin-bottom: 6px; }
   .suggestion pre { font-size: 11px; max-height: 150px; }
   .turn { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
-  .turn .turn-header { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: #888; margin-bottom: 8px; }
+  .turn .turn-header { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: #888; }
   .turn .turn-header strong { color: #e6e6e6; }
+  details.turn > summary > span:first-child::before { content: "▸"; }
+  details.turn[open] > summary > span:first-child::before { content: "▾"; }
+  details.turn > summary > span:first-child { font-size: 0; }
+  details.turn > summary > span:first-child::before { font-size: 11px; }
+  details.turn > summary::-webkit-details-marker { display: none; }
+  details.turn > summary:hover { background: #1f2230; }
   .turn .msg { padding: 6px 10px; border-radius: 4px; margin: 4px 0; font-size: 12px; }
   .turn .msg.user { background: #1a2030; color: #d8dee9; }
   .turn .msg.assistant { background: #1a261a; color: #d8dee9; }
   .turn .msg.tool { background: #2a2418; color: #d8dee9; }
   .turn .msg .role { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+  .tool-error-summary { color: #e08080 !important; }
+  .tool-error-summary::before { content: "⚠ "; color: #bf616a; }
+  details.tool-error-msg { background: #2a1818 !important; border: 1px solid #6a3030 !important; }
+  details.tool-error-msg pre { background: #1a0e0e; border-color: #4a2020; }
+  .tool-error-excerpt { color: #e08080; font-size: 11px; margin-left: 6px; max-width: 600px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
   #rules-editor textarea { width: 100%; min-height: 320px; background: #0f1116; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 4px; padding: 10px 12px; font: 12px/1.45 ui-monospace, "SF Mono", Consolas, monospace; resize: vertical; }
   #rules-editor textarea.dirty { border-color: #ebcb8b; }
   #rules-editor .toolbar { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
@@ -114,6 +205,50 @@
   #rules-editor .status { font-size: 12px; }
   #rules-editor .status.ok { color: #a3be8c; }
   #rules-editor .status.err { color: #bf616a; }
+  .routing-panel { background: #1a1d26; border: 1px solid #2a2e3a; border-left: 3px solid #88c0d0; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; }
+  .routing-panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; margin: 0 0 8px 0; font-weight: 600; }
+  .routing-panel .desc { color: #888; font-size: 11px; margin-bottom: 8px; }
+  .routing-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+  .routing-row label { font-size: 11px; color: #888; display: flex; gap: 6px; align-items: center; }
+  .routing-row input { background: #0f1116; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 8px; border-radius: 3px; font: 12px ui-monospace, monospace; min-width: 200px; }
+  .routing-mode-btn { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .routing-mode-btn:hover { background: #3a3e4a; color: #e6e6e6; }
+  .routing-mode-btn.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
+  .routing-mode-btn.mode-shadow.active { background: #2e4a3a; border-color: #4a6a4a; color: #a3be8c; }
+  .routing-mode-btn.mode-redirect.active { background: #4a3a2e; border-color: #6a5a3a; color: #ebcb8b; }
+  #routing-status { font-size: 11px; color: #888; margin-top: 6px; }
+  .flow-section { margin-bottom: 22px; }
+  .flow-section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; margin: 0 0 10px 0; font-weight: 600; }
+  .flow-grid { display: grid; grid-template-columns: 1fr auto 1.1fr auto 1fr; gap: 10px; align-items: stretch; }
+  @media (max-width: 1100px) { .flow-grid { grid-template-columns: 1fr; } .flow-arrow-col { display: none; } }
+  .flow-col { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 10px 12px; min-width: 0; display: flex; flex-direction: column; }
+  .flow-col-clients   { border-left: 3px solid #88c0d0; }
+  .flow-col-proxy     { border-left: 3px solid #b48ead; }
+  .flow-col-upstreams { border-left: 3px solid #5e8c66; }
+  .flow-col-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: #888; margin-bottom: 8px; }
+  .flow-arrow-col { display: flex; align-items: center; justify-content: center; padding: 0 4px; min-width: 60px; }
+  .flow-arrow-col .flow-arrow { font-size: 22px; color: #4a5a7a; }
+  .flow-arrow-col .flow-arrow-label { font-size: 10px; color: #666; text-align: center; margin-top: 2px; }
+  .flow-card { background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; padding: 7px 9px; margin-bottom: 6px; font-size: 11px; }
+  .flow-card:last-child { margin-bottom: 0; }
+  .flow-card-name { display: flex; gap: 6px; align-items: center; margin-bottom: 3px; }
+  .flow-card-name strong { color: #e6e6e6; font-size: 12px; }
+  .flow-card-stat { color: #888; font-size: 11px; }
+  .flow-card-stat strong { color: #d8dee9; font-weight: 600; }
+  .flow-card.flow-card-live { border-color: #5e8c66; box-shadow: inset 0 0 0 1px #2e4a3a; animation: flow-pulse 2s infinite; }
+  @keyframes flow-pulse { 0%,100% { box-shadow: inset 0 0 0 1px #2e4a3a } 50% { box-shadow: inset 0 0 0 1px #5e8c66 } }
+  .flow-rule { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 3px; font-size: 11px; }
+  .flow-rule + .flow-rule { border-top: 1px solid #1f232c; }
+  .flow-rule .rule-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+  .flow-rule .rule-dot.on  { background: #a3be8c; }
+  .flow-rule .rule-dot.off { background: #3a3e4a; }
+  .flow-rule .rule-name { flex: 1; color: #d8dee9; font-family: ui-monospace, monospace; font-size: 11px; }
+  .flow-rule.is-off .rule-name { color: #666; }
+  .flow-rule .rule-count { color: #88c0d0; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .flow-rule .rule-count.zero { color: #555; }
+  .flow-rule.is-off .rule-count { color: #555; }
+  .flow-totals { display: flex; gap: 12px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a2e3a; font-size: 11px; color: #888; }
+  .flow-totals strong { color: #d8dee9; }
   .quick-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 4px; margin-right: 6px; margin-bottom: 6px; font-size: 12px; }
   details.suggestion summary span:first-child::before, #suggestions-section > summary > .caret::before { content: "▸"; }
   details[open].suggestion > summary span:first-child::before, #suggestions-section[open] > summary > .caret::before { content: "▾"; }
@@ -123,7 +258,39 @@
   .gate-block { background: #2a1818; border: 1px solid #6a3030; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
   .gate-warn { background: #2a2418; border: 1px solid #6a5a30; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
   .gate-rewrite { background: #1a2030; border: 1px solid #3a5070; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
+  .gate-intercept { background: #251a30; border: 1px solid #503a60; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
   .gate-allow { background: #1a261a; border: 1px solid #2e4a2e; padding: 8px 12px; border-radius: 6px; margin-bottom: 14px; font-size: 12px; color: #aaa; }
+  .conv-layout { display: flex; gap: 14px; align-items: flex-start; }
+  .conv-toc { width: 240px; flex: 0 0 240px; position: sticky; top: 0; max-height: calc(100vh - 110px); overflow: auto; background: #14171f; border: 1px solid #2a2e3a; border-radius: 6px; padding: 8px; }
+  .conv-toc-controls { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid #2a2e3a; margin-bottom: 8px; }
+  .conv-toc-controls input { background: #0f1116; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 3px; padding: 4px 6px; font-size: 11px; width: 100%; }
+  .conv-filter-row, .conv-jump-row { display: flex; gap: 4px; flex-wrap: wrap; }
+  .conv-filter-row button, .conv-jump-row button { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1; }
+  .conv-filter-row button.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
+  .conv-filter-row button:hover, .conv-jump-row button:hover { background: #3a3e4a; }
+  .conv-toc-list { list-style: none; margin: 0; padding: 0; }
+  .conv-toc-item { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 3px; text-decoration: none; color: #aaa; font-size: 11px; cursor: pointer; border-left: 2px solid transparent; line-height: 1.3; }
+  .conv-toc-item:hover { background: #1f2230; color: #e6e6e6; }
+  .conv-toc-item.current { background: #243049; color: #e6e6e6; border-left-color: #88c0d0; }
+  .conv-toc-item .toc-num { font-weight: 600; color: #88c0d0; min-width: 26px; font-variant-numeric: tabular-nums; }
+  .conv-toc-item .toc-snippet { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .conv-toc-item .toc-icons { color: #888; font-size: 10px; white-space: nowrap; }
+  .conv-toc-item .toc-icons .err { color: #e08080; }
+  .conv-toc-item.off-page { opacity: 0.55; }
+  .conv-toc-item.off-page .toc-num::after { content: " ↗"; color: #666; }
+  .conv-turns { flex: 1; min-width: 0; }
+  .conv-pager { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; padding: 8px 10px; background: #14171f; border: 1px solid #2a2e3a; border-radius: 6px; margin-bottom: 10px; font-size: 11px; }
+  .conv-pager button { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 3px 9px; border-radius: 3px; cursor: pointer; font-size: 11px; min-width: 28px; }
+  .conv-pager button:hover:not(:disabled) { background: #3a3e4a; color: #e6e6e6; }
+  .conv-pager button.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
+  .conv-pager button:disabled { opacity: 0.4; cursor: not-allowed; }
+  .conv-pager .pager-gap { color: #666; padding: 0 2px; }
+  .conv-pager .pager-info { color: #888; margin-left: auto; }
+  .conv-pager select { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 3px 6px; border-radius: 3px; font-size: 11px; }
+  .conv-toc-pager { color: #888; font-size: 10px; padding: 4px 0; text-align: center; }
+  details.turn.turn-flash { animation: turn-flash-anim 1000ms ease-out; }
+  @keyframes turn-flash-anim { 0% { box-shadow: 0 0 0 2px #ebcb8b; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  @media (max-width: 900px) { .conv-layout { flex-direction: column; } .conv-toc { width: 100%; flex: none; position: static; max-height: 280px; } }
 </style>
 </head>
 <body>
@@ -134,6 +301,7 @@
     <button class="tab active" id="tab-req" onclick="setView('requests')">Requests</button>
     <button class="tab" id="tab-convs" onclick="setView('convs')">Conversations</button>
     <button class="tab" id="tab-system" onclick="setView('system')">System</button>
+    <button class="tab" id="tab-setup" onclick="setView('setup')">Setup</button>
     <button class="tab" id="tab-stats" onclick="setView('stats')">Stats</button>
     <button class="tab" id="tab-audit" onclick="setView('audit')">Audit <span id="audit-badge" style="display:none;background:#bf616a;color:#fff;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
   </div>
@@ -156,6 +324,7 @@
   <div id="audit"></div>
   <div id="convs"></div>
   <div id="system"></div>
+  <div id="setup"></div>
 </div>
 <script>
 let selected = null;
@@ -169,11 +338,11 @@ const num = (n) => (n == null ? '' : Number(n).toLocaleString());
 
 function setView(v) {
   view = v;
-  for (const t of ['req','stats','audit','convs','system']) {
+  for (const t of ['req','stats','audit','convs','system','setup']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
-  for (const c of ['stats','audit','convs','system']) {
+  for (const c of ['stats','audit','convs','system','setup']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
@@ -181,13 +350,16 @@ function setView(v) {
   else if (v === 'audit') loadAudit();
   else if (v === 'convs') loadConversations();
   else if (v === 'system') loadSystem();
+  else if (v === 'setup') loadSetup();
   else refresh();
 }
 
 async function loadInfo() {
   try {
     const d = await (await fetch('/__proxy/api/info')).json();
-    $('upstream').textContent = d.upstream;
+    const parts = [d.upstream];
+    if (d.anthropic) parts.push(d.anthropic + ' (anthropic)');
+    $('upstream').textContent = parts.join('  ·  ');
   } catch {}
 }
 
@@ -218,15 +390,33 @@ function renderList() {
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
     const ms = it.duration_ms ? Math.round(it.duration_ms) : '';
-    const tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
+    let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
+    if (tokens && it.tokens_live) {
+      const tip = it.tokens_estimated ? 'estimated prompt tokens (chars/3.5); upstream usage not yet received' : 'live token count from upstream stream — still in flight';
+      tokens = `<span style="color:#ebcb8b;font-style:italic" title="${tip}">${tokens}${it.tokens_estimated ? '~' : ''}<span style="color:#888"> live</span></span>`;
+    }
     const sel = it.id === selected ? 'selected' : '';
-    const ip = esc(it.client_ip || '');
+    const appBadge = it.client_app
+      ? `<div style="margin-top:2px"><span class="app-badge app-${esc(it.client_app)}" title="Detected client SDK / app">${esc(it.client_app)}</span></div>`
+      : '';
+    const ipCell = `<code style="font-size:11px">${esc(it.client_ip || '')}</code>${appBadge}`;
     let rowCls = sel;
     let pathExtra = '';
     if (it.gate_verdict === 'block') { rowCls += ' row-block'; pathExtra = ` <span class="verdict block" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'BLOCK')}</span>`; }
     else if (it.gate_verdict === 'warn') { rowCls += ' row-warn'; pathExtra = ` <span class="verdict warn" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'WARN')}</span>`; }
-    else if (it.gate_verdict === 'rewrite') { rowCls += ' row-rewrite'; pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">routed</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td><code style="font-size:11px">${ip}</code></td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    else if (it.gate_verdict === 'rewrite') {
+      rowCls += ' row-rewrite';
+      let badge = 'rewrite';
+      const rule = it.gate_rule || '';
+      if (rule === 'model_router') badge = 'routed';
+      else if (rule === 'ollama_options') badge = 'options';
+      else if (rule === 'tool_args_autofix') badge = 'autofixed';
+      else if (rule.includes('+')) badge = rule.replace('model_router', 'routed').replace('ollama_options', 'options');
+      else if (rule) badge = rule;
+      pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
+    }
+    else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
@@ -234,6 +424,8 @@ function renderList() {
 }
 
 async function selectItem(id) {
+  // Navigating to a different request implicitly closes any open compare view.
+  if (compareView && compareView.primaryId !== id) compareView = null;
   selected = id;
   lastDetailSig = null;  // force re-render for newly opened item
   renderList();
@@ -275,18 +467,99 @@ function analyzeRequest(bodyText) {
 
   const roles = {};
   const messages = j.messages || [];
+  // Build tool_call_id → {name, args} from assistant turns. Handles both OpenAI
+  // (assistant.tool_calls[]) and Anthropic (assistant.content[].type=='tool_use').
+  const tcMap = {};
+  for (const m of messages) {
+    if (!m || m.role !== 'assistant') continue;
+    if (Array.isArray(m.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc && tc.id && tc.function) {
+          tcMap[tc.id] = { name: tc.function.name, args: tc.function.arguments };
+        }
+      }
+    }
+    if (Array.isArray(m.content)) {
+      for (const blk of m.content) {
+        if (blk && blk.type === 'tool_use' && blk.id && blk.name) {
+          tcMap[blk.id] = { name: blk.name, args: blk.input == null ? '' : JSON.stringify(blk.input) };
+        }
+      }
+    }
+  }
+  // Flatten Anthropic content blocks into a plain text representation for "chars" counts.
+  const flattenContent = (c) => {
+    if (typeof c === 'string') return c;
+    if (c == null) return '';
+    if (Array.isArray(c)) {
+      const parts = [];
+      for (const p of c) {
+        if (!p || typeof p !== 'object') continue;
+        if (typeof p.text === 'string') parts.push(p.text);
+        else if (p.type === 'tool_use' && p.input != null) parts.push(JSON.stringify(p.input));
+        else if (p.type === 'tool_result') {
+          const inner = p.content;
+          if (typeof inner === 'string') parts.push(inner);
+          else if (Array.isArray(inner)) for (const ip of inner) if (ip && typeof ip.text === 'string') parts.push(ip.text);
+        }
+      }
+      return parts.join('\n');
+    }
+    return JSON.stringify(c);
+  };
   let lastUser = null, lastSystem = null, toolResults = [];
   for (const m of messages) {
     const role = m.role || 'unknown';
-    const content = typeof m.content === 'string' ? m.content : (m.content == null ? '' : JSON.stringify(m.content));
+    const content = flattenContent(m.content);
     roles[role] = roles[role] || { count: 0, chars: 0 };
     roles[role].count += 1;
     roles[role].chars += content.length;
     if (role === 'user') lastUser = content;
     if (role === 'system') lastSystem = content;
-    if (role === 'tool') toolResults.push({ name: m.name || m.tool_call_id || '?', content });
-    if (role === 'assistant' && m.tool_calls) {
-      roles.assistant.tool_calls = (roles.assistant.tool_calls || 0) + m.tool_calls.length;
+    // OpenAI tool-result message
+    if (role === 'tool') {
+      const call = m.tool_call_id ? tcMap[m.tool_call_id] : null;
+      toolResults.push({
+        name: (call && call.name) || m.name || '?',
+        content,
+        tool_call_id: m.tool_call_id,
+        calledWith: call,
+      });
+    }
+    // Anthropic tool_result blocks live inside user messages
+    if (role === 'user' && Array.isArray(m.content)) {
+      for (const blk of m.content) {
+        if (!blk || blk.type !== 'tool_result') continue;
+        const call = blk.tool_use_id ? tcMap[blk.tool_use_id] : null;
+        let inner = blk.content;
+        if (Array.isArray(inner)) inner = inner.map(p => (p && typeof p.text === 'string') ? p.text : '').join('\n');
+        else if (inner == null) inner = '';
+        else if (typeof inner !== 'string') inner = JSON.stringify(inner);
+        if (blk.is_error && inner && !/^error/i.test(inner)) inner = 'Error: ' + inner;
+        toolResults.push({
+          name: (call && call.name) || '?',
+          content: inner,
+          tool_call_id: blk.tool_use_id,
+          calledWith: call,
+        });
+      }
+    }
+    if (role === 'assistant') {
+      let tcCount = 0;
+      if (Array.isArray(m.tool_calls)) tcCount += m.tool_calls.length;
+      if (Array.isArray(m.content)) tcCount += m.content.filter(b => b && b.type === 'tool_use').length;
+      if (tcCount) roles.assistant.tool_calls = (roles.assistant.tool_calls || 0) + tcCount;
+    }
+  }
+
+  // Anthropic system: top-level field (string or list of {type:'text',text}).
+  if (!lastSystem && j.system != null) {
+    if (typeof j.system === 'string') lastSystem = j.system;
+    else if (Array.isArray(j.system)) lastSystem = j.system.map(p => (p && typeof p.text === 'string') ? p.text : '').join('\n');
+    if (lastSystem) {
+      roles.system = roles.system || { count: 0, chars: 0 };
+      roles.system.count += 1;
+      roles.system.chars += lastSystem.length;
     }
   }
 
@@ -297,14 +570,16 @@ function analyzeRequest(bodyText) {
   }
 
   const tools = (j.tools || []).map(t => {
-    const fn = t.function || t;
-    return { name: fn.name || '?', description: fn.description || '', params: fn.parameters || null };
+    // OpenAI: tools[i].function.{name,description,parameters}; Anthropic: tools[i].{name,description,input_schema}
+    const fn = (t.function && typeof t.function === 'object') ? t.function : t;
+    return { name: fn.name || '?', description: fn.description || '', params: fn.parameters || fn.input_schema || null };
   });
 
   return { params, roles, messages: messages.length, lastUser, lastSystem, toolResults, tools };
 }
 
 // Walk a response body or SSE stream and extract finish reason + invoked tool calls + assistant content length.
+// Handles three response shapes: OpenAI chat.completion(.chunk), Ollama native /api/chat, and Anthropic /v1/messages.
 function analyzeResponse(respBody, streamChunks) {
   const out = { finish_reason: null, tool_calls: [], content_chars: 0, content: '' };
 
@@ -329,19 +604,35 @@ function analyzeResponse(respBody, streamChunks) {
       }
     }
     if (j.done_reason) out.finish_reason = out.finish_reason || j.done_reason;
+    // Anthropic non-streaming /v1/messages: {type:"message", role:"assistant", content:[...], stop_reason}
+    if (j.type === 'message' && Array.isArray(j.content)) {
+      if (j.stop_reason) out.finish_reason = out.finish_reason || j.stop_reason;
+      for (const blk of j.content) {
+        if (!blk || typeof blk !== 'object') continue;
+        if (blk.type === 'text' && typeof blk.text === 'string') out.content += blk.text;
+        else if (blk.type === 'tool_use') {
+          out.tool_calls.push({
+            name: blk.name || '?',
+            arguments: blk.input == null ? '' : JSON.stringify(blk.input),
+          });
+        }
+      }
+    }
   }
 
   if (respBody) { try { fromObj(JSON.parse(respBody)); } catch {} }
 
   if (streamChunks) {
     // Streaming tool calls: name appears once per index, arguments accumulate as a string.
-    const tcByIdx = {};
+    const tcByIdx = {};                  // OpenAI/Ollama
+    const anthroBlocks = {};             // Anthropic: index -> {type, name, input_json}
     for (const line of streamChunks.split('\n')) {
       let data = null;
       if (line.startsWith('data: ')) data = line.slice(6);
       else if (line.trim().startsWith('{')) data = line.trim();
       if (!data || data === '[DONE]') continue;
       let j; try { j = JSON.parse(data); } catch { continue; }
+      // OpenAI chat.completion.chunk
       for (const c of j.choices || []) {
         if (c.finish_reason) out.finish_reason = c.finish_reason;
         const delta = c.delta || c.message || {};
@@ -361,8 +652,38 @@ function analyzeResponse(respBody, streamChunks) {
           out.tool_calls.push({ name: fn.name || '?', arguments: fn.arguments ? JSON.stringify(fn.arguments) : '' });
         }
       }
+      // Anthropic SSE event payloads carry `type` at top level.
+      if (typeof j.type === 'string') {
+        if (j.type === 'content_block_start' && j.content_block && typeof j.index === 'number') {
+          if (j.content_block.type === 'tool_use') {
+            anthroBlocks[j.index] = {
+              type: 'tool_use',
+              name: j.content_block.name || '?',
+              input_json: '',
+            };
+          } else if (j.content_block.type === 'text') {
+            anthroBlocks[j.index] = { type: 'text' };
+            if (typeof j.content_block.text === 'string') out.content += j.content_block.text;
+          }
+        } else if (j.type === 'content_block_delta' && j.delta && typeof j.index === 'number') {
+          if (j.delta.type === 'text_delta' && typeof j.delta.text === 'string') {
+            out.content += j.delta.text;
+          } else if (j.delta.type === 'input_json_delta' && typeof j.delta.partial_json === 'string') {
+            const slot = anthroBlocks[j.index];
+            if (slot && slot.type === 'tool_use') slot.input_json += j.delta.partial_json;
+          }
+        } else if (j.type === 'message_delta' && j.delta && j.delta.stop_reason) {
+          out.finish_reason = out.finish_reason || j.delta.stop_reason;
+        } else if (j.type === 'message_start' && j.message && j.message.stop_reason) {
+          out.finish_reason = out.finish_reason || j.message.stop_reason;
+        }
+      }
     }
     for (const k of Object.keys(tcByIdx)) out.tool_calls.push(tcByIdx[k]);
+    for (const k of Object.keys(anthroBlocks)) {
+      const b = anthroBlocks[k];
+      if (b && b.type === 'tool_use') out.tool_calls.push({ name: b.name, arguments: b.input_json });
+    }
   }
 
   out.content_chars = out.content.length;
@@ -386,7 +707,7 @@ function renderAnalysis(d) {
     }).join('');
 
     const userPreview = req.lastUser ? `<div class="section"><h3>Latest User Message (${num(req.lastUser.length)} chars)</h3><pre data-k="lastuser" style="max-height:240px">${esc(req.lastUser.slice(0, 4000))}${req.lastUser.length > 4000 ? '\n…' : ''}</pre></div>` : '';
-    const sysPreview = req.lastSystem ? `<div class="section"><h3>System Message (${num(req.lastSystem.length)} chars)</h3><pre data-k="sys" style="max-height:200px">${esc(req.lastSystem.slice(0, 2000))}${req.lastSystem.length > 2000 ? '\n…' : ''}</pre></div>` : '';
+    const sysPreview = req.lastSystem ? `<div class="section"><h3>System Message (${num(req.lastSystem.length)} chars)</h3><pre data-k="sys" style="max-height:280px">${esc(req.lastSystem)}</pre></div>` : '';
 
     const toolList = req.tools.length ? `
       <div class="section"><h3>Tools Defined (${req.tools.length})</h3>
@@ -396,7 +717,19 @@ function renderAnalysis(d) {
 
     const toolResultsHtml = req.toolResults.length ? `
       <div class="section"><h3>Tool Results In Request (${req.toolResults.length})</h3>
-        ${req.toolResults.map(t => `<details style="margin-bottom:6px"><summary><code>${esc(t.name)}</code> · ${num(t.content.length)} chars</summary><pre data-k="tr-${esc(t.name)}" style="max-height:200px">${esc(t.content.slice(0, 4000))}</pre></details>`).join('')}
+        ${req.toolResults.map(t => {
+          const er = looksLikeToolError(t.content);
+          const cls = er.isError ? 'tool-error-msg' : '';
+          const summaryCls = er.isError ? 'tool-error-summary' : '';
+          const excerpt = er.isError ? `<span class="tool-error-excerpt">${esc(er.excerpt || '')}</span>` : '';
+          let argsHtml = '';
+          if (t.calledWith && t.calledWith.args) {
+            let argsPretty = t.calledWith.args;
+            try { argsPretty = JSON.stringify(JSON.parse(t.calledWith.args), null, 2); } catch {}
+            argsHtml = `<div style="margin:6px 0 4px 0;font-size:11px;color:#88c0d0">→ called with</div><pre style="max-height:160px;font-size:11px">${esc(argsPretty)}</pre><div style="margin:6px 0 4px 0;font-size:11px;color:#888">→ returned</div>`;
+          }
+          return `<details class="${cls}" style="margin-bottom:6px"><summary class="${summaryCls}"><code>${esc(t.name)}</code> · ${num(t.content.length)} chars${excerpt}</summary>${argsHtml}<pre data-k="tr-${esc(t.name)}" style="max-height:200px">${esc(t.content.slice(0, 4000))}</pre></details>`;
+        }).join('')}
       </div>` : '';
 
     reqHtml = `
@@ -428,6 +761,32 @@ function renderAnalysis(d) {
   return reqHtml + respHtml;
 }
 
+// Heuristic: does this tool-result content look like an error? Returns { isError, excerpt }.
+function looksLikeToolError(text) {
+  if (!text) return { isError: false, excerpt: null };
+  const s = String(text).trim();
+  if (!s) return { isError: false, excerpt: null };
+  try {
+    const j = JSON.parse(s);
+    if (j && typeof j === 'object' && !Array.isArray(j)) {
+      if (j.error || j.success === false || j.isError) {
+        let msg = (typeof j.error === 'string') ? j.error : (j.message || (typeof j.error === 'object' ? JSON.stringify(j.error) : null));
+        if (!msg) msg = JSON.stringify(j).slice(0, 240);
+        return { isError: true, excerpt: String(msg).slice(0, 240) };
+      }
+    }
+  } catch {}
+  const firstLine = s.split('\n', 1)[0];
+  const fl = firstLine.toLowerCase();
+  if (fl.startsWith('error') || fl.startsWith('exception')) return { isError: true, excerpt: firstLine.slice(0, 240) };
+  const patterns = ['must have required property', 'validation error', 'is not allowed', 'is required', 'is invalid', 'could not be', 'failed to', 'traceback (most recent call'];
+  const sLower = s.toLowerCase();
+  for (const p of patterns) {
+    if (sLower.includes(p)) return { isError: true, excerpt: firstLine.slice(0, 240) };
+  }
+  return { isError: false, excerpt: null };
+}
+
 function reconstructStream(s) {
   if (!s) return '';
   const parts = [];
@@ -437,13 +796,389 @@ function reconstructStream(s) {
     if (data === '[DONE]') continue;
     try {
       const j = JSON.parse(data);
+      // OpenAI chat.completion.chunk
       const c = j.choices && j.choices[0];
-      if (!c) continue;
-      const delta = c.delta || c.message || {};
-      if (delta.content) parts.push(delta.content);
+      if (c) {
+        const delta = c.delta || c.message || {};
+        if (delta.content) parts.push(delta.content);
+      }
+      // Anthropic SSE: text arrives via content_block_delta {delta:{type:'text_delta',text}}
+      // and (occasionally) content_block_start carries pre-set text.
+      if (j.type === 'content_block_delta' && j.delta && j.delta.type === 'text_delta' && typeof j.delta.text === 'string') {
+        parts.push(j.delta.text);
+      } else if (j.type === 'content_block_start' && j.content_block && j.content_block.type === 'text' && typeof j.content_block.text === 'string') {
+        parts.push(j.content_block.text);
+      }
     } catch {}
   }
   return parts.join('');
+}
+
+// Map provider-specific finish reasons to a canonical token so cross-shape comparisons
+// don't false-flag (e.g. Anthropic 'tool_use' is the same outcome as OpenAI 'tool_calls').
+function _normFinish(r) {
+  if (!r) return null;
+  const s = String(r).toLowerCase();
+  if (s === 'tool_use' || s === 'tool_calls' || s === 'function_call') return 'tool_use';
+  if (s === 'end_turn' || s === 'stop') return 'end_turn';
+  if (s === 'max_tokens' || s === 'length') return 'max_tokens';
+  if (s === 'stop_sequence' || s === 'content_filter') return 'stop_sequence';
+  return s;
+}
+
+// 4-gram Jaccard similarity between two strings (0-1). Cheap, character-level, language-agnostic.
+function _ngrams(text, n = 4) {
+  const s = (text || '').toLowerCase().replace(/\s+/g, ' ').trim();
+  const out = new Set();
+  for (let i = 0; i + n <= s.length; i++) out.add(s.slice(i, i + n));
+  return out;
+}
+function _jaccard(a, b) {
+  if (!a.size && !b.size) return 1.0;
+  let inter = 0;
+  for (const x of a) if (b.has(x)) inter++;
+  const union = a.size + b.size - inter;
+  return union ? inter / union : 0;
+}
+
+// Normalize a tool_call's args for argument-equality comparison (key order, whitespace).
+function _normArgs(args) {
+  if (args == null || args === '') return '';
+  try {
+    const parsed = typeof args === 'string' ? JSON.parse(args) : args;
+    return JSON.stringify(parsed, Object.keys(parsed || {}).sort());
+  } catch {
+    return String(args);
+  }
+}
+
+// Compare a primary request and one of its shadows. Returns a structured comparison or null
+// when the shadow doesn't have a response yet.
+function compareShadow(primary, shadow, primaryAnalysis) {
+  if (!shadow || (!shadow.response_body && !shadow.stream_chunks)) return null;
+  const pAnalysis = primaryAnalysis || analyzeResponse(primary.response_body, primary.stream_chunks);
+  const sAnalysis = analyzeResponse(shadow.response_body, shadow.stream_chunks);
+
+  const cmp = {};
+
+  if (primary.duration_ms != null && shadow.duration_ms != null) {
+    cmp.latency = {
+      primary: Math.round(primary.duration_ms),
+      shadow: Math.round(shadow.duration_ms),
+      ratio: primary.duration_ms ? shadow.duration_ms / primary.duration_ms : null,
+    };
+  }
+  if (primary.total_tokens != null || shadow.total_tokens != null) {
+    cmp.tokens = {
+      primary_in: primary.prompt_tokens || 0,
+      shadow_in: shadow.prompt_tokens || 0,
+      primary_out: primary.completion_tokens || 0,
+      shadow_out: shadow.completion_tokens || 0,
+    };
+  }
+  cmp.content = {
+    primary: pAnalysis.content_chars || 0,
+    shadow: sAnalysis.content_chars || 0,
+  };
+  cmp.finish = {
+    primary: pAnalysis.finish_reason || '?',
+    shadow: sAnalysis.finish_reason || '?',
+    matches: _normFinish(pAnalysis.finish_reason) === _normFinish(sAnalysis.finish_reason),
+  };
+
+  // Tool calls: name set comparison + per-name arg equality.
+  const pTools = (pAnalysis.tool_calls || []).map(t => ({ name: t.name || '?', args: _normArgs(t.arguments) }));
+  const sTools = (sAnalysis.tool_calls || []).map(t => ({ name: t.name || '?', args: _normArgs(t.arguments) }));
+  const pNames = pTools.map(t => t.name);
+  const sNames = sTools.map(t => t.name);
+  const pSet = new Set(pNames);
+  const sSet = new Set(sNames);
+  const onlyP = [...new Set(pNames)].filter(n => !sSet.has(n));
+  const onlyS = [...new Set(sNames)].filter(n => !pSet.has(n));
+  const shared = [...pSet].filter(n => sSet.has(n));
+  const argsMatch = {};
+  for (const n of shared) {
+    const pa = pTools.find(t => t.name === n);
+    const sa = sTools.find(t => t.name === n);
+    argsMatch[n] = pa && sa && pa.args === sa.args;
+  }
+  const overlapDenom = pSet.size + sSet.size - shared.length;
+  cmp.tools = {
+    primary_count: pNames.length,
+    shadow_count: sNames.length,
+    shared,
+    only_primary: onlyP,
+    only_shadow: onlyS,
+    args_match: argsMatch,
+    name_overlap: overlapDenom ? shared.length / overlapDenom : 1.0,
+  };
+
+  const pText = (pAnalysis.content || '').slice(0, 20000);
+  const sText = (sAnalysis.content || '').slice(0, 20000);
+  if (!pText && !sText) cmp.text_similarity = null;
+  else if (!pText || !sText) cmp.text_similarity = 0;
+  else cmp.text_similarity = _jaccard(_ngrams(pText), _ngrams(sText));
+
+  return cmp;
+}
+
+function _renderShadowComparison(cmp) {
+  if (!cmp) return '';
+  const rows = [];
+  if (cmp.latency) {
+    const r = cmp.latency.ratio;
+    let note = '';
+    let cls = '';
+    if (r != null) {
+      if (r < 0.5) { note = ` · <span style="color:#a3be8c">${(1/r).toFixed(1)}× faster</span>`; cls = 'cmp-good'; }
+      else if (r < 1.2) { note = ' · ≈ same speed'; cls = 'cmp-good'; }
+      else if (r < 3) { note = ` · <span style="color:#ebcb8b">${r.toFixed(1)}× slower</span>`; cls = 'cmp-warn'; }
+      else { note = ` · <span style="color:#e08080">${r.toFixed(1)}× slower</span>`; cls = 'cmp-bad'; }
+    }
+    rows.push(`<div class="cmp-row ${cls}"><span class="cmp-label">⏱ Latency</span> primary <strong>${num(cmp.latency.primary)}ms</strong> · shadow <strong>${num(cmp.latency.shadow)}ms</strong>${note}</div>`);
+  }
+  if (cmp.tokens) {
+    const inDelta = cmp.tokens.shadow_in - cmp.tokens.primary_in;
+    const outDelta = cmp.tokens.shadow_out - cmp.tokens.primary_out;
+    const inSign = inDelta >= 0 ? '+' : '';
+    const outSign = outDelta >= 0 ? '+' : '';
+    rows.push(`<div class="cmp-row"><span class="cmp-label">📊 Tokens</span> in: <strong>${num(cmp.tokens.primary_in)}</strong> → <strong>${num(cmp.tokens.shadow_in)}</strong> (${inSign}${num(inDelta)}) · out: <strong>${num(cmp.tokens.primary_out)}</strong> → <strong>${num(cmp.tokens.shadow_out)}</strong> (${outSign}${num(outDelta)})</div>`);
+  }
+  if (cmp.content && (cmp.content.primary || cmp.content.shadow)) {
+    const delta = cmp.content.shadow - cmp.content.primary;
+    const sign = delta >= 0 ? '+' : '';
+    const ratio = cmp.content.primary ? (cmp.content.shadow / cmp.content.primary).toFixed(2) + '×' : '—';
+    rows.push(`<div class="cmp-row"><span class="cmp-label">💬 Reply chars</span> primary <strong>${num(cmp.content.primary)}</strong> · shadow <strong>${num(cmp.content.shadow)}</strong> (${sign}${num(delta)}, ${ratio})</div>`);
+  }
+  if (cmp.tools && (cmp.tools.primary_count || cmp.tools.shadow_count)) {
+    const t = cmp.tools;
+    const sameSet = t.only_primary.length === 0 && t.only_shadow.length === 0 && t.shared.length === t.primary_count;
+    const argsAllMatch = sameSet && Object.values(t.args_match).every(Boolean);
+    if (sameSet && argsAllMatch && t.shared.length) {
+      rows.push(`<div class="cmp-row cmp-good"><span class="cmp-label">🔧 Tools</span> both called <strong>${esc(t.shared.join(', '))}</strong> · args match</div>`);
+    } else if (sameSet) {
+      const diff = Object.entries(t.args_match).filter(([, v]) => !v).map(([n]) => n);
+      rows.push(`<div class="cmp-row cmp-warn"><span class="cmp-label">🔧 Tools</span> same set <strong>${esc(t.shared.join(', '))}</strong> · args differ on <strong>${esc(diff.join(', '))}</strong></div>`);
+    } else {
+      const onlyP = t.only_primary.length ? `primary-only: <strong>${esc(t.only_primary.join(', '))}</strong>` : '';
+      const onlyS = t.only_shadow.length ? `shadow-only: <strong>${esc(t.only_shadow.join(', '))}</strong>` : '';
+      const shared = t.shared.length ? `shared: <strong>${esc(t.shared.join(', '))}</strong>` : '';
+      const cls = t.name_overlap >= 0.5 ? 'cmp-warn' : 'cmp-bad';
+      rows.push(`<div class="cmp-row ${cls}"><span class="cmp-label">🔧 Tools</span> ${[shared, onlyP, onlyS].filter(Boolean).join(' · ')} · overlap ${(t.name_overlap*100).toFixed(0)}%</div>`);
+    }
+  }
+  if (cmp.finish) {
+    const cls = cmp.finish.matches ? 'cmp-good' : 'cmp-warn';
+    rows.push(`<div class="cmp-row ${cls}"><span class="cmp-label">🏁 Finish</span> primary <code>${esc(cmp.finish.primary)}</code> · shadow <code>${esc(cmp.finish.shadow)}</code>${cmp.finish.matches ? ' · match' : ''}</div>`);
+  }
+  if (cmp.text_similarity != null) {
+    const pct = (cmp.text_similarity * 100).toFixed(0);
+    let cls = 'cmp-good', label = 'near match';
+    if (cmp.text_similarity < 0.4) { cls = 'cmp-bad'; label = 'very different'; }
+    else if (cmp.text_similarity < 0.7) { cls = 'cmp-warn'; label = 'diverges'; }
+    rows.push(`<div class="cmp-row ${cls}"><span class="cmp-label">🔁 Text overlap</span> ${pct}% (4-gram Jaccard) · ${label}</div>`);
+  }
+  return `<div class="shadow-cmp">${rows.join('')}</div>`;
+}
+
+// Extract a comparable assistant text from a stored response (handles both Anthropic
+// non-streaming and OpenAI non-streaming shapes — shadows are always non-streaming).
+function _shadowResponseText(s) {
+  if (!s) return '';
+  if (s.stream_chunks) return reconstructStream(s.stream_chunks);
+  if (!s.response_body) return '';
+  try {
+    const j = JSON.parse(s.response_body);
+    if (j && j.type === 'message' && Array.isArray(j.content)) {
+      return j.content.filter(b => b && b.type === 'text').map(b => b.text || '').join('');
+    }
+    const ch = j && j.choices && j.choices[0];
+    if (ch) {
+      const m = ch.message || ch.delta || {};
+      if (typeof m.content === 'string') return m.content;
+    }
+    if (j && j.message && typeof j.message.content === 'string') return j.message.content;
+  } catch {}
+  return s.response_body.slice(0, 4000);
+}
+
+// Tracks the open compare view ({primaryId, shadowId} | null). When set, loadDetail
+// renders the comparison page instead of the normal detail layout.
+let compareView = null;
+
+async function openCompare(primaryId, shadowId) {
+  compareView = { primaryId, shadowId };
+  selected = primaryId;
+  lastDetailSig = null;
+  await loadDetail(primaryId);
+}
+
+function closeCompare() {
+  const id = compareView ? compareView.primaryId : selected;
+  compareView = null;
+  lastDetailSig = null;
+  loadDetail(id);
+}
+
+function _toolCardsHtml(analysis) {
+  if (!analysis.tool_calls || !analysis.tool_calls.length) return '<div style="color:#666;font-size:11px">(no tool calls)</div>';
+  return analysis.tool_calls.map(tc => {
+    let pretty = tc.arguments || '';
+    try { pretty = JSON.stringify(JSON.parse(tc.arguments || '{}'), null, 2); } catch {}
+    return `<div class="tool-card">
+      <div class="tool-name">🔧 ${esc(tc.name || '?')}</div>
+      <pre>${esc(pretty)}</pre>
+    </div>`;
+  }).join('');
+}
+
+function _toolPairsHtml(primaryAnalysis, shadowAnalysis) {
+  const pTools = primaryAnalysis.tool_calls || [];
+  const sTools = shadowAnalysis.tool_calls || [];
+  if (!pTools.length && !sTools.length) return '';
+  // Pair by name; if a name appears multiple times on either side, pair in arrival order.
+  const pByName = {};
+  const sByName = {};
+  for (const t of pTools) (pByName[t.name] ||= []).push(t);
+  for (const t of sTools) (sByName[t.name] ||= []).push(t);
+  const allNames = [...new Set([...Object.keys(pByName), ...Object.keys(sByName)])];
+  const pairs = [];
+  for (const n of allNames) {
+    const ps = pByName[n] || [];
+    const ss = sByName[n] || [];
+    const max = Math.max(ps.length, ss.length);
+    for (let i = 0; i < max; i++) pairs.push({ name: n, primary: ps[i] || null, shadow: ss[i] || null });
+  }
+  const rows = pairs.map(p => {
+    let tag, tagCls;
+    if (!p.primary) { tag = 'shadow only'; tagCls = 'tag-only'; }
+    else if (!p.shadow) { tag = 'primary only'; tagCls = 'tag-only'; }
+    else {
+      const pa = _normArgs(p.primary.arguments);
+      const sa = _normArgs(p.shadow.arguments);
+      if (pa === sa) { tag = 'args match'; tagCls = 'tag-match'; }
+      else { tag = 'args differ'; tagCls = 'tag-diff'; }
+    }
+    const fmt = (tc) => {
+      if (!tc) return '<div class="empty">(not called)</div>';
+      let pretty = tc.arguments || '';
+      try { pretty = JSON.stringify(JSON.parse(tc.arguments || '{}'), null, 2); } catch {}
+      return `<pre>${esc(pretty)}</pre>`;
+    };
+    return `<div class="compare-tool-pair">
+      <div class="pair-name">🔧 ${esc(p.name)} <span class="pair-tag ${tagCls}">${tag}</span></div>
+      <div class="pair-grid">
+        <div>${fmt(p.primary)}</div>
+        <div>${fmt(p.shadow)}</div>
+      </div>
+    </div>`;
+  }).join('');
+  return `<div class="compare-tools">
+    <h3>🔧 Tool calls — paired</h3>
+    <div style="font-size:11px;color:#888;margin-bottom:6px">left: primary &nbsp;·&nbsp; right: shadow</div>
+    ${rows}
+  </div>`;
+}
+
+function _renderCompareView(primary, shadow) {
+  if (!shadow) {
+    return `<div class="compare-view">
+      <div class="compare-header">
+        <button onclick="closeCompare()">← Back</button>
+        <h2>Shadow not found</h2>
+      </div>
+      <div class="empty">The selected shadow is no longer attached to this primary.</div>
+    </div>`;
+  }
+  const pAnalysis = analyzeResponse(primary.response_body, primary.stream_chunks);
+  const sAnalysis = analyzeResponse(shadow.response_body, shadow.stream_chunks);
+  const cmp = compareShadow(primary, shadow, pAnalysis);
+  const cmpBlock = _renderShadowComparison(cmp);
+  const pStatus = primary.status || (primary.error ? 'ERR' : 'pending');
+  const sStatus = shadow.status || (shadow.error ? 'ERR' : 'pending');
+  const pText = pAnalysis.content || '';
+  const sText = sAnalysis.content || '';
+
+  const colHtml = (label, model, status, ms, tokens, finishReason, text, analysis, kind) => `
+    <div class="compare-col compare-${kind}">
+      <div class="col-title">
+        <h3>${esc(label)}</h3>
+        <strong>${esc(model || '?')}</strong>
+      </div>
+      <div class="col-meta">
+        <span>status <code>${esc(status)}</code></span>
+        <span>${ms ? Math.round(ms) + ' ms' : '—'}</span>
+        <span>${tokens}</span>
+        <span>finish <code>${esc(finishReason || '?')}</code></span>
+      </div>
+      <h3>Assistant text (${num(text.length)} chars)</h3>
+      <div class="text-pane ${text ? '' : 'empty'}">${text ? esc(text) : '(no text content — tool-only turn)'}</div>
+      <h3 style="margin-top:10px">Tool calls (${analysis.tool_calls.length})</h3>
+      ${_toolCardsHtml(analysis)}
+    </div>`;
+
+  const pTokensLine = `${num(primary.total_tokens || 0)} tok (p:${num(primary.prompt_tokens) || 0} / c:${num(primary.completion_tokens) || 0})`;
+  const sTokensLine = `${num(shadow.total_tokens || 0)} tok (p:${num(shadow.prompt_tokens) || 0} / c:${num(shadow.completion_tokens) || 0})`;
+
+  return `<div class="compare-view">
+    <div class="compare-header">
+      <button onclick="closeCompare()">← Back to request</button>
+      <h2>🔀 Compare</h2>
+      <span style="color:#888;font-size:12px">primary <code>${esc(primary.id.slice(0,8))}</code> · shadow <code>${esc(shadow.id.slice(0,8))}</code></span>
+    </div>
+    ${cmpBlock}
+    <div class="compare-grid" style="margin-top:14px">
+      ${colHtml('Primary', primary.model, pStatus, primary.duration_ms, pTokensLine, pAnalysis.finish_reason, pText, pAnalysis, 'primary')}
+      ${colHtml('Shadow', shadow.model, sStatus, shadow.duration_ms, sTokensLine, sAnalysis.finish_reason, sText, sAnalysis, 'shadow')}
+    </div>
+    ${_toolPairsHtml(pAnalysis, sAnalysis)}
+  </div>`;
+}
+
+function renderShadows(shadows, primary) {
+  if (!shadows || !shadows.length) return '';
+  // Compute primary analysis once and reuse for each shadow comparison.
+  const primaryAnalysis = analyzeResponse(primary.response_body, primary.stream_chunks);
+  const rows = shadows.map((s) => {
+    const status = s.status || (s.error ? 'ERR' : 'pending');
+    const cls = !s.status && !s.error ? 'shadow-status-pending'
+              : s.error || (s.status >= 400) ? 'shadow-status-err' : 'shadow-status-ok';
+    const ms = s.duration_ms ? Math.round(s.duration_ms) + ' ms' : '—';
+    const tokens = s.total_tokens ? `${num(s.total_tokens)} tok (p:${num(s.prompt_tokens)||0} / c:${num(s.completion_tokens)||0})` : '—';
+    const respText = _shadowResponseText(s);
+    const errBlock = s.error ? `<pre style="margin-top:6px;color:#bf616a;max-height:120px">${esc(s.error)}</pre>` : '';
+    const cmp = compareShadow(primary, s, primaryAnalysis);
+    const cmpBlock = _renderShadowComparison(cmp);
+    const respBlock = respText
+      ? `<details style="margin-top:6px"><summary style="cursor:pointer;color:#888;font-size:11px">show response (${num(respText.length)} chars)</summary>
+           <pre data-k="shadow-${esc(s.id)}-resp" style="max-height:300px">${esc(respText)}</pre></details>`
+      : '<div style="margin-top:6px;color:#666;font-size:11px">(no response yet)</div>';
+    const rawBlock = s.response_body
+      ? `<details style="margin-top:4px"><summary style="cursor:pointer;color:#666;font-size:10px">raw upstream JSON</summary>
+           <pre data-k="shadow-${esc(s.id)}-raw" style="max-height:240px;font-size:11px">${esc(tryPretty(s.response_body))}</pre></details>`
+      : '';
+    const compareBtn = (s.response_body || s.stream_chunks)
+      ? ` &nbsp;<a href="#" style="color:#a3be8c;font-size:11px" onclick="event.preventDefault();openCompare('${esc(primary.id)}','${esc(s.id)}')">🔍 compare →</a>`
+      : '';
+    return `<div class="shadow-row">
+      <div class="shadow-meta">
+        <span><strong>${esc(s.model || '(?)')}</strong></span>
+        <span class="${cls}">${esc(status)}</span>
+        <span style="color:#888">${ms}</span>
+        <span style="color:#888">${tokens}</span>
+        <span style="color:#666;font-size:11px">${esc(s.upstream_url || '')}</span>
+        <span style="margin-left:auto"><a href="#" style="color:#88c0d0;font-size:11px" onclick="event.preventDefault();selectItem('${esc(s.id)}')">open ${esc(s.id.slice(0,8))} →</a>${compareBtn}</span>
+      </div>
+      ${cmpBlock}
+      ${errBlock}
+      ${respBlock}
+      ${rawBlock}
+    </div>`;
+  }).join('');
+  return `<div class="shadow-section">
+    <h3>🔀 Shadow runs (${shadows.length}) — primary model <code>${esc(primary.model || '?')}</code></h3>
+    ${rows}
+  </div>`;
 }
 
 async function loadDetail(id) {
@@ -451,13 +1186,25 @@ async function loadDetail(id) {
   if (!r.ok) { $('detail').innerHTML = '<div class="empty">not found</div>'; lastDetailSig = null; return; }
   const d = await r.json();
 
+  // Compare view: render the side-by-side comparison and exit early.
+  if (compareView && compareView.primaryId === d.id) {
+    const shadow = (d.shadows || []).find(s => s.id === compareView.shadowId);
+    const sig = `compare|${d.id}|${compareView.shadowId}|${(d.response_body || '').length}|${(d.stream_chunks || '').length}|${shadow ? shadow.status || 'p' : 'none'}|${shadow ? (shadow.response_body || '').length : 0}`;
+    if (sig === lastDetailSig) return;
+    $('detail').innerHTML = _renderCompareView(d, shadow);
+    lastDetailSig = sig;
+    return;
+  }
+
   // Skip re-render if nothing the user can see has changed; preserves scroll position during auto-refresh.
+  const shadowSig = (d.shadows || []).map(s => `${s.id}:${s.status || 'p'}:${(s.response_body || '').length}:${s.duration_ms || 0}`).join(';');
   const sig = [
     d.id, d.status, d.error || '',
     (d.response_body || '').length,
     (d.stream_chunks || '').length,
     d.duration_ms || 0,
     d.total_tokens || 0,
+    shadowSig,
   ].join('|');
   if (sig === lastDetailSig) return;
 
@@ -490,11 +1237,20 @@ async function loadDetail(id) {
   const tokensLine = (d.prompt_tokens != null || d.completion_tokens != null || d.total_tokens != null)
     ? `<div class="row"><span class="label">Tokens</span> prompt: <code>${num(d.prompt_tokens) || '—'}</code> · completion: <code>${num(d.completion_tokens) || '—'}</code> · total: <code>${num(d.total_tokens) || '—'}</code></div>`
     : '';
+  let downsizeLine = '';
+  if (d.downsize_score != null) {
+    const s = d.downsize_score;
+    const filled = Math.round(s / 10);
+    const bar = '●'.repeat(filled) + '○'.repeat(10 - filled);
+    const color = s >= 70 ? '#a3be8c' : s >= 40 ? '#ebcb8b' : '#888';
+    const reasons = (d.downsize_reasons || []).join(' · ') || 'no signals';
+    downsizeLine = `<div class="row"><span class="label">Downsize</span> <span style="color:${color};font-family:ui-monospace,monospace">${bar}</span> <code>${s}/100</code> <span style="color:#888;font-size:11px" title="${esc(reasons)}">${esc(reasons)}</span></div>`;
+  }
 
   const analysisHtml = renderAnalysis(d);
 
   let gateHtml = '';
-  if (d.gate_verdict === 'block' || d.gate_verdict === 'warn' || d.gate_verdict === 'rewrite') {
+  if (d.gate_verdict === 'block' || d.gate_verdict === 'warn' || d.gate_verdict === 'rewrite' || d.gate_verdict === 'intercept') {
     let detailsBlock = '';
     let parsed = null;
     if (d.gate_details) {
@@ -503,11 +1259,25 @@ async function loadDetail(id) {
       detailsBlock = `<pre data-k="gate-details" style="margin-top:8px;max-height:200px">${esc(pretty)}</pre>`;
     }
     let routedLine = '';
-    if (parsed && parsed.rewrite) {
-      const r = parsed.rewrite;
-      routedLine = `<div style="margin-top:6px;font-size:14px"><code>${esc(r.from)}</code> &nbsp;→&nbsp; <code style="color:#88c0d0">${esc(r.to)}</code> <span class="badge">via ${esc(r.via || '')}</span></div>`;
+    if (parsed) {
+      if (parsed.rewrite) {
+        const r = parsed.rewrite;
+        routedLine += `<div style="margin-top:6px;font-size:14px"><strong>model:</strong> <code>${esc(r.from)}</code> &nbsp;→&nbsp; <code style="color:#88c0d0">${esc(r.to)}</code> <span class="badge">via ${esc(r.via || '')}</span></div>`;
+      }
+      if (parsed.options && parsed.options.applied) {
+        const apps = parsed.options.applied;
+        const kvs = Object.entries(apps).map(([k, v]) => `<code>${esc(k)}=${esc(JSON.stringify(v))}</code>`).join(' &nbsp;');
+        routedLine += `<div style="margin-top:6px;font-size:13px"><strong style="color:#88c0d0">options injected:</strong> ${kvs}</div>`;
+      }
+      if (parsed.fixes && Array.isArray(parsed.fixes) && parsed.fixes.length) {
+        const fixSummary = parsed.fixes.map(f => `<code>${esc(f.tool_name)}</code> ← {${Object.entries(f.fixed_fields || {}).map(([k, v]) => `${esc(k)}: ${esc(JSON.stringify(v))}`).join(', ')}}`).join('; ');
+        routedLine += `<div style="margin-top:6px;font-size:13px"><strong style="color:#88c0d0">tool args autofixed:</strong> ${fixSummary}</div>`;
+      }
     }
-    const cls = d.gate_verdict === 'block' ? 'gate-block' : (d.gate_verdict === 'warn' ? 'gate-warn' : 'gate-rewrite');
+    const cls = d.gate_verdict === 'block' ? 'gate-block'
+              : d.gate_verdict === 'warn' ? 'gate-warn'
+              : d.gate_verdict === 'rewrite' ? 'gate-rewrite'
+              : 'gate-intercept';
     gateHtml = `<div class="${cls}">
       <div><span class="verdict ${d.gate_verdict}">${esc(d.gate_verdict)}</span> · rule: <code>${esc(d.gate_rule || '')}</code></div>
       <div style="margin-top:6px">${esc(d.gate_reason || '')}</div>
@@ -518,17 +1288,26 @@ async function loadDetail(id) {
     gateHtml = `<div class="gate-allow"><span class="verdict allow">allow</span> · no rule fired</div>`;
   }
 
+  // If this row is itself a shadow, show a banner linking back to its primary.
+  const shadowBackBanner = d.shadow_of
+    ? `<div class="shadow-back-banner">🔀 This is a shadow run of <a href="#" onclick="event.preventDefault();selectItem('${esc(d.shadow_of)}')">${esc(d.shadow_of)}</a> — comparison only, not delivered to the client.</div>`
+    : '';
+  const shadowsHtml = renderShadows(d.shadows || [], d);
+
   detailEl.innerHTML = `
+    ${shadowBackBanner}
     <div class="summary">
       <div class="row"><span class="label">Request</span> <strong class="method">${esc(d.method)}</strong> <code>${esc(d.path)}</code></div>
-      <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code></div>
+      <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
       <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code></div>
       <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${d.duration_ms ? Math.round(d.duration_ms) + ' ms' : '—'}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}</div>
       <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code></div>
       ${tokensLine}
+      ${downsizeLine}
     </div>
     ${gateHtml}
     ${errBlock}
+    ${shadowsHtml}
     ${analysisHtml}
     <div class="section"><h3>Request Headers</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="reqh">${esc(reqHeaders)}</pre></details></div>
     <div class="section"><h3>Request Body (raw)</h3><details open><summary style="cursor:pointer;color:#888;font-size:11px">hide</summary><pre data-k="reqb">${esc(reqBody)}</pre></details></div>
@@ -556,8 +1335,110 @@ async function clearAll() {
   if (view === 'stats') await loadStats();
 }
 
+function _renderTrafficFlow(stats, rules, audit) {
+  const apps = (stats.by_app || []).slice().sort((a, b) => b.count - a.count);
+  const cfg = (rules && rules.config) || {};
+  const auditCounts = {};
+  for (const ev of (audit && audit.items) || []) {
+    const rule = ev.gate_rule || '?';
+    // gate_rule can be combined like "model_router+protocol_bridge" — count each component.
+    for (const r of rule.split('+')) {
+      auditCounts[r] = (auditCounts[r] || 0) + 1;
+    }
+  }
+  // Aggregate paths into upstream buckets.
+  const upstreams = { Anthropic: { reqs: 0, tokens: 0, ms_total: 0 }, 'Ollama (local)': { reqs: 0, tokens: 0, ms_total: 0 }, Other: { reqs: 0, tokens: 0, ms_total: 0 } };
+  for (const p of (stats.by_path || [])) {
+    let key = 'Other';
+    if (p.path && (p.path.startsWith('/v1/messages') || p.path.startsWith('/v1/complete'))) key = 'Anthropic';
+    else if (p.path && (p.path.startsWith('/v1/') || p.path.startsWith('/api/'))) key = 'Ollama (local)';
+    upstreams[key].reqs += p.count || 0;
+    upstreams[key].tokens += p.total_tokens || 0;
+    upstreams[key].ms_total += (p.avg_ms || 0) * (p.count || 0);
+  }
+  // Most-recently-active first.
+  const clientCards = apps.length ? apps.map(a => {
+    const live = (Date.now() / 1000 - (a.last_ts || 0)) < 60 ? 'flow-card-live' : '';
+    const ago = a.last_ts ? _agoShort(Date.now() / 1000 - a.last_ts) : '—';
+    return `<div class="flow-card ${live}">
+      <div class="flow-card-name"><span class="app-badge app-${esc(a.client_app)}">${esc(a.client_app)}</span></div>
+      <div class="flow-card-stat"><strong>${num(a.count)}</strong> reqs · <strong>${num(a.total_tokens)}</strong> tok</div>
+      <div class="flow-card-stat" style="font-size:10px">avg ${(a.avg_ms / 1000).toFixed(1)}s · ${esc(ago)} ago</div>
+    </div>`;
+  }).join('') : '<div class="flow-card" style="color:#666">no clients yet</div>';
+
+  // Pipeline rules in execution order. Activation count from audit (best-effort match).
+  const ruleOrder = [
+    'model_router', 'ollama_options', 'protocol_bridge', 'tool_pruner', 'context_overflow_guard',
+    'shadow_router', 'loop_detector', 'tool_failure_breaker',
+    'schema_validator', 'hallucinated_tool', 'tool_args_autofix',
+  ];
+  const ruleHtml = ruleOrder.map(name => {
+    const rcfg = cfg[name] || {};
+    const enabled = !!rcfg.enabled;
+    const count = auditCounts[name] || 0;
+    return `<div class="flow-rule ${enabled ? '' : 'is-off'}">
+      <span class="rule-dot ${enabled ? 'on' : 'off'}"></span>
+      <span class="rule-name">${esc(name)}</span>
+      <span class="rule-count ${count === 0 ? 'zero' : ''}">${count ? num(count) + ' fired' : (enabled ? 'idle' : 'off')}</span>
+    </div>`;
+  }).join('');
+
+  const upstreamCards = Object.entries(upstreams).filter(([, v]) => v.reqs > 0).map(([name, v]) => {
+    const avg = v.reqs > 0 ? Math.round(v.ms_total / v.reqs) : 0;
+    return `<div class="flow-card">
+      <div class="flow-card-name"><strong>${esc(name)}</strong></div>
+      <div class="flow-card-stat"><strong>${num(v.reqs)}</strong> reqs · <strong>${num(v.tokens)}</strong> tok</div>
+      <div class="flow-card-stat" style="font-size:10px">avg ${avg < 1000 ? avg + ' ms' : (avg / 1000).toFixed(1) + ' s'}</div>
+    </div>`;
+  }).join('') || '<div class="flow-card" style="color:#666">no upstream traffic yet</div>';
+
+  const totalReqs = (stats.overall && stats.overall.count) || 0;
+  const totalTok = (stats.overall && stats.overall.total_tokens) || 0;
+  const blocks = (audit && audit.counts && audit.counts.block) || 0;
+  const intercepts = (audit && audit.counts && audit.counts.intercept) || 0;
+  const rewrites = (audit && audit.counts && audit.counts.rewrite) || 0;
+
+  return `<div class="flow-section">
+    <h2>🔀 Traffic Flow <span style="color:#666;font-weight:normal;font-size:10px;margin-left:8px">live · refreshes every 1.5s</span></h2>
+    <div class="flow-grid">
+      <div class="flow-col flow-col-clients">
+        <div class="flow-col-title">CLIENTS (${apps.length})</div>
+        ${clientCards}
+      </div>
+      <div class="flow-arrow-col"><div><div class="flow-arrow">→</div><div class="flow-arrow-label">${num(totalReqs)} req<br>${num(totalTok)} tok</div></div></div>
+      <div class="flow-col flow-col-proxy">
+        <div class="flow-col-title">AI PROXY · rule pipeline</div>
+        ${ruleHtml}
+        <div class="flow-totals">
+          <span><strong>${num(blocks)}</strong> blocks</span>
+          <span><strong>${num(intercepts)}</strong> intercepts</span>
+          <span><strong>${num(rewrites)}</strong> rewrites</span>
+        </div>
+      </div>
+      <div class="flow-arrow-col"><div><div class="flow-arrow">→</div><div class="flow-arrow-label">to upstream</div></div></div>
+      <div class="flow-col flow-col-upstreams">
+        <div class="flow-col-title">UPSTREAMS</div>
+        ${upstreamCards}
+      </div>
+    </div>
+  </div>`;
+}
+
+function _agoShort(s) {
+  if (s < 60) return Math.round(s) + 's';
+  if (s < 3600) return Math.round(s / 60) + 'm';
+  if (s < 86400) return (s / 3600).toFixed(1) + 'h';
+  return (s / 86400).toFixed(1) + 'd';
+}
+
 async function loadStats() {
-  const d = await (await fetch('/__proxy/api/stats')).json();
+  const [d, rules, audit] = await Promise.all([
+    fetch('/__proxy/api/stats').then(r => r.json()),
+    fetch('/__proxy/api/rules').then(r => r.json()).catch(() => null),
+    fetch('/__proxy/api/audit?include_allow=true').then(r => r.json()).catch(() => null),
+  ]);
+  const flowHtml = _renderTrafficFlow(d, rules, audit);
   const o = d.overall || {};
   const span = (o.first_ts && o.last_ts) ? Math.max(1, o.last_ts - o.first_ts) : 0;
   const cards = `
@@ -571,7 +1452,10 @@ async function loadStats() {
   const maxModelTokens = Math.max(1, ...d.by_model.map(m => m.total_tokens || 0));
   const modelRows = d.by_model.length ? d.by_model.map(m => {
     const w = Math.round(80 * (m.total_tokens || 0) / maxModelTokens);
-    const tokensPerSec = m.total_ms > 0 ? ((m.completion_tokens || 0) / (m.total_ms / 1000)).toFixed(1) : '—';
+    const compTokens = m.completion_tokens || 0;
+    const totalMs = m.total_ms || 0;
+    const tokensPerSec = totalMs > 0 && compTokens > 0 ? (compTokens / (totalMs / 1000)).toFixed(1) : '—';
+    const msPer1k = compTokens > 0 ? Math.round((totalMs / compTokens) * 1000) : '—';
     return `<tr>
       <td><code>${esc(m.model)}</code></td>
       <td class="num">${num(m.count)}</td>
@@ -579,10 +1463,11 @@ async function loadStats() {
       <td class="num">${num(m.completion_tokens)}</td>
       <td class="num"><span class="bar" style="width:${w}px"></span>${num(m.total_tokens)}</td>
       <td class="num">${Math.round(m.avg_ms || 0)}</td>
-      <td class="num">${tokensPerSec}</td>
+      <td class="num" title="completion tokens per second">${tokensPerSec}</td>
+      <td class="num" title="ms to generate 1,000 completion tokens">${msPer1k === '—' ? '—' : num(msPer1k)}</td>
       <td class="num">${num(m.errors || 0)}</td>
     </tr>`;
-  }).join('') : '<tr><td colspan="8" class="empty">No data yet</td></tr>';
+  }).join('') : '<tr><td colspan="9" class="empty">No data yet</td></tr>';
 
   const pathRows = d.by_path.length ? d.by_path.map(p => `
     <tr><td><code>${esc(p.path)}</code></td><td class="num">${num(p.count)}</td><td class="num">${num(p.total_tokens)}</td><td class="num">${Math.round(p.avg_ms || 0)}</td></tr>
@@ -598,6 +1483,23 @@ async function loadStats() {
     <tr><td><code>${esc(c.client_ip)}</code></td><td class="num">${num(c.count)}</td><td class="num">${num(c.total_tokens)}</td><td class="num">${Math.round(c.avg_ms || 0)}</td><td style="color:#888;font-size:11px">${c.last_ts ? new Date(c.last_ts*1000).toLocaleString() : ''}</td></tr>
   `).join('') : '<tr><td colspan="5" class="empty">No data yet</td></tr>';
 
+  const apps = d.by_app || [];
+  const appRows = apps.length ? apps.map(a => {
+    const modelsSeen = (a.models_seen || '').split(',').filter(Boolean).slice(0, 4).map(m => `<code style="font-size:10px;color:#888">${esc(m)}</code>`).join(' ');
+    const more = ((a.models_seen || '').split(',').filter(Boolean).length || 0) - 4;
+    return `<tr>
+      <td><span class="app-badge app-${esc(a.client_app)}">${esc(a.client_app)}</span></td>
+      <td class="num">${num(a.count)}</td>
+      <td class="num">${num(a.conversations || 0)}</td>
+      <td class="num">${num(a.prompt_tokens)}</td>
+      <td class="num">${num(a.completion_tokens)}</td>
+      <td class="num">${num(a.total_tokens)}</td>
+      <td class="num">${Math.round(a.avg_ms || 0)}</td>
+      <td>${modelsSeen}${more > 0 ? ` <span style="color:#666;font-size:10px">+${more}</span>` : ''}</td>
+      <td style="color:#888;font-size:11px">${a.last_ts ? new Date(a.last_ts*1000).toLocaleString() : ''}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="9" class="empty">No data yet</td></tr>';
+
   const tools = d.by_tool || [];
   const toolRows = tools.length ? tools.map(t => {
     const byModel = Object.entries(t.by_model || {}).map(([m, n]) => `<code style="font-size:11px">${esc(m)}</code>:${num(n)}`).join(' · ') || '—';
@@ -605,11 +1507,12 @@ async function loadStats() {
   }).join('') : '<tr><td colspan="3" class="empty">No tool calls observed yet</td></tr>';
 
   $('stats').innerHTML = `
+    ${flowHtml}
     ${cards}
     <div class="stats-section">
       <h2>By Model</h2>
       <table style="width:100%">
-        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th class="num">tok/s</th><th class="num">Errors</th></tr></thead>
+        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th class="num" title="completion tokens per second">tok/s</th><th class="num" title="ms to generate 1,000 completion tokens">ms/1k</th><th class="num">Errors</th></tr></thead>
         <tbody>${modelRows}</tbody>
       </table>
     </div>
@@ -621,7 +1524,14 @@ async function loadStats() {
       </table>
     </div>
     <div class="stats-section">
-      <h2>By Client</h2>
+      <h2>By Client App</h2>
+      <table style="width:100%">
+        <thead><tr><th>App</th><th class="num">Requests</th><th class="num">Conversations</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th>Models</th><th>Last Seen</th></tr></thead>
+        <tbody>${appRows}</tbody>
+      </table>
+    </div>
+    <div class="stats-section">
+      <h2>By Client IP</h2>
       <table style="width:100%">
         <thead><tr><th>Client IP</th><th class="num">Requests</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th>Last Seen</th></tr></thead>
         <tbody>${clientRows}</tbody>
@@ -660,6 +1570,7 @@ async function loadAudit() {
   const warns = counts.warn || 0;
   const allows = counts.allow || 0;
   const rewrites = counts.rewrite || 0;
+  const intercepts = counts.intercept || 0;
 
   const rulesCfg = r.config || {};
   const ruleRows = (r.registered || []).map(name => {
@@ -690,8 +1601,20 @@ async function loadAudit() {
   }).join('') || '<tr><td colspan="7" class="empty">No blocks or warnings yet</td></tr>';
 
   const suggItems = (s.items || []);
-  const suggestionsHtml = suggItems.length ? suggItems.map(it => `
-    <details class="suggestion ${esc(it.severity || '')}">
+  // Capture open/closed state from previous render so auto-refresh doesn't thrash the UI.
+  const prevOpen = new Set();
+  for (const el of $('audit').querySelectorAll('details.suggestion[open][data-sid]')) prevOpen.add(el.dataset.sid);
+  const prevSnipOpen = new Set();
+  for (const el of $('audit').querySelectorAll('details.suggestion details[open][data-snip]')) prevSnipOpen.add(el.dataset.snip);
+  const prevSectionOpenEl = $('suggestions-section');
+  const prevSectionOpen = prevSectionOpenEl ? prevSectionOpenEl.hasAttribute('open') : null;
+
+  const suggestionsHtml = suggItems.length ? suggItems.map(it => {
+    const sid = it.id || it.title;
+    const isOpen = prevOpen.has(sid);
+    const snipOpen = prevSnipOpen.has(sid);
+    return `
+    <details class="suggestion ${esc(it.severity || '')}" data-sid="${esc(sid)}" ${isOpen ? 'open' : ''}>
       <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px">
         <span style="color:#666;font-size:10px;width:10px">▸</span>
         <strong style="font-size:13px">${esc(it.title)}</strong>
@@ -699,26 +1622,20 @@ async function loadAudit() {
       </summary>
       <div style="margin:8px 0 0 18px">
         <div class="detail">${esc(it.detail)}</div>
-        ${it.snippet ? `<details><summary style="cursor:pointer;color:#888;font-size:11px">show rules.json snippet</summary><pre>${esc(JSON.stringify(it.snippet, null, 2))}</pre></details>` : ''}
+        ${it.snippet ? `<details data-snip="${esc(sid)}" ${snipOpen ? 'open' : ''}><summary style="cursor:pointer;color:#888;font-size:11px">show rules.json snippet</summary><pre>${esc(JSON.stringify(it.snippet, null, 2))}</pre></details>` : ''}
       </div>
-    </details>
-  `).join('') : `<div class="empty" style="padding:20px">No suggestions yet — need more traffic to find patterns (analyzed ${num(s.sample_size || 0)} requests).</div>`;
+    </details>`;
+  }).join('') : `<div class="empty" style="padding:20px">No suggestions yet — need more traffic to find patterns (analyzed ${num(s.sample_size || 0)} requests).</div>`;
 
   $('audit').innerHTML = `
     <div class="cards">
       <div class="card"><div class="l">Allowed</div><div class="v" style="color:#a3be8c">${num(allows)}</div></div>
       <div class="card"><div class="l">Rewrites</div><div class="v" style="color:#88c0d0">${num(rewrites)}</div></div>
+      <div class="card"><div class="l">Intercepts</div><div class="v" style="color:#c8a8d8">${num(intercepts)}</div></div>
       <div class="card"><div class="l">Warnings</div><div class="v" style="color:#ebcb8b">${num(warns)}</div></div>
       <div class="card"><div class="l">Blocks</div><div class="v" style="color:#bf616a">${num(blocks)}</div></div>
       <div class="card"><div class="l">Rules File</div><div class="v" style="font-size:12px"><code>${esc((r.rules_file || '').split('/').pop())}</code></div><div class="s">${r.rules_file_exists ? 'override active' : 'using defaults'}</div></div>
     </div>
-    <details class="stats-section" ${suggItems.length ? 'open' : ''} id="suggestions-section">
-      <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
-        <span style="color:#888;font-size:10px;width:10px" class="caret">▾</span>
-        <h2 style="margin:0">Config Suggestions${suggItems.length ? ` <span style="color:#666;font-weight:normal;font-size:11px">(${suggItems.length})</span>` : ''}</h2>
-      </summary>
-      ${suggestionsHtml}
-    </details>
     <div class="stats-section">
       <h2>Active Rules</h2>
       <div style="margin-bottom:8px">${quickToggles}</div>
@@ -726,6 +1643,20 @@ async function loadAudit() {
         <thead><tr><th>Rule</th><th>Enabled</th><th>Action</th><th>Config</th></tr></thead>
         <tbody>${ruleRows}</tbody>
       </table>
+    </div>
+    <div class="routing-panel">
+      <h2>🔀 Routing mode</h2>
+      <div class="desc">Quick toggle between passthrough, shadow comparison, and full redirect to a local model. Edits the rules config below — saves apply immediately, no restart needed.</div>
+      <div class="routing-row">
+        <label>From <input type="text" id="routing-from" value="claude-opus-4-7" placeholder="claude-opus-4-7"></label>
+        <label>To <input type="text" id="routing-to" value="qwen3-coder-next:latest" placeholder="qwen3-coder-next:latest"></label>
+      </div>
+      <div class="routing-row">
+        <button class="routing-mode-btn mode-passthrough" id="mode-btn-passthrough" onclick="setRoutingMode('passthrough')">Passthrough · Claude → Claude</button>
+        <button class="routing-mode-btn mode-shadow" id="mode-btn-shadow" onclick="setRoutingMode('shadow')">🔀 Shadow · Claude + local in parallel</button>
+        <button class="routing-mode-btn mode-redirect" id="mode-btn-redirect" onclick="setRoutingMode('redirect')">⇄ Redirect · Claude → local</button>
+      </div>
+      <div id="routing-status"></div>
     </div>
     <div class="stats-section" id="rules-editor">
       <h2>Rules Editor <span style="color:#888;font-weight:normal;font-size:11px">${esc(r.source || '')}${r.updated_ts ? ' · saved ' + new Date(r.updated_ts*1000).toLocaleString() : ''}</span></h2>
@@ -744,6 +1675,26 @@ async function loadAudit() {
         <thead><tr><th>Time</th><th>Verdict</th><th>Rule</th><th>Reason</th><th>Model</th><th>Client</th><th>Path</th></tr></thead>
         <tbody>${auditRows}</tbody>
       </table>
+    </div>
+    <details class="stats-section" ${(prevSectionOpen === null ? (suggItems.length > 0) : prevSectionOpen) ? 'open' : ''} id="suggestions-section">
+      <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
+        <span style="color:#888;font-size:10px;width:10px" class="caret">▾</span>
+        <h2 style="margin:0">Config Suggestions${suggItems.length ? ` <span style="color:#666;font-weight:normal;font-size:11px">(${suggItems.length})</span>` : ''}</h2>
+      </summary>
+      ${suggestionsHtml}
+    </details>
+    <div class="stats-section">
+      <h2>Export for AI review</h2>
+      <div style="color:#888;font-size:12px;margin-bottom:8px">Build a digest you can paste into Claude/GPT to get rule recommendations. Or wire up the MCP endpoint and let an AI pull this data on demand.</div>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <label style="font-size:12px;color:#aaa">Samples <input type="number" id="export-samples" value="10" min="0" max="50" style="width:60px;background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 6px;border-radius:3px;font-size:12px"></label>
+        <label style="font-size:12px;color:#aaa">Window (min) <input type="number" id="export-minutes" value="1440" min="1" max="43200" style="width:80px;background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 6px;border-radius:3px;font-size:12px"></label>
+        <label style="font-size:12px;color:#aaa"><input type="checkbox" id="export-redact" checked> redact PII</label>
+        <label style="font-size:12px;color:#aaa"><input type="checkbox" id="export-bodies"> longer bodies</label>
+        <button onclick="exportDigest('markdown', this)">Copy Markdown</button>
+        <button onclick="exportDigest('json', this)">Download JSON</button>
+        <button onclick="exportDigest('ndjson', this)">Download NDJSON</button>
+      </div>
     </div>
   `;
   for (const tr of $('audit').querySelectorAll('tbody tr[data-id]')) {
@@ -803,17 +1754,44 @@ async function loadConversations() {
   }
 }
 
+function _conversationTurnSummary(t, body, userText, assistantText, toolCalls, toolResults) {
+  // One-line scan: short user message OR what the assistant did this turn.
+  let snippet = '';
+  if (userText) {
+    snippet = userText.replace(/\s+/g, ' ').slice(0, 100);
+  } else if (toolResults.length) {
+    snippet = `↩ ${toolResults.length} tool result${toolResults.length === 1 ? '' : 's'}`;
+  }
+  let outcome = '';
+  if (toolCalls.length) {
+    outcome = ` 🔧 ${toolCalls.map(tc => tc.name || '?').slice(0, 3).join(', ')}${toolCalls.length > 3 ? ` +${toolCalls.length - 3}` : ''}`;
+  } else if (assistantText) {
+    const assistSnip = assistantText.replace(/\s+/g, ' ').slice(0, 80);
+    outcome = ` 💬 ${assistSnip}${assistantText.length > 80 ? '…' : ''}`;
+  }
+  return { snippet, outcome };
+}
+
 async function loadConversationDetail(cid) {
   const d = await (await fetch('/__proxy/api/conversations/' + encodeURIComponent(cid))).json();
   const turns = d.turns || [];
-  const turnHtml = turns.map((t, i) => {
+  // Auto-expand last 3 turns on long conversations; expand all on short ones.
+  const longConv = turns.length > 8;
+  const expandedSet = new Set();
+  if (!longConv) {
+    turns.forEach((_, i) => expandedSet.add(i));
+  } else {
+    for (let i = Math.max(0, turns.length - 3); i < turns.length; i++) expandedSet.add(i);
+  }
+
+  // First pass: compute per-turn metadata so both TOC and turn list render from one source.
+  const meta = turns.map((t) => {
     let body = null;
     try { body = JSON.parse(t.request_body || ''); } catch {}
     const userMsgs = (body && body.messages || []).filter(m => m && m.role === 'user');
     const lastUser = userMsgs[userMsgs.length - 1];
     const userText = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content)) : '';
 
-    // Assistant: prefer reconstructed stream, else parse response_body.
     let assistantText = '';
     let toolCalls = [];
     if (t.stream_chunks) {
@@ -826,8 +1804,30 @@ async function loadConversationDetail(cid) {
       toolCalls = a.tool_calls;
     }
 
-    // Tool result messages in this turn's request (results from prior turn's tool calls).
-    const toolResults = (body && body.messages || []).filter(m => m && m.role === 'tool');
+    const allMsgs = (body && body.messages) || [];
+    const tcMap = {};
+    for (const m of allMsgs) {
+      if (m && m.role === 'assistant' && Array.isArray(m.tool_calls)) {
+        for (const tc of m.tool_calls) {
+          if (tc && tc.id && tc.function) {
+            tcMap[tc.id] = { name: tc.function.name, args: tc.function.arguments };
+          }
+        }
+      }
+    }
+    const toolResults = allMsgs.filter(m => m && m.role === 'tool').map(m => ({
+      ...m,
+      _call: m.tool_call_id ? tcMap[m.tool_call_id] : null,
+    }));
+    const hasError = toolResults.some(tr => {
+      const c = typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || '');
+      return looksLikeToolError(c).isError;
+    });
+    return { t, body, userText, assistantText, toolCalls, toolResults, hasError, hasTool: toolCalls.length > 0 };
+  });
+
+  const turnHtml = meta.map((m, i) => {
+    const { t, body, userText, assistantText, toolCalls, toolResults, hasError, hasTool } = m;
 
     let verdictBadge = '';
     if (t.gate_verdict && t.gate_verdict !== 'allow') {
@@ -840,36 +1840,301 @@ async function loadConversationDetail(cid) {
       return `<details style="margin:4px 0"><summary style="font-size:11px;cursor:pointer">🔧 <code>${esc(tc.name)}</code></summary><pre style="font-size:11px;max-height:160px">${esc(pretty)}</pre></details>`;
     }).join('') : '';
 
-    const trHtml = toolResults.length ? toolResults.map(tr => `
-      <details class="msg tool" style="margin:4px 0"><summary style="font-size:11px;cursor:pointer">tool result · <code>${esc(tr.name || tr.tool_call_id || '?')}</code></summary>
-        <pre style="font-size:11px;max-height:160px;margin-top:4px">${esc(typeof tr.content === 'string' ? tr.content.slice(0, 4000) : JSON.stringify(tr.content).slice(0, 4000))}</pre>
-      </details>
-    `).join('') : '';
+    const trHtml = toolResults.length ? toolResults.map(tr => {
+      const contentStr = typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || '');
+      const er = looksLikeToolError(contentStr);
+      const cls = er.isError ? 'msg tool tool-error-msg' : 'msg tool';
+      const summaryCls = er.isError ? 'tool-error-summary' : '';
+      const excerpt = er.isError ? `<span class="tool-error-excerpt">${esc(er.excerpt || '')}</span>` : '';
+      const callName = (tr._call && tr._call.name) || tr.name || tr.tool_call_id || '?';
+      let argsHtml = '';
+      if (tr._call && tr._call.args) {
+        let argsPretty = tr._call.args;
+        try { argsPretty = JSON.stringify(JSON.parse(tr._call.args), null, 2); } catch {}
+        argsHtml = `<div style="margin:6px 0 2px 0;font-size:10px;color:#88c0d0;text-transform:uppercase;letter-spacing:0.5px">→ called with</div><pre style="font-size:11px;max-height:160px;margin:0 0 4px 0">${esc(argsPretty)}</pre><div style="margin:0 0 2px 0;font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:0.5px">→ returned</div>`;
+      }
+      return `<details class="${cls}" style="margin:4px 0"><summary class="${summaryCls}" style="font-size:11px;cursor:pointer">🔧 <code>${esc(callName)}</code>${argsHtml ? '' : ' (result)'}${excerpt}</summary>
+        ${argsHtml}<pre style="font-size:11px;max-height:160px;margin-top:0">${esc(contentStr.slice(0, 4000))}</pre>
+      </details>`;
+    }).join('') : '';
 
-    return `<div class="turn">
-      <div class="turn-header">
-        <strong>Turn ${num(t.turn_index || (i + 1))}</strong>
-        <span>· <a href="#" onclick="event.preventDefault();setView('requests');selectItem('${esc(t.id)}')" style="color:#88c0d0">${esc(t.id.slice(0,8))}</a></span>
+    const sum = _conversationTurnSummary(t, body, userText, assistantText, toolCalls, toolResults);
+    const isOpen = expandedSet.has(i);
+    const summaryLine = `<span style="color:#888;font-size:11px">${esc(sum.snippet || '(no user msg)')}</span>${sum.outcome ? `<span style="color:#aaa;font-size:11px">${esc(sum.outcome)}</span>` : ''}`;
+    return `<details id="turn-${i}" class="turn" data-turn-idx="${i}" data-has-error="${hasError ? 1 : 0}" data-has-tool="${hasTool ? 1 : 0}" ${isOpen ? 'open' : ''}>
+      <summary class="turn-header" style="cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:6px">
+        <span style="color:#888;font-size:10px;width:10px">▸</span>
+        <strong>Turn ${i + 1}</strong>${t.turn_index && t.turn_index !== (i + 1) ? `<span style="color:#666;font-size:10px"> (msg #${num(t.turn_index)})</span>` : ''}
         <span>· ${fmt(t.ts)}</span>
         <span>· <code>${esc(t.model || '')}</code></span>
         <span>· ${num(t.total_tokens || 0)} tok</span>
         <span>· ${Math.round(t.duration_ms || 0)}ms</span>
         ${verdictBadge}
+        <span style="flex:1;min-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${summaryLine}</span>
+        <a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(t.id)}')" style="color:#88c0d0;font-size:11px;margin-left:auto">open ${esc(t.id.slice(0,8))}</a>
+      </summary>
+      <div style="margin-top:8px">
+        ${trHtml}
+        ${userText ? `<div class="msg user"><div class="role">user</div>${esc(userText.slice(0, 4000))}${userText.length > 4000 ? '\n…' : ''}</div>` : ''}
+        ${assistantText ? `<div class="msg assistant"><div class="role">assistant</div>${esc(assistantText.slice(0, 4000))}${assistantText.length > 4000 ? '\n…' : ''}</div>` : ''}
+        ${tcHtml}
       </div>
-      ${trHtml}
-      ${userText ? `<div class="msg user"><div class="role">user</div>${esc(userText.slice(0, 4000))}${userText.length > 4000 ? '\n…' : ''}</div>` : ''}
-      ${assistantText ? `<div class="msg assistant"><div class="role">assistant</div>${esc(assistantText.slice(0, 4000))}${assistantText.length > 4000 ? '\n…' : ''}</div>` : ''}
-      ${tcHtml}
-    </div>`;
+    </details>`;
   }).join('');
+
+  const tocHtml = meta.map((m, i) => {
+    const { t, userText, assistantText, toolCalls, toolResults, hasError, hasTool } = m;
+    const sum = _conversationTurnSummary(t, m.body, userText, assistantText, toolCalls, toolResults);
+    const snippet = sum.snippet || sum.outcome.replace(/^[^A-Za-z0-9]+/, '') || '(no msg)';
+    const verdict = t.gate_verdict && t.gate_verdict !== 'allow' ? t.gate_verdict : '';
+    const icons = [
+      hasTool ? `🔧${toolCalls.length}` : '',
+      hasError ? `<span class="err">⚠</span>` : '',
+      verdict ? `<span class="verdict ${esc(verdict)}" style="font-size:9px;padding:0 4px">${esc(verdict[0].toUpperCase())}</span>` : '',
+    ].filter(Boolean).join(' ');
+    return `<li><a href="#" class="conv-toc-item" data-turn-idx="${i}" data-has-error="${hasError ? 1 : 0}" data-has-tool="${hasTool ? 1 : 0}" title="${esc(snippet)}">
+      <span class="toc-num">T${i + 1}</span>
+      <span class="toc-snippet">${esc(snippet)}</span>
+      <span class="toc-icons">${icons}</span>
+    </a></li>`;
+  }).join('');
+
+  const layout = turns.length > 1 ? `
+    <div class="conv-layout">
+      <aside class="conv-toc">
+        <div class="conv-toc-controls">
+          <input type="text" placeholder="Search turns…" oninput="convSearch(this.value)">
+          <div class="conv-filter-row">
+            <button data-filter="all" class="active" onclick="convFilter('all', this)">All</button>
+            <button data-filter="error" onclick="convFilter('error', this)">⚠ Errors</button>
+            <button data-filter="tool" onclick="convFilter('tool', this)">🔧 Tools</button>
+          </div>
+          <div class="conv-jump-row">
+            <button onclick="convJumpTop()" title="Scroll to top">↑ Top</button>
+            <button onclick="convJumpError()" title="Jump to next error">⚠ Next err</button>
+            <button onclick="convToggleAll('${esc(cid)}', true)" title="Expand all turns">＋ All</button>
+            <button onclick="convToggleAll('${esc(cid)}', false)" title="Collapse all turns">－ All</button>
+          </div>
+          <div class="conv-toc-pager"></div>
+        </div>
+        <ol class="conv-toc-list">${tocHtml}</ol>
+      </aside>
+      <div class="conv-turns">
+        <div class="conv-pager"></div>
+        ${turnHtml}
+      </div>
+    </div>
+  ` : turnHtml;
 
   $('conv-detail').innerHTML = `
     <div class="stats-section">
       <h2>Conversation <code style="font-size:13px">${esc(cid)}</code> · ${turns.length} turn${turns.length === 1 ? '' : 's'}</h2>
-      ${turnHtml}
+      ${layout}
     </div>
   `;
+  for (const a of $('conv-detail').querySelectorAll('.conv-toc-item')) {
+    a.addEventListener('click', (e) => {
+      e.preventDefault();
+      convJumpTo(+a.dataset.turnIdx);
+    });
+  }
+  // Initialize pagination state. Default to last page so most-recent turns are visible.
+  _convState = { cid, perPage: 25, page: 0, filter: 'all', search: '', total: turns.length };
+  if (turns.length > _convState.perPage) {
+    _convState.page = Math.ceil(turns.length / _convState.perPage) - 1;
+  }
+  _applyConvVisibility();
+  _convSetupScrollSpy();
   $('conv-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+let _convState = null;
+
+function _convMatches(el, filter, q) {
+  if (filter === 'error' && el.dataset.hasError !== '1') return false;
+  if (filter === 'tool' && el.dataset.hasTool !== '1') return false;
+  if (q && !((el.textContent || '').toLowerCase().includes(q))) return false;
+  return true;
+}
+
+function _applyConvVisibility() {
+  if (!_convState) return;
+  const root = $('conv-detail');
+  if (!root) return;
+  const { perPage, page, filter, search } = _convState;
+  const q = (search || '').trim().toLowerCase();
+  const turnEls = [...root.querySelectorAll('details.turn')];
+  const tocItems = [...root.querySelectorAll('.conv-toc-item')];
+
+  const matchIdxs = [];
+  turnEls.forEach((el, i) => { if (_convMatches(el, filter, q)) matchIdxs.push(i); });
+
+  const totalPages = Math.max(1, Math.ceil(matchIdxs.length / perPage));
+  if (_convState.page >= totalPages) _convState.page = totalPages - 1;
+  if (_convState.page < 0) _convState.page = 0;
+  const curPage = _convState.page;
+  const start = curPage * perPage;
+  const visibleIdxs = new Set(matchIdxs.slice(start, start + perPage));
+
+  turnEls.forEach((el, i) => { el.style.display = visibleIdxs.has(i) ? '' : 'none'; });
+  tocItems.forEach(a => {
+    const i = +a.dataset.turnIdx;
+    const matched = matchIdxs.includes(i);
+    a.parentElement.style.display = matched ? '' : 'none';
+    a.classList.toggle('off-page', matched && !visibleIdxs.has(i));
+  });
+
+  const pager = root.querySelector('.conv-pager');
+  if (pager) {
+    if (matchIdxs.length <= perPage) {
+      pager.style.display = 'none';
+      pager.innerHTML = '';
+    } else {
+      pager.style.display = '';
+      pager.innerHTML = _convPagerHtml(curPage, totalPages, matchIdxs.length, perPage);
+      for (const b of pager.querySelectorAll('button[data-page]')) {
+        b.addEventListener('click', () => { _convGoToPage(+b.dataset.page); });
+      }
+      const sel = pager.querySelector('select.per-page');
+      if (sel) sel.addEventListener('change', () => {
+        _convState.perPage = +sel.value;
+        _convState.page = 0;
+        _applyConvVisibility();
+      });
+    }
+  }
+  const tocPager = root.querySelector('.conv-toc-pager');
+  if (tocPager) {
+    tocPager.textContent = totalPages > 1 ? `Page ${curPage + 1} / ${totalPages} · ${matchIdxs.length} turn${matchIdxs.length === 1 ? '' : 's'}` : '';
+  }
+}
+
+function _convGoToPage(p) {
+  if (!_convState) return;
+  _convState.page = p;
+  _applyConvVisibility();
+  const first = $('conv-detail').querySelector('details.turn:not([style*="display: none"])');
+  if (first) first.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function _convPagerHtml(page, totalPages, totalMatches, perPage) {
+  const pages = [];
+  for (let i = 0; i < totalPages; i++) {
+    if (i < 2 || i >= totalPages - 2 || Math.abs(i - page) <= 1) {
+      pages.push(i);
+    } else if (pages[pages.length - 1] !== '…') {
+      pages.push('…');
+    }
+  }
+  const btns = pages.map(p => p === '…'
+    ? `<span class="pager-gap">…</span>`
+    : `<button data-page="${p}" class="${p === page ? 'active' : ''}">${p + 1}</button>`).join('');
+  const perPageSel = `<select class="per-page" title="Turns per page">
+    ${[10, 25, 50, 100].map(n => `<option value="${n}" ${n === perPage ? 'selected' : ''}>${n}/page</option>`).join('')}
+  </select>`;
+  return `
+    <button data-page="${Math.max(0, page - 1)}" ${page === 0 ? 'disabled' : ''}>« Prev</button>
+    ${btns}
+    <button data-page="${Math.min(totalPages - 1, page + 1)}" ${page >= totalPages - 1 ? 'disabled' : ''}>Next »</button>
+    ${perPageSel}
+    <span class="pager-info">${totalMatches} match${totalMatches === 1 ? '' : 'es'}</span>
+  `;
+}
+
+function convToggleAll(cid, open) {
+  for (const el of $('conv-detail').querySelectorAll('details.turn')) {
+    if (open) el.setAttribute('open', '');
+    else el.removeAttribute('open');
+  }
+}
+
+function convJumpTo(i) {
+  // If the target is filtered out or on a different page, switch first.
+  if (_convState) {
+    const root = $('conv-detail');
+    const turnEls = [...root.querySelectorAll('details.turn')];
+    const q = (_convState.search || '').trim().toLowerCase();
+    const matchIdxs = [];
+    turnEls.forEach((el, j) => { if (_convMatches(el, _convState.filter, q)) matchIdxs.push(j); });
+    let pos = matchIdxs.indexOf(i);
+    if (pos < 0) {
+      // Target doesn't match current filter — clear filter and search to reveal it.
+      _convState.filter = 'all';
+      _convState.search = '';
+      const si = root.querySelector('.conv-toc-controls input');
+      if (si) si.value = '';
+      for (const b of root.querySelectorAll('.conv-filter-row button')) b.classList.toggle('active', b.dataset.filter === 'all');
+      pos = i;
+    }
+    const targetPage = Math.floor(pos / _convState.perPage);
+    if (targetPage !== _convState.page) {
+      _convState.page = targetPage;
+    }
+    _applyConvVisibility();
+  }
+  const el = document.getElementById(`turn-${i}`);
+  if (!el) return;
+  el.setAttribute('open', '');
+  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  el.classList.remove('turn-flash');
+  void el.offsetWidth;
+  el.classList.add('turn-flash');
+  setTimeout(() => el.classList.remove('turn-flash'), 1000);
+}
+
+function convJumpTop() {
+  const scroller = $('convs');
+  if (scroller) scroller.scrollTo({ top: 0, behavior: 'smooth' });
+}
+
+function convJumpError() {
+  const errs = [...document.querySelectorAll('#conv-detail details.turn[data-has-error="1"]')];
+  if (!errs.length) return;
+  const scroller = $('convs');
+  const sTop = scroller ? scroller.getBoundingClientRect().top : 0;
+  const next = errs.find(el => el.getBoundingClientRect().top > sTop + 60) || errs[0];
+  convJumpTo(+next.dataset.turnIdx);
+}
+
+function convFilter(kind, btn) {
+  if (!_convState) return;
+  _convState.filter = kind;
+  _convState.page = 0;
+  if (btn) {
+    for (const b of $('conv-detail').querySelectorAll('.conv-filter-row button')) b.classList.toggle('active', b === btn);
+  }
+  _applyConvVisibility();
+}
+
+function convSearch(q) {
+  if (!_convState) return;
+  _convState.search = q || '';
+  _convState.page = 0;
+  _applyConvVisibility();
+}
+
+function _convSetupScrollSpy() {
+  const root = $('conv-detail');
+  const scroller = $('convs');
+  if (!root || !scroller) return;
+  const turns = [...root.querySelectorAll('details.turn')];
+  const tocItems = [...root.querySelectorAll('.conv-toc-item')];
+  if (!turns.length || !tocItems.length) return;
+  const update = () => {
+    const threshold = scroller.getBoundingClientRect().top + 80;
+    let activeIdx = turns[0].dataset.turnIdx;
+    for (const el of turns) {
+      if (el.style.display === 'none') continue;
+      if (el.getBoundingClientRect().top <= threshold) activeIdx = el.dataset.turnIdx;
+      else break;
+    }
+    for (const a of tocItems) a.classList.toggle('current', a.dataset.turnIdx === activeIdx);
+  };
+  // Replace any prior listener so re-renders don't pile up.
+  if (scroller._convSpy) scroller.removeEventListener('scroll', scroller._convSpy);
+  scroller._convSpy = update;
+  scroller.addEventListener('scroll', update, { passive: true });
+  update();
 }
 
 let rulesEditorBaseline = '';
@@ -891,7 +2156,6 @@ function setRulesStatus(msg, kind) {
 async function reloadRules() {
   const r = await (await fetch('/__proxy/api/rules')).json();
   const ta = $('rules-json');
-  // Show what's actually stored (or current effective config if nothing stored).
   const text = JSON.stringify(r.stored ?? r.config, null, 2);
   if (ta) {
     ta.value = text;
@@ -899,6 +2163,92 @@ async function reloadRules() {
     ta.classList.remove('dirty');
   }
   setRulesStatus('Loaded from ' + (r.source || 'unknown'), 'ok');
+  // Sync the routing mode quick-toggle indicator + prefill from/to inputs from current rules.
+  syncRoutingModeUI(r.config || {});
+}
+
+function detectRoutingMode(cfg) {
+  const sr = cfg.shadow_router || {};
+  const mr = cfg.model_router || {};
+  if (sr.enabled && (sr.rules || []).length > 0) return 'shadow';
+  if (mr.enabled && (mr.rules || []).length > 0) return 'redirect';
+  return 'passthrough';
+}
+
+function _firstRoutingPair(cfg) {
+  for (const r of (cfg.shadow_router?.rules || [])) {
+    const fm = r?.if?.from_model;
+    if (fm && r.shadow_to) return { from: Array.isArray(fm) ? fm[0] : fm, to: r.shadow_to };
+  }
+  for (const r of (cfg.model_router?.rules || [])) {
+    const fm = r?.if?.from_model;
+    if (fm && r.then) return { from: Array.isArray(fm) ? fm[0] : fm, to: r.then };
+  }
+  return null;
+}
+
+function syncRoutingModeUI(cfg) {
+  const mode = detectRoutingMode(cfg);
+  for (const m of ['passthrough', 'shadow', 'redirect']) {
+    const btn = $('mode-btn-' + m);
+    if (btn) btn.classList.toggle('active', m === mode);
+  }
+  const pair = _firstRoutingPair(cfg);
+  if (pair) {
+    const fromEl = $('routing-from');
+    const toEl = $('routing-to');
+    if (fromEl && !fromEl.dataset.userEdited) fromEl.value = pair.from;
+    if (toEl && !toEl.dataset.userEdited) toEl.value = pair.to;
+  }
+  const labels = {
+    passthrough: 'Passthrough — Anthropic requests go straight to api.anthropic.com',
+    shadow: 'Shadow — primary still goes to Anthropic; local model runs in parallel for comparison',
+    redirect: 'Redirect — Anthropic requests are translated and sent to the local model',
+  };
+  const status = $('routing-status');
+  if (status) status.textContent = 'Active: ' + (labels[mode] || mode);
+}
+
+async function setRoutingMode(mode) {
+  const fromEl = $('routing-from');
+  const toEl = $('routing-to');
+  if (fromEl) fromEl.dataset.userEdited = '1';
+  if (toEl) toEl.dataset.userEdited = '1';
+  const from = (fromEl?.value || '').trim();
+  const to = (toEl?.value || '').trim();
+  if ((mode === 'shadow' || mode === 'redirect') && (!from || !to)) {
+    setRulesStatus('Set both From and To models first', 'err');
+    return;
+  }
+  // Pull current effective config to merge with — preserves any unrelated rule settings.
+  const r = await (await fetch('/__proxy/api/rules')).json();
+  const cfg = JSON.parse(JSON.stringify(r.stored ?? r.config ?? {}));
+  if (mode === 'shadow') {
+    cfg.shadow_router = { enabled: true, rules: [{ if: { from_model: from }, shadow_to: to }] };
+    cfg.model_router = { ...(cfg.model_router || {}), enabled: false };
+  } else if (mode === 'redirect') {
+    cfg.model_router = {
+      ...(cfg.model_router || {}),
+      enabled: true,
+      aliases: cfg.model_router?.aliases || {},
+      rules: [{ if: { from_model: from }, then: to }],
+    };
+    cfg.shadow_router = { ...(cfg.shadow_router || {}), enabled: false };
+  } else {
+    cfg.shadow_router = { ...(cfg.shadow_router || {}), enabled: false };
+    cfg.model_router = { ...(cfg.model_router || {}), enabled: false };
+  }
+  const resp = await fetch('/__proxy/api/rules', {
+    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(cfg),
+  });
+  if (!resp.ok) {
+    let msg = 'Save failed (' + resp.status + ')';
+    try { msg = (await resp.json()).error || msg; } catch {}
+    setRulesStatus(msg, 'err');
+    return;
+  }
+  setRulesStatus('Routing mode → ' + mode, 'ok');
+  await reloadRules();
 }
 
 async function saveRules() {
@@ -955,6 +2305,31 @@ async function toggleRule(name, enabled) {
   loadAudit();
 }
 
+function ollamaConfigSection(ollama) {
+  const env = ollama.env || {};
+  const keys = Object.keys(env).sort();
+  if (!ollama.pid && !keys.length && !ollama.version) return '';
+  const envRows = keys.length
+    ? keys.map(k => `<tr><td><code>${esc(k)}</code></td><td><code style="font-size:11px">${esc(env[k])}</code></td></tr>`).join('')
+    : `<tr><td colspan="2" class="empty" style="padding:8px">Couldn't read OLLAMA_* env vars. The proxy isn't the same user as the ollama process and the systemd unit lookup also failed. Set <code>OLLAMA_SYSTEMD_UNIT</code> on the proxy if your unit name isn't <code>ollama.service</code>.</td></tr>`;
+  const meta = [
+    ollama.version ? 'v' + ollama.version : null,
+    ollama.pid ? 'pid ' + ollama.pid : null,
+    ollama.env_source ? 'from ' + ollama.env_source : null,
+  ].filter(Boolean).join(' · ');
+  return `
+    <details class="stats-section" open>
+      <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
+        <span style="color:#888;font-size:10px;width:10px">▾</span>
+        <h2 style="margin:0">Ollama Server Config <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
+      </summary>
+      <table style="width:100%">
+        <thead><tr><th>Variable</th><th>Value</th></tr></thead>
+        <tbody>${envRows}</tbody>
+      </table>
+    </details>`;
+}
+
 function sparklinePath(values, w, h) {
   // values: array of numbers (may include null). Returns {line, fill, max, min, last}.
   const clean = values.map(v => (v == null || isNaN(v)) ? null : Number(v));
@@ -1000,14 +2375,183 @@ function barClass(pct) {
 
 let systemHistoryCache = null;
 let systemNowCache = null;
+let systemHealthCache = null;
+
+function fmtBytes(n) {
+  if (n == null) return '—';
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  if (n < 1024 * 1024 * 1024) return (n / (1024 * 1024)).toFixed(1) + ' MB';
+  return (n / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function renderProxyHealth(hp) {
+  if (!hp) return '';
+  const db = hp.db || {};
+  const proc = hp.process || {};
+  const oh = hp.overhead_ms || {};
+  const tableRows = Object.entries(db.table_sizes || {})
+    .map(([name, sz]) => `<tr><td><code>${esc(name)}</code></td><td class="num">${fmtBytes(sz)}</td></tr>`).join('') ||
+    '<tr><td colspan="2" style="color:#666;font-size:11px;padding:4px 8px">(per-table sizes unavailable — SQLite was built without dbstat)</td></tr>';
+  const upH = proc.uptime_s ? (proc.uptime_s < 3600 ? Math.round(proc.uptime_s/60) + ' min' : (proc.uptime_s/3600).toFixed(1) + ' h') : '—';
+  return `
+    <div class="stats-section">
+      <h2>Proxy Health</h2>
+      <div class="cards" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
+        <div class="gauge">
+          <div class="l">Database</div>
+          <div class="v">${fmtBytes(db.size_bytes)}</div>
+          <div class="s">${num(db.request_count || 0)} requests · ${num(db.metric_count || 0)} metric rows</div>
+        </div>
+        <div class="gauge">
+          <div class="l">Proxy memory (RSS)</div>
+          <div class="v">${proc.rss_mb != null ? proc.rss_mb + ' MB' : '—'}</div>
+          <div class="s">${proc.threads || '?'} threads · up ${upH}</div>
+        </div>
+        <div class="gauge">
+          <div class="l">Pre-flight overhead</div>
+          <div class="v">${oh.p50_ms != null ? oh.p50_ms.toFixed(2) + ' ms' : '—'}<span style="font-size:13px;color:#888"> p50</span></div>
+          <div class="s">avg ${oh.avg_ms != null ? oh.avg_ms.toFixed(2) : '—'} · p95 ${oh.p95_ms != null ? oh.p95_ms.toFixed(2) : '—'} · p99 ${oh.p99_ms != null ? oh.p99_ms.toFixed(2) : '—'} (${num(oh.samples || 0)} samples)</div>
+        </div>
+      </div>
+      ${Object.keys(db.table_sizes || {}).length ? `
+        <details style="margin-bottom:14px">
+          <summary style="cursor:pointer;color:#888;font-size:12px">Per-table sizes</summary>
+          <table style="width:auto;min-width:300px;margin-top:6px">
+            <thead><tr><th>Table</th><th class="num">Size</th></tr></thead>
+            <tbody>${tableRows}</tbody>
+          </table>
+        </details>` : ''}
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <strong style="font-size:12px;color:#aaa">Reset:</strong>
+        <label style="font-size:12px;color:#aaa"><input type="checkbox" id="reset-requests" checked> requests (${num(db.request_count || 0)})</label>
+        <label style="font-size:12px;color:#aaa"><input type="checkbox" id="reset-metrics" checked> metrics (${num(db.metric_count || 0)})</label>
+        <label style="font-size:12px;color:#aaa"><input type="checkbox" id="reset-settings"> settings (${num(db.settings_count || 0)} — rules etc.)</label>
+        <label style="font-size:12px;color:#aaa"><input type="checkbox" id="reset-vacuum" checked> VACUUM</label>
+        <button onclick="resetDb(this)" style="background:#4a2e2e;color:#e08080;border:1px solid #6a3030;padding:4px 14px;border-radius:3px;cursor:pointer;font-size:12px">Wipe selected</button>
+      </div>
+      <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <strong style="font-size:12px;color:#aaa">Process:</strong>
+        <span style="font-size:11px;color:#888">PID ${proc.pid || '?'} · uptime ${upH}</span>
+        <button id="restart-btn" onclick="restartProxy(this)" style="background:#4a3a2e;color:#ebcb8b;border:1px solid #6a5a30;padding:4px 14px;border-radius:3px;cursor:pointer;font-size:12px">↻ Restart proxy</button>
+        <span id="restart-status" style="font-size:11px;color:#888"></span>
+      </div>
+    </div>
+  `;
+}
+
+async function resetDb(btn) {
+  const targets = [];
+  if ($('reset-requests').checked) targets.push('requests');
+  if ($('reset-metrics').checked) targets.push('metrics');
+  if ($('reset-settings').checked) targets.push('settings');
+  if (!targets.length) { alert('Select at least one target.'); return; }
+  const msg = `This will permanently delete: ${targets.join(', ')}. Continue?`;
+  if (!confirm(msg)) return;
+  const orig = btn.textContent;
+  btn.textContent = '…';
+  btn.disabled = true;
+  try {
+    const r = await fetch('/__proxy/api/db/reset', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ targets, vacuum: $('reset-vacuum').checked }),
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    btn.textContent = '✓ wiped';
+    btn.style.background = '#2e4a2e';
+    btn.style.color = '#a3be8c';
+    btn.style.borderColor = '#4a6a4a';
+    setTimeout(() => loadSystem(), 500);
+  } catch (e) {
+    btn.textContent = '✗ ' + e.message;
+  } finally {
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.style.background = '';
+      btn.style.color = '';
+      btn.style.borderColor = '';
+      btn.disabled = false;
+    }, 2000);
+  }
+}
+
+async function restartProxy(btn) {
+  const status = $('restart-status');
+  const wasManaged = (systemHealthCache && systemHealthCache.process && systemHealthCache.process.managed_by_systemd);
+  const oldPid = systemHealthCache && systemHealthCache.process && systemHealthCache.process.pid;
+  const warn = wasManaged
+    ? 'Restart the proxy now? In-flight requests will be terminated; systemd will relaunch it within ~1s.'
+    : 'Restart the proxy now? This process is NOT managed by systemd — exiting will stop the proxy entirely until you start it manually.';
+  if (!confirm(warn)) return;
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '↻ restarting…';
+  status.textContent = '';
+  try {
+    const r = await fetch('/__proxy/api/restart', {
+      method: 'POST',
+      headers: { 'x-confirm': 'restart-now' },
+    });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || ('HTTP ' + r.status));
+    }
+    status.textContent = 'sent — waiting for proxy to come back…';
+    // Poll health until we see a different PID (or any successful response if old PID unknown).
+    const deadline = Date.now() + 15000;
+    let backOnline = false;
+    while (Date.now() < deadline) {
+      await new Promise(res => setTimeout(res, 600));
+      try {
+        const hp = await fetch('/__proxy/api/health').then(r => r.ok ? r.json() : null);
+        const newPid = hp && hp.process && hp.process.pid;
+        if (newPid && (!oldPid || newPid !== oldPid)) {
+          backOnline = true;
+          break;
+        }
+      } catch {}
+    }
+    if (backOnline) {
+      btn.textContent = '✓ restarted';
+      btn.style.background = '#2e4a2e';
+      btn.style.color = '#a3be8c';
+      btn.style.borderColor = '#4a6a4a';
+      status.textContent = 'proxy is back';
+      loadSystem();
+    } else {
+      btn.textContent = '? no response';
+      btn.style.background = '#4a2e2e';
+      btn.style.color = '#e08080';
+      status.textContent = wasManaged
+        ? 'Proxy did not come back within 15s — check systemctl status ai_proxy'
+        : 'Proxy exited but no supervisor restarted it. Run it again manually.';
+    }
+  } catch (e) {
+    btn.textContent = '✗ ' + e.message;
+    btn.style.background = '#4a2e2e';
+    btn.style.color = '#e08080';
+  } finally {
+    setTimeout(() => {
+      btn.textContent = orig;
+      btn.style.background = '';
+      btn.style.color = '';
+      btn.style.borderColor = '';
+      btn.disabled = false;
+    }, 4000);
+  }
+}
 
 async function loadSystem() {
-  const [now, hist] = await Promise.all([
+  const [now, hist, hp] = await Promise.all([
     fetch('/__proxy/api/system/now').then(r => r.json()),
     fetch('/__proxy/api/system/history?minutes=60').then(r => r.json()),
+    fetch('/__proxy/api/health').then(r => r.json()).catch(() => null),
   ]);
   systemNowCache = now;
   systemHistoryCache = hist;
+  systemHealthCache = hp;
   renderSystem();
 }
 
@@ -1055,10 +2599,12 @@ function renderSystem() {
     const gpuMemPct = (memUsed && memTotal) ? (memUsed / memTotal * 100) : null;
     const procs = (g.processes || []).slice(0, 6).map(p => `<span class="pid"><code>${esc(String(p.pid))}</code> ${esc(p.name || '')} <span style="color:#666">${num(p.mem_mb || 0)}MB</span></span>`).join('');
     const utilSpark = i === 0 ? spark(gpuUtilVals, 'gpu', '%') : '';
+    const unifiedTag = g.unified ? ' <span class="badge" title="Unified memory: GPU shares system RAM (e.g. DGX Spark / GB10)">unified</span>' : '';
+    const memLabel = g.unified ? 'GPU mem (shared)' : 'VRAM';
     return `<div class="gauge">
-      <div class="l">GPU ${g.idx}: ${esc(g.name || '')}</div>
+      <div class="l">GPU ${g.idx}: ${esc(g.name || '')}${unifiedTag}</div>
       <div class="v">${util == null ? '—' : util}<span style="font-size:14px;color:#888">% util</span> <span style="font-size:13px;color:#888">· ${g.temp_c == null ? '' : g.temp_c + '°C'}</span></div>
-      <div class="s">VRAM ${memUsed == null ? '—' : (memUsed/1024).toFixed(1)} / ${memTotal == null ? '—' : (memTotal/1024).toFixed(1)} GB${gpuMemPct ? ' · ' + gpuMemPct.toFixed(0) + '%' : ''}</div>
+      <div class="s">${memLabel} ${memUsed == null ? '—' : (memUsed/1024).toFixed(1)} / ${memTotal == null ? '—' : (memTotal/1024).toFixed(1)} GB${gpuMemPct ? ' · ' + gpuMemPct.toFixed(0) + '%' : ''}</div>
       <div class="bar-bg"><div class="bar-fg ${barClass(gpuMemPct || 0)}" style="width:${gpuMemPct == null ? 0 : gpuMemPct}%"></div></div>
       ${utilSpark}
       ${procs ? `<div class="pid-list">${procs}</div>` : ''}
@@ -1093,6 +2639,7 @@ function renderSystem() {
   `).join('') || '<tr><td colspan="3" class="empty" style="padding:8px">No models</td></tr>';
 
   $('system').innerHTML = `
+    ${renderProxyHealth(systemHealthCache)}
     <div class="cards" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
       ${cpuCard}
       ${memCard}
@@ -1106,6 +2653,8 @@ function renderSystem() {
         <tbody>${ollamaPs}</tbody>
       </table>
     </div>
+
+    ${ollamaConfigSection(ollama)}
 
     <div class="stats-section">
       <h2><span class="reach-dot ${lmstudio.reachable ? 'ok' : 'bad'}"></span>LM Studio Loaded Models</h2>
@@ -1131,6 +2680,356 @@ function renderSystem() {
       </table>
     </div>
   `;
+}
+
+let setupSelectedModel = '';
+let setupSubTab = 'api';
+
+function setSetupSubTab(t) {
+  setupSubTab = t;
+  loadSetup();
+}
+
+function apiSnippets(base, baseRoot, model) {
+  const j = JSON.stringify;
+  return [
+    {
+      title: 'OpenAI Python SDK',
+      desc: 'Standard openai package',
+      lang: 'python',
+      code: `from openai import OpenAI
+
+client = OpenAI(
+    base_url="${base}",
+    api_key="ollama",  # any non-empty string
+)
+
+response = client.chat.completions.create(
+    model="${model}",
+    messages=[{"role": "user", "content": "Hello"}],
+)
+print(response.choices[0].message.content)`,
+    },
+    {
+      title: 'OpenAI JS / TypeScript SDK',
+      desc: 'openai npm package',
+      lang: 'javascript',
+      code: `import OpenAI from "openai";
+
+const client = new OpenAI({
+  baseURL: "${base}",
+  apiKey: "ollama",
+});
+
+const r = await client.chat.completions.create({
+  model: "${model}",
+  messages: [{ role: "user", content: "Hello" }],
+});
+console.log(r.choices[0].message.content);`,
+    },
+    {
+      title: 'curl',
+      desc: 'Quick test from a shell',
+      lang: 'bash',
+      code: `curl ${base}/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -H "Authorization: Bearer ollama" \\
+  -d '{
+    "model": "${model}",
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'`,
+    },
+    {
+      title: 'Continue (VS Code / JetBrains)',
+      desc: 'Add a model entry to ~/.continue/config.json',
+      lang: 'json',
+      code: j({
+        models: [{
+          title: 'AI Proxy',
+          provider: 'openai',
+          model: model,
+          apiBase: base,
+          apiKey: 'ollama',
+        }],
+      }, null, 2),
+    },
+    {
+      title: 'Cline / Roo Code (VS Code)',
+      desc: 'Settings → API Provider',
+      lang: 'text',
+      code: `API Provider: OpenAI Compatible
+Base URL: ${base}
+API Key: ollama
+Model ID: ${model}`,
+    },
+    {
+      title: 'Aider',
+      desc: 'Set env vars or pass as flags',
+      lang: 'bash',
+      code: `export OPENAI_API_BASE=${base}
+export OPENAI_API_KEY=ollama
+aider --model ${model}`,
+    },
+    {
+      title: 'Zed',
+      desc: '~/.config/zed/settings.json',
+      lang: 'json',
+      code: j({
+        language_models: { openai: { api_url: base } },
+        assistant: { version: '2', default_model: { provider: 'openai', model: model } },
+      }, null, 2),
+    },
+    {
+      title: 'Open WebUI',
+      desc: 'Admin → Settings → Connections → OpenAI API',
+      lang: 'text',
+      code: `URL: ${base}
+Key: ollama`,
+    },
+    {
+      title: 'GitHub Copilot Chat (Ollama provider)',
+      desc: 'VS Code settings.json — uses raw Ollama endpoint, NOT /v1',
+      lang: 'json',
+      code: j({
+        'github.copilot.chat.byok.ollamaEndpoint': baseRoot,
+      }, null, 2),
+    },
+    {
+      title: 'opencode (sst/opencode)',
+      desc: '~/.config/opencode/opencode.json — declares a custom OpenAI-compatible provider',
+      lang: 'json',
+      code: j({
+        $schema: 'https://opencode.ai/config.json',
+        provider: {
+          'ai-proxy': {
+            npm: '@ai-sdk/openai-compatible',
+            name: 'AI Proxy',
+            options: { baseURL: base, apiKey: 'ollama' },
+            models: { [model]: { name: model } },
+          },
+        },
+      }, null, 2),
+    },
+    {
+      title: 'Generic OpenAI-compatible client',
+      desc: 'Any tool that accepts OpenAI base URL + API key',
+      lang: 'text',
+      code: `Base URL:  ${base}
+API Key:   ollama   (any non-empty string)
+Model:     ${model}`,
+    },
+  ];
+}
+
+function mcpSnippets(baseRoot) {
+  const url = baseRoot + '/__proxy/mcp';
+  const j = JSON.stringify;
+  return [
+    {
+      title: 'Claude Desktop',
+      desc: 'macOS: ~/Library/Application Support/Claude/claude_desktop_config.json · Windows: %APPDATA%\\Claude\\claude_desktop_config.json — restart Claude Desktop after editing',
+      lang: 'json',
+      code: j({
+        mcpServers: {
+          'ai-proxy': { type: 'http', url: url },
+        },
+      }, null, 2),
+    },
+    {
+      title: 'Claude Code (CLI)',
+      desc: 'Run once to register the server; persists in ~/.claude.json',
+      lang: 'bash',
+      code: `claude mcp add --transport http ai-proxy ${url}`,
+    },
+    {
+      title: 'Cursor',
+      desc: '.cursor/mcp.json (project) or ~/.cursor/mcp.json (global)',
+      lang: 'json',
+      code: j({
+        mcpServers: {
+          'ai-proxy': { url: url },
+        },
+      }, null, 2),
+    },
+    {
+      title: 'Continue (VS Code / JetBrains)',
+      desc: '~/.continue/config.json — adds the proxy as an MCP server',
+      lang: 'json',
+      code: j({
+        experimental: {
+          modelContextProtocolServers: [
+            { transport: { type: 'streamable-http', url: url } },
+          ],
+        },
+      }, null, 2),
+    },
+    {
+      title: 'Cline / Roo Code (VS Code)',
+      desc: 'Click "Configure MCP Servers" → Edit JSON',
+      lang: 'json',
+      code: j({
+        mcpServers: {
+          'ai-proxy': { type: 'streamableHttp', url: url, alwaysAllow: [] },
+        },
+      }, null, 2),
+    },
+    {
+      title: 'opencode (sst/opencode)',
+      desc: '~/.config/opencode/opencode.json — uses opencode\'s built-in MCP support',
+      lang: 'json',
+      code: j({
+        $schema: 'https://opencode.ai/config.json',
+        mcp: {
+          'ai-proxy': { type: 'remote', url: url, enabled: true },
+        },
+      }, null, 2),
+    },
+    {
+      title: 'Generic MCP client (Streamable HTTP)',
+      desc: 'Any client that follows the MCP HTTP transport spec',
+      lang: 'text',
+      code: `Transport: streamable-http
+URL:       ${url}
+Auth:      none (set MCP_API_KEY on the proxy + send "Authorization: Bearer <key>" if you want auth)`,
+    },
+    {
+      title: 'Quick test — list tools (curl)',
+      desc: 'Sanity-check the server is reachable and reports its tool catalog',
+      lang: 'bash',
+      code: `curl ${url} \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq '.result.tools[].name'`,
+    },
+    {
+      title: 'Quick test — call a tool (curl)',
+      desc: 'Pull a digest directly via JSON-RPC',
+      lang: 'bash',
+      code: `curl ${url} \\
+  -H "Content-Type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"export_digest","arguments":{"samples":3,"minutes":60}}}' \\
+  | jq -r '.result.content[0].text'`,
+    },
+  ];
+}
+
+async function loadSetup() {
+  const baseRoot = window.location.origin;
+  const base = baseRoot + '/v1';
+
+  // Pull the model list through the proxy itself so we get whatever upstream offers.
+  let models = [];
+  try {
+    const r = await fetch(base + '/models');
+    if (r.ok) {
+      const d = await r.json();
+      models = (d.data || []).map(m => m.id).filter(Boolean);
+    }
+  } catch {}
+  if (!models.length) models = ['<your-model>'];
+
+  if (!setupSelectedModel || !models.includes(setupSelectedModel)) {
+    setupSelectedModel = models[0];
+  }
+
+  const modelOpts = models.map(m => `<option value="${esc(m)}" ${m === setupSelectedModel ? 'selected' : ''}>${esc(m)}</option>`).join('');
+
+  const snippets = setupSubTab === 'mcp'
+    ? mcpSnippets(baseRoot)
+    : apiSnippets(base, baseRoot, setupSelectedModel);
+  const snippetsHtml = snippets.map((s, i) => `
+    <div class="snippet">
+      <div class="snippet-head">
+        <h4>${esc(s.title)}</h4>
+        <span class="desc">${esc(s.desc || '')}</span>
+        <button onclick="copySnippet(${i}, this)">Copy</button>
+      </div>
+      <pre id="snip-${i}">${esc(s.code)}</pre>
+    </div>
+  `).join('');
+
+  // Stash for the copy button.
+  window._setupSnippets = snippets;
+
+  const mcpUrl = baseRoot + '/__proxy/mcp';
+  const apiVarsHtml = `
+    <div><span class="label">Base URL</span> <code>${esc(base)}</code> <button onclick="copyText('${esc(base)}', this)" style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px">copy</button></div>
+    <div><span class="label">Ollama URL</span> <code>${esc(baseRoot)}</code> <span style="color:#666;font-size:11px">(for clients using Ollama-native API, not /v1)</span></div>
+    <div><span class="label">API Key</span> <code>ollama</code> <span style="color:#666;font-size:11px">(any non-empty string — proxy passes it to upstream)</span></div>
+    <div><span class="label">Model</span> <select id="setup-model" onchange="setupSelectedModel = this.value; loadSetup();">${modelOpts}</select> <span style="color:#666;font-size:11px">${num(models.length)} model${models.length === 1 ? '' : 's'} available</span></div>
+  `;
+  const mcpVarsHtml = `
+    <div><span class="label">MCP URL</span> <code>${esc(mcpUrl)}</code> <button onclick="copyText('${esc(mcpUrl)}', this)" style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px">copy</button></div>
+    <div><span class="label">Transport</span> <code>streamable-http</code> <span style="color:#666;font-size:11px">(JSON-RPC 2.0 over HTTP POST)</span></div>
+    <div><span class="label">Auth</span> <span style="color:#666;font-size:11px">none unless <code>MCP_API_KEY</code> is set on the proxy</span></div>
+    <div><span class="label">Tools</span> <span style="color:#666;font-size:11px">list_recent_requests, get_request_detail, list_conversations, get_conversation, get_stats, get_audit, get_suggestions, get_rules, get_system_metrics, export_digest <span style="color:#666">(+ update_rules when MCP_ALLOW_WRITE=true)</span></span></div>
+  `;
+
+  $('setup').innerHTML = `
+    <h2 style="margin:0 0 6px 0;font-size:14px">Connect IDEs and tools</h2>
+    <p style="color:#888;font-size:12px;margin:0 0 12px 0">Two ways to wire the proxy into AI tools: as an OpenAI-compatible API endpoint (model traffic flows through it), or as an MCP server (an AI can call it as a tool to inspect its own traffic and tune rules).</p>
+    <div class="tabs" style="margin-bottom:14px">
+      <button class="tab ${setupSubTab === 'api' ? 'active' : ''}" onclick="setSetupSubTab('api')">OpenAI API</button>
+      <button class="tab ${setupSubTab === 'mcp' ? 'active' : ''}" onclick="setSetupSubTab('mcp')">MCP Server</button>
+    </div>
+    <div class="setup-vars">
+      ${setupSubTab === 'mcp' ? mcpVarsHtml : apiVarsHtml}
+    </div>
+    ${snippetsHtml}
+  `;
+}
+
+async function exportDigest(format, btn) {
+  const samples = parseInt($('export-samples').value, 10) || 0;
+  const minutes = parseInt($('export-minutes').value, 10) || 1440;
+  const redact = $('export-redact').checked;
+  const bodies = $('export-bodies').checked;
+  const url = `/__proxy/api/export?format=${format}&samples=${samples}&minutes=${minutes}&include_bodies=${bodies}&redact=${redact}`;
+  const orig = btn.textContent;
+  btn.textContent = '…';
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const blob = await r.blob();
+    if (format === 'markdown') {
+      const text = await blob.text();
+      await navigator.clipboard.writeText(text);
+      btn.textContent = '✓ copied';
+      btn.classList.add('ok');
+    } else {
+      const ext = format === 'json' ? 'json' : 'ndjson';
+      const link = document.createElement('a');
+      link.href = URL.createObjectURL(blob);
+      link.download = `ai-proxy-export-${Date.now()}.${ext}`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+      btn.textContent = '✓ downloaded';
+      btn.classList.add('ok');
+    }
+  } catch (e) {
+    btn.textContent = '✗ ' + e.message;
+  }
+  setTimeout(() => { btn.textContent = orig; btn.classList.remove('ok'); }, 1500);
+}
+
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    if (btn) {
+      const orig = btn.textContent;
+      btn.textContent = '✓ copied';
+      btn.classList.add('ok');
+      setTimeout(() => { btn.textContent = orig; btn.classList.remove('ok'); }, 1200);
+    }
+  } catch (e) {
+    alert('Copy failed: ' + e.message);
+  }
+}
+
+async function copySnippet(i, btn) {
+  const snippets = window._setupSnippets || [];
+  const s = snippets[i];
+  if (!s) return;
+  await copyText(s.code, btn);
 }
 
 async function refreshAuditBadge() {

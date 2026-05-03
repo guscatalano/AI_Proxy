@@ -1,143 +1,259 @@
-# AI Proxy - Setup Guide
+# AI Proxy
 
-## Quick Start
+A transparent inspector and rule engine that sits between your AI clients (Claude Code, GitHub Copilot Chat, Cursor, raw SDKs) and their upstreams (Anthropic, Ollama, LM Studio, anything OpenAI-compatible). Logs every request, surfaces conversations and tool calls, applies configurable rules, and gives you a live web UI to see what's actually happening.
+
+Built around two ideas:
+1. **Observability without changing your client** — set `ANTHROPIC_BASE_URL` (or `OLLAMA_URL`) to the proxy and every request, response, tool call, token count, and conversation thread is captured automatically.
+2. **Rules that improve model behavior** — pre/post-flight hooks catch loops, fix malformed tool calls, prune unused tools, prevent silent context-window truncation, route requests across models, and more.
+
+![Live traffic flow with rule pipeline](docs/screenshots/tab-stats.png)
+
+---
+
+## What it does
+
+- **Inspect every request** — full bodies, headers, streaming chunks, tool calls, token counts, latency. Searchable. PII-redacted by default for cross-network viewers.
+- **Group requests into conversations** — automatic threading by `system + first_user` hash, with a turn-by-turn timeline view.
+- **Identify the client app** — distinguishes Claude Code, VS Code Copilot Chat, Cursor, Anthropic SDK, OpenAI SDK, LangChain, browsers, etc. via header/User-Agent fingerprinting.
+- **Translate Anthropic ↔ OpenAI** — point Claude Code at any OpenAI-compatible backend (Ollama, LM Studio, vLLM). The proxy translates request/response bodies and SSE streams in both directions.
+- **Shadow runs** — send the same request to a primary upstream AND a local model in parallel, store both, and get an automatic side-by-side comparison page (latency delta, token delta, tool-call agreement, text similarity).
+- **Rule pipeline** — pluggable pre-flight (block/warn/transform) and post-flight (intercept/autofix) rules with a JSON editor and quick-toggle UI.
+- **Auditor suggestions** — the proxy analyzes recent traffic and recommends config changes (route slow-short requests off Opus, prune unused tools, bump `OLLAMA_NUM_PARALLEL`, etc.).
+- **MCP server** — exposes the same data via Model Context Protocol so an LLM can query traffic patterns directly.
+- **Restart from the UI** — one button to bounce the systemd-managed proxy, with health-check polling for confirmation.
+
+---
+
+## Screenshots
+
+### Requests list — every API call, with client app badges
+![Requests list](docs/screenshots/tab-requests.png)
+
+### Request detail — body, response, headers, gate verdict, downsize heuristic
+![Request detail](docs/screenshots/request-detail.png)
+
+### Conversations — threaded turns with TOC navigation
+![Conversation detail](docs/screenshots/conversation-detail.png)
+
+### Shadow comparison — side-by-side primary vs local model
+![Compare view](docs/screenshots/compare-view.png)
+
+### Audit tab — routing toggle, rule editor, automatic suggestions
+![Audit tab](docs/screenshots/tab-audit.png)
+
+### System — CPU, memory, GPU, loaded models, restart button
+![System tab](docs/screenshots/tab-system.png)
+
+---
+
+## Quick start
 
 ### Prerequisites
 - Python 3.10+
-- Ollama running on `http://localhost:11434`
+- An upstream to forward to (Ollama on `localhost:11434`, Anthropic API, etc.)
 
-### Installation
+### Install
 
 ```bash
-# Clone or navigate to the project directory
-cd ai_proxy
-
-# Create virtual environment
+git clone https://github.com/guscatalano/AI_Proxy.git
+cd AI_Proxy
 python -m venv .venv
 
-# Activate virtual environment
-# Windows:
+# Windows
 .venv\Scripts\Activate.ps1
-# Linux/macOS:
+# Linux/macOS
 source .venv/bin/activate
 
-# Install dependencies
 pip install -r requirements.txt
-
-# Copy environment example
-cp .env.example .env
-
-# Edit .env with your settings
+python proxy.py
 ```
 
-### Running
+UI: <http://127.0.0.1:8000/__proxy/>
+
+### Point your client at the proxy
 
 ```bash
-# Start the proxy server
-python proxy.py
+# Claude Code (and any Anthropic SDK client)
+export ANTHROPIC_BASE_URL=http://localhost:8000
+claude
 
-# Or use uvicorn directly
-uvicorn proxy:app --host 127.0.0.1 --port 8000
+# OpenAI SDK / VS Code Copilot Chat / Cursor / Continue / Cline
+export OPENAI_BASE_URL=http://localhost:8000/v1
+# or set the equivalent in the client's settings
+
+# Ollama-native clients (set OLLAMA_HOST)
+export OLLAMA_HOST=http://localhost:8000
 ```
 
-### Access
-- **Proxy API**: `http://127.0.0.1:8000/`
-- **Web UI**: `http://127.0.0.1:8000/__proxy/`
+The proxy routes by path: `/v1/messages*` and `/v1/complete*` go to Anthropic (`ANTHROPIC_URL` env var, default `https://api.anthropic.com`); everything else (`/v1/chat/completions`, `/api/*`) goes to Ollama (`OLLAMA_URL` env var, default `http://localhost:11434`).
+
+---
 
 ## Configuration
 
-### Environment Variables
+### Environment variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `OLLAMA_URL` | `http://localhost:11434` | Upstream Ollama server |
-| `PROXY_HOST` | `127.0.0.1` | Proxy bind address |
-| `PROXY_PORT` | `8000` | Proxy port |
-| `PROXY_DB` | `./proxy.db` | SQLite database path |
-| `PROXY_RULES_FILE` | `./rules.json` | Rules configuration file |
+| Variable | Default | What it does |
+|---|---|---|
+| `OLLAMA_URL` | `http://localhost:11434` | OpenAI-compat / Ollama upstream |
+| `ANTHROPIC_URL` | `https://api.anthropic.com` | Anthropic upstream for `/v1/messages*` |
+| `LMSTUDIO_URL` | `http://localhost:1234` | Optional LM Studio for the System tab |
+| `PROXY_HOST` | `127.0.0.1` | Bind address |
+| `PROXY_PORT` | `8000` | Bind port |
+| `PROXY_DB` | `./proxy.db` | SQLite DB path |
+| `PROXY_RULES_FILE` | `./rules.json` | One-time rules import (subsequently stored in DB) |
+| `PROXY_REDACT_PII` | `1` | Redact bodies/headers from cross-subnet viewers |
+| `PROXY_REDACT_SUBNET_BITS` | `24` | IPv4 subnet width for PII gating |
+| `MCP_ALLOW_WRITE` | `false` | Allow `update_rules` MCP tool |
+| `MCP_API_KEY` | (none) | Bearer token for MCP endpoint |
 
-### Rules Configuration
+### Rule pipeline
 
-Create `rules.json` to define traffic rules:
+All rules are configured via a single JSON object, edited in the **Audit tab → Rules Editor** (or POSTed to `/__proxy/api/rules`). Saves apply on the next request — no restart needed.
 
-```json
-{
-  "loop_detector": {
-    "enabled": true,
-    "action": "block",
-    "max_repeats": 4,
-    "window": 10,
-    "tail_consecutive": 3
-  },
-  "model_router": {
-    "enabled": false,
-    "aliases": {},
-    "rules": []
-  }
-}
-```
+| Rule | Phase | What it does |
+|---|---|---|
+| `model_router` | transform | Rewrite `model` based on conditions (from_model, prompt size, has_tools, client IP). |
+| `ollama_options` | transform | Inject Ollama options (`num_ctx`, `keep_alive`, `cache_prompt`, etc.) when client didn't set them. |
+| `protocol_bridge` | transform | When an Anthropic-shape request gets routed to a non-Claude model, translate body to OpenAI shape and route to Ollama; translate the SSE stream back on the way out. |
+| `tool_pruner` | transform | Drop tool definitions the model has been offered repeatedly but never invoked in this conversation. |
+| `context_overflow_guard` | transform | Estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window. |
+| `shadow_router` | transform | Fan out a parallel shadow request to a comparison model. Best-effort, never blocks the primary. |
+| `loop_detector` | pre-flight | Block when the same tool call repeats too often. |
+| `tool_failure_breaker` | pre-flight | Block when a tool has N consecutive error results. |
+| `schema_validator` | post-flight | Validate tool-call args against the request's tool schemas; replace invalid calls with corrective assistant content. |
+| `hallucinated_tool` | post-flight | Reject tool calls naming functions not declared in the request. |
+| `tool_args_autofix` | post-flight | Fill in missing required tool-call fields from configured defaults. |
+
+### Routing modes
+
+The Audit tab includes a one-click toggle between three modes (with auto-detection of the active mode):
+
+- **Passthrough** — Anthropic requests go straight to api.anthropic.com.
+- **Shadow** — primary still goes to Anthropic; local model runs in parallel for comparison.
+- **Redirect** — Anthropic requests are translated to OpenAI shape and sent to the local model entirely.
+
+---
 
 ## Deployment
 
 ### Linux (systemd)
 
 ```bash
-# Edit the service file with your paths
 sudo cp ai_proxy.service /etc/systemd/system/
+# Edit the Environment= lines for your paths/ports
 sudo systemctl daemon-reload
 sudo systemctl enable --now ai_proxy
 ```
 
-### Windows (PowerShell)
+The proxy supports self-restart via the System tab's "↻ Restart proxy" button when running under systemd (it exits with code 1; `Restart=on-failure` brings it back).
+
+### Windows
 
 ```powershell
 # Run as Administrator
 New-Service -Name "AIProxy" `
   -BinaryPathName "C:\path\to\python.exe C:\path\to\proxy.py" `
-  -DisplayName "AI Proxy" `
-  -StartupType Automatic
+  -DisplayName "AI Proxy" -StartupType Automatic
 ```
 
-## Web UI Features
+---
 
-- **Requests Tab**: View all intercepted API calls
-- **Stats Tab**: Token usage, response times, model distribution
-- **Audit Tab**: Block/warn/rewrite verdicts
-- **Conversations Tab**: Grouped request history
-- **Rules Editor**: Configure traffic rules
-- **Suggestions Tab**: AI-powered optimization recommendations
+## Architecture
 
-## API Endpoints
+```
+clients ──► [PROXY :8000] ──► upstreams
+                │
+                ├── pre-flight: block/warn rules (loop_detector, tool_failure_breaker)
+                ├── transform:  model_router, ollama_options, protocol_bridge,
+                │               tool_pruner, context_overflow_guard
+                ├── fan-out:    shadow_router (concurrent comparison runs)
+                ├── upstream:   stream chunks captured + live token tracking
+                └── post-flight: schema_validator, hallucinated_tool, tool_args_autofix
+                                 (intercept invalid tool calls, replace with corrective content)
+
+                ▼
+          SQLite (proxy.db)
+                │
+                ├── /__proxy/  ◄── web UI (single-page, no build step)
+                └── /__proxy/mcp ◄── MCP server (Model Context Protocol)
+```
+
+- **Single Python file** (`proxy.py`) — FastAPI + httpx, no other heavy deps.
+- **SQLite for storage** — WAL mode, schema migrations baked in, automatic backfills for parser improvements.
+- **Single static file** (`static/index.html`) — vanilla JS, dark theme, no build step or framework.
+- **Streaming-aware** — buffers SSE only when post-flight intercept is enabled or `protocol_bridge` is translating; otherwise passes through chunk-by-chunk.
+
+---
+
+## API endpoints
 
 | Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/__proxy/api/info` | GET | Proxy configuration |
-| `/__proxy/api/requests` | GET | List requests |
-| `/__proxy/api/requests/{id}` | GET | Get request details |
-| `/__proxy/api/stats` | GET | Statistics |
-| `/__proxy/api/audit` | GET | Audit log |
-| `/__proxy/api/conversations` | GET | List conversations |
-| `/__proxy/api/conversations/{id}` | GET | Conversation details |
-| `/__proxy/api/rules` | GET/POST | Rules configuration |
-| `/__proxy/api/suggestions` | GET | Optimization suggestions |
-| `/__proxy/api/clear` | POST | Clear request history |
+|---|---|---|
+| `/__proxy/api/info` | GET | Upstream URLs, port |
+| `/__proxy/api/health` | GET | DB stats, process info, pre-flight overhead |
+| `/__proxy/api/requests` | GET | List requests (with live token state for pending rows) |
+| `/__proxy/api/requests/{id}` | GET | Full detail incl. shadows |
+| `/__proxy/api/conversations` | GET | List grouped conversations |
+| `/__proxy/api/conversations/{id}` | GET | Turn-by-turn timeline |
+| `/__proxy/api/stats` | GET | Per-model, per-client, per-app, per-tool aggregates |
+| `/__proxy/api/audit` | GET | Gate verdict log |
+| `/__proxy/api/suggestions` | GET | Auto-detected config recommendations |
+| `/__proxy/api/rules` | GET / POST | Rules config (live-edit) |
+| `/__proxy/api/system/now` | GET | CPU, memory, GPU, loaded models |
+| `/__proxy/api/restart` | POST | Self-restart (requires `X-Confirm: restart-now`) |
+| `/__proxy/api/export` | GET | Markdown/JSON digest for AI review |
+| `/__proxy/mcp` | POST | MCP server (JSON-RPC) |
 
-## Security Notes
+---
 
-- The proxy stores full request/response data in SQLite
-- No authentication is built-in (add reverse proxy if needed)
-- Bind to `127.0.0.1` for local-only access
-- Consider rate limiting for production use
+## MCP integration
+
+Register the proxy as an MCP server in any MCP-aware client:
+
+```bash
+claude mcp add --transport http ai-proxy http://localhost:8000/__proxy/mcp
+```
+
+Available tools: `list_recent_requests`, `get_request_detail`, `list_conversations`, `get_conversation`, `get_stats`, `get_audit`, `get_suggestions`, `get_rules`, `get_system_metrics`, `export_digest` (and `update_rules` when `MCP_ALLOW_WRITE=true`). Now Claude can answer "what's been going through the proxy in the last hour?" or "show me the slowest requests today" by querying the data directly.
+
+---
+
+## Screenshots automation
+
+Reproducible UI screenshots via Playwright headless Chromium:
+
+```bash
+pip install playwright
+playwright install chromium
+sudo playwright install-deps chromium  # Linux only
+
+python scripts/screenshots.py --url http://localhost:8000/__proxy/ --out docs/screenshots/
+```
+
+Generates 9 PNGs covering every tab plus request detail, conversation detail, and the shadow compare view. See `scripts/screenshots.py` for options.
+
+---
+
+## Security notes
+
+- No authentication built in — bind to `127.0.0.1` for local-only or front with a reverse proxy that handles auth.
+- PII redaction is on by default: viewers from a different subnet than the request originator see body/header/preview fields replaced with a placeholder. Loopback viewers always see everything. Tunable via `PROXY_REDACT_PII` and `PROXY_REDACT_SUBNET_BITS`.
+- Stored data includes full request/response bodies and headers (which means API keys, since they're in headers). The DB lives at `PROXY_DB` (default `./proxy.db`); protect it accordingly.
+- Anthropic API keys are stripped from headers when the proxy bridges a request to a non-Anthropic upstream (so they don't leak into Ollama logs).
+
+---
 
 ## Troubleshooting
 
-### Proxy not starting
-- Check Ollama is running: `curl http://localhost:11434`
-- Verify port is not in use: `netstat -ano | findstr :8000`
+- **Proxy not starting**: check Ollama is running (`curl http://localhost:11434`), check the port isn't in use (`netstat -ano | findstr :8000` on Windows, `ss -ltn | grep :8000` on Linux).
+- **Database errors**: delete `proxy.db` and restart for a fresh DB. Schema migrations run automatically on startup.
+- **Slow shadow runs on Ollama**: see the auditor's `OLLAMA_NUM_PARALLEL` suggestion in the Audit tab. Each parallel slot is a separate KV-cache; with too few slots, interleaved conversations evict each other and pay full prefill every turn.
+- **Conversations not grouping**: the proxy hashes `system + first_user` to derive a conversation ID. Per-request volatile content (e.g., timestamps, billing headers) is normalized out automatically; if you find a client that breaks grouping, the normalizer in `_normalize_for_cid` is the place to extend.
+- **Tokens missing on Anthropic streams**: requires `Accept-Encoding: identity` to upstream (already forced by the proxy) — older rows from before that fix get repaired automatically by `backfill_v5`/`backfill_v7` migrations on next startup.
 
-### Database errors
-- Delete `proxy.db` and restart (creates fresh database)
+---
 
-### Rules not applying
-- Check `PROXY_RULES_FILE` environment variable
-- Verify JSON syntax in rules file
+## Status
+
+Active development. Single-file design, SQLite-backed, no build step. Pull requests welcome.
