@@ -52,6 +52,8 @@
   .shadow-back-banner { background: #1a2a1f; border: 1px solid #2e4a3a; border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; font-size: 12px; }
   .shadow-back-banner a { color: #88c0d0; text-decoration: none; }
   .shadow-back-banner a:hover { text-decoration: underline; }
+  .pii-banner { background: #2a2030; border: 1px solid #503a60; border-left: 3px solid #b48ead; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; font-size: 12px; color: #d8c8e8; }
+  .pii-banner code { background: #1a1426; padding: 1px 6px; border-radius: 3px; }
   .shadow-cmp { margin-top: 8px; padding: 8px 10px; background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; font-size: 11px; }
   .cmp-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0 3px 8px; border-left: 2px solid #3a3e4a; align-items: baseline; }
   .cmp-row + .cmp-row { margin-top: 2px; }
@@ -134,12 +136,44 @@
   tr.row-warn td { background: #2a2418 !important; }
   tr.row-rewrite td { background: #1a2030 !important; }
   tr.row-intercept td { background: #251a30 !important; }
-  #audit, #convs, #system, #setup { flex: 1; overflow: auto; padding: 18px; display: none; }
+  #audit, #convs, #system, #setup, #chat { flex: 1; overflow: auto; padding: 18px; display: none; }
+  #audit.show, #convs.show, #system.show, #setup.show, #chat.show { display: flex; flex-direction: column; }
   #audit.show, #convs.show, #system.show, #setup.show { display: block; }
-  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup { display: none; }
-  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup { display: none; }
-  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup { display: none; }
-  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system { display: none; }
+  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup, #main.audit #chat { display: none; }
+  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup, #main.convs #chat { display: none; }
+  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup, #main.system #chat { display: none; }
+  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system, #main.setup #chat { display: none; }
+  #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup { display: none; }
+  /* Chat tab: 2-pane layout with composer pinned at bottom */
+  #chat.show { padding: 0; flex-direction: column; height: 100%; }
+  #chat .chat-header { padding: 10px 14px; border-bottom: 1px solid #2a2e3a; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; background: #14171f; }
+  #chat .chat-header select { background: #1a1d26; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 4px; padding: 4px 8px; font: 12px ui-monospace, monospace; }
+  #chat .chat-header button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  #chat .chat-header button:hover { background: #3a3e4a; }
+  #chat .chat-scroll { flex: 1; overflow-y: auto; padding: 14px 18px; }
+  #chat .chat-empty { color: #666; text-align: center; padding: 60px 20px; font-size: 13px; }
+  #chat .cmsg { margin: 0 0 12px; max-width: 80%; }
+  #chat .cmsg.user { margin-left: auto; }
+  #chat .cmsg .role { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 3px; padding: 0 4px; }
+  #chat .cmsg.user .role { text-align: right; color: #88c0d0; }
+  #chat .cmsg.model .role { color: #a3be8c; }
+  #chat .cmsg.system .role { color: #b48ead; }
+  #chat .cmsg .bubble { padding: 9px 13px; border-radius: 12px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
+  #chat .cmsg.user .bubble { background: #2a3e5a; color: #fff; border-bottom-right-radius: 4px; }
+  #chat .cmsg.model .bubble { background: #1a261f; color: #d8dee9; border: 1px solid #2a3a2a; border-bottom-left-radius: 4px; }
+  #chat .cmsg.system .bubble { background: #1a1d26; color: #aaa; border: 1px dashed #2a2e3a; font-size: 12px; }
+  #chat .cmsg.streaming .bubble::after { content: '▌'; color: #5e8c66; animation: chat-blink 1s infinite; margin-left: 2px; }
+  @keyframes chat-blink { 50% { opacity: 0 } }
+  #chat .cmsg pre { background: #0a0c12; border: 1px solid #2a2e3a; border-radius: 6px; padding: 10px; margin: 8px 0; overflow-x: auto; font: 12px ui-monospace, monospace; white-space: pre; }
+  #chat .cmsg code:not(pre code) { background: #0f1116; border: 1px solid #2a2e3a; padding: 1px 5px; border-radius: 3px; font: 12px ui-monospace, monospace; color: #88c0d0; }
+  #chat .cmsg .meta { font-size: 10px; color: #666; margin-top: 4px; padding: 0 4px; }
+  #chat .cmsg.user .meta { text-align: right; }
+  #chat .composer { border-top: 1px solid #2a2e3a; padding: 10px 14px; background: #14171f; flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  #chat .composer textarea { flex: 1; min-height: 40px; max-height: 220px; resize: none; background: #1a1d26; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 18px; padding: 10px 14px; font: 14px/1.4 inherit; outline: none; }
+  #chat .composer textarea:focus { border-color: #88c0d0; }
+  #chat .composer button { border: none; border-radius: 8px; padding: 10px 16px; background: #3a5a7a; color: #fff; font-weight: 600; cursor: pointer; min-width: 64px; }
+  #chat .composer button:hover { background: #4a6a8a; }
+  #chat .composer button:disabled { opacity: 0.4; cursor: not-allowed; }
   .setup-vars { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; }
   .setup-vars > div { margin: 4px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .setup-vars .label { width: 110px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -300,6 +334,7 @@
   <div class="tabs">
     <button class="tab active" id="tab-req" onclick="setView('requests')">Requests</button>
     <button class="tab" id="tab-convs" onclick="setView('convs')">Conversations</button>
+    <button class="tab" id="tab-chat" onclick="setView('chat')">Chat</button>
     <button class="tab" id="tab-system" onclick="setView('system')">System</button>
     <button class="tab" id="tab-setup" onclick="setView('setup')">Setup</button>
     <button class="tab" id="tab-stats" onclick="setView('stats')">Stats</button>
@@ -325,6 +360,22 @@
   <div id="convs"></div>
   <div id="system"></div>
   <div id="setup"></div>
+  <div id="chat">
+    <div class="chat-header">
+      <span style="font-size:12px;color:#aaa">Model:</span>
+      <select id="chat-model"></select>
+      <button onclick="chatNew()">+ New chat</button>
+      <span style="flex:1"></span>
+      <span id="chat-status" style="color:#666;font-size:11px"></span>
+    </div>
+    <div class="chat-scroll" id="chat-scroll">
+      <div class="chat-empty" id="chat-empty">Pick a model and type below — your messages route through this proxy and the conversation appears in the Requests / Conversations tabs.</div>
+    </div>
+    <div class="composer">
+      <textarea id="chat-input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
+      <button id="chat-send" onclick="chatSend()">Send</button>
+    </div>
+  </div>
 </div>
 <script>
 let selected = null;
@@ -336,21 +387,26 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
 const num = (n) => (n == null ? '' : Number(n).toLocaleString());
 
+const VIEW_KEY = 'ai-proxy-active-view';
+const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat']);
+
 function setView(v) {
   view = v;
-  for (const t of ['req','stats','audit','convs','system','setup']) {
+  for (const t of ['req','stats','audit','convs','system','setup','chat']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
-  for (const c of ['stats','audit','convs','system','setup']) {
+  for (const c of ['stats','audit','convs','system','setup','chat']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
+  try { localStorage.setItem(VIEW_KEY, v); } catch {}
   if (v === 'stats') loadStats();
   else if (v === 'audit') loadAudit();
   else if (v === 'convs') loadConversations();
   else if (v === 'system') loadSystem();
   else if (v === 'setup') loadSetup();
+  else if (v === 'chat') loadChat();
   else refresh();
 }
 
@@ -1292,10 +1348,16 @@ async function loadDetail(id) {
   const shadowBackBanner = d.shadow_of
     ? `<div class="shadow-back-banner">🔀 This is a shadow run of <a href="#" onclick="event.preventDefault();selectItem('${esc(d.shadow_of)}')">${esc(d.shadow_of)}</a> — comparison only, not delivered to the client.</div>`
     : '';
+  // PII-redaction banner: makes it explicit when content fields are placeholders rather than
+  // looking like an empty/broken render.
+  const piiBanner = d._pii_redacted
+    ? `<div class="pii-banner">🔒 PII redacted — this request was sent by <code>${esc(d.client_ip || '?')}</code>, which isn't on the same subnet as your viewer IP. The metadata (timing, tokens, gate verdict) is visible above; the request/response bodies and headers are hidden. Set <code>PROXY_REDACT_PII=0</code> on the proxy to disable, or view from the originator's network to see the full content.</div>`
+    : '';
   const shadowsHtml = renderShadows(d.shadows || [], d);
 
   detailEl.innerHTML = `
     ${shadowBackBanner}
+    ${piiBanner}
     <div class="summary">
       <div class="row"><span class="label">Request</span> <strong class="method">${esc(d.method)}</strong> <code>${esc(d.path)}</code></div>
       <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
@@ -3060,8 +3122,299 @@ setInterval(() => {
   else refresh();
   refreshAuditBadge();
 }, 1500);
+// ─── Simple chat tab ───
+const CHAT_KEY = 'ai-proxy-chat-state';
+let chatMessages = [];   // [{role, content, model?, ts, tokens?, ms?}]
+let chatModels = [];     // [{name, kind: 'ollama'|'anthropic'|'openai'}]
+let chatStreaming = false;
+
+function chatLoadState() {
+  try {
+    const s = JSON.parse(localStorage.getItem(CHAT_KEY) || '{}');
+    chatMessages = s.messages || [];
+    if (s.model && $('chat-model')) $('chat-model').value = s.model;
+  } catch { chatMessages = []; }
+}
+function chatSaveState() {
+  try {
+    localStorage.setItem(CHAT_KEY, JSON.stringify({
+      messages: chatMessages.slice(-100),
+      model: $('chat-model') ? $('chat-model').value : '',
+    }));
+  } catch {}
+}
+
+async function chatPopulateModels() {
+  const sel = $('chat-model');
+  if (!sel) return;
+  const prev = sel.value;
+  // Pull the current Ollama snapshot for available local models, plus a curated Anthropic list.
+  let ollama = [];
+  try {
+    const sys = await (await fetch('/__proxy/api/system/now')).json();
+    const tags = (sys.ollama && sys.ollama.tags) || [];
+    ollama = tags.map(t => t.name).filter(Boolean).sort();
+  } catch {}
+  const anthropic = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'];
+  chatModels = [
+    ...anthropic.map(n => ({ name: n, kind: 'anthropic' })),
+    ...ollama.map(n => ({ name: n, kind: 'ollama' })),
+  ];
+  sel.innerHTML = `
+    <optgroup label="Anthropic">
+      ${anthropic.map(n => `<option value="anthropic:${esc(n)}">${esc(n)}</option>`).join('')}
+    </optgroup>
+    <optgroup label="Ollama (local)">
+      ${ollama.length
+        ? ollama.map(n => `<option value="ollama:${esc(n)}">${esc(n)}</option>`).join('')
+        : '<option disabled>(no local models loaded)</option>'}
+    </optgroup>`;
+  if (prev) {
+    const opts = Array.from(sel.options).map(o => o.value);
+    if (opts.includes(prev)) sel.value = prev;
+  }
+}
+
+function _chatRenderMarkdown(text) {
+  // Cheap inline conversion: preserve fenced code blocks, escape everything else.
+  const parts = [];
+  let i = 0;
+  const re = /```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > i) parts.push({ type: 'text', text: text.slice(i, m.index) });
+    parts.push({ type: 'code', lang: m[1] || '', text: m[2] });
+    i = m.index + m[0].length;
+  }
+  if (i < text.length) parts.push({ type: 'text', text: text.slice(i) });
+  return parts.map(p => p.type === 'code'
+    ? `<pre><code>${esc(p.text)}</code></pre>`
+    : esc(p.text).replace(/`([^`]+)`/g, '<code>$1</code>')
+                  .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  ).join('');
+}
+
+function chatRender() {
+  const scroll = $('chat-scroll');
+  const empty = $('chat-empty');
+  if (!chatMessages.length) {
+    empty.style.display = '';
+    Array.from(scroll.querySelectorAll('.cmsg')).forEach(n => n.remove());
+    return;
+  }
+  empty.style.display = 'none';
+  const wasAtBottom = scroll.scrollHeight - scroll.scrollTop - scroll.clientHeight < 100;
+  Array.from(scroll.querySelectorAll('.cmsg')).forEach(n => n.remove());
+  const html = chatMessages.map(m => {
+    const cls = 'cmsg ' + m.role + (m.streaming ? ' streaming' : '');
+    const content = m.role === 'user' ? esc(m.content) : _chatRenderMarkdown(m.content || '');
+    const metaParts = [];
+    if (m.model) metaParts.push(esc(m.model));
+    if (m.ms) metaParts.push(`${Math.round(m.ms)}ms`);
+    if (m.tokens) metaParts.push(`${num(m.tokens)} tok`);
+    return `<div class="${cls}">
+      <div class="role">${m.role}</div>
+      <div class="bubble">${content}</div>
+      ${metaParts.length ? `<div class="meta">${metaParts.join(' · ')}</div>` : ''}
+    </div>`;
+  }).join('');
+  scroll.insertAdjacentHTML('beforeend', html);
+  if (wasAtBottom) requestAnimationFrame(() => { scroll.scrollTop = scroll.scrollHeight; });
+}
+
+function chatNew() {
+  if (chatStreaming) { chatStatus('still streaming…'); return; }
+  if (chatMessages.length && !confirm('Start a new chat? Current conversation will be cleared from this view (the proxy log keeps the history).')) return;
+  chatMessages = [];
+  chatSaveState();
+  chatRender();
+  chatStatus('');
+  $('chat-input').focus();
+}
+
+function chatStatus(msg) {
+  const el = $('chat-status');
+  if (el) el.textContent = msg || '';
+}
+
+async function chatSend() {
+  if (chatStreaming) return;
+  const ta = $('chat-input');
+  const text = ta.value.trim();
+  if (!text) return;
+  const sel = $('chat-model');
+  const modelKey = sel.value;
+  if (!modelKey) { chatStatus('Pick a model first'); return; }
+  const [kind, ...rest] = modelKey.split(':');
+  const modelName = rest.join(':');
+
+  chatMessages.push({ role: 'user', content: text, ts: Date.now() / 1000 });
+  const assistantIdx = chatMessages.length;
+  chatMessages.push({ role: 'model', content: '', model: modelName, streaming: true, ts: Date.now() / 1000 });
+  ta.value = '';
+  ta.style.height = 'auto';
+  chatRender();
+  chatSaveState();
+  chatStreaming = true;
+  $('chat-send').disabled = true;
+  chatStatus(`Streaming from ${modelName}…`);
+
+  const startMs = performance.now();
+  try {
+    if (kind === 'anthropic') {
+      await _chatSendAnthropic(modelName, assistantIdx);
+    } else {
+      await _chatSendOpenAI(modelName, assistantIdx);
+    }
+    const m = chatMessages[assistantIdx];
+    m.streaming = false;
+    m.ms = performance.now() - startMs;
+    chatStatus('');
+  } catch (e) {
+    const m = chatMessages[assistantIdx];
+    m.content += `\n\n_Error: ${e.message}_`;
+    m.streaming = false;
+    chatStatus('Error: ' + e.message);
+  } finally {
+    chatStreaming = false;
+    $('chat-send').disabled = false;
+    chatRender();
+    chatSaveState();
+  }
+}
+
+async function _chatSendOpenAI(modelName, assistantIdx) {
+  const messages = chatMessages.slice(0, assistantIdx).map(m => ({
+    role: m.role === 'model' ? 'assistant' : m.role,
+    content: m.content,
+  }));
+  const r = await fetch('/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ model: modelName, messages, stream: true, stream_options: { include_usage: true } }),
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (data === '[DONE]') continue;
+      try {
+        const j = JSON.parse(data);
+        for (const c of (j.choices || [])) {
+          const delta = c.delta || {};
+          if (typeof delta.content === 'string') {
+            chatMessages[assistantIdx].content += delta.content;
+            chatRender();
+          }
+        }
+        if (j.usage && j.usage.total_tokens) {
+          chatMessages[assistantIdx].tokens = j.usage.total_tokens;
+        }
+      } catch {}
+    }
+  }
+}
+
+async function _chatSendAnthropic(modelName, assistantIdx) {
+  const messages = chatMessages.slice(0, assistantIdx).map(m => ({
+    role: m.role === 'model' ? 'assistant' : m.role,
+    content: m.content,
+  }));
+  const apiKey = localStorage.getItem('ai-proxy-anthropic-key') ||
+                 prompt('Anthropic API key (stored locally in your browser only):');
+  if (!apiKey) throw new Error('Anthropic API key required');
+  if (!localStorage.getItem('ai-proxy-anthropic-key')) {
+    localStorage.setItem('ai-proxy-anthropic-key', apiKey);
+  }
+  const r = await fetch('/v1/messages', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-api-key': apiKey,
+      'anthropic-version': '2023-06-01',
+    },
+    body: JSON.stringify({ model: modelName, max_tokens: 4096, messages, stream: true }),
+  });
+  if (!r.ok) {
+    if (r.status === 401) {
+      localStorage.removeItem('ai-proxy-anthropic-key');
+      throw new Error('invalid Anthropic API key — cleared, try again');
+    }
+    throw new Error('HTTP ' + r.status);
+  }
+  const reader = r.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  let inputTokens = 0, outputTokens = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    const lines = buf.split('\n');
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue;
+      const data = line.slice(6).trim();
+      if (!data) continue;
+      try {
+        const j = JSON.parse(data);
+        if (j.type === 'content_block_delta' && j.delta && j.delta.type === 'text_delta') {
+          chatMessages[assistantIdx].content += j.delta.text || '';
+          chatRender();
+        } else if (j.type === 'message_start' && j.message && j.message.usage) {
+          inputTokens = j.message.usage.input_tokens || 0;
+        } else if (j.type === 'message_delta' && j.usage && j.usage.output_tokens != null) {
+          outputTokens = j.usage.output_tokens;
+        }
+      } catch {}
+    }
+  }
+  chatMessages[assistantIdx].tokens = (inputTokens || 0) + (outputTokens || 0);
+}
+
+async function loadChat() {
+  await chatPopulateModels();
+  chatLoadState();
+  chatRender();
+  setTimeout(() => $('chat-input')?.focus(), 100);
+}
+
+// Composer key bindings
+document.addEventListener('keydown', (e) => {
+  if (view !== 'chat') return;
+  const ta = $('chat-input');
+  if (e.target !== ta) return;
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    chatSend();
+  }
+});
+document.addEventListener('input', (e) => {
+  if (e.target && e.target.id === 'chat-input') {
+    const ta = e.target;
+    ta.style.height = 'auto';
+    ta.style.height = Math.min(ta.scrollHeight, 220) + 'px';
+  }
+});
+
 loadInfo();
-refresh();
+// Restore last-viewed tab if any; default to Requests.
+let _restoredView = null;
+try { _restoredView = localStorage.getItem(VIEW_KEY); } catch {}
+if (_restoredView && VALID_VIEWS.has(_restoredView) && _restoredView !== 'requests') {
+  setView(_restoredView);
+} else {
+  refresh();
+}
 refreshAuditBadge();
 </script>
 </body>

@@ -1,0 +1,97 @@
+{
+  "name": "ai-proxy-remote-chat",
+  "displayName": "AI Proxy Remote Chat",
+  "description": "Drive VS Code's chat panel (Copilot Chat / Continue / Cursor) from any HTTP client.",
+  "version": "0.1.0",
+  "publisher": "guscatalano",
+  "engines": { "vscode": "^1.95.0" },
+  "categories": ["Other", "Chat"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./extension.js",
+  "contributes": {
+    "chatParticipants": [
+      {
+        "id": "aiproxy.chat",
+        "fullName": "AI Proxy",
+        "name": "proxy",
+        "description": "Chat with phone-approved tool execution. Tools queue to your phone for approve/deny.",
+        "isSticky": true
+      }
+    ],
+    "configuration": {
+      "title": "AI Proxy Remote Chat",
+      "properties": {
+        "aiProxyRemoteChat.port": {
+          "type": "number",
+          "default": 13337,
+          "description": "TCP port to listen on for incoming chat-prompt requests."
+        },
+        "aiProxyRemoteChat.bind": {
+          "type": "string",
+          "default": "127.0.0.1",
+          "description": "Bind address. Use 0.0.0.0 to accept LAN connections (firewall accordingly)."
+        },
+        "aiProxyRemoteChat.token": {
+          "type": "string",
+          "default": "",
+          "description": "Required Bearer token. Empty = no auth (only safe with 127.0.0.1 bind)."
+        },
+        "aiProxyRemoteChat.defaultCommand": {
+          "type": "string",
+          "default": "workbench.action.chat.open",
+          "description": "Default VS Code command to invoke. Try 'github.copilot-chat.openChat' for Copilot, or 'workbench.action.chat.openInSidebar'."
+        },
+        "aiProxyRemoteChat.proxyUrl": {
+          "type": "string",
+          "default": "",
+          "description": "Optional AI Proxy URL (e.g. http://192.168.6.183:11444). When set, this extension self-registers so the proxy's phone PWA can route prompts here."
+        },
+        "aiProxyRemoteChat.advertiseUrl": {
+          "type": "string",
+          "default": "",
+          "description": "URL the proxy should call back on, e.g. http://192.168.6.113:13337. If empty, advertises bind+port from this extension."
+        },
+        "aiProxyRemoteChat.advertiseName": {
+          "type": "string",
+          "default": "",
+          "description": "Friendly name to register with (defaults to OS hostname)."
+        },
+        "aiProxyRemoteChat.newChatCommand": {
+          "type": "string",
+          "default": "workbench.action.chat.newChat",
+          "description": "Command to run BEFORE the prompt when the request includes 'newChat': true. Try 'github.copilot.chat.newChat' for Copilot, 'workbench.action.chat.newEditSession' for Edits mode."
+        },
+        "aiProxyRemoteChat.submitCommand": {
+          "type": "string",
+          "default": "workbench.action.chat.submit",
+          "description": "Command to run AFTER the prompt to force submission. Some chat extensions only pre-fill the input from `query` instead of submitting; this is the belt-and-suspenders fallback."
+        },
+        "aiProxyRemoteChat.alwaysSubmit": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run submitCommand after every prompt to force submission (works around chat extensions that don't auto-submit on the `query` arg)."
+        },
+        "aiProxyRemoteChat.participantApprovalTimeout": {
+          "type": "number",
+          "default": 120,
+          "description": "Seconds to wait for phone approval before treating @proxy tool calls as denied."
+        },
+        "aiProxyRemoteChat.participantPollInterval": {
+          "type": "number",
+          "default": 1.0,
+          "description": "Polling interval (seconds) for the @proxy participant to check approval status."
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "aiProxyRemoteChat.showStatus",
+        "title": "AI Proxy Remote Chat: Show Status"
+      },
+      {
+        "command": "aiProxyRemoteChat.restart",
+        "title": "AI Proxy Remote Chat: Restart Listener"
+      }
+    ]
+  }
+}

@@ -45,6 +45,39 @@ MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip() or None
 _overhead_samples: collections.deque = collections.deque(maxlen=2000)
 _PROCESS_START_TS = time.time()
 
+# Panic mode kill-switch — set from the phone PWA when something goes rogue. While on,
+# every proxied request short-circuits to 503 (the proxy itself stays up so you can disable
+# it again). Backed by the settings table so it survives restarts.
+_PANIC_MODE: bool = False
+
+# Tracks recent phone-PWA chat sends so /api/control/await can correlate the resulting
+# upstream request and stream its response back to the phone. Layout:
+#   {send_id: {ts, target_name, target_ip, prompt_hint}}
+# Auto-pruned by age in control_await; bounded by the phone polling client.
+_CONTROL_SENDS: dict = {}
+
+# In-memory pending tool-call queue. Each entry waits for a phone decision.
+# Layout:
+#   {pending_id: {ts, source(extension name), tool_name, arguments, summary, decision, decided_ts}}
+# decision: None | 'allow' | 'deny' | 'always_allow' | 'always_deny'
+_PENDING_TOOLS: dict = {}
+
+
+def _load_panic_mode() -> bool:
+    global _PANIC_MODE
+    s = get_setting("panic_mode")
+    _PANIC_MODE = bool(s and s.get("value") == "on")
+    return _PANIC_MODE
+
+
+def _set_panic_mode(on: bool) -> None:
+    global _PANIC_MODE
+    _PANIC_MODE = bool(on)
+    if _PANIC_MODE:
+        set_setting("panic_mode", "on")
+    else:
+        delete_setting("panic_mode")
+
 # Per-request in-flight token state. While a request is pending the DB has no usage yet,
 # but for streaming responses (especially Anthropic) the upstream tells us input_tokens in
 # the message_start event and updates output_tokens via message_delta as generation
@@ -91,6 +124,47 @@ CREATE TABLE IF NOT EXISTS requests (
     completion_tokens INTEGER,
     total_tokens INTEGER,
     client_ip TEXT
+);
+CREATE TABLE IF NOT EXISTS proxy_memory (
+    conversation_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    created_ts REAL,
+    updated_ts REAL,
+    PRIMARY KEY (conversation_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS proxy_todos (
+    conversation_id TEXT NOT NULL,
+    idx INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending | in_progress | completed
+    created_ts REAL,
+    updated_ts REAL,
+    PRIMARY KEY (conversation_id, idx)
+);
+
+CREATE TABLE IF NOT EXISTS control_endpoints (
+    name TEXT PRIMARY KEY,
+    url TEXT NOT NULL,
+    token TEXT,
+    kind TEXT,
+    registered_ts REAL,
+    last_seen_ts REAL,
+    source TEXT
+);
+
+CREATE TABLE IF NOT EXISTS conversation_labels (
+    conversation_id TEXT PRIMARY KEY,
+    label TEXT NOT NULL,
+    updated_ts REAL
+);
+
+CREATE TABLE IF NOT EXISTS tool_permissions (
+    -- Persistent allow/deny rules. `pattern` is the literal tool_name or "tool_name:argpfx".
+    pattern TEXT PRIMARY KEY,
+    decision TEXT NOT NULL,  -- 'allow' | 'deny'
+    created_ts REAL
 );
 """
 
@@ -321,6 +395,32 @@ def init_db():
             print(f"[init] marked {abandoned.rowcount} pending request(s) as abandoned")
         except Exception:
             pass
+    # Backfill v8: re-compute conversation_id for vscode-* rows. Earlier conversation
+    # hashes included rotating content (Copilot Chat's <environment_info> terminal IDs,
+    # cwd, exit codes), fragmenting one chat session across many cids. The hash now strips
+    # XML wrappers before hashing, so re-running over historical rows merges the fragments.
+    done_v8 = conn.execute("SELECT value FROM settings WHERE key='backfill_v8'").fetchone()
+    if not done_v8:
+        rows = conn.execute(
+            """SELECT id, request_body FROM requests
+               WHERE request_body IS NOT NULL
+                 AND client_app IN ('vscode-copilot', 'github-copilot', 'continue.dev', 'cursor', 'vscode')"""
+        ).fetchall()
+        for r in rows:
+            try:
+                body = json.loads(r["request_body"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            cid = _conversation_id(body)
+            if cid is not None:
+                conn.execute(
+                    "UPDATE requests SET conversation_id=? WHERE id=?",
+                    (cid, r["id"]),
+                )
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v8', '1', ?)",
+            (time.time(),),
+        )
     # Backfill v7: re-extract usage for Anthropic rows that have prompt-cache fields. Old
     # rows recorded only `input_tokens` (the fresh portion); we now sum fresh + cache_read +
     # cache_create so the prompt_tokens reflect the true prompt size.
@@ -544,6 +644,7 @@ def _pick_upstream(full_path: str) -> tuple[str, str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    _load_panic_mode()
     app.state.started_at = time.time()
     app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
     app.state.metrics_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
@@ -1068,6 +1169,20 @@ DEFAULT_RULES_CONFIG = {
         #   {"if": {"from_model": "claude-opus-4-7"}, "shadow_to": "qwen3-coder-next:latest"}
         "enabled": False,
         "rules": [],
+    },
+    "tool_injector": {
+        # Adds proxy-owned tools to outgoing requests and executes them server-side. The model
+        # sees them in tools[] like any other tool; when it calls one, the proxy intercepts
+        # the response, runs the handler, appends a tool_result, and re-calls upstream so the
+        # model sees the answer and continues. Capped at max_iterations to prevent runaway.
+        #
+        # Bundles:
+        #   memory: per-conversation key-value store. Tools: remember, recall, list_memory, forget.
+        #   todos:  per-conversation task list. Tools: set_todos, get_todos, add_todo, complete_todo.
+        "enabled": False,
+        "memory": True,
+        "todos": True,
+        "max_iterations": 4,
     },
 }
 
@@ -2899,7 +3014,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "schema_validator", "hallucinated_tool", "tool_args_autofix"]
+    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "tool_injector", "schema_validator", "hallucinated_tool", "tool_args_autofix"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -3138,6 +3253,834 @@ async def restart_proxy(request: Request):
     )
 
 
+# -------- Remote control: self-registered endpoints + phone PWA bridge + panic mode --------
+
+@app.post("/__proxy/api/control/register")
+async def control_register(request: Request):
+    """Self-registration endpoint for control targets (e.g. the VS Code companion extension).
+    Idempotent upsert keyed by `name`. Re-call as a heartbeat (last_seen_ts gets updated)."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    name = (payload.get("name") or "").strip()
+    url = (payload.get("url") or "").strip()
+    if not name or not url:
+        return JSONResponse({"error": "'name' and 'url' are required"}, status_code=400)
+    token = payload.get("token") or None
+    kind = (payload.get("kind") or "vscode-chat").strip()
+    now = time.time()
+    conn = db()
+    conn.execute(
+        """INSERT INTO control_endpoints (name, url, token, kind, registered_ts, last_seen_ts, source)
+           VALUES (?, ?, ?, ?, ?, ?, 'auto')
+           ON CONFLICT(name) DO UPDATE SET
+             url = excluded.url,
+             token = COALESCE(excluded.token, control_endpoints.token),
+             kind = excluded.kind,
+             last_seen_ts = excluded.last_seen_ts""",
+        (name, url, token, kind, now, now),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "name": name, "registered_ts": now}
+
+
+@app.get("/__proxy/api/control/endpoints")
+async def control_list_endpoints():
+    """Lists all registered control endpoints (auto + manual)."""
+    conn = db()
+    rows = conn.execute(
+        """SELECT name, url, kind, registered_ts, last_seen_ts, source,
+                  CASE WHEN token IS NOT NULL THEN 1 ELSE 0 END AS has_token
+           FROM control_endpoints ORDER BY last_seen_ts DESC"""
+    ).fetchall()
+    conn.close()
+    return {"items": [dict(r) for r in rows], "panic_mode": _PANIC_MODE}
+
+
+@app.delete("/__proxy/api/control/endpoints/{name}")
+async def control_delete_endpoint(name: str):
+    conn = db()
+    cur = conn.execute("DELETE FROM control_endpoints WHERE name = ?", (name,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.post("/__proxy/api/control/chat")
+async def control_chat(request: Request):
+    """Forward a chat prompt to a registered VS Code endpoint. The phone PWA hits this; the
+    proxy looks up the endpoint and POSTs to its /chat with the stored token."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    prompt = payload.get("prompt") or payload.get("query")
+    if not isinstance(prompt, str) or not prompt.strip():
+        return JSONResponse({"error": "'prompt' is required"}, status_code=400)
+    target = payload.get("target")
+    conn = db()
+    if target:
+        row = conn.execute(
+            "SELECT name, url, token FROM control_endpoints WHERE name = ?", (target,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT name, url, token FROM control_endpoints ORDER BY last_seen_ts DESC LIMIT 1"
+        ).fetchone()
+    conn.close()
+    if not row:
+        return JSONResponse({"error": "no control endpoints registered"}, status_code=404)
+    fwd_url = row["url"].rstrip("/") + "/chat"
+    fwd_headers = {"content-type": "application/json"}
+    if row["token"]:
+        fwd_headers["authorization"] = f"Bearer {row['token']}"
+    fwd_body = {"prompt": prompt}
+    for k in ("command", "location", "isPartialQuery", "attachScreenshot",
+              "newChat", "submit", "newChatCommand", "submitCommand"):
+        if payload.get(k) is not None:
+            fwd_body[k] = payload[k]
+    client_http: httpx.AsyncClient = request.app.state.client
+    send_id = uuid.uuid4().hex[:16]
+    send_ts = time.time()
+    try:
+        r = await client_http.post(
+            fwd_url, headers=fwd_headers,
+            content=json.dumps(fwd_body).encode("utf-8"),
+            timeout=httpx.Timeout(10.0),
+        )
+        try:
+            ext_payload = json.loads(r.text)
+        except (json.JSONDecodeError, TypeError):
+            ext_payload = {"raw": r.text}
+        # Record the send so /api/control/await can correlate the resulting LLM call.
+        if r.is_success:
+            _CONTROL_SENDS[send_id] = {
+                "ts": send_ts,
+                "target_name": row["name"],
+                "target_ip": _control_target_ip(row["url"]),
+                "prompt_hint": prompt[:120],
+            }
+        return JSONResponse(
+            {"ok": r.is_success, "target": row["name"], "status": r.status_code,
+             "endpoint_url": row["url"], "extension": ext_payload, "send_id": send_id},
+            status_code=r.status_code,
+        )
+    except Exception as e:
+        return JSONResponse(
+            {"ok": False, "target": row["name"], "error": str(e),
+             "endpoint_url": row["url"], "send_id": send_id},
+            status_code=502,
+        )
+
+
+def _extract_response_text(body_text, stream_text) -> str:
+    """Best-effort assistant text extraction from either OpenAI or Anthropic shape.
+    Used by /api/control/await to stream live responses back to the phone PWA."""
+    parts: list[str] = []
+    if body_text:
+        try:
+            j = json.loads(body_text)
+            if isinstance(j, dict):
+                # OpenAI chat.completion
+                for c in (j.get("choices") or []):
+                    msg = c.get("message") or {}
+                    if isinstance(msg.get("content"), str):
+                        parts.append(msg["content"])
+                # Anthropic /v1/messages
+                if j.get("type") == "message":
+                    for blk in (j.get("content") or []):
+                        if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                            parts.append(blk["text"])
+                # Ollama native
+                m = j.get("message")
+                if isinstance(m, dict) and isinstance(m.get("content"), str):
+                    parts.append(m["content"])
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if stream_text:
+        text = _maybe_gunzip(stream_text)
+        for line in text.split("\n") if isinstance(text, str) else []:
+            if not line.startswith("data: "):
+                continue
+            data = line[6:]
+            if data == "[DONE]":
+                continue
+            try:
+                j = json.loads(data)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            # OpenAI streaming delta
+            for c in (j.get("choices") or []):
+                d = c.get("delta") or c.get("message") or {}
+                if isinstance(d.get("content"), str):
+                    parts.append(d["content"])
+            # Anthropic streaming
+            if j.get("type") == "content_block_delta":
+                d = j.get("delta") or {}
+                if d.get("type") == "text_delta" and isinstance(d.get("text"), str):
+                    parts.append(d["text"])
+            elif j.get("type") == "content_block_start":
+                blk = j.get("content_block") or {}
+                if blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                    parts.append(blk["text"])
+            # Ollama streaming
+            elif isinstance(j.get("message"), dict) and isinstance(j["message"].get("content"), str):
+                parts.append(j["message"]["content"])
+    return "".join(parts)
+
+
+def _extract_response_tool_calls_full(body_text, stream_text) -> list[dict]:
+    """Extract tool calls (name + args) from a response in either shape, in arrival order.
+    Used by the phone PWA to render 'Read welcome.md' / 'Created welcome.md' style events."""
+    out: list[dict] = []
+    if body_text:
+        try:
+            j = json.loads(body_text)
+            if isinstance(j, dict):
+                for c in (j.get("choices") or []):
+                    msg = c.get("message") or {}
+                    for tc in (msg.get("tool_calls") or []):
+                        fn = (tc.get("function") or {})
+                        out.append({
+                            "id": tc.get("id"),
+                            "name": fn.get("name") or "?",
+                            "arguments": fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {}),
+                        })
+                m = j.get("message")
+                if isinstance(m, dict):
+                    for tc in (m.get("tool_calls") or []):
+                        fn = (tc.get("function") or {})
+                        out.append({
+                            "name": fn.get("name") or "?",
+                            "arguments": json.dumps(fn.get("arguments") or {}),
+                        })
+                if j.get("type") == "message" and isinstance(j.get("content"), list):
+                    for blk in j["content"]:
+                        if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                            out.append({
+                                "id": blk.get("id"),
+                                "name": blk.get("name") or "?",
+                                "arguments": json.dumps(blk.get("input") or {}),
+                            })
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if stream_text:
+        text = _maybe_gunzip(stream_text)
+        if isinstance(text, str):
+            tcs: dict = {}
+            order: list = []
+            for line in text.split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    continue
+                try:
+                    j = json.loads(data)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                # OpenAI streaming
+                for c in (j.get("choices") or []):
+                    delta = c.get("delta") or c.get("message") or {}
+                    for tc in (delta.get("tool_calls") or []):
+                        idx = ("oai", tc.get("index", len(order)))
+                        if idx not in tcs:
+                            tcs[idx] = {"name": "", "arguments": "", "id": tc.get("id")}
+                            order.append(idx)
+                        slot = tcs[idx]
+                        if tc.get("id"):
+                            slot["id"] = tc["id"]
+                        fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            slot["name"] = fn["name"]
+                        if fn.get("arguments"):
+                            slot["arguments"] += fn["arguments"]
+                # Anthropic streaming tool_use
+                if j.get("type") == "content_block_start":
+                    blk = j.get("content_block") or {}
+                    if blk.get("type") == "tool_use":
+                        idx = ("anth", j.get("index", len(order)))
+                        tcs[idx] = {"name": blk.get("name") or "?", "arguments": "", "id": blk.get("id")}
+                        order.append(idx)
+                elif j.get("type") == "content_block_delta":
+                    idx = ("anth", j.get("index"))
+                    if idx in tcs:
+                        d = j.get("delta") or {}
+                        if d.get("type") == "input_json_delta":
+                            tcs[idx]["arguments"] += d.get("partial_json") or ""
+            for k in order:
+                out.append(tcs[k])
+    return out
+
+
+def _control_target_ip(url_str: str | None) -> str | None:
+    """Extract host portion of an endpoint URL for client_ip correlation."""
+    if not url_str:
+        return None
+    try:
+        from urllib.parse import urlparse
+        return urlparse(url_str).hostname
+    except (ValueError, TypeError):
+        return None
+
+
+# Context wrappers that VS Code Copilot Chat / Claude Code / Continue inject into the user
+# message envelope. Stripped by _clean_user_prompt so the mirror shows what the user actually
+# typed instead of the whole context bundle. Order matters — more-specific names checked first.
+_USER_PROMPT_TAGS = (
+    "userPrompt", "user_prompt",
+    "userRequest", "user_request",
+    "userMessage", "user_message",
+    "userQuery", "user_query",
+    "userInput", "user_input",
+    "userQuestion", "user_question",
+    "currentRequest", "current_request",
+    "currentMessage", "current_message",
+    "user", "input", "prompt", "question", "request", "message", "query",
+)
+_CONTEXT_WRAPPERS = (
+    # Generic
+    "context", "instructions", "tools", "history", "memory", "session",
+    # File / code context
+    "file", "files", "code_block", "code", "snippet", "selectedText",
+    "currentSelection", "selection", "attachment", "attachments",
+    "active_file", "activeFile", "open_files", "openFiles", "editor_state",
+    "editorState", "currentFile", "current_file",
+    # Environment / workspace
+    "environment", "workspace", "workspaceState", "workspace_state",
+    "repoSummary", "repo_summary", "repositoryContext",
+    # Reminders / instructions (Copilot Chat wraps a lot in these)
+    "reminder", "system-reminder", "system_reminder", "systemReminder",
+    "reminderInstructions", "reminder_instructions",
+    "customInstructions", "custom_instructions",
+    "userInstructions", "user_instructions",
+    "additionalInstructions", "additional_instructions",
+    "agentInstructions", "agent_instructions",
+    "policyInstructions", "policy_instructions",
+    "guidance", "policy",
+    # Diagnostics / git / tasks
+    "diagnostics", "problems", "errors", "git_status", "gitStatus",
+    "git_log", "gitLog", "task", "tasks", "recent_changes", "recentChanges",
+    "lintIssues", "lint_issues",
+    # Conversation framing
+    "conversationContext", "conversation_context", "previousResponse",
+    "previous_response", "thoughts", "scratchpad",
+)
+
+
+_BLOCK_TAG_RE = re.compile(
+    # Match a paired XML-like block: <Tag attr="...">content</Tag>. Non-greedy so nested
+    # blocks of different tag names work via iterative passes.
+    r"<\s*([a-zA-Z_][a-zA-Z0-9_:-]*)\b[^>]*?>(?:.*?)</\s*\1\s*>",
+    re.DOTALL,
+)
+_SELF_CLOSING_TAG_RE = re.compile(r"<\s*[a-zA-Z_][a-zA-Z0-9_:-]*\b[^>]*/\s*>")
+
+
+def _clean_user_prompt(text: str | None) -> tuple[str, list[str], str | None]:
+    """Extract the actual user-typed text from a chat-extension-wrapped envelope.
+    Strategy: (1) check for explicit user-input markers, (2) protect markdown code blocks,
+    (3) iteratively strip every paired XML-like block <Tag>...</Tag> until no more changes,
+    (4) strip self-closing tags, (5) restore code blocks. Returns (cleaned, stripped_tags, raw)."""
+    if not text:
+        return "", [], None
+    raw = text
+
+    # 1. Explicit user-input markers — strongest signal.
+    for tag in _USER_PROMPT_TAGS:
+        m = re.search(
+            rf"<\s*{tag}\b[^>]*>(.*?)</\s*{tag}\s*>",
+            text, re.DOTALL | re.IGNORECASE,
+        )
+        if m:
+            inner = m.group(1).strip()
+            if inner:
+                return inner[:4000], ["(extracted from <" + tag + ">)"], raw
+
+    # 2. Protect markdown code blocks (``` fences and `inline`) so we don't strip XML
+    # the user actually typed inside their code samples.
+    code_blocks: list[str] = []
+    def _protect(m):
+        code_blocks.append(m.group(0))
+        return f"\x00CODEBLK{len(code_blocks) - 1}\x00"
+    protected = re.sub(r"```[a-zA-Z0-9_+-]*\n?[\s\S]*?```", _protect, text)
+    protected = re.sub(r"`[^`\n]{1,200}`", _protect, protected)
+
+    # 3. Iteratively strip every paired XML-like block, REMEMBERING each block's content
+    # so we can fall back to it if all the text was inside wrappers.
+    stripped: list[str] = []
+    block_contents: dict[str, str] = {}    # name(lower) -> last-seen inner text
+    out = protected
+    for _ in range(8):
+        before = out
+        for m in _BLOCK_TAG_RE.finditer(out):
+            tname = m.group(1).lower()
+            stripped.append(tname)
+            # Capture inner content so we can recover it if everything got stripped.
+            full = m.group(0)
+            inner = full[full.index(">") + 1 : full.rindex("<")]
+            if inner.strip():
+                block_contents[tname] = inner.strip()
+        out = _BLOCK_TAG_RE.sub("", out)
+        if out == before:
+            break
+
+    # 4. Self-closing tags.
+    out = _SELF_CLOSING_TAG_RE.sub("", out)
+
+    # 5. Restore protected code blocks.
+    def _restore(m):
+        idx = int(m.group(1))
+        return code_blocks[idx] if 0 <= idx < len(code_blocks) else m.group(0)
+    out = re.sub(r"\x00CODEBLK(\d+)\x00", _restore, out)
+
+    out = re.sub(r"\n[ \t]*\n[ \t]*(\n[ \t]*)+", "\n\n", out).strip()
+
+    # Dedup stripped-tags list (preserve first-seen order).
+    seen: list[str] = []
+    for s in stripped:
+        if s not in seen:
+            seen.append(s)
+
+    # If text outside wrappers exists, that's the prompt.
+    if out:
+        return out[:4000], seen, raw
+
+    # Otherwise try to recover from a captured wrapper. Prefer ones that look like user input.
+    user_priority = [t.lower() for t in _USER_PROMPT_TAGS]
+    candidates = [t for t in user_priority if t in block_contents] + \
+                 [t for t in seen if t not in user_priority and t in block_contents]
+    for cand in candidates:
+        return block_contents[cand][:4000], seen + [f"(extracted from <{cand}>)"], raw
+
+    # Truly nothing — return empty so the UI can render a clear "no prompt" placeholder
+    # rather than dumping the raw envelope.
+    if seen:
+        return "", seen, raw
+    # No wrappers were detected at all; return the original.
+    return text.strip()[:4000], [], raw
+
+
+def _classify_turn_origin(req_ts: float, target_ip: str | None) -> str:
+    """Was this chat turn triggered from the phone (recent control send) or typed locally?
+    Wide window because Copilot Chat can take 30+ seconds between the user pressing send
+    and the actual upstream API call firing (especially on cold-start). Underclassifying as
+    'local' would break the phone PWA's placeholder-reconcile logic (visible as echo)."""
+    if not target_ip:
+        return "local"
+    for info in _CONTROL_SENDS.values():
+        if info.get("target_ip") == target_ip:
+            sent_ts = info.get("ts", 0)
+            # Match if the feed turn arrived within 60s after the send (or within 5s before,
+            # to absorb minor clock skew).
+            if -5 <= (req_ts - sent_ts) <= 60:
+                return "phone"
+    return "local"
+
+
+_FEED_APPS = ("vscode-copilot", "claude-code", "github-copilot", "continue.dev", "cursor", "vscode")
+
+
+@app.get("/__proxy/api/control/feed")
+async def control_feed(target: str | None = None, since: float | None = None,
+                        limit: int = 30, conversation_id: str | None = None):
+    """Live-mirror feed of recent chat turns from registered editor endpoints.
+
+    Each item is one round-trip (request → response) shaped as a chat turn. Filterable by
+    `conversation_id` so the PWA can pin to a single session. The `sessions` field in the
+    response lists every conversation_id seen in the broader window so the UI can offer a
+    session picker."""
+    conn = db()
+    target_ip: str | None = None
+    target_url: str | None = None
+    if target:
+        row = conn.execute("SELECT url FROM control_endpoints WHERE name = ?", (target,)).fetchone()
+        if row:
+            target_url = row["url"]
+            target_ip = _control_target_ip(row["url"])
+    where = ["shadow_of IS NULL", f"client_app IN ({','.join('?' * len(_FEED_APPS))})"]
+    params: list = list(_FEED_APPS)
+    if target_ip:
+        where.append("client_ip = ?")
+        params.append(target_ip)
+
+    # Session picker window: last 24 hours so sessions you've worked on across the day all
+    # appear. Capped at 30 entries to keep the dropdown manageable.
+    sess_window = time.time() - 24 * 3600
+    sess_where = list(where) + ["ts > ?", "conversation_id IS NOT NULL"]
+    sess_params = list(params) + [sess_window]
+    sess_sql = (
+        "SELECT conversation_id, MAX(ts) AS last_ts, MIN(ts) AS first_ts, "
+        "       COUNT(*) AS turn_count, "
+        "       (SELECT request_body FROM requests "
+        "        WHERE conversation_id = r.conversation_id AND request_body IS NOT NULL "
+        "        ORDER BY ts ASC LIMIT 1) AS first_body "
+        "FROM requests r WHERE " + " AND ".join(sess_where)
+        + " GROUP BY conversation_id ORDER BY last_ts DESC LIMIT 30"
+    )
+    sess_rows = conn.execute(sess_sql, sess_params).fetchall()
+    sessions = []
+    for sr in sess_rows:
+        first_user = ""
+        try:
+            body = json.loads(sr["first_body"]) if sr["first_body"] else None
+        except (json.JSONDecodeError, TypeError):
+            body = None
+        if isinstance(body, dict):
+            # Prefer the first user-typed prompt (skips Copilot's <environment_info>-only
+            # first message); fall back to cleaned first user content for non-Copilot shapes.
+            typed = _first_typed_user_prompt(body)
+            if typed:
+                first_user = typed[:120]
+            else:
+                for m in (body.get("messages") or []):
+                    if isinstance(m, dict) and m.get("role") == "user":
+                        cleaned, _, _ = _clean_user_prompt(_msg_text(m))
+                        if cleaned:
+                            first_user = cleaned[:120]
+                        break
+        # Honor custom labels set via /api/control/session-label.
+        label_row = conn.execute(
+            "SELECT label FROM conversation_labels WHERE conversation_id = ?",
+            (sr["conversation_id"],),
+        ).fetchone()
+        custom_label = label_row["label"] if label_row else None
+        sessions.append({
+            "conversation_id": sr["conversation_id"],
+            "first_ts": sr["first_ts"],
+            "last_ts": sr["last_ts"],
+            "turn_count": sr["turn_count"],
+            "first_user": first_user or "(no user prompt)",
+            "label": custom_label,
+        })
+
+    # Now the actual feed query.
+    if conversation_id:
+        where.append("conversation_id = ?")
+        params.append(conversation_id)
+    if since is not None:
+        where.append("ts > ?")
+        params.append(float(since))
+    # Only chat round-trips, not utility endpoints (model discovery, embeddings, etc.).
+    where.append(
+        "(path LIKE '%/v1/chat/completions%' OR path LIKE '%/v1/messages%' "
+        "OR path LIKE '%/v1/complete%' OR path LIKE '/api/chat%')"
+    )
+    sql = (
+        "SELECT id, ts, model, status, prompt_tokens, completion_tokens, total_tokens, "
+        "duration_ms, request_body, response_body, stream_chunks, error, client_app, "
+        "client_ip, conversation_id "
+        "FROM requests WHERE " + " AND ".join(where) + " ORDER BY ts ASC LIMIT ?"
+    )
+    params.append(max(1, min(int(limit), 100)))
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+
+    items = []
+    newest_ts = since or 0.0
+    for r in rows:
+        last_user = ""
+        try:
+            body = json.loads(r["request_body"]) if r["request_body"] else None
+        except (json.JSONDecodeError, TypeError):
+            body = None
+        if isinstance(body, dict):
+            msgs = body.get("messages") or []
+            for m in reversed(msgs):
+                if isinstance(m, dict) and m.get("role") == "user":
+                    last_user = _msg_text(m)
+                    break
+        cleaned, stripped, raw = _clean_user_prompt(last_user)
+        text = _extract_response_text(r["response_body"], r["stream_chunks"])
+        tool_calls = _extract_response_tool_calls_full(r["response_body"], r["stream_chunks"])
+        if r["status"] is None and not r["error"]:
+            state = "streaming"
+        elif r["error"]:
+            state = "error"
+        else:
+            state = "complete"
+        items.append({
+            "id": r["id"],
+            "ts": r["ts"],
+            "model": r["model"],
+            "client_app": r["client_app"],
+            "conversation_id": r["conversation_id"],
+            "status": state,
+            "via": _classify_turn_origin(r["ts"] or 0.0, target_ip),
+            "prompt": cleaned,
+            "prompt_raw": raw if raw and raw != cleaned else None,
+            "context_blocks": stripped,
+            "text": text,
+            "tool_calls": tool_calls,
+            "prompt_tokens": r["prompt_tokens"],
+            "completion_tokens": r["completion_tokens"],
+            "total_tokens": r["total_tokens"],
+            "duration_ms": r["duration_ms"],
+            "error": r["error"],
+        })
+        if (r["ts"] or 0.0) > newest_ts:
+            newest_ts = r["ts"]
+    return {
+        "items": items,
+        "newest_ts": newest_ts,
+        "target_url": target_url,
+        "sessions": sessions,
+        "active_session": conversation_id,
+        "panic_mode": _PANIC_MODE,
+    }
+
+
+@app.get("/__proxy/api/control/await/{send_id}")
+async def control_await(send_id: str):
+    """Polled by the phone PWA after a /api/control/chat send. Looks for the LLM API call
+    that VS Code's chat triggered as a result, and returns its response (live or final).
+    Returns one of: {state: 'pending'|'streaming'|'complete'|'error'|'unknown'}."""
+    # Prune sends older than 10 minutes so the in-memory map can't grow unbounded.
+    cutoff = time.time() - 600
+    stale = [k for k, v in _CONTROL_SENDS.items() if v.get("ts", 0) < cutoff]
+    for k in stale:
+        _CONTROL_SENDS.pop(k, None)
+
+    info = _CONTROL_SENDS.get(send_id)
+    if not info:
+        return JSONResponse({"state": "unknown", "error": "send_id not found or expired"}, status_code=404)
+    target_ip = info.get("target_ip")
+    elapsed = time.time() - info["ts"]
+    conn = db()
+    rows = conn.execute(
+        """SELECT id, ts, status, model, prompt_tokens, completion_tokens, total_tokens,
+                  response_body, stream_chunks, error, duration_ms
+           FROM requests
+           WHERE ts > ? AND client_ip = ?
+             AND client_app IN ('vscode-copilot','claude-code','github-copilot','continue.dev','cursor')
+             AND shadow_of IS NULL
+           ORDER BY ts ASC LIMIT 1""",
+        (info["ts"] - 1, target_ip or ""),
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return {"state": "pending", "elapsed_s": round(elapsed, 1), "target_ip": target_ip}
+    r = rows[0]
+    text = _extract_response_text(r["response_body"], r["stream_chunks"])
+    tool_calls = _extract_response_tool_calls_full(r["response_body"], r["stream_chunks"])
+    if r["status"] is None and not r["error"]:
+        return {
+            "state": "streaming", "request_id": r["id"], "model": r["model"],
+            "elapsed_s": round(elapsed, 1), "text": text, "tool_calls": tool_calls,
+        }
+    return {
+        "state": "error" if r["error"] else "complete",
+        "request_id": r["id"], "model": r["model"],
+        "duration_ms": r["duration_ms"],
+        "prompt_tokens": r["prompt_tokens"],
+        "completion_tokens": r["completion_tokens"],
+        "total_tokens": r["total_tokens"],
+        "text": text,
+        "tool_calls": tool_calls,
+        "error": r["error"],
+        "elapsed_s": round(elapsed, 1),
+    }
+
+
+# -------- Tool permission queue (used by the @proxy chat participant) --------
+
+def _tool_permission_lookup(tool_name: str, args_str: str) -> str | None:
+    """Check persistent allow/deny rules. Returns 'allow', 'deny', or None.
+    Patterns: exact tool name match, or 'tool_name:<argprefix>' for command-prefix rules."""
+    if not tool_name:
+        return None
+    conn = db()
+    rows = conn.execute(
+        "SELECT pattern, decision FROM tool_permissions WHERE pattern = ? OR pattern LIKE ? || '%'",
+        (tool_name, tool_name + ":"),
+    ).fetchall()
+    conn.close()
+    for r in rows:
+        pat = r["pattern"]
+        if pat == tool_name:
+            return r["decision"]
+        # Prefix rules: pattern is "bash:npm test", argument starts with "npm test"
+        if pat.startswith(tool_name + ":"):
+            prefix = pat[len(tool_name) + 1:]
+            if isinstance(args_str, str) and args_str.startswith(prefix):
+                return r["decision"]
+    return None
+
+
+@app.post("/__proxy/api/control/pending-tool")
+async def control_pending_tool_register(request: Request):
+    """Extension calls this when its LLM emits a tool call requiring approval. Returns a
+    pending_id; the extension then polls /pending-tool/{id} until decided. Hits a persistent
+    allow/deny rule first (auto-decided immediately if matched)."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    name = (payload.get("tool_name") or "").strip()
+    args = payload.get("arguments")
+    if isinstance(args, dict):
+        args_str = json.dumps(args)
+    elif args is None:
+        args_str = ""
+    else:
+        args_str = str(args)
+    summary = (payload.get("summary") or "").strip() or f"{name}({args_str[:120]})"
+    if not name:
+        return JSONResponse({"error": "'tool_name' required"}, status_code=400)
+    source = (payload.get("source") or "extension").strip()
+    pending_id = uuid.uuid4().hex[:16]
+
+    # Auto-decide via persistent rules.
+    rule = _tool_permission_lookup(name, args_str)
+    decision = rule if rule in ("allow", "deny") else None
+
+    _PENDING_TOOLS[pending_id] = {
+        "id": pending_id,
+        "ts": time.time(),
+        "source": source,
+        "tool_name": name,
+        "arguments": args_str,
+        "summary": summary[:300],
+        "decision": decision,
+        "decided_ts": time.time() if decision else None,
+        "auto_rule": rule if rule else None,
+    }
+    return {"id": pending_id, "decision": decision, "auto_rule": rule}
+
+
+@app.get("/__proxy/api/control/pending-tool/{pending_id}")
+async def control_pending_tool_status(pending_id: str):
+    info = _PENDING_TOOLS.get(pending_id)
+    if not info:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return info
+
+
+@app.get("/__proxy/api/control/pending-tools")
+async def control_pending_tools_list():
+    """List undecided pending tool calls (for the phone PWA to show approve/deny prompts).
+    Also auto-prunes entries older than 10 minutes."""
+    cutoff = time.time() - 600
+    for k in list(_PENDING_TOOLS.keys()):
+        info = _PENDING_TOOLS[k]
+        if info.get("ts", 0) < cutoff and info.get("decision") is not None:
+            _PENDING_TOOLS.pop(k, None)
+    pending = [v for v in _PENDING_TOOLS.values() if v.get("decision") is None]
+    pending.sort(key=lambda v: v.get("ts", 0))
+    return {"items": pending}
+
+
+@app.post("/__proxy/api/control/tool-decision/{pending_id}")
+async def control_tool_decision(pending_id: str, request: Request):
+    """Phone PWA POSTs the user's decision. Body: {"decision": "allow"|"deny"|"always_allow"|"always_deny"}.
+    'always_*' also writes a persistent rule to tool_permissions."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    decision = (payload.get("decision") or "").strip()
+    if decision not in ("allow", "deny", "always_allow", "always_deny"):
+        return JSONResponse({"error": "decision must be allow/deny/always_allow/always_deny"}, status_code=400)
+    info = _PENDING_TOOLS.get(pending_id)
+    if not info:
+        return JSONResponse({"error": "pending_id not found"}, status_code=404)
+    short = "allow" if decision in ("allow", "always_allow") else "deny"
+    info["decision"] = short
+    info["decided_ts"] = time.time()
+    info["decided_via"] = decision
+    if decision in ("always_allow", "always_deny"):
+        # Persistent rule. Pattern format: "tool_name" or "tool_name:argprefix" — for now,
+        # use exact-tool-name rules; argument-prefix rules can be added by /tool-permissions.
+        conn = db()
+        conn.execute(
+            """INSERT OR REPLACE INTO tool_permissions (pattern, decision, created_ts)
+               VALUES (?, ?, ?)""",
+            (info["tool_name"], short, time.time()),
+        )
+        conn.commit()
+        conn.close()
+    return {"ok": True, "decision": short}
+
+
+@app.get("/__proxy/api/control/tool-permissions")
+async def control_tool_permissions_list():
+    conn = db()
+    rows = conn.execute(
+        "SELECT pattern, decision, created_ts FROM tool_permissions ORDER BY created_ts DESC"
+    ).fetchall()
+    conn.close()
+    return {"items": [dict(r) for r in rows]}
+
+
+@app.delete("/__proxy/api/control/tool-permissions/{pattern}")
+async def control_tool_permissions_delete(pattern: str):
+    conn = db()
+    cur = conn.execute("DELETE FROM tool_permissions WHERE pattern = ?", (pattern,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+# -------- Custom session labels (extension scrapes / user renames) --------
+
+@app.get("/__proxy/api/control/session-label/{conversation_id}")
+async def control_session_label_get(conversation_id: str):
+    conn = db()
+    row = conn.execute(
+        "SELECT label, updated_ts FROM conversation_labels WHERE conversation_id = ?",
+        (conversation_id,),
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else {"label": None}
+
+
+@app.post("/__proxy/api/control/session-label/{conversation_id}")
+async def control_session_label_set(conversation_id: str, request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    label = (payload.get("label") or "").strip()
+    conn = db()
+    if label:
+        conn.execute(
+            """INSERT OR REPLACE INTO conversation_labels (conversation_id, label, updated_ts)
+               VALUES (?, ?, ?)""",
+            (conversation_id, label[:200], time.time()),
+        )
+    else:
+        conn.execute("DELETE FROM conversation_labels WHERE conversation_id = ?", (conversation_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "label": label or None}
+
+
+@app.get("/__proxy/api/control/panic")
+async def control_panic_status():
+    return {"panic": _PANIC_MODE}
+
+
+@app.post("/__proxy/api/control/panic")
+async def control_panic_set(request: Request):
+    """Toggle panic mode. Body: {"on": bool}. While on, every proxied request returns 503
+    (the proxy itself stays up so this endpoint remains reachable to disable it)."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    on = bool(payload.get("on", not _PANIC_MODE))  # if `on` not provided, toggle current
+    _set_panic_mode(on)
+    return {"ok": True, "panic": _PANIC_MODE}
+
+
+@app.get("/__proxy/remote")
+async def remote_pwa():
+    """Mobile-first PWA for sending prompts to registered control endpoints + panic toggle."""
+    return FileResponse(STATIC_DIR / "remote.html")
+
+
 @app.get("/__proxy")
 @app.get("/__proxy/")
 async def ui_index():
@@ -3213,33 +4156,92 @@ def _normalize_for_cid(text: str) -> str:
     return out.strip()
 
 
+def _hash_input_for_cid(text: str) -> str:
+    """Reduce a string to its stable identity for conversation grouping. Strips per-request
+    volatile patterns AND all XML-like wrappers."""
+    if not text:
+        return ""
+    cleaned, _, _ = _clean_user_prompt(text)
+    return _normalize_for_cid(cleaned or text)
+
+
+def _first_typed_user_prompt(body) -> str:
+    """Scan ALL user messages for the FIRST user-input marker (<userRequest>, <userPrompt>,
+    etc.) and return its inner text. Copilot Chat puts <environment_info> in the very first
+    user message and the actual typed prompt only in later messages — so scanning by index
+    instead of relying on message[0] gives us a stable conversation identity that survives
+    the rotating env wrappers."""
+    if not isinstance(body, dict):
+        return ""
+    for m in (body.get("messages") or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        text = _msg_text(m)
+        if not text:
+            continue
+        for tag in _USER_PROMPT_TAGS:
+            mm = re.search(
+                rf"<\s*{tag}\b[^>]*>(.*?)</\s*{tag}\s*>",
+                text, re.DOTALL | re.IGNORECASE,
+            )
+            if mm:
+                inner = mm.group(1).strip()
+                if inner:
+                    return inner
+    return ""
+
+
 def _conversation_id(body) -> str | None:
-    """Stable conversation hash: derived from system message + first user message.
-    Survives appended turns, breaks if the client truncates earlier history.
-    Anthropic puts `system` at the top level (string or list of {type:"text",text}); fold that in.
-    Volatile per-request content (e.g. Claude Code's billing header `cch=<hex>;`) is normalized out."""
+    """Stable conversation hash. Three-layer strategy for finding session identity:
+      1. If any user message has an explicit <userRequest>/<userPrompt>/etc. marker, the
+         FIRST such block's content is the session identity (Copilot Chat pattern — the
+         first user message is just env_info; actual typed prompt lives in later turns).
+      2. Otherwise, hash system + cleaned first-user-message (Claude Code, Anthropic SDKs).
+      3. Volatile content (XML wrappers, billing headers, env IDs) is normalized out at
+         every layer so turns of the same chat share an id even when env rotates."""
     if not isinstance(body, dict):
         return None
     messages = body.get("messages")
-    if isinstance(messages, list) and messages:
+    if not isinstance(messages, list) or not messages:
+        return None
+
+    # Layer 1: explicit user-input marker anywhere in the messages list.
+    typed = _first_typed_user_prompt(body)
+    if typed:
         sys_msg = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
-        first_user = next((m for m in messages if isinstance(m, dict) and m.get("role") == "user"), None)
-        parts: list[str] = []
-        if sys_msg:
-            parts.append("system:" + _normalize_for_cid(_msg_text(sys_msg)))
-        else:
+        sys_text = _hash_input_for_cid(_msg_text(sys_msg)) if sys_msg else ""
+        if not sys_text:
             top_sys = body.get("system")
-            sys_text = ""
             if isinstance(top_sys, str):
-                sys_text = top_sys
+                sys_text = _hash_input_for_cid(top_sys)
             elif isinstance(top_sys, list):
-                sys_text = "\n".join(p.get("text", "") for p in top_sys if isinstance(p, dict))
-            if sys_text:
-                parts.append("system:" + _normalize_for_cid(sys_text))
-        if first_user:
-            parts.append("user:" + _normalize_for_cid(_msg_text(first_user)))
-        if parts:
-            return hashlib.sha256("\n---\n".join(parts).encode("utf-8")).hexdigest()[:16]
+                joined = "\n".join(p.get("text", "") for p in top_sys if isinstance(p, dict))
+                sys_text = _hash_input_for_cid(joined)
+        # Use just the first 400 chars of cleaned system + typed prompt as identity.
+        # Short system prefix dampens collisions for short prompts ("test") across different
+        # client setups, while staying stable across turns.
+        ident = (sys_text[:400] + "\n---\n" + typed).encode("utf-8")
+        return hashlib.sha256(ident).hexdigest()[:16]
+
+    # Layer 2: legacy path — system + cleaned first-user.
+    sys_msg = next((m for m in messages if isinstance(m, dict) and m.get("role") == "system"), None)
+    first_user = next((m for m in messages if isinstance(m, dict) and m.get("role") == "user"), None)
+    parts: list[str] = []
+    if sys_msg:
+        parts.append("system:" + _hash_input_for_cid(_msg_text(sys_msg)))
+    else:
+        top_sys = body.get("system")
+        sys_text = ""
+        if isinstance(top_sys, str):
+            sys_text = top_sys
+        elif isinstance(top_sys, list):
+            sys_text = "\n".join(p.get("text", "") for p in top_sys if isinstance(p, dict))
+        if sys_text:
+            parts.append("system:" + _hash_input_for_cid(sys_text))
+    if first_user:
+        parts.append("user:" + _hash_input_for_cid(_msg_text(first_user)))
+    if parts:
+        return hashlib.sha256("\n---\n".join(parts).encode("utf-8")).hexdigest()[:16]
     return None
 
 
@@ -4175,6 +5177,418 @@ async def _run_shadow(primary_id: str, primary_body: dict, primary_path: str,
             pass
 
 
+# -------- Proxy-owned tools (memory, etc.) --------
+# Tool defs are provider-agnostic (name/description/parameters); injection emits the
+# right shape per request. Keep this list small and high-signal — every entry costs
+# tokens on every request that has tool_injector enabled.
+
+PROXY_TOOLS_MEMORY: list[dict] = [
+    {
+        "name": "remember",
+        "description": (
+            "Store a value in proxy-managed memory for this conversation. The value persists "
+            "across turns of the same conversation. Use when the user asks you to remember "
+            "something or you identify a fact worth retaining for later."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Short identifier (e.g. 'preferred_language')"},
+                "value": {"type": "string", "description": "The value to remember"},
+            },
+            "required": ["key", "value"],
+        },
+    },
+    {
+        "name": "recall",
+        "description": "Retrieve a previously remembered value from proxy memory by key.",
+        "parameters": {
+            "type": "object",
+            "properties": {"key": {"type": "string", "description": "The key to look up"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "list_memory",
+        "description": "List all keys currently stored in proxy memory for this conversation.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "forget",
+        "description": "Remove a key from proxy memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"],
+        },
+    },
+]
+
+PROXY_TOOLS_TODOS: list[dict] = [
+    {
+        "name": "set_todos",
+        "description": (
+            "Replace this conversation's entire todo list. Use to plan multi-step work or "
+            "track progress. Each todo has 'text' (the task) and optional 'status' "
+            "(pending | in_progress | completed; default pending). Pass an empty list to clear."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "todos": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "text": {"type": "string"},
+                            "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                        },
+                        "required": ["text"],
+                    },
+                },
+            },
+            "required": ["todos"],
+        },
+    },
+    {
+        "name": "get_todos",
+        "description": "Get this conversation's current todo list with statuses.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "add_todo",
+        "description": "Append a new pending todo to this conversation's list.",
+        "parameters": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "complete_todo",
+        "description": (
+            "Mark a todo as completed. Provide either 'idx' (1-based index from get_todos) "
+            "or 'text' (substring match against existing todo text)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "idx": {"type": "integer"},
+                "text": {"type": "string"},
+            },
+        },
+    },
+]
+
+
+def _active_proxy_tools() -> list[dict]:
+    """Return the active set of proxy-owned tool definitions per current rule config."""
+    cfg = (load_rules_config().get("tool_injector") or {})
+    out: list[dict] = []
+    if cfg.get("memory", True):
+        out.extend(PROXY_TOOLS_MEMORY)
+    if cfg.get("todos", True):
+        out.extend(PROXY_TOOLS_TODOS)
+    return out
+
+
+# Combined name set used by post-flight detection. Static (covers everything we might inject).
+PROXY_TOOLS: list[dict] = PROXY_TOOLS_MEMORY + PROXY_TOOLS_TODOS
+PROXY_TOOL_NAMES: set[str] = {t["name"] for t in PROXY_TOOLS}
+
+
+def _exec_proxy_tool(name: str, args, conversation_id: str | None) -> tuple[str, bool]:
+    """Run a proxy-owned tool. Returns (result_text, is_error)."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    cid = conversation_id or "_global"
+    conn = db()
+    try:
+        if name == "remember":
+            key = (args.get("key") or "").strip()
+            val = args.get("value")
+            if not key:
+                return ("Error: 'key' is required.", True)
+            if val is None:
+                return ("Error: 'value' is required.", True)
+            val_str = val if isinstance(val, str) else json.dumps(val)
+            now = time.time()
+            conn.execute(
+                """INSERT INTO proxy_memory (conversation_id, key, value, created_ts, updated_ts)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(conversation_id, key) DO UPDATE SET
+                     value = excluded.value, updated_ts = excluded.updated_ts""",
+                (cid, key, val_str, now, now),
+            )
+            conn.commit()
+            return (f"Stored '{key}'.", False)
+        if name == "recall":
+            key = (args.get("key") or "").strip()
+            if not key:
+                return ("Error: 'key' is required.", True)
+            row = conn.execute(
+                "SELECT value FROM proxy_memory WHERE conversation_id = ? AND key = ?",
+                (cid, key),
+            ).fetchone()
+            if not row:
+                return (f"No memory found for key '{key}'.", False)
+            return (row["value"], False)
+        if name == "list_memory":
+            rows = conn.execute(
+                "SELECT key, length(value) AS sz, updated_ts FROM proxy_memory "
+                "WHERE conversation_id = ? ORDER BY updated_ts DESC",
+                (cid,),
+            ).fetchall()
+            if not rows:
+                return ("(no memory stored for this conversation)", False)
+            return (
+                "Stored keys:\n" + "\n".join(f"  - {r['key']} ({r['sz']} chars)" for r in rows),
+                False,
+            )
+        if name == "forget":
+            key = (args.get("key") or "").strip()
+            if not key:
+                return ("Error: 'key' is required.", True)
+            cur = conn.execute(
+                "DELETE FROM proxy_memory WHERE conversation_id = ? AND key = ?",
+                (cid, key),
+            )
+            conn.commit()
+            return ((f"Removed '{key}'.", False) if cur.rowcount else (f"No memory found for key '{key}'.", False))
+
+        # ─── Todos ───
+        if name == "set_todos":
+            todos = args.get("todos")
+            if not isinstance(todos, list):
+                return ("Error: 'todos' must be a list.", True)
+            now = time.time()
+            conn.execute("DELETE FROM proxy_todos WHERE conversation_id = ?", (cid,))
+            valid_status = {"pending", "in_progress", "completed"}
+            for i, t in enumerate(todos, start=1):
+                if not isinstance(t, dict):
+                    continue
+                text = (t.get("text") or "").strip()
+                if not text:
+                    continue
+                status = t.get("status") or "pending"
+                if status not in valid_status:
+                    status = "pending"
+                conn.execute(
+                    """INSERT INTO proxy_todos (conversation_id, idx, text, status, created_ts, updated_ts)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (cid, i, text[:500], status, now, now),
+                )
+            conn.commit()
+            count = conn.execute(
+                "SELECT COUNT(*) c FROM proxy_todos WHERE conversation_id = ?", (cid,)
+            ).fetchone()["c"]
+            return (f"Saved {count} todo(s).", False)
+
+        if name == "get_todos":
+            rows = conn.execute(
+                "SELECT idx, text, status FROM proxy_todos WHERE conversation_id = ? ORDER BY idx ASC",
+                (cid,),
+            ).fetchall()
+            if not rows:
+                return ("(no todos for this conversation)", False)
+            icons = {"pending": "[ ]", "in_progress": "[~]", "completed": "[x]"}
+            lines = [f"{r['idx']}. {icons.get(r['status'], '[?]')} {r['text']}" for r in rows]
+            return ("\n".join(lines), False)
+
+        if name == "add_todo":
+            text = (args.get("text") or "").strip()
+            if not text:
+                return ("Error: 'text' is required.", True)
+            now = time.time()
+            row = conn.execute(
+                "SELECT COALESCE(MAX(idx), 0) + 1 AS next_idx FROM proxy_todos WHERE conversation_id = ?",
+                (cid,),
+            ).fetchone()
+            next_idx = row["next_idx"]
+            conn.execute(
+                """INSERT INTO proxy_todos (conversation_id, idx, text, status, created_ts, updated_ts)
+                   VALUES (?, ?, ?, 'pending', ?, ?)""",
+                (cid, next_idx, text[:500], now, now),
+            )
+            conn.commit()
+            return (f"Added todo #{next_idx}: {text[:80]}", False)
+
+        if name == "complete_todo":
+            idx = args.get("idx")
+            text_match = (args.get("text") or "").strip().lower()
+            target_idx = None
+            if isinstance(idx, int) and idx > 0:
+                target_idx = idx
+            elif text_match:
+                # Find first pending/in-progress todo whose text contains the substring.
+                row = conn.execute(
+                    """SELECT idx FROM proxy_todos
+                       WHERE conversation_id = ? AND status != 'completed'
+                         AND lower(text) LIKE ?
+                       ORDER BY idx ASC LIMIT 1""",
+                    (cid, f"%{text_match}%"),
+                ).fetchone()
+                if row:
+                    target_idx = row["idx"]
+            if target_idx is None:
+                return ("Error: provide 'idx' or 'text' matching an existing todo.", True)
+            cur = conn.execute(
+                """UPDATE proxy_todos SET status = 'completed', updated_ts = ?
+                   WHERE conversation_id = ? AND idx = ?""",
+                (time.time(), cid, target_idx),
+            )
+            conn.commit()
+            if cur.rowcount:
+                row = conn.execute(
+                    "SELECT text FROM proxy_todos WHERE conversation_id = ? AND idx = ?",
+                    (cid, target_idx),
+                ).fetchone()
+                return (f"Completed #{target_idx}: {row['text'][:80] if row else ''}", False)
+            return (f"No todo at index {target_idx}.", True)
+
+        return (f"Unknown proxy tool: {name}", True)
+    except Exception as e:
+        return (f"Internal error: {e!r}", True)
+    finally:
+        conn.close()
+
+
+def _detect_body_shape(body: dict) -> str:
+    """'anthropic' or 'openai' — used to inject the right tool shape."""
+    if not isinstance(body, dict):
+        return "openai"
+    # Anthropic carries a top-level `system` field and tools without a `function` wrapper.
+    if "system" in body and not isinstance(body.get("messages") or [], type(None)):
+        return "anthropic"
+    tools = body.get("tools")
+    if isinstance(tools, list) and tools:
+        t0 = tools[0]
+        if isinstance(t0, dict):
+            if t0.get("type") == "function":
+                return "openai"
+            if "input_schema" in t0:
+                return "anthropic"
+    return "openai"
+
+
+def _inject_proxy_tools(body: dict) -> int:
+    """Append proxy-owned tool definitions to body['tools']. Returns count of injected tools.
+    Skips clients that don't already declare tools[] (they likely don't expect tool calls).
+    Skips any tool whose name collides with a client-declared tool. Bundles to inject are
+    selected by the rule config (memory: true, todos: true)."""
+    if not isinstance(body, dict):
+        return 0
+    cfg = (load_rules_config().get("tool_injector") or {})
+    if not cfg.get("enabled", False):
+        return 0
+    active = _active_proxy_tools()
+    if not active:
+        return 0
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return 0
+    existing = set(_tool_names_from_body(body))
+    shape = _detect_body_shape(body)
+    added = 0
+    for t in active:
+        if t["name"] in existing:
+            continue
+        if shape == "anthropic":
+            tools.append({
+                "name": t["name"],
+                "description": t["description"],
+                "input_schema": t["parameters"],
+            })
+        else:
+            tools.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t["description"],
+                    "parameters": t["parameters"],
+                },
+            })
+        added += 1
+    return added
+
+
+def _extract_proxy_tool_calls(resp_obj: dict) -> list[dict]:
+    """Find tool calls naming a proxy-owned tool in either an Anthropic or OpenAI response.
+    Returns [{id, name, input(dict)}] in arrival order."""
+    out: list[dict] = []
+    if not isinstance(resp_obj, dict):
+        return out
+    # Anthropic /v1/messages shape
+    if resp_obj.get("type") == "message" and isinstance(resp_obj.get("content"), list):
+        for blk in resp_obj["content"]:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("name") in PROXY_TOOL_NAMES:
+                out.append({
+                    "id": blk.get("id") or f"toolu_{uuid.uuid4().hex[:12]}",
+                    "name": blk["name"],
+                    "input": blk.get("input") or {},
+                })
+        return out
+    # OpenAI chat.completion shape
+    for c in (resp_obj.get("choices") or []):
+        msg = c.get("message") or {}
+        for tc in (msg.get("tool_calls") or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") or {}
+            if fn.get("name") in PROXY_TOOL_NAMES:
+                args = fn.get("arguments")
+                try:
+                    parsed = json.loads(args) if isinstance(args, str) else (args or {})
+                except (json.JSONDecodeError, TypeError):
+                    parsed = {"_raw": args}
+                out.append({
+                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                    "name": fn["name"],
+                    "input": parsed,
+                })
+    return out
+
+
+def _build_followup_body_anthropic(orig_body: dict, resp_obj: dict, executed: list[dict]) -> dict:
+    """Construct a new Anthropic request body that appends the assistant turn + tool_results."""
+    new_body = json.loads(json.dumps(orig_body))
+    msgs = new_body.get("messages") or []
+    msgs.append({"role": "assistant", "content": resp_obj.get("content") or []})
+    tr_blocks = []
+    for ex in executed:
+        tr_blocks.append({
+            "type": "tool_result",
+            "tool_use_id": ex["id"],
+            "content": [{"type": "text", "text": ex["result"]}],
+            "is_error": ex.get("is_error", False),
+        })
+    msgs.append({"role": "user", "content": tr_blocks})
+    new_body["messages"] = msgs
+    return new_body
+
+
+def _build_followup_body_openai(orig_body: dict, resp_obj: dict, executed: list[dict]) -> dict:
+    """Construct a new OpenAI request body that appends the assistant turn + tool messages."""
+    new_body = json.loads(json.dumps(orig_body))
+    msgs = new_body.get("messages") or []
+    choice = (resp_obj.get("choices") or [{}])[0]
+    asst_msg = choice.get("message") or {"role": "assistant", "content": ""}
+    msgs.append(asst_msg)
+    for ex in executed:
+        msgs.append({
+            "role": "tool",
+            "tool_call_id": ex["id"],
+            "content": ex["result"],
+        })
+    new_body["messages"] = msgs
+    return new_body
+
+
 def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | None, stream_text: str | None, elapsed_ms: float, error: str | None):
     pt, ct, tt = _extract_usage(body_text, stream_text)
     conn = db()
@@ -4207,6 +5621,16 @@ async def proxy(full_path: str, request: Request):
     # Defensive: never proxy our own UI/API namespace.
     if full_path.startswith("__proxy"):
         return JSONResponse({"error": "not found"}, status_code=404)
+
+    # Panic kill-switch: refuse all upstream traffic until disabled. Proxy stays up so the
+    # UI / phone PWA / control endpoints remain reachable to flip it off again.
+    if _PANIC_MODE:
+        return JSONResponse(
+            {"error": {"message": "AI Proxy is in PANIC MODE — all upstream traffic blocked. Disable via the phone PWA or POST /__proxy/api/control/panic with {\"on\": false}.",
+                       "type": "proxy_panic", "code": "panic_mode"}},
+            status_code=503,
+            headers={"X-Proxy-Panic": "1"},
+        )
 
     req_id = uuid.uuid4().hex
     start = time.perf_counter()
@@ -4272,8 +5696,12 @@ async def proxy(full_path: str, request: Request):
     # context_overflow_guard runs AFTER ollama_options so it sees the effective num_ctx.
     overflow = evaluate_context_overflow(body_json, router_ctx) if isinstance(body_json, dict) else None
     overflow_blocks = bool(overflow and overflow.get("action") == "block")
+    # tool_injector runs AFTER all transforms (incl. bridge translation) so the proxy tools
+    # are added in whatever shape the body will actually be sent in. Returns count of injected.
+    tool_injection_count = _inject_proxy_tools(body_json) if isinstance(body_json, dict) else 0
+    tool_injection_active = tool_injection_count > 0
     body_mutated = bool(
-        rewrite or options_inject or bridge_active
+        rewrite or options_inject or bridge_active or tool_injection_active
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
     )
@@ -4401,10 +5829,51 @@ async def proxy(full_path: str, request: Request):
     content_type = upstream_resp.headers.get("content-type", "")
     treat_as_stream = ("text/event-stream" in content_type) or ("application/x-ndjson" in content_type) or is_stream
 
+    # Helper used by both streaming and non-streaming paths: iteratively call upstream,
+    # execute proxy-owned tools, append tool_results, and re-call until the model stops
+    # using proxy tools (or max_iterations). Mutates nothing visible — returns the final
+    # parsed response object plus the count of iterations consumed.
+    async def _proxy_tool_loop(start_resp_obj: dict, current_body: dict) -> tuple[dict, int]:
+        cfg = (load_rules_config().get("tool_injector") or {})
+        max_iter = max(1, int(cfg.get("max_iterations", 4) or 4))
+        shape = "anthropic" if (start_resp_obj.get("type") == "message") else "openai"
+        cur_resp = start_resp_obj
+        cur_body = current_body
+        cur_conv = _conversation_id(body_json)
+        followup_headers = list(headers_out)
+        # Force identity encoding on followups (already in headers_out, but be defensive).
+        for i in range(max_iter):
+            calls = _extract_proxy_tool_calls(cur_resp)
+            if not calls:
+                return cur_resp, i
+            executed = []
+            for c in calls:
+                txt, is_err = _exec_proxy_tool(c["name"], c["input"], cur_conv)
+                executed.append({"id": c["id"], "name": c["name"], "result": txt, "is_error": is_err})
+            if shape == "anthropic":
+                cur_body = _build_followup_body_anthropic(cur_body, cur_resp, executed)
+            else:
+                cur_body = _build_followup_body_openai(cur_body, cur_resp, executed)
+            cur_body["stream"] = False  # follow-ups are non-streaming for simplicity
+            cur_body.pop("stream_options", None)
+            try:
+                fu_req = client.build_request(
+                    "POST", upstream_url, headers=followup_headers,
+                    content=json.dumps(cur_body).encode("utf-8"),
+                )
+                fu_resp = await client.send(fu_req)
+                fu_text = (await fu_resp.aread()).decode("utf-8", errors="replace")
+                await fu_resp.aclose()
+                fu_obj = json.loads(fu_text)
+                cur_resp = fu_obj if isinstance(fu_obj, dict) else cur_resp
+            except Exception:
+                return cur_resp, i + 1
+        return cur_resp, max_iter
+
     if treat_as_stream:
         do_intercept = _post_flight_active(body_json) and 200 <= upstream_resp.status_code < 300
-        # Bridge translation requires the full upstream stream before we can emit Anthropic events.
-        do_buffer = do_intercept or bridge_active
+        # Bridge translation AND tool-injection both require the full upstream stream first.
+        do_buffer = do_intercept or bridge_active or tool_injection_active
 
         async def streamer():
             chunks: list[bytes] = []
@@ -4455,6 +5924,23 @@ async def proxy(full_path: str, request: Request):
                     for chunk in chunks:
                         yield chunk
 
+            # Phase 2.5: proxy-owned tool execution loop. If the model called a proxy-injected
+            # tool (e.g. memory.recall), run it, append a tool_result, and re-call upstream until
+            # the model produces a non-tool response (capped at max_iterations).
+            tool_iters = 0
+            if tool_injection_active and not err:
+                # Parse buffered upstream response into an object the loop can iterate on.
+                start_obj = _assemble_streaming_response(full) if not bridge_active else _assemble_streaming_response(full)
+                if isinstance(start_obj, dict):
+                    final_obj, tool_iters = await _proxy_tool_loop(start_obj, body_json)
+                    if tool_iters > 0 and isinstance(final_obj, dict):
+                        # Replace buffered SSE with a synthetic stream of the final response.
+                        synth_bytes = _synth_response_stream(final_obj)
+                        full = synth_bytes.decode("utf-8", errors="replace")
+                        replaced = True
+                        if not bridge_active:
+                            yield synth_bytes
+
             # Phase 3: protocol bridge — translate the (possibly intercepted) OpenAI stream into
             # Anthropic SSE events for the client. We yield the translated bytes; `full` keeps
             # the OpenAI form for upstream-truth audit storage (UI parsers handle both shapes).
@@ -4468,10 +5954,18 @@ async def proxy(full_path: str, request: Request):
                     "error": {"type": "api_error", "message": err},
                 }
                 yield f"event: error\ndata: {json.dumps(err_payload)}\n\n".encode("utf-8")
-            elif do_buffer and not do_intercept:
-                # Should not happen (do_buffer implies do_intercept or bridge_active), defensive.
+            elif do_buffer and not do_intercept and not tool_iters:
+                # Buffered for some reason but nothing transformed it — replay raw chunks.
                 for chunk in chunks:
                     yield chunk
+
+            if tool_iters > 0:
+                _save_gate(req_id, {
+                    "verdict": "intercept",
+                    "rule": "tool_injector",
+                    "reason": f"executed {tool_iters} proxy-tool round(s)",
+                    "details": {"iterations": tool_iters, "streaming": True},
+                })
 
             elapsed = (time.perf_counter() - start) * 1000
             if findings:
@@ -4535,6 +6029,25 @@ async def proxy(full_path: str, request: Request):
                         "reason": "; ".join(f"{f['tool_name']}: filled {', '.join(f['fixed_fields'].keys())}" for f in fixes),
                         "details": {"fixes": fixes, "streaming": False},
                     })
+
+    # Proxy-tool execution loop (non-streaming): if the model called a proxy-injected tool,
+    # run it, append a tool_result, and re-call upstream until done (capped at max_iterations).
+    if tool_injection_active and 200 <= upstream_resp.status_code < 300:
+        try:
+            cur_obj = json.loads(body_text_resp)
+        except (json.JSONDecodeError, TypeError):
+            cur_obj = None
+        if isinstance(cur_obj, dict):
+            final_obj, tool_iters = await _proxy_tool_loop(cur_obj, body_json)
+            if tool_iters > 0 and isinstance(final_obj, dict):
+                body_text_resp = json.dumps(final_obj)
+                body_bytes = body_text_resp.encode("utf-8")
+                _save_gate(req_id, {
+                    "verdict": "intercept",
+                    "rule": "tool_injector",
+                    "reason": f"executed {tool_iters} proxy-tool round(s)",
+                    "details": {"iterations": tool_iters, "streaming": False},
+                })
 
     # Protocol bridge (non-streaming): translate the OpenAI response back to Anthropic shape
     # before returning to the client. We store the translated form so audit/UI parsers see what
@@ -4763,6 +6276,7 @@ def _render_digest_markdown(data: dict, samples: int, include_bodies: bool, reda
     lines.append("- `context_overflow_guard` (transform): estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window (prevents Ollama silent truncation). Keys: `enabled`, `action` (warn|bump|trim|block), `chars_per_token`, `headroom_ratio`, `max_ctx`, `bump_to`, `min_keep_messages`, `assumed_default_num_ctx`.")
     lines.append("- `tool_pruner` (transform): drop tool definitions the model has been offered repeatedly in this conversation but never invoked, cutting prompt tokens and reducing tool-selection noise. Keys: `enabled`, `action` (prune|warn), `min_turns_offered`, `min_history_turns`, `always_keep` (names), `max_prune_ratio`, `include_hint`.")
     lines.append("- `protocol_bridge` (transform): when an Anthropic-shape request gets routed (via `model_router`) to a non-Claude model, translate the body to OpenAI shape, send to OLLAMA_URL, and translate the response back. Lets Claude Code & Anthropic SDKs drive any OpenAI-compatible backend. Keys: `enabled`.")
+    lines.append("- `tool_injector` (transform + post-flight): inject proxy-owned tools (currently `remember`/`recall`/`list_memory`/`forget` for per-conversation memory) into outgoing requests, then intercept tool_use of those names, execute server-side, append tool_result, and re-call upstream so the model sees the answer and continues. Capped at `max_iterations`. Keys: `enabled`, `memory`, `max_iterations`.")
     lines.append("- `schema_validator` (post-flight): validate tool_call args against the request's `tools[].parameters` schema; replace bad calls with a corrective assistant message. Keys: `enabled`, `action`, `strict_types`, `reject_unknown_fields`.")
     lines.append("- `hallucinated_tool` (post-flight): same intercept for tool names not declared in the request.")
     lines.append("")
