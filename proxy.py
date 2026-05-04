@@ -12,6 +12,7 @@ import collections
 import gzip
 import ipaddress
 import math
+import datetime
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -166,6 +167,26 @@ CREATE TABLE IF NOT EXISTS tool_permissions (
     decision TEXT NOT NULL,  -- 'allow' | 'deny'
     created_ts REAL
 );
+
+CREATE TABLE IF NOT EXISTS proxy_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    prompt TEXT NOT NULL,
+    mode TEXT NOT NULL,                 -- 'chat' | 'agent'
+    target_endpoint TEXT,               -- agent mode: registered VS Code endpoint name
+    model TEXT,                         -- chat mode: model id
+    status TEXT NOT NULL,               -- 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+    result TEXT,
+    error TEXT,
+    created_ts REAL NOT NULL,
+    started_ts REAL,
+    finished_ts REAL,
+    schedule TEXT,                      -- cron expr, 'every Nm/Nh/Nd', or null = one-shot
+    next_run_ts REAL,                   -- when scheduler should fire it next; null for completed one-shots
+    parent_task_id INTEGER,             -- when a recurring task fires it spawns a one-shot child
+    tool_approval_mode TEXT,            -- 'rules-only' | 'notify-phone' | 'yolo' (agent mode only)
+    enabled INTEGER NOT NULL DEFAULT 1, -- recurring tasks: 0 to pause without deleting
+    creator_ip TEXT                     -- caller IP at create time, for subnet-scoped visibility
+);
 """
 
 SCHEMA_INDEXES = """
@@ -175,6 +196,9 @@ CREATE INDEX IF NOT EXISTS idx_requests_client ON requests(client_ip);
 CREATE INDEX IF NOT EXISTS idx_requests_verdict ON requests(gate_verdict);
 CREATE INDEX IF NOT EXISTS idx_requests_conversation ON requests(conversation_id, ts);
 CREATE INDEX IF NOT EXISTS idx_metrics_ts ON system_metrics(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_tasks_status ON proxy_tasks(status, created_ts);
+CREATE INDEX IF NOT EXISTS idx_tasks_schedule ON proxy_tasks(schedule, enabled, next_run_ts) WHERE schedule IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON proxy_tasks(parent_task_id);
 """
 
 MIGRATIONS = [
@@ -190,6 +214,7 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN turn_index INTEGER",
     "ALTER TABLE requests ADD COLUMN client_app TEXT",
     "ALTER TABLE requests ADD COLUMN shadow_of TEXT",
+    "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
 ]
 
 
@@ -395,6 +420,21 @@ def init_db():
             print(f"[init] marked {abandoned.rowcount} pending request(s) as abandoned")
         except Exception:
             pass
+    # Tasks that were 'running' when the proxy died are now orphaned. Mark them failed
+    # rather than silently re-running, so the user decides whether to retry.
+    orphaned = conn.execute(
+        """UPDATE proxy_tasks
+           SET status = 'failed',
+               error = COALESCE(error, 'orphaned: proxy restarted while task was running'),
+               finished_ts = COALESCE(finished_ts, ?)
+           WHERE status = 'running'""",
+        (time.time(),),
+    )
+    if orphaned.rowcount:
+        try:
+            print(f"[init] marked {orphaned.rowcount} task(s) as orphaned/failed")
+        except Exception:
+            pass
     # Backfill v8: re-compute conversation_id for vscode-* rows. Earlier conversation
     # hashes included rotating content (Copilot Chat's <environment_info> terminal IDs,
     # cwd, exit codes), fragmenting one chat session across many cids. The hash now strips
@@ -419,6 +459,31 @@ def init_db():
                 )
         conn.execute(
             "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v8', '1', ?)",
+            (time.time(),),
+        )
+    # Backfill v9: re-classify rows still tagged 'unknown' using the latest detector
+    # (now honors x-client-name and extracts a label from arbitrary 'Name/Version' UAs).
+    done_v9 = conn.execute("SELECT value FROM settings WHERE key='backfill_v9'").fetchone()
+    if not done_v9:
+        rows = conn.execute(
+            """SELECT id, request_headers, request_body FROM requests WHERE client_app = 'unknown'"""
+        ).fetchall()
+        for r in rows:
+            headers = None
+            body = None
+            try:
+                headers = json.loads(r["request_headers"]) if r["request_headers"] else None
+            except (TypeError, json.JSONDecodeError):
+                pass
+            try:
+                body = json.loads(r["request_body"]) if r["request_body"] else None
+            except (TypeError, json.JSONDecodeError):
+                pass
+            app = _detect_client_app(headers, body if isinstance(body, dict) else None)
+            if app != "unknown":
+                conn.execute("UPDATE requests SET client_app=? WHERE id=?", (app, r["id"]))
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v9', '1', ?)",
             (time.time(),),
         )
     # Backfill v7: re-extract usage for Anthropic rows that have prompt-cache fields. Old
@@ -649,14 +714,18 @@ async def lifespan(app: FastAPI):
     app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
     app.state.metrics_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
     app.state.metrics_task = asyncio.create_task(_metrics_loop(app))
+    app.state.task_worker = asyncio.create_task(_task_worker_loop(app))
     try:
         yield
     finally:
-        app.state.metrics_task.cancel()
-        try:
-            await app.state.metrics_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        for t_attr in ("metrics_task", "task_worker"):
+            t = getattr(app.state, t_attr, None)
+            if t is not None:
+                t.cancel()
+                try:
+                    await t
+                except (asyncio.CancelledError, Exception):
+                    pass
         await app.state.client.aclose()
         await app.state.metrics_client.aclose()
 
@@ -1118,7 +1187,7 @@ DEFAULT_RULES_CONFIG = {
         "enabled": False,
         "defaults": {},          # global, e.g. {"num_ctx": 8192, "temperature": 0.7}
         "per_model": {},          # {"qwen2.5:14b": {"num_ctx": 16384}}
-        "per_client": {},         # {"192.168.6.20": {"temperature": 0.2}}
+        "per_client": {},         # {"10.0.0.20": {"temperature": 0.2}}
         "rules": [],              # [{"if": {...}, "set": {"num_ctx": 16384}}] (first match)
     },
     "context_overflow_guard": {
@@ -1179,10 +1248,25 @@ DEFAULT_RULES_CONFIG = {
         # Bundles:
         #   memory: per-conversation key-value store. Tools: remember, recall, list_memory, forget.
         #   todos:  per-conversation task list. Tools: set_todos, get_todos, add_todo, complete_todo.
+        #
+        # Per-client scopes: `scopes` is an evaluated-in-order list. The first entry whose
+        # `match` clause matches the inbound request wins, and its overrides are merged onto
+        # the root config. match keys (all AND'd; at least one required):
+        #   ip:         exact client IP match (after X-Forwarded-For resolution)
+        #   ip_cidr:    "10.0.0.0/24" / "fd00::/64" — client IP within network
+        #   user_agent: case-insensitive substring of User-Agent header
+        #   client_app: exact match against the detected label (e.g. "myapp", "claude-code")
+        # Scope overrides may set: enabled, memory, todos, max_iterations.
         "enabled": False,
         "memory": True,
         "todos": True,
         "max_iterations": 4,
+        # Example:
+        #   "scopes": [
+        #     {"match": {"client_app": "myapp"}, "enabled": true, "memory": true, "todos": false},
+        #     {"match": {"ip_cidr": "10.0.0.0/24", "user_agent": "claude-code"}, "enabled": true},
+        #   ]
+        "scopes": [],
     },
 }
 
@@ -2614,23 +2698,20 @@ async def list_requests(request: Request, limit: int = 200, offset: int = 0, inc
 
 
 @app.get("/__proxy/api/audit")
-async def audit(request: Request, limit: int = 200, include_allow: bool = False):
+async def audit(request: Request, limit: int = 200, offset: int = 0, include_allow: bool = False):
     viewer = _client_ip(request)
+    limit = max(1, min(int(limit or 200), 1000))
+    offset = max(0, int(offset or 0))
     conn = db()
-    if include_allow:
-        rows = conn.execute(
-            """SELECT id, ts, method, path, model, client_ip, gate_verdict, gate_rule, gate_reason, gate_details
-               FROM requests WHERE gate_verdict IS NOT NULL
-               ORDER BY ts DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """SELECT id, ts, method, path, model, client_ip, gate_verdict, gate_rule, gate_reason, gate_details
-               FROM requests WHERE gate_verdict IN ('block', 'warn', 'rewrite', 'intercept')
-               ORDER BY ts DESC LIMIT ?""",
-            (limit,),
-        ).fetchall()
+    where = ("gate_verdict IS NOT NULL" if include_allow
+             else "gate_verdict IN ('block', 'warn', 'rewrite', 'intercept')")
+    rows = conn.execute(
+        f"""SELECT id, ts, method, path, model, client_ip, gate_verdict, gate_rule, gate_reason, gate_details
+           FROM requests WHERE {where}
+           ORDER BY ts DESC LIMIT ? OFFSET ?""",
+        (limit, offset),
+    ).fetchall()
+    total = conn.execute(f"SELECT COUNT(*) FROM requests WHERE {where}").fetchone()[0]
     counts = {}
     for v, n in conn.execute(
         "SELECT COALESCE(gate_verdict, '(none)'), COUNT(*) FROM requests GROUP BY gate_verdict"
@@ -2638,7 +2719,7 @@ async def audit(request: Request, limit: int = 200, include_allow: bool = False)
         counts[v] = n
     conn.close()
     items = [_redact_row(dict(r), viewer) for r in rows]
-    return {"counts": counts, "items": items, "redacted": REDACT_PII_ENABLED}
+    return {"counts": counts, "items": items, "total": total, "redacted": REDACT_PII_ENABLED}
 
 
 @app.get("/__proxy/api/conversations")
@@ -3935,6 +4016,18 @@ async def control_pending_tool_register(request: Request):
     # Auto-decide via persistent rules.
     rule = _tool_permission_lookup(name, args_str)
     decision = rule if rule in ("allow", "deny") else None
+    auto_rule_label = rule if rule else None
+    # If this tool call originates while a queued agent task is running, fall back to
+    # that task's tool_approval_mode when no persistent rule applied.
+    if decision is None and _CURRENT_AGENT_TASK:
+        mode = _CURRENT_AGENT_TASK.get("mode")
+        if mode == "yolo":
+            decision = "allow"
+            auto_rule_label = "task:yolo"
+        elif mode == "rules-only":
+            decision = "deny"
+            auto_rule_label = "task:rules-only"
+        # 'notify-phone' (and unset) → fall through to existing wait-for-approval flow.
 
     _PENDING_TOOLS[pending_id] = {
         "id": pending_id,
@@ -3945,9 +4038,9 @@ async def control_pending_tool_register(request: Request):
         "summary": summary[:300],
         "decision": decision,
         "decided_ts": time.time() if decision else None,
-        "auto_rule": rule if rule else None,
+        "auto_rule": auto_rule_label,
     }
-    return {"id": pending_id, "decision": decision, "auto_rule": rule}
+    return {"id": pending_id, "decision": decision, "auto_rule": auto_rule_label}
 
 
 @app.get("/__proxy/api/control/pending-tool/{pending_id}")
@@ -4075,6 +4168,221 @@ async def control_panic_set(request: Request):
     return {"ok": True, "panic": _PANIC_MODE}
 
 
+# -------- Task queue REST API --------
+
+_VALID_TASK_MODES = {"chat", "agent"}
+_VALID_APPROVAL_MODES = {"rules-only", "notify-phone", "yolo"}
+
+
+def _task_visible_to(viewer_ip: str | None, creator_ip: str | None) -> bool:
+    """Same subnet visibility rule as PII redaction: a viewer sees a task only if the
+    viewer and the creator share a subnet (or either is loopback). Tasks with no creator_ip
+    (legacy rows) are visible to everyone — they predate this column."""
+    if not creator_ip:
+        return True
+    return _ips_share_subnet(viewer_ip, creator_ip)
+
+
+def _task_check_or_404(task_id: int, request: Request) -> JSONResponse | None:
+    """Return a 404 JSONResponse if the task doesn't exist OR isn't visible to the caller's
+    subnet (mirrors the PII redaction policy). Returns None if the caller may proceed."""
+    conn = db()
+    row = conn.execute("SELECT creator_ip FROM proxy_tasks WHERE id=?", (task_id,)).fetchone()
+    conn.close()
+    if not row or not _task_visible_to(_client_ip(request), row["creator_ip"]):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return None
+
+
+def _task_row_to_dict(r) -> dict:
+    if not r:
+        return {}
+    d = dict(r)
+    d["enabled"] = bool(d.get("enabled"))
+    return d
+
+
+@app.post("/__proxy/api/control/tasks")
+async def control_task_create(request: Request):
+    """Create a queued task. Body: {prompt, mode, target_endpoint?, model?, schedule?,
+    tool_approval_mode?}. mode='chat'|'agent'. schedule null = one-shot, else cron expr or
+    'every Nm/Nh/Nd' for recurring."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    prompt = (payload.get("prompt") or "").strip()
+    if not prompt:
+        return JSONResponse({"error": "'prompt' is required"}, status_code=400)
+    mode = (payload.get("mode") or "chat").strip().lower()
+    if mode not in _VALID_TASK_MODES:
+        return JSONResponse({"error": f"mode must be one of {sorted(_VALID_TASK_MODES)}"}, status_code=400)
+    target_endpoint = (payload.get("target_endpoint") or "").strip() or None
+    model = (payload.get("model") or "").strip() or None
+    schedule = (payload.get("schedule") or "").strip() or None
+    approval = (payload.get("tool_approval_mode") or "").strip() or None
+    if approval and approval not in _VALID_APPROVAL_MODES:
+        return JSONResponse(
+            {"error": f"tool_approval_mode must be one of {sorted(_VALID_APPROVAL_MODES)}"},
+            status_code=400,
+        )
+    if mode == "agent" and not approval:
+        approval = "notify-phone"
+    now = time.time()
+    next_run = _task_compute_next_run(schedule, now) if schedule else None
+    if schedule and next_run is None:
+        return JSONResponse(
+            {"error": f"schedule {schedule!r} could not be parsed (use 'every 30m', 'every 2h', "
+                      f"'every 1d', or a 5-field cron expr if croniter is installed)"},
+            status_code=400,
+        )
+    creator_ip = _client_ip(request)
+    conn = db()
+    cur = conn.execute(
+        """INSERT INTO proxy_tasks
+           (prompt, mode, target_endpoint, model, status, created_ts,
+            schedule, next_run_ts, tool_approval_mode, enabled, creator_ip)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?, 1, ?)""",
+        (prompt, mode, target_endpoint, model, now, schedule, next_run, approval, creator_ip),
+    )
+    task_id = cur.lastrowid
+    conn.commit()
+    row = conn.execute("SELECT * FROM proxy_tasks WHERE id=?", (task_id,)).fetchone()
+    conn.close()
+    return _task_row_to_dict(row)
+
+
+@app.get("/__proxy/api/control/tasks")
+async def control_task_list(request: Request, status: str = "", recurring_only: int = 0, limit: int = 100):
+    """List tasks, newest first. Query: status (comma-separated filter), recurring_only=1
+    to show only schedule-bearing parents, limit (max 500). Same subnet visibility rule as
+    PII redaction: each viewer only sees tasks created by clients in their subnet."""
+    limit = max(1, min(int(limit or 100), 500))
+    where = []
+    params: list = []
+    if status:
+        statuses = [s.strip() for s in status.split(",") if s.strip()]
+        if statuses:
+            where.append("status IN (" + ",".join("?" for _ in statuses) + ")")
+            params.extend(statuses)
+    if recurring_only:
+        where.append("schedule IS NOT NULL")
+    sql = "SELECT * FROM proxy_tasks"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_ts DESC LIMIT ?"
+    params.append(limit)
+    conn = db()
+    rows = conn.execute(sql, params).fetchall()
+    conn.close()
+    viewer = _client_ip(request)
+    visible = [r for r in rows if _task_visible_to(viewer, r["creator_ip"])]
+    return {"items": [_task_row_to_dict(r) for r in visible]}
+
+
+@app.get("/__proxy/api/control/tasks/{task_id}")
+async def control_task_get(task_id: int, request: Request):
+    conn = db()
+    row = conn.execute("SELECT * FROM proxy_tasks WHERE id=?", (task_id,)).fetchone()
+    children_rows = []
+    if row and row["schedule"]:
+        children_rows = conn.execute(
+            "SELECT * FROM proxy_tasks WHERE parent_task_id=? ORDER BY created_ts DESC LIMIT 50",
+            (task_id,),
+        ).fetchall()
+    conn.close()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    viewer = _client_ip(request)
+    if not _task_visible_to(viewer, row["creator_ip"]):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    out = _task_row_to_dict(row)
+    children = [_task_row_to_dict(r) for r in children_rows if _task_visible_to(viewer, r["creator_ip"])]
+    if children:
+        out["children"] = children
+    return out
+
+
+@app.delete("/__proxy/api/control/tasks/{task_id}")
+async def control_task_delete(task_id: int, request: Request):
+    blocked = _task_check_or_404(task_id, request)
+    if blocked: return blocked
+    conn = db()
+    cur = conn.execute("DELETE FROM proxy_tasks WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.post("/__proxy/api/control/tasks/{task_id}/cancel")
+async def control_task_cancel(task_id: int, request: Request):
+    """Mark a pending or running task as cancelled. (Running agent task: the worker
+    coroutine doesn't get aborted mid-call, but its result will be discarded by the
+    final-status check inside _task_execute.)"""
+    blocked = _task_check_or_404(task_id, request)
+    if blocked: return blocked
+    conn = db()
+    cur = conn.execute(
+        """UPDATE proxy_tasks SET status='cancelled', finished_ts=?
+           WHERE id=? AND status IN ('pending','running')""",
+        (time.time(), task_id),
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "updated": cur.rowcount}
+
+
+@app.post("/__proxy/api/control/tasks/{task_id}/pause")
+async def control_task_pause(task_id: int, request: Request):
+    blocked = _task_check_or_404(task_id, request)
+    if blocked: return blocked
+    conn = db()
+    cur = conn.execute("UPDATE proxy_tasks SET enabled=0 WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "updated": cur.rowcount}
+
+
+@app.post("/__proxy/api/control/tasks/{task_id}/resume")
+async def control_task_resume(task_id: int, request: Request):
+    blocked = _task_check_or_404(task_id, request)
+    if blocked: return blocked
+    conn = db()
+    cur = conn.execute("UPDATE proxy_tasks SET enabled=1 WHERE id=?", (task_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "updated": cur.rowcount}
+
+
+@app.post("/__proxy/api/control/tasks/{task_id}/run-now")
+async def control_task_run_now(task_id: int, request: Request):
+    """Force a recurring task to fire immediately. Spawns a one-shot child without
+    advancing the parent's next_run_ts."""
+    blocked = _task_check_or_404(task_id, request)
+    if blocked: return blocked
+    conn = db()
+    parent = conn.execute("SELECT * FROM proxy_tasks WHERE id=?", (task_id,)).fetchone()
+    if not parent:
+        conn.close()
+        return JSONResponse({"error": "not found"}, status_code=404)
+    if not parent["schedule"]:
+        conn.close()
+        return JSONResponse({"error": "task is not recurring"}, status_code=400)
+    cur = conn.execute(
+        """INSERT INTO proxy_tasks
+           (prompt, mode, target_endpoint, model, status, created_ts,
+            parent_task_id, tool_approval_mode, creator_ip)
+           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+        (parent["prompt"], parent["mode"], parent["target_endpoint"],
+         parent["model"], time.time(), parent["id"], parent["tool_approval_mode"],
+         parent["creator_ip"]),
+    )
+    child_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return {"ok": True, "child_task_id": child_id}
+
+
 @app.get("/__proxy/remote")
 async def remote_pwa():
     """Mobile-first PWA for sending prompts to registered control endpoints + panic toggle."""
@@ -4085,6 +4393,282 @@ async def remote_pwa():
 @app.get("/__proxy/")
 async def ui_index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+# -------- Task queue (one-shots + cron/interval recurring) --------
+#
+# Lets the user queue prompts (chat or agent mode) from the phone PWA and run them in the
+# background. Recurring rows fire on a cron expression or "every Nm/Nh/Nd" interval and
+# spawn a one-shot child each time. Agent tasks reuse the existing /api/control/chat +
+# /await flow; chat tasks hit OLLAMA_URL directly with non-streaming completions.
+
+# Concurrency: agent tasks are serialized (one VS Code session); chat tasks run up to 3
+# in parallel. Semaphores live module-global so the worker tick can fire-and-forget.
+_TASK_AGENT_SEM = asyncio.Semaphore(1)
+_TASK_CHAT_SEM = asyncio.Semaphore(3)
+# Tracks which task (if any) is currently driving an agent run, so /pending-tool/register
+# can apply that task's tool_approval_mode when no persistent rule matches.
+_CURRENT_AGENT_TASK: dict = {}
+
+
+def _task_compute_next_run(schedule: str | None, now_ts: float) -> float | None:
+    """Parse `schedule` and return the next-fire timestamp after `now_ts`. Supported:
+      - 'every Nm' / 'every Nh' / 'every Nd' (case-insensitive, also accepts 's')
+      - 5-field cron exprs ('m h dom mon dow') iff `croniter` is installed.
+    Returns None on parse failure (worker will mark the recurring row as failed)."""
+    if not schedule or not isinstance(schedule, str):
+        return None
+    s = schedule.strip().lower()
+    m = re.match(r"^every\s+(\d+)\s*([smhd])$", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        secs = {"s": 1, "m": 60, "h": 3600, "d": 86400}[unit] * n
+        if secs <= 0:
+            return None
+        return now_ts + secs
+    try:
+        from croniter import croniter  # optional dep
+    except ImportError:
+        return None
+    try:
+        return float(croniter(schedule, datetime.datetime.fromtimestamp(now_ts)).get_next(float))
+    except (ValueError, KeyError):
+        return None
+
+
+async def _task_run_chat(task_id: int, prompt: str, model: str | None) -> tuple[str | None, str | None]:
+    """Run a chat-mode task against OLLAMA_URL. Returns (result_text, error_text)."""
+    if not model:
+        # Pick the first currently-loaded Ollama model; fall back to first available tag.
+        try:
+            client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+            try:
+                r = await client.get(OLLAMA_URL + "/api/ps")
+                ps = (r.json() or {}).get("models") or []
+                if ps:
+                    model = ps[0].get("name") or ps[0].get("model")
+                if not model:
+                    r2 = await client.get(OLLAMA_URL + "/api/tags")
+                    tags = (r2.json() or {}).get("models") or []
+                    if tags:
+                        model = tags[0].get("name")
+            finally:
+                await client.aclose()
+        except Exception as e:
+            return None, f"could not pick a model: {e}"
+    if not model:
+        return None, "no model specified and none discoverable from Ollama"
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": False,
+    }
+    try:
+        client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
+        try:
+            r = await client.post(OLLAMA_URL + "/v1/chat/completions", json=payload)
+        finally:
+            await client.aclose()
+    except Exception as e:
+        return None, f"upstream request failed: {e}"
+    if r.status_code >= 400:
+        return None, f"upstream HTTP {r.status_code}: {r.text[:500]}"
+    try:
+        j = r.json()
+        choices = j.get("choices") or []
+        if choices:
+            content = ((choices[0] or {}).get("message") or {}).get("content")
+            if isinstance(content, str):
+                return content, None
+        return r.text, None
+    except (json.JSONDecodeError, ValueError):
+        return r.text, None
+
+
+async def _task_run_agent(task_id: int, prompt: str, target: str | None,
+                          tool_approval_mode: str | None) -> tuple[str | None, str | None]:
+    """Run an agent-mode task by POSTing to /api/control/chat (an existing registered VS
+    Code endpoint) and polling /await for the resulting LLM call. Honors tool_approval_mode
+    via _CURRENT_AGENT_TASK so the @proxy participant respects rules-only / yolo / phone."""
+    _CURRENT_AGENT_TASK.clear()
+    _CURRENT_AGENT_TASK.update({"task_id": task_id, "mode": tool_approval_mode or "notify-phone"})
+    try:
+        conn = db()
+        if target:
+            row = conn.execute(
+                "SELECT name, url, token FROM control_endpoints WHERE name = ?", (target,),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT name, url, token FROM control_endpoints ORDER BY last_seen_ts DESC LIMIT 1"
+            ).fetchone()
+        conn.close()
+        if not row:
+            return None, "no control endpoints registered"
+        fwd_url = row["url"].rstrip("/") + "/chat"
+        fwd_headers = {"content-type": "application/json"}
+        if row["token"]:
+            fwd_headers["authorization"] = f"Bearer {row['token']}"
+        send_id = uuid.uuid4().hex[:16]
+        send_ts = time.time()
+        client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+        try:
+            try:
+                r = await client.post(
+                    fwd_url, headers=fwd_headers,
+                    content=json.dumps({"prompt": prompt, "newChat": True}).encode("utf-8"),
+                    timeout=httpx.Timeout(15.0),
+                )
+            except Exception as e:
+                return None, f"could not reach control endpoint {row['name']}: {e}"
+            if not r.is_success:
+                return None, f"control endpoint returned HTTP {r.status_code}: {r.text[:300]}"
+            _CONTROL_SENDS[send_id] = {
+                "ts": send_ts,
+                "target_name": row["name"],
+                "target_ip": _control_target_ip(row["url"]),
+                "prompt_hint": prompt[:120],
+            }
+        finally:
+            await client.aclose()
+        # Poll /await for up to 30 minutes (matches typical agent run length).
+        deadline = time.time() + 1800
+        last_text = ""
+        while time.time() < deadline:
+            await asyncio.sleep(2.0)
+            target_ip = _CONTROL_SENDS.get(send_id, {}).get("target_ip")
+            conn = db()
+            rows = conn.execute(
+                """SELECT id, status, response_body, stream_chunks, error
+                   FROM requests
+                   WHERE ts > ? AND client_ip = ?
+                     AND client_app IN ('vscode-copilot','claude-code','github-copilot','continue.dev','cursor')
+                     AND shadow_of IS NULL
+                   ORDER BY ts ASC LIMIT 1""",
+                (send_ts - 1, target_ip or ""),
+            ).fetchall()
+            conn.close()
+            if not rows:
+                continue
+            r0 = rows[0]
+            text = _extract_response_text(r0["response_body"], r0["stream_chunks"])
+            if text:
+                last_text = text
+            if r0["error"]:
+                return last_text or None, r0["error"]
+            if r0["status"] is not None:
+                return last_text or "(no text)", None
+        return last_text or None, "timed out after 30 minutes waiting for agent response"
+    finally:
+        _CURRENT_AGENT_TASK.clear()
+
+
+async def _task_execute(task_id: int):
+    """Claim a task row, dispatch by mode, write result. Runs inside the appropriate sema."""
+    conn = db()
+    row = conn.execute("SELECT * FROM proxy_tasks WHERE id=?", (task_id,)).fetchone()
+    if not row:
+        conn.close()
+        return
+    if row["status"] != "pending":
+        conn.close()
+        return
+    cur = conn.execute(
+        "UPDATE proxy_tasks SET status='running', started_ts=? WHERE id=? AND status='pending'",
+        (time.time(), task_id),
+    )
+    conn.commit()
+    conn.close()
+    if cur.rowcount != 1:
+        return  # another tick claimed it first
+    sem = _TASK_AGENT_SEM if row["mode"] == "agent" else _TASK_CHAT_SEM
+    async with sem:
+        # Re-check that we weren't cancelled while waiting on the semaphore.
+        conn = db()
+        cur_row = conn.execute("SELECT status FROM proxy_tasks WHERE id=?", (task_id,)).fetchone()
+        conn.close()
+        if not cur_row or cur_row["status"] != "running":
+            return
+        try:
+            if row["mode"] == "agent":
+                result, err = await _task_run_agent(
+                    task_id, row["prompt"], row["target_endpoint"],
+                    row["tool_approval_mode"],
+                )
+            else:
+                result, err = await _task_run_chat(task_id, row["prompt"], row["model"])
+        except Exception as e:
+            result, err = None, f"worker exception: {e}"
+        conn = db()
+        conn.execute(
+            """UPDATE proxy_tasks
+               SET status=?, result=?, error=?, finished_ts=?
+               WHERE id=? AND status='running'""",
+            ("failed" if err else "done", result, err, time.time(), task_id),
+        )
+        conn.commit()
+        conn.close()
+
+
+async def _task_worker_loop(app: FastAPI):
+    """Tick every 5s. Spawn child rows for due recurring tasks; pick up pending one-shots
+    and dispatch them. Each dispatch is an asyncio.create_task — the loop never blocks."""
+    while True:
+        try:
+            await asyncio.sleep(5.0)
+            now = time.time()
+            conn = db()
+            due = conn.execute(
+                """SELECT * FROM proxy_tasks
+                   WHERE schedule IS NOT NULL AND enabled=1 AND status='pending'
+                     AND (next_run_ts IS NULL OR next_run_ts <= ?)""",
+                (now,),
+            ).fetchall()
+            for parent in due:
+                # Don't pile up: skip if a previous child of this parent is still pending/running.
+                still = conn.execute(
+                    """SELECT 1 FROM proxy_tasks
+                       WHERE parent_task_id=? AND status IN ('pending','running') LIMIT 1""",
+                    (parent["id"],),
+                ).fetchone()
+                if not still:
+                    conn.execute(
+                        """INSERT INTO proxy_tasks
+                           (prompt, mode, target_endpoint, model, status, created_ts,
+                            parent_task_id, tool_approval_mode, creator_ip)
+                           VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+                        (parent["prompt"], parent["mode"], parent["target_endpoint"],
+                         parent["model"], now, parent["id"], parent["tool_approval_mode"],
+                         parent["creator_ip"]),
+                    )
+                next_ts = _task_compute_next_run(parent["schedule"], now)
+                if next_ts is None:
+                    conn.execute(
+                        "UPDATE proxy_tasks SET enabled=0, error=? WHERE id=?",
+                        (f"unparseable schedule: {parent['schedule']!r}", parent["id"]),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE proxy_tasks SET next_run_ts=? WHERE id=?",
+                        (next_ts, parent["id"]),
+                    )
+            conn.commit()
+            # Pick up pending one-shots (NOT recurring parent rows — those have schedule).
+            pending = conn.execute(
+                """SELECT id FROM proxy_tasks
+                   WHERE status='pending' AND schedule IS NULL
+                   ORDER BY created_ts ASC LIMIT 25"""
+            ).fetchall()
+            conn.close()
+            for r in pending:
+                asyncio.create_task(_task_execute(r["id"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            try:
+                print(f"[task_worker] tick error: {e}")
+            except Exception:
+                pass
 
 
 # -------- Transparent proxy --------
@@ -4281,6 +4865,16 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
     if "cc_entrypoint=cli" in sys_text or "claude-code" in ua or "claudecode" in ua:
         return "claude-code"
 
+    # Caller-supplied identification: if a client sets x-client-name (or x-app-id /
+    # x-application-name), trust it. This lets arbitrary scripts label themselves
+    # without us having to maintain a UA whitelist.
+    for hk in ("x-client-name", "x-app-id", "x-application-name"):
+        v = (h.get(hk) or "").strip()
+        if v:
+            slug = re.sub(r"[^a-z0-9._-]+", "-", v.lower())[:40].strip("-")
+            if slug:
+                return slug
+
     # Editor / IDE integrations
     ev = (h.get("editor-version") or "").lower()
     epv = (h.get("editor-plugin-version") or "").lower()
@@ -4345,6 +4939,18 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
         return "browser-safari"
     if ua.startswith("mozilla/"):
         return "browser-other"
+
+    # Final fallback: extract a "name" from a "Name/Version" or "Name (...)" UA so
+    # arbitrary scripts ("MyApp/1.0", "MyTool/2.3 (+url)") get a label
+    # instead of being lumped into 'unknown'. Skip if too short or too generic.
+    raw_ua = (h.get("user-agent") or "").strip()
+    if raw_ua:
+        m = re.match(r"^([A-Za-z][\w.\-]{2,40})", raw_ua)
+        if m:
+            slug = re.sub(r"[^a-z0-9._-]+", "-", m.group(1).lower()).strip("-")
+            generic = {"python", "client", "http", "app", "test", "mozilla", "user-agent"}
+            if slug and slug not in generic and len(slug) >= 3:
+                return slug
 
     return "unknown"
 
@@ -5281,9 +5887,57 @@ PROXY_TOOLS_TODOS: list[dict] = [
 ]
 
 
-def _active_proxy_tools() -> list[dict]:
-    """Return the active set of proxy-owned tool definitions per current rule config."""
-    cfg = (load_rules_config().get("tool_injector") or {})
+def _resolve_tool_injector_cfg(ctx: dict | None = None) -> dict:
+    """Return the effective tool_injector config for a request. Walks `scopes` (a list of
+    {match: {...}, ...overrides}) in order — the first match's overrides are merged onto
+    the root config. ctx keys: `client_ip`, `user_agent`, `client_app`. With no ctx (or no
+    scopes configured), returns the root config as-is.
+
+    A scope match is ALL of: ip (exact), ip_cidr, user_agent (substring, case-insensitive),
+    client_app (exact). Empty match {} matches nothing (avoids accidentally global rules)."""
+    cfg = dict(load_rules_config().get("tool_injector") or {})
+    scopes = cfg.get("scopes") or []
+    if not isinstance(scopes, list) or not ctx:
+        return cfg
+    ip = (ctx.get("client_ip") or "")
+    ua = (ctx.get("user_agent") or "").lower()
+    app = (ctx.get("client_app") or "")
+    for sc in scopes:
+        if not isinstance(sc, dict):
+            continue
+        m = sc.get("match") or {}
+        if not isinstance(m, dict) or not m:
+            continue
+        ok = True
+        if m.get("ip"):
+            if str(m["ip"]) != ip:
+                ok = False
+        if ok and m.get("ip_cidr"):
+            try:
+                if ipaddress.ip_address(ip) not in ipaddress.ip_network(m["ip_cidr"], strict=False):
+                    ok = False
+            except (ValueError, TypeError):
+                ok = False
+        if ok and m.get("user_agent"):
+            if str(m["user_agent"]).lower() not in ua:
+                ok = False
+        if ok and m.get("client_app"):
+            if str(m["client_app"]) != app:
+                ok = False
+        if ok:
+            merged = dict(cfg)
+            for k, v in sc.items():
+                if k != "match":
+                    merged[k] = v
+            merged["_scope_matched"] = m
+            return merged
+    return cfg
+
+
+def _active_proxy_tools(ctx: dict | None = None) -> list[dict]:
+    """Return the active set of proxy-owned tool definitions per the effective config
+    (root config + any matching scope override)."""
+    cfg = _resolve_tool_injector_cfg(ctx)
     out: list[dict] = []
     if cfg.get("memory", True):
         out.extend(PROXY_TOOLS_MEMORY)
@@ -5476,17 +6130,17 @@ def _detect_body_shape(body: dict) -> str:
     return "openai"
 
 
-def _inject_proxy_tools(body: dict) -> int:
+def _inject_proxy_tools(body: dict, ctx: dict | None = None) -> int:
     """Append proxy-owned tool definitions to body['tools']. Returns count of injected tools.
     Skips clients that don't already declare tools[] (they likely don't expect tool calls).
-    Skips any tool whose name collides with a client-declared tool. Bundles to inject are
-    selected by the rule config (memory: true, todos: true)."""
+    Skips any tool whose name collides with a client-declared tool. Effective config is the
+    root tool_injector config plus any matching scope (see _resolve_tool_injector_cfg)."""
     if not isinstance(body, dict):
         return 0
-    cfg = (load_rules_config().get("tool_injector") or {})
+    cfg = _resolve_tool_injector_cfg(ctx)
     if not cfg.get("enabled", False):
         return 0
-    active = _active_proxy_tools()
+    active = _active_proxy_tools(ctx)
     if not active:
         return 0
     tools = body.get("tools")
@@ -5698,7 +6352,13 @@ async def proxy(full_path: str, request: Request):
     overflow_blocks = bool(overflow and overflow.get("action") == "block")
     # tool_injector runs AFTER all transforms (incl. bridge translation) so the proxy tools
     # are added in whatever shape the body will actually be sent in. Returns count of injected.
-    tool_injection_count = _inject_proxy_tools(body_json) if isinstance(body_json, dict) else 0
+    # Build a scope-match context (ip / UA / detected client_app) so per-client scopes apply.
+    _ti_ctx = {
+        "client_ip": _client_ip(request),
+        "user_agent": request.headers.get("user-agent", ""),
+        "client_app": _detect_client_app(dict(request.headers), body_json if isinstance(body_json, dict) else None),
+    }
+    tool_injection_count = _inject_proxy_tools(body_json, _ti_ctx) if isinstance(body_json, dict) else 0
     tool_injection_active = tool_injection_count > 0
     body_mutated = bool(
         rewrite or options_inject or bridge_active or tool_injection_active
@@ -5834,7 +6494,8 @@ async def proxy(full_path: str, request: Request):
     # using proxy tools (or max_iterations). Mutates nothing visible — returns the final
     # parsed response object plus the count of iterations consumed.
     async def _proxy_tool_loop(start_resp_obj: dict, current_body: dict) -> tuple[dict, int]:
-        cfg = (load_rules_config().get("tool_injector") or {})
+        # Use the same scoped config as injection so per-client max_iterations applies.
+        cfg = _resolve_tool_injector_cfg(_ti_ctx)
         max_iter = max(1, int(cfg.get("max_iterations", 4) or 4))
         shape = "anthropic" if (start_resp_obj.get("type") == "message") else "openai"
         cur_resp = start_resp_obj
@@ -6276,7 +6937,7 @@ def _render_digest_markdown(data: dict, samples: int, include_bodies: bool, reda
     lines.append("- `context_overflow_guard` (transform): estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window (prevents Ollama silent truncation). Keys: `enabled`, `action` (warn|bump|trim|block), `chars_per_token`, `headroom_ratio`, `max_ctx`, `bump_to`, `min_keep_messages`, `assumed_default_num_ctx`.")
     lines.append("- `tool_pruner` (transform): drop tool definitions the model has been offered repeatedly in this conversation but never invoked, cutting prompt tokens and reducing tool-selection noise. Keys: `enabled`, `action` (prune|warn), `min_turns_offered`, `min_history_turns`, `always_keep` (names), `max_prune_ratio`, `include_hint`.")
     lines.append("- `protocol_bridge` (transform): when an Anthropic-shape request gets routed (via `model_router`) to a non-Claude model, translate the body to OpenAI shape, send to OLLAMA_URL, and translate the response back. Lets Claude Code & Anthropic SDKs drive any OpenAI-compatible backend. Keys: `enabled`.")
-    lines.append("- `tool_injector` (transform + post-flight): inject proxy-owned tools (currently `remember`/`recall`/`list_memory`/`forget` for per-conversation memory) into outgoing requests, then intercept tool_use of those names, execute server-side, append tool_result, and re-call upstream so the model sees the answer and continues. Capped at `max_iterations`. Keys: `enabled`, `memory`, `max_iterations`.")
+    lines.append("- `tool_injector` (transform + post-flight): inject proxy-owned tools (memory: `remember`/`recall`/`list_memory`/`forget`; todos: `set_todos`/`get_todos`/`add_todo`/`complete_todo`) into outgoing requests, then intercept tool_use of those names, execute server-side, append tool_result, and re-call upstream so the model sees the answer and continues. Capped at `max_iterations`. Keys: `enabled`, `memory`, `todos`, `max_iterations`, `scopes`. `scopes` is a list of `{match, enabled?, memory?, todos?, max_iterations?}`; first matching scope wins. `match` accepts `ip`, `ip_cidr`, `user_agent` (substring), `client_app` (exact label).")
     lines.append("- `schema_validator` (post-flight): validate tool_call args against the request's `tools[].parameters` schema; replace bad calls with a corrective assistant message. Keys: `enabled`, `action`, `strict_types`, `reject_unknown_fields`.")
     lines.append("- `hallucinated_tool` (post-flight): same intercept for tool names not declared in the request.")
     lines.append("")
@@ -6680,4 +7341,68 @@ if __name__ == "__main__":
     print(f"AI Proxy → forwarding to {OLLAMA_URL}")
     print(f"Listening on http://{PROXY_HOST}:{PROXY_PORT}")
     print(f"UI: http://{PROXY_HOST}:{PROXY_PORT}/__proxy/")
-    uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+
+    # Optional HTTPS listener that runs concurrently with HTTP, sharing the same FastAPI app
+    # and lifespan state. Enabled when PROXY_SSL_CERT + PROXY_SSL_KEY are set AND
+    # PROXY_HTTPS_PORT > 0. Useful for serving the phone PWA over HTTPS so iOS Safari will
+    # honor "Add to Home Screen", microphone permissions, service workers, etc.
+    ssl_cert = os.environ.get("PROXY_SSL_CERT", "").strip()
+    ssl_key = os.environ.get("PROXY_SSL_KEY", "").strip()
+    ssl_key_pw = os.environ.get("PROXY_SSL_KEY_PASSWORD") or None
+    try:
+        https_port = int(os.environ.get("PROXY_HTTPS_PORT", "0") or "0")
+    except ValueError:
+        https_port = 0
+    https_enabled = bool(ssl_cert and ssl_key and https_port > 0)
+
+    if not https_enabled:
+        uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+    else:
+        if not Path(ssl_cert).exists():
+            print(f"WARNING: PROXY_SSL_CERT does not exist at {ssl_cert!r}; HTTPS disabled.")
+            uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+        elif not Path(ssl_key).exists():
+            print(f"WARNING: PROXY_SSL_KEY does not exist at {ssl_key!r}; HTTPS disabled.")
+            uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+        else:
+            print(f"Also listening on https://{PROXY_HOST}:{https_port}")
+            print(f"HTTPS UI: https://{PROXY_HOST}:{https_port}/__proxy/")
+            print(f"  cert: {ssl_cert}")
+            print(f"  key:  {ssl_key}")
+
+            async def _serve_both():
+                # Single FastAPI app, two listeners. The HTTP server owns the lifespan
+                # (init_db, app.state.client setup); the HTTPS server runs with
+                # lifespan="off" and shares the same in-process state. Requests to either
+                # listener hit the same handlers and the same SQLite database.
+                http_cfg = uvicorn.Config(
+                    "proxy:app", host=PROXY_HOST, port=PROXY_PORT,
+                    log_level="info",
+                )
+                https_cfg = uvicorn.Config(
+                    "proxy:app", host=PROXY_HOST, port=https_port,
+                    ssl_certfile=ssl_cert,
+                    ssl_keyfile=ssl_key,
+                    ssl_keyfile_password=ssl_key_pw,
+                    lifespan="off",
+                    log_level="info",
+                )
+                http_server = uvicorn.Server(http_cfg)
+                https_server = uvicorn.Server(https_cfg)
+                http_task = asyncio.create_task(http_server.serve())
+                # Wait for HTTP server lifespan startup to complete before opening HTTPS,
+                # so the shared httpx client / DB are ready when HTTPS requests arrive.
+                for _ in range(50):
+                    await asyncio.sleep(0.1)
+                    if getattr(http_server, "started", False):
+                        break
+                https_task = asyncio.create_task(https_server.serve())
+                try:
+                    await asyncio.gather(http_task, https_task)
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    pass
+
+            try:
+                asyncio.run(_serve_both())
+            except KeyboardInterrupt:
+                pass

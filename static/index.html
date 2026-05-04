@@ -22,6 +22,7 @@
   header label { color: #888; font-size: 12px; user-select: none; cursor: pointer; }
   #main { display: flex; flex: 1; min-height: 0; }
   #list { width: 48%; min-width: 320px; overflow: auto; border-right: 1px solid #2a2e3a; }
+  #requests-pager { position: sticky; top: 0; background: #0f1116; padding: 6px 12px; border-bottom: 1px solid #2a2e3a; z-index: 5; }
   table { width: 100%; border-collapse: collapse; }
   thead th { position: sticky; top: 0; background: #1a1d26; color: #aaa; font-weight: normal; font-size: 11px; text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2e3a; text-transform: uppercase; letter-spacing: 0.5px; z-index: 1; }
   tbody td { padding: 5px 8px; border-bottom: 1px solid #1f232c; font-size: 12px; vertical-align: top; }
@@ -136,14 +137,15 @@
   tr.row-warn td { background: #2a2418 !important; }
   tr.row-rewrite td { background: #1a2030 !important; }
   tr.row-intercept td { background: #251a30 !important; }
-  #audit, #convs, #system, #setup, #chat { flex: 1; overflow: auto; padding: 18px; display: none; }
-  #audit.show, #convs.show, #system.show, #setup.show, #chat.show { display: flex; flex-direction: column; }
-  #audit.show, #convs.show, #system.show, #setup.show { display: block; }
-  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup, #main.audit #chat { display: none; }
-  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup, #main.convs #chat { display: none; }
-  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup, #main.system #chat { display: none; }
-  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system, #main.setup #chat { display: none; }
-  #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup { display: none; }
+  #audit, #convs, #system, #setup, #chat, #tasks { flex: 1; overflow: auto; padding: 18px; display: none; }
+  #audit.show, #convs.show, #system.show, #setup.show, #chat.show, #tasks.show { display: flex; flex-direction: column; }
+  #audit.show, #convs.show, #system.show, #setup.show, #tasks.show { display: block; }
+  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup, #main.audit #chat, #main.audit #tasks { display: none; }
+  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup, #main.convs #chat, #main.convs #tasks { display: none; }
+  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup, #main.system #chat, #main.system #tasks { display: none; }
+  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system, #main.setup #chat, #main.setup #tasks { display: none; }
+  #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup, #main.chat #tasks { display: none; }
+  #main.tasks #list, #main.tasks #detail, #main.tasks #stats, #main.tasks #audit, #main.tasks #convs, #main.tasks #system, #main.tasks #setup, #main.tasks #chat { display: none; }
   /* Chat tab: 2-pane layout with composer pinned at bottom */
   #chat.show { padding: 0; flex-direction: column; height: 100%; }
   #chat .chat-header { padding: 10px 14px; border-bottom: 1px solid #2a2e3a; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; background: #14171f; }
@@ -174,6 +176,137 @@
   #chat .composer button { border: none; border-radius: 8px; padding: 10px 16px; background: #3a5a7a; color: #fff; font-weight: 600; cursor: pointer; min-width: 64px; }
   #chat .composer button:hover { background: #4a6a8a; }
   #chat .composer button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  /* Mobile back button — only visible at narrow widths when a request row is selected. */
+  #mobile-back-btn { display: none; }
+
+  /* ─── Mobile (<= 720px viewport) ─── */
+  @media (max-width: 720px) {
+    body { font-size: 14px; }
+
+    /* Header: allow wrap, hide non-essential metadata, scrollable tab strip. */
+    header { flex-wrap: wrap; padding: 6px 10px; gap: 6px; }
+    header h1 { font-size: 13px; flex: 0 0 auto; }
+    header .meta { display: none; }
+    header > span:nth-of-type(2) { display: none; }   /* count badge */
+    header label { font-size: 11px; margin-left: auto; }
+    header button { min-height: 36px; padding: 6px 10px; font-size: 12px; }
+    .tabs {
+      width: 100%;
+      flex-wrap: nowrap;
+      overflow-x: auto;
+      -webkit-overflow-scrolling: touch;
+      scrollbar-width: none;
+      order: 99;
+      padding-bottom: 2px;
+    }
+    .tabs::-webkit-scrollbar { display: none; }
+    .tab { flex: 0 0 auto; padding: 8px 12px; font-size: 13px; min-height: 38px; white-space: nowrap; }
+
+    /* Stack list on top, detail below — only one shown at a time. */
+    #main { flex-direction: column; }
+    #list { width: 100%; min-width: 0; max-width: 100%; border-right: none; border-bottom: 1px solid #2a2e3a; }
+
+    /* When a row is selected AND we're on the requests view, hide list, show full-width
+       detail with a sticky back bar. The :not() chain skips other tabs where #list is
+       already display:none but a stale tr.selected may remain in the DOM. */
+    #main:has(#list tr.selected):not(.stats):not(.audit):not(.convs):not(.system):not(.setup):not(.chat) #list { display: none; }
+    #main:has(#list tr.selected):not(.stats):not(.audit):not(.convs):not(.system):not(.setup):not(.chat) #mobile-back-btn {
+      display: flex;
+      align-items: center;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      height: 40px;
+      padding: 0 14px;
+      background: rgba(26,29,38,0.96);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid #2a2e3a;
+      color: #88c0d0;
+      font-weight: 600;
+      z-index: 1000;
+      cursor: pointer;
+      gap: 4px;
+    }
+    #main:has(#list tr.selected):not(.stats):not(.audit):not(.convs):not(.system):not(.setup):not(.chat) #detail { margin-top: 40px; padding: 14px; }
+
+    /* Request list table: hide secondary columns to fit. Keep Time, Path, Status, tokens, ms. */
+    #rows tr td:nth-child(2),    /* Client */
+    #rows tr td:nth-child(3),    /* Method */
+    #rows tr td:nth-child(5),    /* Model */
+    table thead th:nth-child(2), table thead th:nth-child(3), table thead th:nth-child(5) {
+      display: none;
+    }
+    td.path { max-width: 60vw; }
+
+    /* Stats / audit / convs / system / setup tabs: shrink padding, allow horizontal table scroll. */
+    #stats, #audit, #convs, #system, #setup { padding: 10px; }
+    .stats-section { margin-bottom: 14px; }
+    .stats-section table { min-width: max-content; font-size: 12px; }
+    .stats-section { overflow-x: auto; }
+    .stats-section h2 { font-size: 11px; }
+
+    /* Card grids: 1-2 wide cards instead of fixed minmax(180px). */
+    .cards { grid-template-columns: 1fr 1fr; gap: 8px; }
+    .card { padding: 10px 12px; }
+    .card .v { font-size: 18px; }
+    .gauge { padding: 10px 12px; }
+
+    /* Code blocks / pre: smaller font, capped height. */
+    pre { font-size: 11px; padding: 8px; max-height: 360px; }
+
+    /* Conversation detail: TOC stacks on top (overrides 900px breakpoint). */
+    .conv-layout { flex-direction: column !important; gap: 8px !important; }
+    .conv-toc {
+      width: 100% !important;
+      flex: none !important;
+      position: static !important;
+      max-height: 30vh !important;
+    }
+    .conv-toc-list { max-height: 22vh; overflow-y: auto; }
+
+    /* Compare view: stack columns. */
+    .compare-grid { grid-template-columns: 1fr !important; }
+
+    /* Traffic flow on Stats: already collapses at 1100px, but tighten further. */
+    .flow-grid { gap: 6px; }
+    .flow-card-stat { font-size: 11px; }
+
+    /* Routing-mode toggle: buttons full-width on mobile. */
+    .routing-mode-btn { font-size: 11px; padding: 8px 10px; }
+
+    /* Rules editor textarea: shorter on mobile so the toolbar isn't off-screen. */
+    #rules-editor textarea { min-height: 240px; font-size: 12px; }
+
+    /* Quick-toggle pills: tighter. */
+    .quick-toggle { font-size: 11px; padding: 4px 8px; }
+
+    /* Suggestion cards: tighter padding. */
+    .suggestion { padding: 8px 10px; }
+
+    /* Chat tab composer: less padding. */
+    #chat .chat-header { padding: 8px 10px; flex-wrap: wrap; }
+    #chat .chat-scroll { padding: 10px 12px; }
+    #chat .composer { padding: 8px 10px; }
+    #chat .cmsg { max-width: 92%; }
+
+    /* Modal-ish elements: leave room for the fixed back bar. */
+    .turn { padding: 10px 12px; margin-bottom: 8px; }
+
+    /* Bigger tap targets for clickable rows. */
+    tbody tr { min-height: 44px; }
+    tbody td { padding: 8px 6px; font-size: 12px; }
+    thead th { padding: 8px 6px; font-size: 10px; }
+  }
+
+  /* Phone (very narrow) — drop more columns to fit. */
+  @media (max-width: 480px) {
+    header h1 { display: none; }
+    /* Also hide tokens column on the request list to leave room for path. */
+    #rows tr td:nth-child(7),
+    table thead th:nth-child(7) { display: none; }
+    .cards { grid-template-columns: 1fr; }
+    .compare-grid { grid-template-columns: 1fr !important; }
+  }
   .setup-vars { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; }
   .setup-vars > div { margin: 4px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .setup-vars .label { width: 110px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -335,10 +468,11 @@
     <button class="tab active" id="tab-req" onclick="setView('requests')">Requests</button>
     <button class="tab" id="tab-convs" onclick="setView('convs')">Conversations</button>
     <button class="tab" id="tab-chat" onclick="setView('chat')">Chat</button>
+    <button class="tab" id="tab-tasks" onclick="setView('tasks')">Tasks <span id="tasks-badge" style="display:none;background:#7aaffe;color:#0e1014;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
     <button class="tab" id="tab-system" onclick="setView('system')">System</button>
     <button class="tab" id="tab-setup" onclick="setView('setup')">Setup</button>
     <button class="tab" id="tab-stats" onclick="setView('stats')">Stats</button>
-    <button class="tab" id="tab-audit" onclick="setView('audit')">Audit <span id="audit-badge" style="display:none;background:#bf616a;color:#fff;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
+    <button class="tab" id="tab-audit" onclick="setView('audit')">Audit <span id="audit-badge" title="Click ✕ to mark as seen" style="display:none;background:#bf616a;color:#fff;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
   </div>
   <span style="flex:1"></span>
   <span class="meta" id="count"></span>
@@ -348,18 +482,21 @@
 </header>
 <div id="main">
   <div id="list">
+    <div id="requests-pager"></div>
     <table>
       <thead><tr><th>Time</th><th>Client</th><th>Method</th><th>Path</th><th>Model</th><th>Status</th><th class="num">tokens</th><th class="ms">ms</th></tr></thead>
       <tbody id="rows"></tbody>
     </table>
     <div class="empty" id="empty">No requests captured yet.</div>
   </div>
+  <div id="mobile-back-btn" onclick="mobileBack()">← back to list</div>
   <div id="detail"><div class="empty">Select a request to inspect</div></div>
   <div id="stats"></div>
   <div id="audit"></div>
   <div id="convs"></div>
   <div id="system"></div>
   <div id="setup"></div>
+  <div id="tasks"></div>
   <div id="chat">
     <div class="chat-header">
       <span style="font-size:12px;color:#aaa">Model:</span>
@@ -388,25 +525,26 @@ const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&
 const num = (n) => (n == null ? '' : Number(n).toLocaleString());
 
 const VIEW_KEY = 'ai-proxy-active-view';
-const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat']);
+const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks']);
 
 function setView(v) {
   view = v;
-  for (const t of ['req','stats','audit','convs','system','setup','chat']) {
+  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
-  for (const c of ['stats','audit','convs','system','setup','chat']) {
+  for (const c of ['stats','audit','convs','system','setup','chat','tasks']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
   try { localStorage.setItem(VIEW_KEY, v); } catch {}
   if (v === 'stats') loadStats();
-  else if (v === 'audit') loadAudit();
+  else if (v === 'audit') { loadAudit(); refreshAuditBadge().then(dismissAuditBadge); }
   else if (v === 'convs') loadConversations();
   else if (v === 'system') loadSystem();
   else if (v === 'setup') loadSetup();
   else if (v === 'chat') loadChat();
+  else if (v === 'tasks') loadTasks();
   else refresh();
 }
 
@@ -419,17 +557,43 @@ async function loadInfo() {
   } catch {}
 }
 
+const REQ_PS_KEY = 'ai-proxy-requests-pagesize';
+let _reqPage = 1;
+let _reqTotal = 0;
+
 async function refresh() {
   try {
-    const d = await (await fetch('/__proxy/api/requests')).json();
+    const size = _getPageSize(REQ_PS_KEY, 50);
+    const offset = Math.max(0, (_reqPage - 1) * size);
+    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}`)).json();
     items = d.items;
+    _reqTotal = d.total || 0;
+    // Snap back to last page if current page is now beyond total (e.g. after Clear).
+    const maxPage = Math.max(1, Math.ceil(_reqTotal / size));
+    if (_reqPage > maxPage) { _reqPage = maxPage; return refresh(); }
     $('count').textContent = `${d.total} request${d.total === 1 ? '' : 's'}`;
+    renderRequestsPager();
     renderList();
     if (selected) {
       const still = items.find(i => i.id === selected);
       if (still) await loadDetail(selected);
     }
   } catch (e) { /* ignore transient errors */ }
+}
+
+function renderRequestsPager() {
+  const wrap = $('requests-pager');
+  if (!wrap) return;
+  const size = _getPageSize(REQ_PS_KEY, 50);
+  const totalPages = Math.max(1, Math.ceil(_reqTotal / size));
+  const start = _reqTotal ? (_reqPage - 1) * size : 0;
+  const end = Math.min(start + size, _reqTotal);
+  wrap.innerHTML = _pagerHtml('rq', { total: _reqTotal, totalPages, page: _reqPage, size, start });
+  _wirePager('rq', ({ size, pageDelta }) => {
+    if (size) { _setPageSize(REQ_PS_KEY, size); _reqPage = 1; }
+    if (pageDelta) _reqPage = Math.max(1, _reqPage + pageDelta);
+    refresh();
+  });
 }
 
 function fmt(ts) {
@@ -486,6 +650,16 @@ async function selectItem(id) {
   lastDetailSig = null;  // force re-render for newly opened item
   renderList();
   await loadDetail(id);
+}
+
+// Mobile-only: clear selection so the list re-shows. Bound to the sticky "← back" bar
+// that appears at narrow widths when a request is selected.
+function mobileBack() {
+  selected = null;
+  compareView = null;
+  lastDetailSig = null;
+  renderList();
+  $('detail').innerHTML = '<div class="empty">Select a request to inspect</div>';
 }
 
 function tryPretty(s) {
@@ -1616,17 +1790,183 @@ async function loadStats() {
   `;
 }
 
+// ---------- Audit pagination helpers ----------
+const AUDIT_EVENTS_PS_KEY = 'ai-proxy-audit-events-pagesize';
+const AUDIT_SUGGS_PS_KEY = 'ai-proxy-audit-suggs-pagesize';
+let _auditItemsCache = [];
+let _suggItemsCache = [];
+let _auditPage = 1;
+let _suggPage = 1;
+
+function _getPageSize(key, def) {
+  try { const n = parseInt(localStorage.getItem(key) || '', 10); return [10,20,50,100].includes(n) ? n : def; }
+  catch { return def; }
+}
+function _setPageSize(key, n) { try { localStorage.setItem(key, String(n)); } catch {} }
+
+function _paginate(items, page, size) {
+  const total = items.length;
+  const totalPages = Math.max(1, Math.ceil(total / size));
+  page = Math.max(1, Math.min(page, totalPages));
+  const start = (page - 1) * size;
+  return { slice: items.slice(start, start + size), total, totalPages, page, size, start };
+}
+function _pagerHtml(prefix, p) {
+  const opts = [10,20,50,100].map(n => `<option value="${n}" ${n===p.size?'selected':''}>${n}</option>`).join('');
+  return `<div style="display:flex;gap:8px;align-items:center;font-size:11px;color:#888;margin-top:8px;flex-wrap:wrap">
+    <span>${p.total ? `Showing ${p.start+1}–${Math.min(p.start+p.size, p.total)} of ${p.total}` : 'No items'}</span>
+    <span style="flex:1"></span>
+    <label>Per page <select id="${prefix}-pagesize" style="background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 4px;border-radius:3px;font-size:11px">${opts}</select></label>
+    <button id="${prefix}-prev" ${p.page<=1?'disabled':''} style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page<=1?'opacity:0.4;cursor:not-allowed':''}">‹ prev</button>
+    <span>page ${p.page} / ${p.totalPages}</span>
+    <button id="${prefix}-next" ${p.page>=p.totalPages?'disabled':''} style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page>=p.totalPages?'opacity:0.4;cursor:not-allowed':''}">next ›</button>
+  </div>`;
+}
+function _wirePager(prefix, onChange) {
+  const ps = $(`${prefix}-pagesize`);
+  const prev = $(`${prefix}-prev`);
+  const next = $(`${prefix}-next`);
+  if (ps) ps.onchange = (e) => onChange({ size: parseInt(e.target.value, 10) });
+  if (prev) prev.onclick = () => onChange({ pageDelta: -1 });
+  if (next) next.onclick = () => onChange({ pageDelta: 1 });
+}
+
+let _auditTotal = 0;
+let _auditEventsLoading = false;
+
+async function fetchAuditEventsPage() {
+  if (_auditEventsLoading) return;
+  _auditEventsLoading = true;
+  const wrap = $('audit-events-wrap');
+  try {
+    const size = _getPageSize(AUDIT_EVENTS_PS_KEY, 20);
+    const offset = Math.max(0, (_auditPage - 1) * size);
+    const r = await fetch(`/__proxy/api/audit?include_allow=false&limit=${size}&offset=${offset}`);
+    const a = await r.json();
+    _auditItemsCache = a.items || [];
+    _auditTotal = a.total || 0;
+    const maxPage = Math.max(1, Math.ceil(_auditTotal / size));
+    if (_auditPage > maxPage) { _auditPage = maxPage; _auditEventsLoading = false; return fetchAuditEventsPage(); }
+    renderAuditEvents();
+  } catch (e) {
+    if (wrap) wrap.innerHTML = `<div class="empty" style="padding:20px;color:#bf616a">${esc(e.message)}</div>`;
+  } finally {
+    _auditEventsLoading = false;
+  }
+}
+
+function renderAuditEvents() {
+  const wrap = $('audit-events-wrap');
+  if (!wrap) return;
+  const size = _getPageSize(AUDIT_EVENTS_PS_KEY, 20);
+  const totalPages = Math.max(1, Math.ceil(_auditTotal / size));
+  const start = _auditTotal ? (_auditPage - 1) * size : 0;
+  const p = { total: _auditTotal, totalPages, page: _auditPage, size, start };
+  const rowsHtml = _auditItemsCache.map(it => `<tr style="cursor:pointer" data-id="${esc(it.id)}">
+    <td style="font-size:11px;color:#888">${fmt(it.ts)}</td>
+    <td><span class="verdict ${esc(it.gate_verdict)}">${esc(it.gate_verdict)}</span></td>
+    <td><code>${esc(it.gate_rule || '')}</code></td>
+    <td>${esc(it.gate_reason || '')}</td>
+    <td>${esc(it.model || '')}</td>
+    <td><code style="font-size:11px">${esc(it.client_ip || '')}</code></td>
+    <td><code style="font-size:11px">${esc(it.path)}</code></td>
+  </tr>`).join('') || '<tr><td colspan="7" class="empty">No blocks or warnings yet</td></tr>';
+  wrap.innerHTML = `<table style="width:100%">
+    <thead><tr><th>Time</th><th>Verdict</th><th>Rule</th><th>Reason</th><th>Model</th><th>Client</th><th>Path</th></tr></thead>
+    <tbody>${rowsHtml}</tbody>
+  </table>${_pagerHtml('ae', p)}`;
+  for (const tr of wrap.querySelectorAll('tbody tr[data-id]')) {
+    tr.onclick = () => { setView('requests'); selectItem(tr.dataset.id); };
+  }
+  _wirePager('ae', ({ size, pageDelta }) => {
+    if (size) { _setPageSize(AUDIT_EVENTS_PS_KEY, size); _auditPage = 1; }
+    if (pageDelta) _auditPage = Math.max(1, _auditPage + pageDelta);
+    fetchAuditEventsPage();
+  });
+}
+
+let _suggLoaded = false;
+let _suggLoading = false;
+
+async function loadSuggestionsLazy() {
+  if (_suggLoading || _suggLoaded) return;
+  _suggLoading = true;
+  const wrap = $('audit-suggs-wrap');
+  const cnt = $('suggs-count');
+  if (wrap) wrap.innerHTML = '<div class="empty" style="padding:20px;color:#888">Scanning recent traffic…</div>';
+  if (cnt) cnt.textContent = '(loading…)';
+  try {
+    const s = await (await fetch('/__proxy/api/suggestions')).json();
+    _suggItemsCache = s.items || [];
+    _suggLoaded = true;
+    const sample = num(s.sample_size || 0);
+    if (cnt) cnt.textContent = _suggItemsCache.length ? `(${_suggItemsCache.length})` : `(no patterns from ${sample} requests)`;
+    if (_suggItemsCache.length) {
+      renderSuggestions();
+    } else if (wrap) {
+      wrap.innerHTML = `<div class="empty" style="padding:20px">No suggestions — analyzed ${sample} requests.</div>`;
+    }
+  } catch (e) {
+    if (wrap) wrap.innerHTML = `<div class="empty" style="padding:20px;color:#bf616a">${esc(e.message)}</div>`;
+    if (cnt) cnt.textContent = '(error)';
+  } finally {
+    _suggLoading = false;
+  }
+}
+
+function renderSuggestions() {
+  const wrap = $('audit-suggs-wrap');
+  if (!wrap) return;
+  const size = _getPageSize(AUDIT_SUGGS_PS_KEY, 20);
+  const p = _paginate(_suggItemsCache, _suggPage, size);
+  _suggPage = p.page;
+  // Preserve open/closed state of expanded suggestion items across re-renders.
+  const prevOpen = new Set();
+  for (const el of wrap.querySelectorAll('details.suggestion[open][data-sid]')) prevOpen.add(el.dataset.sid);
+  const prevSnipOpen = new Set();
+  for (const el of wrap.querySelectorAll('details.suggestion details[open][data-snip]')) prevSnipOpen.add(el.dataset.snip);
+  const html = p.slice.length ? p.slice.map(it => {
+    const sid = it.id || it.title;
+    const isOpen = prevOpen.has(sid);
+    const snipOpen = prevSnipOpen.has(sid);
+    return `<details class="suggestion ${esc(it.severity || '')}" data-sid="${esc(sid)}" ${isOpen ? 'open' : ''}>
+      <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px">
+        <span style="color:#666;font-size:10px;width:10px">▸</span>
+        <strong style="font-size:13px">${esc(it.title)}</strong>
+        <span style="color:#666;font-size:10px;text-transform:uppercase;letter-spacing:0.5px">${esc(it.severity || '')}</span>
+      </summary>
+      <div style="margin:8px 0 0 18px">
+        <div class="detail">${esc(it.detail)}</div>
+        ${it.snippet ? `<details data-snip="${esc(sid)}" ${snipOpen ? 'open' : ''}><summary style="cursor:pointer;color:#888;font-size:11px">show rules.json snippet</summary><pre>${esc(JSON.stringify(it.snippet, null, 2))}</pre></details>` : ''}
+      </div>
+    </details>`;
+  }).join('') : `<div class="empty" style="padding:20px">No suggestions on this page.</div>`;
+  wrap.innerHTML = html + _pagerHtml('su', p);
+  _wirePager('su', ({ size, pageDelta }) => {
+    if (size) { _setPageSize(AUDIT_SUGGS_PS_KEY, size); _suggPage = 1; }
+    if (pageDelta) _suggPage = Math.max(1, _suggPage + pageDelta);
+    renderSuggestions();
+  });
+}
+
 async function loadAudit() {
   // Preserve any in-progress edit in the rules textarea across the rebuild.
   const prevTa = $('rules-json');
   const wasDirty = prevTa && prevTa.classList.contains('dirty');
   const dirtyValue = wasDirty ? prevTa.value : null;
 
-  const [a, r, s] = await Promise.all([
-    fetch('/__proxy/api/audit?include_allow=false').then(x => x.json()),
+  // Audit events: fetch only the current page's worth (server-side pagination).
+  // Suggestions: deferred — only fetched when the section is expanded (it scans 5000 rows
+  // worth of bodies, so loading it eagerly slows the whole tab).
+  const size = _getPageSize(AUDIT_EVENTS_PS_KEY, 20);
+  const offset = Math.max(0, (_auditPage - 1) * size);
+  const [a, r] = await Promise.all([
+    fetch(`/__proxy/api/audit?include_allow=false&limit=${size}&offset=${offset}`).then(x => x.json()),
     fetch('/__proxy/api/rules').then(x => x.json()).catch(() => ({})),
-    fetch('/__proxy/api/suggestions').then(x => x.json()).catch(() => ({ items: [] })),
   ]);
+  _auditItemsCache = a.items || [];
+  _auditTotal = a.total || 0;
+  const s = { items: _suggItemsCache, sample_size: 0, _deferred: true };
   const counts = a.counts || {};
   const blocks = counts.block || 0;
   const warns = counts.warn || 0;
@@ -1646,48 +1986,13 @@ async function loadAudit() {
     return `<label class="quick-toggle"><input type="checkbox" id="${id}" ${c.enabled ? 'checked' : ''} onchange="toggleRule('${esc(name)}', this.checked)"> <code>${esc(name)}</code></label>`;
   }).join('');
 
-  const auditRows = (a.items || []).map(it => {
-    let detailsPretty = '';
-    if (it.gate_details) {
-      try { detailsPretty = JSON.stringify(JSON.parse(it.gate_details), null, 2); } catch { detailsPretty = it.gate_details; }
-    }
-    return `<tr style="cursor:pointer" data-id="${esc(it.id)}">
-      <td style="font-size:11px;color:#888">${fmt(it.ts)}</td>
-      <td><span class="verdict ${esc(it.gate_verdict)}">${esc(it.gate_verdict)}</span></td>
-      <td><code>${esc(it.gate_rule || '')}</code></td>
-      <td>${esc(it.gate_reason || '')}</td>
-      <td>${esc(it.model || '')}</td>
-      <td><code style="font-size:11px">${esc(it.client_ip || '')}</code></td>
-      <td><code style="font-size:11px">${esc(it.path)}</code></td>
-    </tr>`;
-  }).join('') || '<tr><td colspan="7" class="empty">No blocks or warnings yet</td></tr>';
-
-  const suggItems = (s.items || []);
-  // Capture open/closed state from previous render so auto-refresh doesn't thrash the UI.
-  const prevOpen = new Set();
-  for (const el of $('audit').querySelectorAll('details.suggestion[open][data-sid]')) prevOpen.add(el.dataset.sid);
-  const prevSnipOpen = new Set();
-  for (const el of $('audit').querySelectorAll('details.suggestion details[open][data-snip]')) prevSnipOpen.add(el.dataset.snip);
+  // Suggestions stays on its own page-state; auto-refresh shouldn't reset it.
+  const _sPS = _getPageSize(AUDIT_SUGGS_PS_KEY, 20);
+  const _sMaxPage = Math.max(1, Math.ceil(_suggItemsCache.length / _sPS));
+  if (_suggPage > _sMaxPage) _suggPage = _sMaxPage;
   const prevSectionOpenEl = $('suggestions-section');
   const prevSectionOpen = prevSectionOpenEl ? prevSectionOpenEl.hasAttribute('open') : null;
-
-  const suggestionsHtml = suggItems.length ? suggItems.map(it => {
-    const sid = it.id || it.title;
-    const isOpen = prevOpen.has(sid);
-    const snipOpen = prevSnipOpen.has(sid);
-    return `
-    <details class="suggestion ${esc(it.severity || '')}" data-sid="${esc(sid)}" ${isOpen ? 'open' : ''}>
-      <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px">
-        <span style="color:#666;font-size:10px;width:10px">▸</span>
-        <strong style="font-size:13px">${esc(it.title)}</strong>
-        <span style="color:#666;font-size:10px;text-transform:uppercase;letter-spacing:0.5px">${esc(it.severity || '')}</span>
-      </summary>
-      <div style="margin:8px 0 0 18px">
-        <div class="detail">${esc(it.detail)}</div>
-        ${it.snippet ? `<details data-snip="${esc(sid)}" ${snipOpen ? 'open' : ''}><summary style="cursor:pointer;color:#888;font-size:11px">show rules.json snippet</summary><pre>${esc(JSON.stringify(it.snippet, null, 2))}</pre></details>` : ''}
-      </div>
-    </details>`;
-  }).join('') : `<div class="empty" style="padding:20px">No suggestions yet — need more traffic to find patterns (analyzed ${num(s.sample_size || 0)} requests).</div>`;
+  const sampleSize = 0;  // suggestions are deferred; sample_size populated when loaded
 
   $('audit').innerHTML = `
     <div class="cards">
@@ -1732,18 +2037,15 @@ async function loadAudit() {
       </div>
     </div>
     <div class="stats-section">
-      <h2>Recent Block / Warn Events</h2>
-      <table style="width:100%">
-        <thead><tr><th>Time</th><th>Verdict</th><th>Rule</th><th>Reason</th><th>Model</th><th>Client</th><th>Path</th></tr></thead>
-        <tbody>${auditRows}</tbody>
-      </table>
+      <h2>Recent Block / Warn Events <span style="color:#666;font-weight:normal;font-size:11px">(${num(_auditTotal)} total)</span></h2>
+      <div id="audit-events-wrap"></div>
     </div>
-    <details class="stats-section" ${(prevSectionOpen === null ? (suggItems.length > 0) : prevSectionOpen) ? 'open' : ''} id="suggestions-section">
+    <details class="stats-section" ${prevSectionOpen ? 'open' : ''} id="suggestions-section">
       <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
         <span style="color:#888;font-size:10px;width:10px" class="caret">▾</span>
-        <h2 style="margin:0">Config Suggestions${suggItems.length ? ` <span style="color:#666;font-weight:normal;font-size:11px">(${suggItems.length})</span>` : ''}</h2>
+        <h2 style="margin:0">Config Suggestions <span style="color:#666;font-weight:normal;font-size:11px" id="suggs-count">${_suggItemsCache.length ? `(${_suggItemsCache.length})` : '(scans recent traffic — click to load)'}</span></h2>
       </summary>
-      ${suggestionsHtml}
+      <div id="audit-suggs-wrap">${_suggItemsCache.length ? '' : '<div class="empty" style="padding:20px;color:#888">Click to load — this scans up to 5000 recent requests for patterns.</div>'}</div>
     </details>
     <div class="stats-section">
       <h2>Export for AI review</h2>
@@ -1759,8 +2061,15 @@ async function loadAudit() {
       </div>
     </div>
   `;
-  for (const tr of $('audit').querySelectorAll('tbody tr[data-id]')) {
-    tr.onclick = () => { setView('requests'); selectItem(tr.dataset.id); };
+  renderAuditEvents();
+  if (_suggItemsCache.length) renderSuggestions();
+  // Wire suggestions section to lazy-load on first open.
+  const sg = $('suggestions-section');
+  if (sg) {
+    sg.ontoggle = () => {
+      if (sg.open && !_suggLoaded && !_suggLoading) loadSuggestionsLazy();
+    };
+    if (sg.open && !_suggLoaded && !_suggLoading) loadSuggestionsLazy();
   }
 
   // Populate the Rules Editor textarea with what's actually persisted (or the effective config if nothing is stored).
@@ -3094,15 +3403,41 @@ async function copySnippet(i, btn) {
   await copyText(s.code, btn);
 }
 
+const AUDIT_SEEN_KEY = 'ai-proxy-audit-seen-count';
+let _auditLastTotal = 0;
+
+function _readAuditSeen() {
+  try { return parseInt(localStorage.getItem(AUDIT_SEEN_KEY) || '0', 10) || 0; }
+  catch { return 0; }
+}
+function _writeAuditSeen(n) {
+  try { localStorage.setItem(AUDIT_SEEN_KEY, String(n)); } catch {}
+}
+function dismissAuditBadge() {
+  _writeAuditSeen(_auditLastTotal);
+  $('audit-badge').style.display = 'none';
+}
+
 async function refreshAuditBadge() {
   try {
     const a = await (await fetch('/__proxy/api/audit?include_allow=false&limit=1')).json();
     const blocks = (a.counts && a.counts.block) || 0;
     const warns = (a.counts && a.counts.warn) || 0;
     const total = blocks + warns;
+    _auditLastTotal = total;
+    const seen = _readAuditSeen();
+    // If audit log has shrunk (cleared), reset baseline so the badge stays consistent.
+    if (seen > total) _writeAuditSeen(total);
+    const unread = Math.max(0, total - _readAuditSeen());
     const b = $('audit-badge');
-    if (total > 0) { b.textContent = total; b.style.display = 'inline'; }
-    else { b.style.display = 'none'; }
+    if (unread > 0) {
+      b.innerHTML = `${unread} <span style="cursor:pointer;opacity:0.8;margin-left:2px" id="audit-badge-x" title="Mark as seen">✕</span>`;
+      b.style.display = 'inline';
+      const x = document.getElementById('audit-badge-x');
+      if (x) x.onclick = (e) => { e.stopPropagation(); dismissAuditBadge(); };
+    } else {
+      b.style.display = 'none';
+    }
   } catch {}
 }
 
@@ -3148,31 +3483,50 @@ async function chatPopulateModels() {
   const sel = $('chat-model');
   if (!sel) return;
   const prev = sel.value;
-  // Pull the current Ollama snapshot for available local models, plus a curated Anthropic list.
-  let ollama = [];
+  // Pull the current Ollama snapshot. Loaded models (in /api/ps) come first because they're
+  // already warm in VRAM — picking one avoids the 5-30s cold-load. Remaining tags are listed
+  // below as "available". Non-local providers (Anthropic etc.) are intentionally omitted —
+  // this UI is a quick scratchpad against your local backend.
+  let loaded = [];
+  let available = [];
   try {
     const sys = await (await fetch('/__proxy/api/system/now')).json();
+    const ps = (sys.ollama && sys.ollama.ps) || [];
     const tags = (sys.ollama && sys.ollama.tags) || [];
-    ollama = tags.map(t => t.name).filter(Boolean).sort();
+    loaded = ps.map(m => m.name || m.model).filter(Boolean);
+    const loadedSet = new Set(loaded);
+    available = tags.map(t => t.name).filter(Boolean).filter(n => !loadedSet.has(n)).sort();
   } catch {}
-  const anthropic = ['claude-opus-4-7', 'claude-sonnet-4-6', 'claude-haiku-4-5-20251001'];
   chatModels = [
-    ...anthropic.map(n => ({ name: n, kind: 'anthropic' })),
-    ...ollama.map(n => ({ name: n, kind: 'ollama' })),
+    ...loaded.map(n => ({ name: n, kind: 'ollama', loaded: true })),
+    ...available.map(n => ({ name: n, kind: 'ollama', loaded: false })),
   ];
-  sel.innerHTML = `
-    <optgroup label="Anthropic">
-      ${anthropic.map(n => `<option value="anthropic:${esc(n)}">${esc(n)}</option>`).join('')}
-    </optgroup>
-    <optgroup label="Ollama (local)">
-      ${ollama.length
-        ? ollama.map(n => `<option value="ollama:${esc(n)}">${esc(n)}</option>`).join('')
-        : '<option disabled>(no local models loaded)</option>'}
-    </optgroup>`;
+
+  const groups = [];
+  if (loaded.length) {
+    groups.push(
+      `<optgroup label="✓ Loaded in memory">` +
+      loaded.map(n => `<option value="ollama:${esc(n)}">${esc(n)}</option>`).join('') +
+      `</optgroup>`
+    );
+  }
+  if (available.length) {
+    groups.push(
+      `<optgroup label="Available (cold start)">` +
+      available.map(n => `<option value="ollama:${esc(n)}">${esc(n)}</option>`).join('') +
+      `</optgroup>`
+    );
+  }
+  if (!groups.length) groups.push('<option disabled>(no Ollama models — start one with `ollama run …`)</option>');
+  sel.innerHTML = groups.join('');
+
+  // Restore previous selection if it still exists; otherwise default to the first loaded model.
   if (prev) {
     const opts = Array.from(sel.options).map(o => o.value);
-    if (opts.includes(prev)) sel.value = prev;
+    if (opts.includes(prev)) { sel.value = prev; return; }
   }
+  const firstLoaded = sel.querySelector('optgroup[label^="✓"] option:not([disabled])');
+  if (firstLoaded) sel.value = firstLoaded.value;
 }
 
 function _chatRenderMarkdown(text) {
@@ -3387,6 +3741,223 @@ async function loadChat() {
   chatRender();
   setTimeout(() => $('chat-input')?.focus(), 100);
 }
+
+// ---------- Task queue (background runs) ----------
+let _tasksTimer = null;
+
+function _taskAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+function _taskNextRun(ts) {
+  if (!ts) return '';
+  const s = ts - Date.now()/1000;
+  if (s < 0) return 'due now';
+  if (s < 60) return 'in ' + Math.floor(s) + 's';
+  if (s < 3600) return 'in ' + Math.floor(s/60) + 'm';
+  if (s < 86400) return 'in ' + Math.floor(s/3600) + 'h';
+  return 'in ' + Math.floor(s/86400) + 'd';
+}
+function _taskBadge(s) {
+  const map = { pending: ['#5a7','⏳'], running: ['#7af','▶'], done: ['#5a5','✓'], failed: ['#a55','✗'], cancelled: ['#888','⊘'] };
+  const [c, ic] = map[s] || ['#888','?'];
+  return `<span style="color:${c};font-size:11px">${ic} ${s}</span>`;
+}
+
+async function loadTasks() {
+  const el = $('tasks');
+  if (!el.dataset.bound) {
+    el.dataset.bound = '1';
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
+        <h2 style="margin:0;font-size:14px;flex:1">📋 Task queue</h2>
+        <button id="tasks-refresh-btn" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+      </div>
+      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:8px;padding:12px;margin-bottom:14px">
+        <div style="font-size:12px;color:#aaa;margin-bottom:8px"><strong>+ Queue a task</strong> — agent tasks drive your VS Code session; chat tasks hit Ollama directly.</div>
+        <textarea id="t2-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:6px;align-items:center">
+          <label>Mode <select id="t2-mode" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px"><option value="chat">chat</option><option value="agent">agent</option></select></label>
+          <label id="t2-model-wrap">Model <select id="t2-model" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px;min-width:220px"></select></label>
+          <label id="t2-target-wrap" style="display:none">Endpoint <select id="t2-target" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px;min-width:220px"></select></label>
+          <label id="t2-approval-wrap" style="display:none">Approval <select id="t2-approval" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px"><option value="notify-phone">notify phone</option><option value="rules-only">rules only</option><option value="yolo">yolo</option></select></label>
+          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
+        </div>
+        <button id="t2-add" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#d8dee9;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Queue task</button>
+        <span id="t2-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
+      </div>
+      <h3 style="font-size:11px;text-transform:uppercase;color:#888;margin:14px 0 6px;letter-spacing:0.5px">Recurring</h3>
+      <div id="t2-recurring"></div>
+      <h3 style="font-size:11px;text-transform:uppercase;color:#888;margin:14px 0 6px;letter-spacing:0.5px">Recent runs</h3>
+      <div id="t2-recent"></div>
+    `;
+    $('tasks-refresh-btn').onclick = () => loadTasks();
+    $('t2-add').onclick = _addTaskMain;
+    $('t2-mode').onchange = _t2ApplyMode;
+    _t2ApplyMode();
+    _t2PopulateModels();
+    _t2PopulateEndpoints();
+  }
+  try {
+    const r = await fetch('/__proxy/api/control/tasks?limit=200');
+    const d = await r.json();
+    const items = d.items || [];
+    const recurring = items.filter(t => t.schedule);
+    const recent = items.filter(t => !t.schedule).slice(0, 50);
+    $('t2-recurring').innerHTML = recurring.length ? recurring.map(t => `
+      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:6px;padding:10px 12px;margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
+          <span style="font-size:11px;color:#7af">${esc(t.mode)}</span>
+          <span style="font-size:11px;color:#888;font-family:ui-monospace,monospace">${esc(t.schedule)}</span>
+          <span style="font-size:11px;color:${t.enabled ? '#5a5' : '#888'}">${t.enabled ? '● enabled' : '○ paused'}</span>
+          ${t.tool_approval_mode ? `<span style="font-size:11px;color:#666">${esc(t.tool_approval_mode)}</span>` : ''}
+          <span style="margin-left:auto;font-size:11px;color:#888">${_taskNextRun(t.next_run_ts)}</span>
+        </div>
+        <div style="font-size:13px;color:#d8dee9;white-space:pre-wrap;word-break:break-word;margin-bottom:8px">${esc((t.prompt||'').slice(0,300))}${(t.prompt||'').length>300?'…':''}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button data-t2-act="run-now" data-t2-id="${t.id}" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">▶ Run now</button>
+          <button data-t2-act="${t.enabled ? 'pause' : 'resume'}" data-t2-id="${t.id}" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">${t.enabled ? '⏸ Pause' : '▶ Resume'}</button>
+          <button data-t2-act="delete" data-t2-id="${t.id}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
+        </div>
+      </div>
+    `).join('') : '<div style="color:#666;font-size:12px;padding:6px">No recurring tasks.</div>';
+    $('t2-recent').innerHTML = recent.length ? recent.map(t => `
+      <details style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:6px;padding:8px 12px;margin-bottom:6px">
+        <summary style="cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+          ${_taskBadge(t.status)}
+          <span style="font-size:11px;color:#7af">${esc(t.mode)}</span>
+          <span style="font-size:11px;color:#888">${_taskAgo(t.created_ts)}</span>
+          ${t.parent_task_id ? `<span style="font-size:11px;color:#666">↳ recurring #${t.parent_task_id}</span>` : ''}
+          <span style="margin-left:auto;font-size:12px;color:#aaa;max-width:60%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc((t.prompt||'').slice(0,80))}${(t.prompt||'').length>80?'…':''}</span>
+        </summary>
+        <div style="margin-top:8px;font-size:12px">
+          <div style="color:#888;margin-bottom:4px"><strong>Prompt:</strong></div>
+          <div style="white-space:pre-wrap;word-break:break-word;background:#0e1014;padding:8px;border-radius:4px;margin-bottom:8px">${esc(t.prompt||'')}</div>
+          ${t.result ? `<div style="color:#888;margin-bottom:4px"><strong>Result:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#0e1014;padding:8px;border-radius:4px;margin-bottom:8px;max-height:400px;overflow:auto">${esc(t.result)}</div>` : ''}
+          ${t.error ? `<div style="color:#e08080;margin-bottom:4px"><strong>Error:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#2a1414;padding:8px;border-radius:4px;color:#e08080">${esc(t.error)}</div>` : ''}
+          <div style="display:flex;gap:6px;margin-top:8px">
+            ${(t.status === 'pending' || t.status === 'running') ? `<button data-t2-act="cancel" data-t2-id="${t.id}" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Cancel</button>` : ''}
+            <button data-t2-act="delete" data-t2-id="${t.id}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
+          </div>
+        </div>
+      </details>
+    `).join('') : '<div style="color:#666;font-size:12px;padding:6px">No tasks queued yet.</div>';
+    document.querySelectorAll('[data-t2-act]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.t2Id, act = btn.dataset.t2Act;
+        if (act === 'delete' && !confirm('Delete this task?')) return;
+        const method = act === 'delete' ? 'DELETE' : 'POST';
+        const url = act === 'delete' ? `/__proxy/api/control/tasks/${id}` : `/__proxy/api/control/tasks/${id}/${act}`;
+        await fetch(url, { method });
+        loadTasks();
+      };
+    });
+    // Tab badge
+    const open = items.filter(t => (t.status === 'pending' || t.status === 'running') && !t.schedule).length;
+    const badge = $('tasks-badge');
+    if (open) { badge.textContent = open; badge.style.display = ''; }
+    else { badge.style.display = 'none'; }
+  } catch (e) {
+    $('t2-recurring').innerHTML = `<div style="color:#e08080;font-size:12px">${esc(e.message)}</div>`;
+  }
+  if (_tasksTimer) clearInterval(_tasksTimer);
+  if (view === 'tasks') _tasksTimer = setInterval(() => { if (view === 'tasks') loadTasks(); else { clearInterval(_tasksTimer); _tasksTimer = null; } }, 4000);
+}
+
+function _t2ApplyMode() {
+  const m = $('t2-mode').value;
+  $('t2-model-wrap').style.display = (m === 'chat') ? '' : 'none';
+  $('t2-target-wrap').style.display = (m === 'agent') ? '' : 'none';
+  $('t2-approval-wrap').style.display = (m === 'agent') ? '' : 'none';
+}
+
+async function _t2PopulateModels() {
+  const sel = $('t2-model');
+  sel.innerHTML = '<option value="">(first loaded)</option>';
+  try {
+    const sys = await (await fetch('/__proxy/api/system')).json();
+    const ps = (sys.ollama && sys.ollama.ps) || [];
+    const tags = (sys.ollama && sys.ollama.tags) || [];
+    const loaded = ps.map(m => m.name || m.model).filter(Boolean);
+    const loadedSet = new Set(loaded);
+    const available = tags.map(t => t.name).filter(Boolean).filter(n => !loadedSet.has(n)).sort();
+    if (loaded.length) {
+      const og = document.createElement('optgroup'); og.label = '✓ Loaded in memory';
+      for (const n of loaded) {
+        const o = document.createElement('option'); o.value = n; o.textContent = n; og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+    if (available.length) {
+      const og = document.createElement('optgroup'); og.label = 'Available (cold start)';
+      for (const n of available) {
+        const o = document.createElement('option'); o.value = n; o.textContent = n; og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+  } catch {}
+}
+
+async function _t2PopulateEndpoints() {
+  const sel = $('t2-target');
+  sel.innerHTML = '<option value="">(newest registered)</option>';
+  try {
+    const d = await (await fetch('/__proxy/api/control/endpoints')).json();
+    for (const ep of (d.items || [])) {
+      const o = document.createElement('option');
+      o.value = ep.name;
+      o.textContent = `${ep.name} — ${ep.url}`;
+      sel.appendChild(o);
+    }
+  } catch {}
+}
+
+async function _addTaskMain() {
+  const prompt = $('t2-prompt').value.trim();
+  if (!prompt) { $('t2-err').textContent = 'prompt required'; return; }
+  const mode = $('t2-mode').value;
+  const body = { prompt, mode };
+  if (mode === 'agent') {
+    body.tool_approval_mode = $('t2-approval').value;
+    const tg = $('t2-target').value.trim(); if (tg) body.target_endpoint = tg;
+  } else {
+    const m = $('t2-model').value.trim(); if (m) body.model = m;
+  }
+  const sc = $('t2-schedule').value.trim(); if (sc) body.schedule = sc;
+  $('t2-err').textContent = '';
+  try {
+    const r = await fetch('/__proxy/api/control/tasks', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { $('t2-err').textContent = d.error || ('HTTP ' + r.status); return; }
+    $('t2-prompt').value = '';
+    $('t2-schedule').value = '';
+    loadTasks();
+  } catch (e) {
+    $('t2-err').textContent = e.message;
+  }
+}
+
+// Background badge update on the Tasks tab even when not viewing it.
+async function _refreshTasksBadge() {
+  try {
+    const r = await fetch('/__proxy/api/control/tasks?status=pending,running&limit=50');
+    const d = await r.json();
+    const open = (d.items || []).filter(t => !t.schedule).length;
+    const badge = $('tasks-badge');
+    if (open) { badge.textContent = open; badge.style.display = ''; }
+    else { badge.style.display = 'none'; }
+  } catch {}
+}
+setInterval(_refreshTasksBadge, 10000);
+_refreshTasksBadge();
 
 // Composer key bindings
 document.addEventListener('keydown', (e) => {

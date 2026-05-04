@@ -127,6 +127,7 @@
   <hr>
   <button id="menu-rename">✎ Rename current session</button>
   <button id="menu-permissions">🔐 Tool permissions <span id="menu-perm-count" style="color:#888;font-size:11px;margin-left:4px"></span></button>
+  <button id="menu-tasks">📋 Task queue <span id="menu-tasks-count" style="color:#888;font-size:11px;margin-left:4px"></span></button>
   <button id="menu-clear">🗑 Clear conversation</button>
   <button id="menu-panic" class="danger">🛑 Toggle PANIC mode</button>
   <hr>
@@ -147,6 +148,36 @@
     <div id="perm-pending"></div>
     <h3 style="font-size:11px;text-transform:uppercase;color:#aaa;margin:14px 0 4px;letter-spacing:0.5px">Persistent rules</h3>
     <div id="perm-rules"></div>
+  </div>
+</div>
+
+<!-- Task queue modal -->
+<div id="tasks-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:200;padding:env(safe-area-inset-top,16px) 12px env(safe-area-inset-bottom,16px)">
+  <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:10px;padding:14px;max-width:560px;margin:0 auto;max-height:88vh;overflow:auto">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+      <h2 style="margin:0;font-size:14px;flex:1">📋 Task queue</h2>
+      <button id="tasks-close" style="background:none;border:none;color:#aaa;font-size:18px;cursor:pointer">✕</button>
+    </div>
+    <div style="font-size:12px;color:#888;margin-bottom:8px">Queue prompts to run later. Agent tasks drive your VS Code session; chat tasks hit Ollama directly.</div>
+    <details style="margin-bottom:12px;background:#12141b;border:1px solid #2a2e3a;border-radius:8px;padding:8px 10px">
+      <summary style="cursor:pointer;font-size:12px;color:#aaa">+ Add task</summary>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-top:8px">
+        <textarea id="task-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:6px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box"></textarea>
+        <div style="display:flex;gap:6px;flex-wrap:wrap;font-size:12px">
+          <label>Mode <select id="task-mode" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:4px"><option value="chat">chat</option><option value="agent">agent</option></select></label>
+          <label id="task-approval-wrap" style="display:none">Approval <select id="task-approval" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:4px"><option value="notify-phone">notify phone</option><option value="rules-only">rules only</option><option value="yolo">yolo</option></select></label>
+        </div>
+        <label id="task-model-wrap" style="font-size:12px;color:#aaa;display:flex;flex-direction:column;gap:2px">Model <select id="task-model" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:6px;padding:6px 8px;font-size:12px;box-sizing:border-box"></select></label>
+        <label id="task-target-wrap" style="display:none;font-size:12px;color:#aaa;flex-direction:column;gap:2px">Endpoint <select id="task-target" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:6px;padding:6px 8px;font-size:12px;box-sizing:border-box"></select></label>
+        <input id="task-schedule" placeholder="schedule: blank = one-shot, 'every 30m', 'every 1d', or cron" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:6px;padding:6px 8px;font-size:12px;box-sizing:border-box">
+        <button id="task-add" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:6px;padding:8px;font-size:13px;cursor:pointer">Queue task</button>
+        <div id="task-add-err" style="color:#e08080;font-size:11px"></div>
+      </div>
+    </details>
+    <h3 style="font-size:11px;text-transform:uppercase;color:#aaa;margin:10px 0 4px;letter-spacing:0.5px">Recurring</h3>
+    <div id="tasks-recurring"></div>
+    <h3 style="font-size:11px;text-transform:uppercase;color:#aaa;margin:14px 0 4px;letter-spacing:0.5px">Recent runs</h3>
+    <div id="tasks-recent"></div>
   </div>
 </div>
 
@@ -864,13 +895,223 @@ $('session').onchange = () => {
   activeSession = $('session').value || 'auto';
   loadFeed(true);
 };
+// ---------- Task queue ----------
+let tasksRefreshTimer = null;
+
+function fmtTaskAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+function fmtNextRun(ts) {
+  if (!ts) return '';
+  const s = ts - Date.now()/1000;
+  if (s < 0) return 'due now';
+  if (s < 60) return 'in ' + Math.floor(s) + 's';
+  if (s < 3600) return 'in ' + Math.floor(s/60) + 'm';
+  if (s < 86400) return 'in ' + Math.floor(s/3600) + 'h';
+  return 'in ' + Math.floor(s/86400) + 'd';
+}
+function taskStatusBadge(s) {
+  const map = { pending: ['#5a7', '⏳'], running: ['#7af', '▶'], done: ['#5a5', '✓'], failed: ['#a55', '✗'], cancelled: ['#888', '⊘'] };
+  const [c, ic] = map[s] || ['#888', '?'];
+  return `<span style="color:${c};font-size:11px">${ic} ${s}</span>`;
+}
+
+async function loadTasks() {
+  try {
+    const r = await fetch('/__proxy/api/control/tasks?limit=200');
+    const d = await r.json();
+    const items = d.items || [];
+    const recurring = items.filter(t => t.schedule);
+    const recent = items.filter(t => !t.schedule).slice(0, 50);
+
+    $('tasks-recurring').innerHTML = recurring.length ? recurring.map(t => `
+      <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:8px;margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:6px;margin-bottom:4px">
+          <span style="font-size:11px;color:#7af">${escapeHtml(t.mode)}</span>
+          <span style="font-size:11px;color:#888">${escapeHtml(t.schedule)}</span>
+          <span style="font-size:11px;color:${t.enabled ? '#5a5' : '#888'}">${t.enabled ? 'enabled' : 'paused'}</span>
+          <span style="margin-left:auto;font-size:11px;color:#888">${fmtNextRun(t.next_run_ts)}</span>
+        </div>
+        <div style="font-size:12px;color:#d8dee9;white-space:pre-wrap;word-break:break-word;margin-bottom:6px">${escapeHtml((t.prompt||'').slice(0,200))}${(t.prompt||'').length>200?'…':''}</div>
+        <div style="display:flex;gap:6px;flex-wrap:wrap">
+          <button data-task-action="run-now" data-task-id="${t.id}" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">▶ Run now</button>
+          <button data-task-action="${t.enabled ? 'pause' : 'resume'}" data-task-id="${t.id}" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">${t.enabled ? '⏸ Pause' : '▶ Resume'}</button>
+          <button data-task-action="delete" data-task-id="${t.id}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">🗑</button>
+        </div>
+      </div>
+    `).join('') : '<div style="color:#666;font-size:12px;padding:6px">No recurring tasks.</div>';
+
+    $('tasks-recent').innerHTML = recent.length ? recent.map(t => `
+      <details style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:6px 8px;margin-bottom:6px">
+        <summary style="cursor:pointer;display:flex;align-items:center;gap:6px;flex-wrap:wrap">
+          ${taskStatusBadge(t.status)}
+          <span style="font-size:11px;color:#7af">${escapeHtml(t.mode)}</span>
+          <span style="font-size:11px;color:#888">${fmtTaskAgo(t.created_ts)}</span>
+          ${t.parent_task_id ? `<span style="font-size:11px;color:#666">↳ recurring #${t.parent_task_id}</span>` : ''}
+          <span style="margin-left:auto;font-size:11px;color:#aaa">${escapeHtml((t.prompt||'').slice(0,60))}${(t.prompt||'').length>60?'…':''}</span>
+        </summary>
+        <div style="margin-top:6px;font-size:12px">
+          <div style="color:#888;margin-bottom:4px"><strong>Prompt:</strong></div>
+          <div style="white-space:pre-wrap;word-break:break-word;background:#0e1014;padding:6px;border-radius:4px;margin-bottom:6px">${escapeHtml(t.prompt||'')}</div>
+          ${t.result ? `<div style="color:#888;margin-bottom:4px"><strong>Result:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#0e1014;padding:6px;border-radius:4px;margin-bottom:6px">${escapeHtml(t.result)}</div>` : ''}
+          ${t.error ? `<div style="color:#e08080;margin-bottom:4px"><strong>Error:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#2a1414;padding:6px;border-radius:4px;color:#e08080">${escapeHtml(t.error)}</div>` : ''}
+          <div style="display:flex;gap:6px;margin-top:6px">
+            ${(t.status === 'pending' || t.status === 'running') ? `<button data-task-action="cancel" data-task-id="${t.id}" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">Cancel</button>` : ''}
+            <button data-task-action="delete" data-task-id="${t.id}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 8px;font-size:11px;cursor:pointer">🗑</button>
+          </div>
+        </div>
+      </details>
+    `).join('') : '<div style="color:#666;font-size:12px;padding:6px">No tasks queued yet.</div>';
+
+    // Wire up action buttons
+    document.querySelectorAll('[data-task-action]').forEach(btn => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const id = btn.dataset.taskId;
+        const action = btn.dataset.taskAction;
+        if (action === 'delete' && !confirm('Delete this task?')) return;
+        const method = action === 'delete' ? 'DELETE' : 'POST';
+        const url = action === 'delete' ? `/__proxy/api/control/tasks/${id}` : `/__proxy/api/control/tasks/${id}/${action}`;
+        try {
+          await fetch(url, { method });
+          loadTasks();
+        } catch (err) { alert(err.message); }
+      };
+    });
+
+    // Update menu badge count: pending + running
+    const open = items.filter(t => (t.status === 'pending' || t.status === 'running') && !t.schedule).length;
+    $('menu-tasks-count').textContent = open ? `(${open})` : '';
+  } catch (e) {
+    $('tasks-recurring').innerHTML = `<div style="color:#e08080;font-size:11px">${escapeHtml(e.message)}</div>`;
+  }
+}
+
+function applyTaskMode() {
+  const m = $('task-mode').value;
+  $('task-model-wrap').style.display = (m === 'chat') ? 'flex' : 'none';
+  $('task-target-wrap').style.display = (m === 'agent') ? 'flex' : 'none';
+  $('task-approval-wrap').style.display = (m === 'agent') ? '' : 'none';
+}
+
+async function populateTaskModels() {
+  const sel = $('task-model');
+  sel.innerHTML = '<option value="">(first loaded)</option>';
+  try {
+    const sys = await (await fetch('/__proxy/api/system')).json();
+    const ps = (sys.ollama && sys.ollama.ps) || [];
+    const tags = (sys.ollama && sys.ollama.tags) || [];
+    const loaded = ps.map(m => m.name || m.model).filter(Boolean);
+    const loadedSet = new Set(loaded);
+    const available = tags.map(t => t.name).filter(Boolean).filter(n => !loadedSet.has(n)).sort();
+    if (loaded.length) {
+      const og = document.createElement('optgroup'); og.label = '✓ Loaded';
+      for (const n of loaded) {
+        const o = document.createElement('option'); o.value = n; o.textContent = n; og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+    if (available.length) {
+      const og = document.createElement('optgroup'); og.label = 'Available';
+      for (const n of available) {
+        const o = document.createElement('option'); o.value = n; o.textContent = n; og.appendChild(o);
+      }
+      sel.appendChild(og);
+    }
+  } catch {}
+}
+
+async function populateTaskEndpoints() {
+  const sel = $('task-target');
+  sel.innerHTML = '<option value="">(newest registered)</option>';
+  try {
+    const d = await (await fetch('/__proxy/api/control/endpoints')).json();
+    for (const ep of (d.items || [])) {
+      const o = document.createElement('option');
+      o.value = ep.name;
+      o.textContent = ep.name;
+      sel.appendChild(o);
+    }
+  } catch {}
+}
+
+async function addTask() {
+  const prompt = $('task-prompt').value.trim();
+  if (!prompt) { $('task-add-err').textContent = 'prompt required'; return; }
+  const mode = $('task-mode').value;
+  const body = { prompt, mode };
+  if (mode === 'agent') {
+    body.tool_approval_mode = $('task-approval').value;
+    const target = $('task-target').value.trim();
+    if (target) body.target_endpoint = target;
+  } else {
+    const model = $('task-model').value.trim();
+    if (model) body.model = model;
+  }
+  const schedule = $('task-schedule').value.trim();
+  if (schedule) body.schedule = schedule;
+  $('task-add-err').textContent = '';
+  try {
+    const r = await fetch('/__proxy/api/control/tasks', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { $('task-add-err').textContent = d.error || ('HTTP ' + r.status); return; }
+    $('task-prompt').value = '';
+    $('task-schedule').value = '';
+    loadTasks();
+  } catch (e) {
+    $('task-add-err').textContent = e.message;
+  }
+}
+
+function openTasksModal() {
+  closeMenu();
+  $('tasks-modal').style.display = '';
+  applyTaskMode();
+  populateTaskModels();
+  populateTaskEndpoints();
+  loadTasks();
+  if (tasksRefreshTimer) clearInterval(tasksRefreshTimer);
+  tasksRefreshTimer = setInterval(loadTasks, 4000);
+}
+function closeTasksModal() {
+  $('tasks-modal').style.display = 'none';
+  if (tasksRefreshTimer) { clearInterval(tasksRefreshTimer); tasksRefreshTimer = null; }
+}
+
+// Background refresh of the count badge so the user sees pending tasks even when modal closed.
+async function refreshTaskCountBadge() {
+  try {
+    const r = await fetch('/__proxy/api/control/tasks?status=pending,running&limit=50');
+    const d = await r.json();
+    const open = (d.items || []).filter(t => !t.schedule).length;
+    $('menu-tasks-count').textContent = open ? `(${open})` : '';
+  } catch {}
+}
+setInterval(refreshTaskCountBadge, 8000);
+refreshTaskCountBadge();
+
 $('menu-btn').onclick = toggleMenu;
 $('menu-clear').onclick = clearConversation;
 $('menu-panic').onclick = togglePanic;
 $('menu-fullui').onclick = () => { window.location.href = '/__proxy/'; };
 $('menu-rename').onclick = () => { closeMenu(); renameCurrentSession(); };
 $('menu-permissions').onclick = openPermissionsModal;
+$('menu-tasks').onclick = openTasksModal;
 $('perm-close').onclick = closePermissionsModal;
+$('tasks-close').onclick = closeTasksModal;
+$('task-add').onclick = addTask;
+$('task-mode').onchange = applyTaskMode;
+document.addEventListener('click', (e) => {
+  if (e.target.id === 'tasks-modal') closeTasksModal();
+});
 document.addEventListener('click', (e) => {
   if (e.target.id === 'perm-modal') closePermissionsModal();
 });
