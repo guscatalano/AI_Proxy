@@ -501,9 +501,51 @@
     <div class="chat-header">
       <span style="font-size:12px;color:#aaa">Model:</span>
       <select id="chat-model"></select>
+      <span style="font-size:12px;color:#aaa">Personality:</span>
+      <select id="chat-personality"></select>
+      <button onclick="chatOpenPersonalityModal()" title="Manage personalities">✎</button>
+      <span style="font-size:12px;color:#aaa;margin-left:8px">Tools:</span>
+      <label style="font-size:12px;color:#d8dee9"><input type="checkbox" id="chat-tool-memory"> memory</label>
+      <label style="font-size:12px;color:#d8dee9"><input type="checkbox" id="chat-tool-todos"> todos</label>
+      <label style="font-size:12px;color:#d8dee9"><input type="checkbox" id="chat-tool-web"> web</label>
+      <button onclick="chatOpenMemoryModal()" id="chat-mem-btn" title="View / edit / erase the active personality's memory">🧠 Memory</button>
       <button onclick="chatNew()">+ New chat</button>
       <span style="flex:1"></span>
       <span id="chat-status" style="color:#666;font-size:11px"></span>
+    </div>
+    <!-- Memory viewer modal -->
+    <div id="chat-mem-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:300;padding:20px">
+      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:10px;padding:18px;max-width:720px;margin:0 auto;max-height:88vh;overflow:auto">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+          <h2 style="margin:0;font-size:14px;flex:1">🧠 Memory <span id="chat-mem-title" style="color:#888;font-weight:normal;font-size:12px"></span></h2>
+          <button onclick="chatRefreshMemory()" style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+          <button onclick="chatCloseMemoryModal()" style="background:none;border:none;color:#aaa;font-size:18px;cursor:pointer">✕</button>
+        </div>
+        <div id="chat-mem-list"></div>
+        <div id="chat-mem-footer" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #2a2e3a;display:flex;align-items:center;gap:8px">
+          <span id="chat-mem-count" style="color:#888;font-size:11px;flex:1"></span>
+          <button onclick="chatEraseAllMemory()" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer">🗑 Erase all</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Personalities management modal -->
+    <div id="chat-pers-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:300;padding:20px">
+      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:10px;padding:18px;max-width:640px;margin:0 auto;max-height:88vh;overflow:auto">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
+          <h2 style="margin:0;font-size:14px;flex:1">Chat personalities</h2>
+          <button onclick="chatClosePersonalityModal()" style="background:none;border:none;color:#aaa;font-size:18px;cursor:pointer">✕</button>
+        </div>
+        <div style="font-size:12px;color:#888;margin-bottom:10px">A personality is a name plus a system prompt that gets prepended to every turn. Pick "(none)" in the chat to disable.</div>
+        <div id="chat-pers-list" style="margin-bottom:14px"></div>
+        <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:10px">
+          <div style="font-size:12px;color:#aaa;margin-bottom:6px"><strong>+ New personality</strong></div>
+          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
+          <textarea id="chat-pers-prompt" rows="6" placeholder="System prompt — describe how the model should respond." style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
+          <button onclick="chatAddPersonality()" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#d8dee9;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Save</button>
+          <span id="chat-pers-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
+        </div>
+      </div>
     </div>
     <div class="chat-scroll" id="chat-scroll">
       <div class="chat-empty" id="chat-empty">Pick a model and type below — your messages route through this proxy and the conversation appears in the Requests / Conversations tabs.</div>
@@ -923,7 +965,7 @@ function analyzeResponse(respBody, streamChunks) {
 function renderAnalysis(d) {
   const req = analyzeRequest(d.request_body);
   const resp = analyzeResponse(d.response_body, d.stream_chunks);
-  if (!req && (!resp.tool_calls.length && !resp.finish_reason && !resp.content_chars)) return '';
+  if (!req && (!resp.tool_calls.length && !resp.finish_reason && !resp.content_chars) && !d.proxy_tool_log) return '';
 
   let reqHtml = '';
   if (req) {
@@ -988,7 +1030,37 @@ function renderAnalysis(d) {
     `;
   }
 
-  return reqHtml + respHtml;
+  // Proxy-injected tool execution log: each row is a single tool call the proxy ran on
+  // behalf of the model (memory/todos/web_search), with what was passed in and what came
+  // out. Visible only when tool_injector actually fired on this request.
+  let toolLogHtml = '';
+  if (d.proxy_tool_log) {
+    let log = [];
+    try { log = JSON.parse(d.proxy_tool_log); } catch {}
+    if (Array.isArray(log) && log.length) {
+      const rows = log.map((e, i) => {
+        let inputPretty = '';
+        try { inputPretty = JSON.stringify(e.input, null, 2); } catch { inputPretty = String(e.input ?? ''); }
+        const errBadge = e.is_error ? ' <span class="verdict block">error</span>' : '';
+        const ms = e.duration_ms != null ? ` · ${e.duration_ms}ms` : '';
+        const iter = e.iteration ? ` · iter ${e.iteration}` : '';
+        return `<details ${e.is_error ? 'open' : ''} style="margin-bottom:6px">
+          <summary><code>${esc(e.name)}</code>${errBadge}${ms}${iter}</summary>
+          <div style="margin:6px 0 4px;font-size:11px;color:#88c0d0">→ called with</div>
+          <pre data-k="ptl-in-${i}" style="max-height:200px;font-size:11px">${esc(inputPretty)}</pre>
+          <div style="margin:6px 0 4px;font-size:11px;color:#a3be8c">→ returned</div>
+          <pre data-k="ptl-out-${i}" style="max-height:300px;font-size:11px">${esc(String(e.result || '').slice(0, 6000))}${(e.result || '').length > 6000 ? '\n…' : ''}</pre>
+        </details>`;
+      }).join('');
+      toolLogHtml = `
+        <div class="section"><h3>Proxy Tool Executions (${log.length})</h3>
+          <div style="font-size:11px;color:#888;margin-bottom:6px">Tools the proxy injected and ran server-side on the model's behalf. Results were fed back to the model as tool_result blocks.</div>
+          ${rows}
+        </div>`;
+    }
+  }
+
+  return reqHtml + respHtml + toolLogHtml;
 }
 
 // Heuristic: does this tool-result content look like an error? Returns { isError, excerpt }.
@@ -3459,15 +3531,73 @@ setInterval(() => {
 }, 1500);
 // ─── Simple chat tab ───
 const CHAT_KEY = 'ai-proxy-chat-state';
+const PERSONALITIES_KEY = 'ai-proxy-chat-personalities';
 let chatMessages = [];   // [{role, content, model?, ts, tokens?, ms?}]
 let chatModels = [];     // [{name, kind: 'ollama'|'anthropic'|'openai'}]
 let chatStreaming = false;
+let chatPersonalities = [];  // [{id, name, prompt}]
+
+async function chatMigratePersonalitiesIfNeeded() {
+  // One-time migration of localStorage personalities → server. Skips ids that already
+  // exist server-side, then clears localStorage so subsequent loads are pure API.
+  let local = [];
+  try { local = JSON.parse(localStorage.getItem(PERSONALITIES_KEY) || '[]') || []; } catch {}
+  if (!Array.isArray(local) || !local.length) return;
+  let serverIds = new Set();
+  try {
+    const r = await fetch('/__proxy/api/personalities');
+    const d = await r.json();
+    for (const p of (d.items || [])) serverIds.add(p.id);
+  } catch { return; /* don't drop localStorage if we can't reach server */ }
+  for (const p of local) {
+    if (!p || !p.id || serverIds.has(p.id)) continue;
+    try {
+      await fetch('/__proxy/api/personalities', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ id: p.id, name: p.name, prompt: p.prompt }),
+      });
+    } catch {}
+  }
+  try { localStorage.removeItem(PERSONALITIES_KEY); } catch {}
+}
+
+async function chatLoadPersonalities() {
+  await chatMigratePersonalitiesIfNeeded();
+  try {
+    const r = await fetch('/__proxy/api/personalities');
+    const d = await r.json();
+    chatPersonalities = d.items || [];
+  } catch { chatPersonalities = []; }
+}
+function chatRenderPersonalitySelect() {
+  const sel = $('chat-personality');
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">(none)</option>' +
+    chatPersonalities.map(p => `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join('');
+  if (prev && Array.from(sel.options).some(o => o.value === prev)) sel.value = prev;
+  sel.onchange = chatSaveState;
+}
+function chatGetActivePersonality() {
+  const id = $('chat-personality') ? $('chat-personality').value : '';
+  if (!id) return null;
+  return chatPersonalities.find(p => p.id === id) || null;
+}
 
 function chatLoadState() {
   try {
     const s = JSON.parse(localStorage.getItem(CHAT_KEY) || '{}');
     chatMessages = s.messages || [];
     if (s.model && $('chat-model')) $('chat-model').value = s.model;
+    if (s.personality && $('chat-personality')) {
+      const opts = Array.from($('chat-personality').options).map(o => o.value);
+      if (opts.includes(s.personality)) $('chat-personality').value = s.personality;
+    }
+    const tools = s.tools || {};
+    if ($('chat-tool-memory')) $('chat-tool-memory').checked = !!tools.memory;
+    if ($('chat-tool-todos')) $('chat-tool-todos').checked = !!tools.todos;
+    if ($('chat-tool-web')) $('chat-tool-web').checked = !!tools.web;
   } catch { chatMessages = []; }
 }
 function chatSaveState() {
@@ -3475,8 +3605,192 @@ function chatSaveState() {
     localStorage.setItem(CHAT_KEY, JSON.stringify({
       messages: chatMessages.slice(-100),
       model: $('chat-model') ? $('chat-model').value : '',
+      personality: $('chat-personality') ? $('chat-personality').value : '',
+      tools: {
+        memory: $('chat-tool-memory') ? $('chat-tool-memory').checked : false,
+        todos: $('chat-tool-todos') ? $('chat-tool-todos').checked : false,
+        web: $('chat-tool-web') ? $('chat-tool-web').checked : false,
+      },
     }));
   } catch {}
+}
+function chatActiveToolBundles() {
+  const out = [];
+  if ($('chat-tool-memory') && $('chat-tool-memory').checked) out.push('memory');
+  if ($('chat-tool-todos') && $('chat-tool-todos').checked) out.push('todos');
+  if ($('chat-tool-web') && $('chat-tool-web').checked) out.push('web_search');
+  return out;
+}
+
+// Personalities modal
+function chatOpenPersonalityModal() {
+  $('chat-pers-modal').style.display = '';
+  chatRenderPersonalityList();
+  $('chat-pers-name').focus();
+}
+function chatClosePersonalityModal() {
+  $('chat-pers-modal').style.display = 'none';
+}
+function chatRenderPersonalityList() {
+  const wrap = $('chat-pers-list');
+  if (!chatPersonalities.length) {
+    wrap.innerHTML = '<div style="color:#666;font-size:12px;padding:6px">No personalities yet — add one below.</div>';
+    return;
+  }
+  wrap.innerHTML = chatPersonalities.map(p => `
+    <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:10px;margin-bottom:6px">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" style="flex:1;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
+        <button data-pers-save="${esc(p.id)}" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Save</button>
+        <button data-pers-del="${esc(p.id)}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
+      </div>
+      <textarea data-pers-prompt="${esc(p.id)}" rows="4" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:6px;font-family:inherit;font-size:12px;resize:vertical;box-sizing:border-box">${esc(p.prompt)}</textarea>
+    </div>
+  `).join('');
+  wrap.querySelectorAll('[data-pers-save]').forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.persSave;
+      const p = chatPersonalities.find(x => x.id === id);
+      if (!p) return;
+      const name = (wrap.querySelector(`[data-pers-name="${id}"]`).value || '').trim();
+      const prompt = wrap.querySelector(`[data-pers-prompt="${id}"]`).value || '';
+      btn.disabled = true;
+      try {
+        const r = await fetch(`/__proxy/api/personalities/${encodeURIComponent(id)}`, {
+          method: 'PUT',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ name, prompt }),
+        });
+        if (!r.ok) { const d = await r.json(); throw new Error(d.error || 'HTTP ' + r.status); }
+        const updated = await r.json();
+        Object.assign(p, updated);
+        chatRenderPersonalitySelect();
+        btn.textContent = 'Saved ✓';
+        setTimeout(() => { btn.textContent = 'Save'; }, 1500);
+      } catch (e) {
+        btn.textContent = 'Error';
+        alert(e.message);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  });
+  wrap.querySelectorAll('[data-pers-del]').forEach(btn => {
+    btn.onclick = async () => {
+      const id = btn.dataset.persDel;
+      const p = chatPersonalities.find(x => x.id === id);
+      if (!p || !confirm(`Delete personality "${p.name}"?`)) return;
+      try {
+        const r = await fetch(`/__proxy/api/personalities/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        if (!r.ok) { const d = await r.json(); throw new Error(d.error || 'HTTP ' + r.status); }
+        chatPersonalities = chatPersonalities.filter(x => x.id !== id);
+        chatRenderPersonalitySelect();
+        chatRenderPersonalityList();
+      } catch (e) { alert(e.message); }
+    };
+  });
+}
+function _chatMemScope() {
+  const personality = chatGetActivePersonality();
+  return personality ? { scope: 'pers:' + personality.id, label: personality.name } : null;
+}
+
+function chatOpenMemoryModal() {
+  const ms = _chatMemScope();
+  if (!ms) {
+    alert('Pick a personality first — memory is scoped per-personality. With "(none)" selected, memory lives per-conversation; start a new chat to forget.');
+    return;
+  }
+  $('chat-mem-modal').style.display = '';
+  $('chat-mem-title').textContent = `(${ms.label})`;
+  chatRefreshMemory();
+}
+
+function chatCloseMemoryModal() { $('chat-mem-modal').style.display = 'none'; }
+
+async function chatRefreshMemory() {
+  const ms = _chatMemScope();
+  if (!ms) return;
+  const list = $('chat-mem-list');
+  list.innerHTML = '<div style="color:#666;font-size:12px;padding:12px">Loading…</div>';
+  try {
+    const r = await fetch('/__proxy/api/memory/' + encodeURIComponent(ms.scope));
+    const d = await r.json();
+    const items = d.items || [];
+    if (!items.length) {
+      list.innerHTML = `<div class="empty" style="padding:30px">No memory stored for "${esc(ms.label)}" yet.</div>`;
+      $('chat-mem-footer').style.display = 'none';
+      return;
+    }
+    list.innerHTML = items.map(it => `
+      <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:10px 12px;margin-bottom:6px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <code style="font-size:12px;color:#88c0d0;flex:1;word-break:break-all">${esc(it.key)}</code>
+          <span style="font-size:10px;color:#666" title="${new Date(it.updated_ts*1000).toLocaleString()}">${_taskAgo(it.updated_ts)}</span>
+          <button data-mem-del-key="${esc(it.key)}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">🗑</button>
+        </div>
+        <pre style="margin:0;background:#0e1014;padding:8px;border-radius:4px;font-size:12px;color:#d8dee9;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto">${esc(it.value)}</pre>
+      </div>
+    `).join('');
+    list.querySelectorAll('[data-mem-del-key]').forEach(btn => {
+      btn.onclick = async () => {
+        const k = btn.dataset.memDelKey;
+        if (!confirm(`Delete memory entry "${k}"?`)) return;
+        try {
+          const r = await fetch(
+            '/__proxy/api/memory/' + encodeURIComponent(ms.scope) +
+            '/key/' + encodeURIComponent(k),
+            { method: 'DELETE' }
+          );
+          if (!r.ok) { const d = await r.json(); throw new Error(d.error || 'HTTP ' + r.status); }
+          chatRefreshMemory();
+        } catch (e) { alert(e.message); }
+      };
+    });
+    $('chat-mem-footer').style.display = '';
+    $('chat-mem-count').textContent = `${items.length} entr${items.length === 1 ? 'y' : 'ies'}`;
+  } catch (e) {
+    list.innerHTML = `<div style="color:#bf616a;padding:12px">${esc(e.message)}</div>`;
+  }
+}
+
+async function chatEraseAllMemory() {
+  const ms = _chatMemScope();
+  if (!ms) return;
+  if (!confirm(`Erase ALL memory for "${ms.label}"?`)) return;
+  try {
+    const r = await fetch('/__proxy/api/memory/' + encodeURIComponent(ms.scope), { method: 'DELETE' });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || ('HTTP ' + r.status)); return; }
+    chatStatus(`Erased ${d.removed} memory entr${d.removed === 1 ? 'y' : 'ies'} for ${ms.label}`);
+    setTimeout(() => chatStatus(''), 3000);
+    chatRefreshMemory();
+  } catch (e) { alert(e.message); }
+}
+
+async function chatAddPersonality() {
+  const name = $('chat-pers-name').value.trim();
+  const prompt = $('chat-pers-prompt').value.trim();
+  const errEl = $('chat-pers-err');
+  if (!name) { errEl.textContent = 'name required'; return; }
+  if (!prompt) { errEl.textContent = 'prompt required'; return; }
+  errEl.textContent = '';
+  try {
+    const r = await fetch('/__proxy/api/personalities', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name, prompt }),
+    });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.error || ('HTTP ' + r.status); return; }
+    chatPersonalities.push(d);
+    chatRenderPersonalitySelect();
+    chatRenderPersonalityList();
+    $('chat-pers-name').value = '';
+    $('chat-pers-prompt').value = '';
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
 }
 
 async function chatPopulateModels() {
@@ -3642,12 +3956,39 @@ async function _chatSendOpenAI(modelName, assistantIdx) {
     role: m.role === 'model' ? 'assistant' : m.role,
     content: m.content,
   }));
+  const personality = chatGetActivePersonality();
+  if (personality && personality.prompt) {
+    messages.unshift({ role: 'system', content: personality.prompt });
+  }
+  const headers = { 'content-type': 'application/json', 'x-client-name': 'ai-proxy-chat' };
+  const bundles = chatActiveToolBundles();
+  if (bundles.length) headers['x-proxy-tools'] = bundles.join(',');
+  // Scope memory by personality so e.g. a "Vera" personality remembers your name across
+  // conversations, while a "Pirate" personality has its own separate memory store.
+  if (personality && personality.id && bundles.includes('memory')) {
+    headers['x-proxy-memory-scope'] = 'pers:' + personality.id;
+  }
+  // Tool calls require non-streaming for the proxy's tool-loop to work; otherwise stream.
+  const wantStream = bundles.length === 0;
   const r = await fetch('/v1/chat/completions', {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ model: modelName, messages, stream: true, stream_options: { include_usage: true } }),
+    headers,
+    body: JSON.stringify({
+      model: modelName, messages,
+      stream: wantStream,
+      ...(wantStream ? { stream_options: { include_usage: true } } : {}),
+    }),
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
+  if (!wantStream) {
+    // Non-streaming path used when proxy tools are active. Proxy runs the tool loop and
+    // returns the final assistant message; we just paint it.
+    const j = await r.json();
+    const content = ((j.choices || [])[0] || {}).message?.content || '';
+    chatMessages[assistantIdx].content = content;
+    chatRender();
+    return;
+  }
   const reader = r.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
@@ -3695,6 +4036,7 @@ async function _chatSendAnthropic(modelName, assistantIdx) {
       'content-type': 'application/json',
       'x-api-key': apiKey,
       'anthropic-version': '2023-06-01',
+      'x-client-name': 'ai-proxy-chat',
     },
     body: JSON.stringify({ model: modelName, max_tokens: 4096, messages, stream: true }),
   });
@@ -3736,9 +4078,15 @@ async function _chatSendAnthropic(modelName, assistantIdx) {
 }
 
 async function loadChat() {
+  await chatLoadPersonalities();
+  chatRenderPersonalitySelect();
   await chatPopulateModels();
   chatLoadState();
   chatRender();
+  for (const id of ['chat-tool-memory', 'chat-tool-todos', 'chat-tool-web']) {
+    const el = $(id);
+    if (el && !el.dataset.bound) { el.dataset.bound = '1'; el.onchange = chatSaveState; }
+  }
   setTimeout(() => $('chat-input')?.focus(), 100);
 }
 

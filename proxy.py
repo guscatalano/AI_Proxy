@@ -168,6 +168,15 @@ CREATE TABLE IF NOT EXISTS tool_permissions (
     created_ts REAL
 );
 
+CREATE TABLE IF NOT EXISTS proxy_personalities (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    created_ts REAL NOT NULL,
+    updated_ts REAL NOT NULL,
+    creator_ip TEXT
+);
+
 CREATE TABLE IF NOT EXISTS proxy_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     prompt TEXT NOT NULL,
@@ -215,6 +224,7 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN client_app TEXT",
     "ALTER TABLE requests ADD COLUMN shadow_of TEXT",
     "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
+    "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
 ]
 
 
@@ -4383,6 +4393,152 @@ async def control_task_run_now(task_id: int, request: Request):
     return {"ok": True, "child_task_id": child_id}
 
 
+# -------- Chat personalities (server-side, subnet-scoped) --------
+
+def _personality_visible_to(viewer_ip: str | None, creator_ip: str | None) -> bool:
+    """Same subnet-visibility rule as tasks/PII redaction."""
+    if not creator_ip:
+        return True
+    return _ips_share_subnet(viewer_ip, creator_ip)
+
+
+@app.get("/__proxy/api/memory/{scope:path}")
+async def memory_get(scope: str):
+    """Return all memory entries for a scope. Sorted by most recently updated."""
+    if not scope or len(scope) > 200:
+        return JSONResponse({"error": "invalid scope"}, status_code=400)
+    conn = db()
+    rows = conn.execute(
+        "SELECT key, value, created_ts, updated_ts FROM proxy_memory "
+        "WHERE conversation_id = ? ORDER BY updated_ts DESC",
+        (scope,),
+    ).fetchall()
+    conn.close()
+    items = [dict(r) for r in rows]
+    return {"scope": scope, "count": len(items), "items": items}
+
+
+@app.delete("/__proxy/api/memory/{scope:path}/key/{key:path}")
+async def memory_delete_key(scope: str, key: str):
+    """Delete a single memory entry by key under a scope."""
+    if not scope or not key or len(scope) > 200 or len(key) > 500:
+        return JSONResponse({"error": "invalid scope or key"}, status_code=400)
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM proxy_memory WHERE conversation_id = ? AND key = ?", (scope, key)
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.delete("/__proxy/api/memory/{scope:path}")
+async def memory_delete(scope: str):
+    """Erase all memory entries for a scope (e.g. 'pers:p_abc12345' wipes a personality)."""
+    if not scope or len(scope) > 200:
+        return JSONResponse({"error": "invalid scope"}, status_code=400)
+    conn = db()
+    cur = conn.execute(
+        "DELETE FROM proxy_memory WHERE conversation_id = ?", (scope,)
+    )
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.get("/__proxy/api/personalities")
+async def personalities_list(request: Request):
+    viewer = _client_ip(request)
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, name, prompt, created_ts, updated_ts, creator_ip "
+        "FROM proxy_personalities ORDER BY name COLLATE NOCASE"
+    ).fetchall()
+    conn.close()
+    items = [dict(r) for r in rows if _personality_visible_to(viewer, r["creator_ip"])]
+    return {"items": items}
+
+
+@app.post("/__proxy/api/personalities")
+async def personalities_create(request: Request):
+    """Create a personality. Body: {name, prompt, id?}. id is optional — if supplied (used
+    by the localStorage migration path), it must match [a-zA-Z0-9_-]{1,64}; if absent, a
+    new id is generated."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    name = (payload.get("name") or "").strip()
+    prompt_text = (payload.get("prompt") or "").strip()
+    if not name:
+        return JSONResponse({"error": "'name' is required"}, status_code=400)
+    if not prompt_text:
+        return JSONResponse({"error": "'prompt' is required"}, status_code=400)
+    pid = (payload.get("id") or "").strip() or ("p_" + uuid.uuid4().hex[:8])
+    if not re.match(r"^[a-zA-Z0-9_-]{1,64}$", pid):
+        return JSONResponse({"error": "invalid id (allowed: a-z, A-Z, 0-9, _, -)"}, status_code=400)
+    creator_ip = _client_ip(request)
+    now = time.time()
+    conn = db()
+    try:
+        conn.execute(
+            """INSERT INTO proxy_personalities (id, name, prompt, created_ts, updated_ts, creator_ip)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (pid, name[:200], prompt_text, now, now, creator_ip),
+        )
+    except sqlite3.IntegrityError:
+        conn.close()
+        return JSONResponse({"error": f"id {pid!r} already exists"}, status_code=409)
+    conn.commit()
+    row = conn.execute("SELECT * FROM proxy_personalities WHERE id=?", (pid,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+@app.put("/__proxy/api/personalities/{pid}")
+async def personalities_update(pid: str, request: Request):
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    conn = db()
+    row = conn.execute("SELECT creator_ip FROM proxy_personalities WHERE id=?", (pid,)).fetchone()
+    if not row or not _personality_visible_to(_client_ip(request), row["creator_ip"]):
+        conn.close()
+        return JSONResponse({"error": "not found"}, status_code=404)
+    fields, params = [], []
+    if isinstance(payload.get("name"), str) and payload["name"].strip():
+        fields.append("name=?")
+        params.append(payload["name"].strip()[:200])
+    if isinstance(payload.get("prompt"), str) and payload["prompt"].strip():
+        fields.append("prompt=?")
+        params.append(payload["prompt"].strip())
+    if not fields:
+        conn.close()
+        return JSONResponse({"error": "nothing to update"}, status_code=400)
+    fields.append("updated_ts=?")
+    params.append(time.time())
+    params.append(pid)
+    conn.execute(f"UPDATE proxy_personalities SET {','.join(fields)} WHERE id=?", params)
+    conn.commit()
+    out = dict(conn.execute("SELECT * FROM proxy_personalities WHERE id=?", (pid,)).fetchone())
+    conn.close()
+    return out
+
+
+@app.delete("/__proxy/api/personalities/{pid}")
+async def personalities_delete(pid: str, request: Request):
+    conn = db()
+    row = conn.execute("SELECT creator_ip FROM proxy_personalities WHERE id=?", (pid,)).fetchone()
+    if not row or not _personality_visible_to(_client_ip(request), row["creator_ip"]):
+        conn.close()
+        return JSONResponse({"error": "not found"}, status_code=404)
+    conn.execute("DELETE FROM proxy_personalities WHERE id=?", (pid,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
 @app.get("/__proxy/remote")
 async def remote_pwa():
     """Mobile-first PWA for sending prompts to registered control endpoints + panic toggle."""
@@ -5887,6 +6043,26 @@ PROXY_TOOLS_TODOS: list[dict] = [
 ]
 
 
+PROXY_TOOLS_WEB: list[dict] = [
+    {
+        "name": "web_search",
+        "description": (
+            "Search the web for up-to-date information. Returns the top results with title, "
+            "URL, and snippet. Use when the user asks about current events, recent docs, or "
+            "facts you may not be sure about — not for opinions or things obvious from context."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "num_results": {"type": "integer", "description": "Max results (1-10, default 5)"},
+            },
+            "required": ["query"],
+        },
+    },
+]
+
+
 def _resolve_tool_injector_cfg(ctx: dict | None = None) -> dict:
     """Return the effective tool_injector config for a request. Walks `scopes` (a list of
     {match: {...}, ...overrides}) in order — the first match's overrides are merged onto
@@ -5896,6 +6072,18 @@ def _resolve_tool_injector_cfg(ctx: dict | None = None) -> dict:
     A scope match is ALL of: ip (exact), ip_cidr, user_agent (substring, case-insensitive),
     client_app (exact). Empty match {} matches nothing (avoids accidentally global rules)."""
     cfg = dict(load_rules_config().get("tool_injector") or {})
+    # Per-request override via X-Proxy-Tools header. Wins over both root config and scopes —
+    # explicit opt-in from the caller. Empty list = explicit no-tools (still enables nothing).
+    if ctx and isinstance(ctx.get("tool_bundles_override"), list):
+        bundles = set(ctx["tool_bundles_override"])
+        out = {**cfg, "enabled": True, "memory": False, "todos": False, "web_search": False,
+               "_override": True}
+        if "memory" in bundles: out["memory"] = True
+        if "todos" in bundles: out["todos"] = True
+        if "web_search" in bundles or "web" in bundles: out["web_search"] = True
+        if not (out["memory"] or out["todos"] or out["web_search"]):
+            out["enabled"] = False
+        return out
     scopes = cfg.get("scopes") or []
     if not isinstance(scopes, list) or not ctx:
         return cfg
@@ -5939,20 +6127,136 @@ def _active_proxy_tools(ctx: dict | None = None) -> list[dict]:
     (root config + any matching scope override)."""
     cfg = _resolve_tool_injector_cfg(ctx)
     out: list[dict] = []
-    if cfg.get("memory", True):
+    # When override is in effect, default-off; otherwise default-on for memory/todos
+    # (preserves prior behavior where memory/todos were on by default once enabled).
+    is_override = bool(cfg.get("_override"))
+    if cfg.get("memory", not is_override):
         out.extend(PROXY_TOOLS_MEMORY)
-    if cfg.get("todos", True):
+    if cfg.get("todos", not is_override):
         out.extend(PROXY_TOOLS_TODOS)
+    if cfg.get("web_search", False):
+        out.extend(PROXY_TOOLS_WEB)
     return out
 
 
 # Combined name set used by post-flight detection. Static (covers everything we might inject).
-PROXY_TOOLS: list[dict] = PROXY_TOOLS_MEMORY + PROXY_TOOLS_TODOS
+PROXY_TOOLS: list[dict] = PROXY_TOOLS_MEMORY + PROXY_TOOLS_TODOS + PROXY_TOOLS_WEB
 PROXY_TOOL_NAMES: set[str] = {t["name"] for t in PROXY_TOOLS}
 
 
-def _exec_proxy_tool(name: str, args, conversation_id: str | None) -> tuple[str, bool]:
-    """Run a proxy-owned tool. Returns (result_text, is_error)."""
+async def _exec_web_search(query: str, num: int) -> tuple[str, bool]:
+    """Web search. Uses Brave Search API when BRAVE_SEARCH_API_KEY is set, otherwise falls
+    back to scraping DuckDuckGo HTML. Returns (text_block, is_error)."""
+    if not query:
+        return ("Error: 'query' is required.", True)
+    num = max(1, min(int(num or 5), 10))
+    api_key = (os.environ.get("BRAVE_SEARCH_API_KEY") or "").strip()
+    if api_key:
+        return await _exec_web_search_brave(query, num, api_key)
+    return await _exec_web_search_ddg(query, num)
+
+
+async def _exec_web_search_brave(query: str, num: int, api_key: str) -> tuple[str, bool]:
+    """Brave Search Web API. https://api.search.brave.com/res/v1/web/search"""
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "gzip",
+        "X-Subscription-Token": api_key,
+    }
+    params = {"q": query, "count": str(num)}
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=headers) as cli:
+            r = await cli.get("https://api.search.brave.com/res/v1/web/search", params=params)
+    except Exception as e:
+        return (f"Brave search failed: {e}", True)
+    if r.status_code != 200:
+        return (f"Brave search failed: HTTP {r.status_code}: {r.text[:200]}", True)
+    try:
+        j = r.json()
+    except (json.JSONDecodeError, ValueError):
+        return ("Brave search: invalid JSON response", True)
+    results = ((j.get("web") or {}).get("results") or [])[:num]
+    if not results:
+        return (f"No results for '{query}'.", False)
+    lines = []
+    for i, item in enumerate(results, start=1):
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        desc = re.sub(r"<[^>]+>", "", item.get("description") or "").strip()
+        lines.append(f"{i}. {title}\n   {url}\n   {desc[:300]}")
+    return ("\n\n".join(lines), False)
+
+
+async def _exec_web_search_ddg(query: str, num: int) -> tuple[str, bool]:
+    """DuckDuckGo HTML scrape fallback. No API key needed but rate-limited and brittle."""
+    import urllib.parse as _up
+    import html as _html
+    url = "https://html.duckduckgo.com/html/?q=" + _up.quote(query)
+    headers = {
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:120.0) Gecko/20100101 Firefox/120.0",
+        "accept-language": "en-US,en;q=0.5",
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0, headers=headers, follow_redirects=True) as cli:
+            r = await cli.get(url)
+    except Exception as e:
+        return (f"Search failed: {e}", True)
+    if r.status_code != 200:
+        return (f"Search failed: HTTP {r.status_code}", True)
+    pattern = re.compile(
+        r'<a[^>]+class="result__a"[^>]+href="([^"]+)"[^>]*>(.*?)</a>.*?'
+        r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>',
+        re.DOTALL,
+    )
+    results = []
+    for m in pattern.finditer(r.text):
+        if len(results) >= num:
+            break
+        href = _html.unescape(m.group(1))
+        title = _html.unescape(re.sub(r'<[^>]+>', '', m.group(2))).strip()
+        snippet = _html.unescape(re.sub(r'<[^>]+>', '', m.group(3))).strip()
+        if "uddg=" in href:
+            try:
+                params = _up.parse_qs(_up.urlparse(href).query)
+                if "uddg" in params:
+                    href = _up.unquote(params["uddg"][0])
+            except (ValueError, TypeError):
+                pass
+        if href.startswith("//"):
+            href = "https:" + href
+        results.append((title, href, snippet[:300]))
+    if not results:
+        return (f"No results for '{query}'.", False)
+    out = "\n\n".join(f"{i+1}. {t}\n   {u}\n   {s}" for i, (t, u, s) in enumerate(results))
+    return (out, False)
+
+
+async def _exec_proxy_tool(name: str, args, conversation_id: str | None,
+                           memory_scope: str | None = None) -> tuple[str, bool]:
+    """Run a proxy-owned tool. Returns (result_text, is_error). Async because some tools
+    (web_search) make outbound HTTP. memory_scope (when set) overrides conversation_id for
+    memory tools only — lets the chat UI scope memory by personality so it persists across
+    conversations."""
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except (json.JSONDecodeError, TypeError):
+            args = {}
+    if not isinstance(args, dict):
+        args = {}
+    if name == "web_search":
+        return await _exec_web_search(
+            (args.get("query") or "").strip(),
+            args.get("num_results") or 5,
+        )
+    # Memory tools route through memory_scope when present; todos always use conversation_id.
+    if name in ("remember", "recall", "list_memory", "forget"):
+        return _exec_proxy_tool_sync(name, args, memory_scope or conversation_id)
+    return _exec_proxy_tool_sync(name, args, conversation_id)
+
+
+def _exec_proxy_tool_sync(name: str, args: dict, conversation_id: str | None) -> tuple[str, bool]:
+    """Sync handler for DB-only tools (memory, todos)."""
     if isinstance(args, str):
         try:
             args = json.loads(args)
@@ -6132,9 +6436,9 @@ def _detect_body_shape(body: dict) -> str:
 
 def _inject_proxy_tools(body: dict, ctx: dict | None = None) -> int:
     """Append proxy-owned tool definitions to body['tools']. Returns count of injected tools.
-    Skips clients that don't already declare tools[] (they likely don't expect tool calls).
-    Skips any tool whose name collides with a client-declared tool. Effective config is the
-    root tool_injector config plus any matching scope (see _resolve_tool_injector_cfg)."""
+    Skips clients that don't already declare tools[] (they likely don't expect tool calls)
+    UNLESS the caller explicitly opted in via X-Proxy-Tools header (override path). Skips
+    any tool whose name collides with a client-declared tool."""
     if not isinstance(body, dict):
         return 0
     cfg = _resolve_tool_injector_cfg(ctx)
@@ -6144,7 +6448,13 @@ def _inject_proxy_tools(body: dict, ctx: dict | None = None) -> int:
     if not active:
         return 0
     tools = body.get("tools")
-    if not isinstance(tools, list) or not tools:
+    if not isinstance(tools, list):
+        if cfg.get("_override"):
+            tools = []
+            body["tools"] = tools
+        else:
+            return 0
+    elif not tools and not cfg.get("_override"):
         return 0
     existing = set(_tool_names_from_body(body))
     shape = _detect_body_shape(body)
@@ -6358,6 +6668,17 @@ async def proxy(full_path: str, request: Request):
         "user_agent": request.headers.get("user-agent", ""),
         "client_app": _detect_client_app(dict(request.headers), body_json if isinstance(body_json, dict) else None),
     }
+    # X-Proxy-Tools: comma-separated bundle list (memory,todos,web_search). Caller-driven
+    # opt-in for which proxy tools to inject this request — overrides config + scopes.
+    _xpt = request.headers.get("x-proxy-tools")
+    if _xpt is not None:
+        _ti_ctx["tool_bundles_override"] = [t.strip().lower() for t in _xpt.split(",") if t.strip()]
+    # X-Proxy-Memory-Scope: optional override for the memory-tool storage key. The chat UI
+    # uses `pers:<personality_id>` so memory persists across conversations under the same
+    # personality (useful for things like name/preferences/PII you want a personality to keep).
+    _xms = (request.headers.get("x-proxy-memory-scope") or "").strip()
+    if _xms:
+        _ti_ctx["memory_scope"] = _xms[:200]
     tool_injection_count = _inject_proxy_tools(body_json, _ti_ctx) if isinstance(body_json, dict) else 0
     tool_injection_active = tool_injection_count > 0
     body_mutated = bool(
@@ -6368,12 +6689,20 @@ async def proxy(full_path: str, request: Request):
     if body_mutated:
         # Re-serialize the body so all mutations are forwarded upstream.
         body = json.dumps(body_json).encode("utf-8")
+        # Update the saved request_body so the request inspector shows what we actually
+        # sent upstream (with tools injected, options merged, model rewritten, etc.) rather
+        # than the original client-sent body. Without this, the inspector hides anything
+        # the proxy added — which makes "did my tool get injected?" hard to verify.
+        conn = db()
+        conn.execute(
+            "UPDATE requests SET request_body=? WHERE id=?",
+            (body.decode("utf-8", errors="replace"), req_id),
+        )
         if rewrite:
             model = body_json.get("model")
-            conn = db()
             conn.execute("UPDATE requests SET model=? WHERE id=?", (model, req_id))
-            conn.commit()
-            conn.close()
+        conn.commit()
+        conn.close()
 
     # Phase 2: block/warn rules.
     gate = evaluate_rules(body_json)
@@ -6502,15 +6831,46 @@ async def proxy(full_path: str, request: Request):
         cur_body = current_body
         cur_conv = _conversation_id(body_json)
         followup_headers = list(headers_out)
-        # Force identity encoding on followups (already in headers_out, but be defensive).
+        # Accumulated log of every proxy-tool call across all iterations. Written to the
+        # requests table at the end so the detail view can show what each tool returned.
+        tool_log: list[dict] = []
+
+        def _persist_log():
+            if not tool_log:
+                return
+            try:
+                conn = db()
+                conn.execute(
+                    "UPDATE requests SET proxy_tool_log=? WHERE id=?",
+                    (json.dumps(tool_log), req_id),
+                )
+                conn.commit()
+                conn.close()
+            except Exception:
+                pass
+
         for i in range(max_iter):
             calls = _extract_proxy_tool_calls(cur_resp)
             if not calls:
+                _persist_log()
                 return cur_resp, i
             executed = []
             for c in calls:
-                txt, is_err = _exec_proxy_tool(c["name"], c["input"], cur_conv)
+                t0 = time.time()
+                txt, is_err = await _exec_proxy_tool(
+                    c["name"], c["input"], cur_conv,
+                    memory_scope=_ti_ctx.get("memory_scope"),
+                )
                 executed.append({"id": c["id"], "name": c["name"], "result": txt, "is_error": is_err})
+                tool_log.append({
+                    "iteration": i + 1,
+                    "name": c["name"],
+                    "input": c["input"],
+                    "result": txt,
+                    "is_error": is_err,
+                    "ts": t0,
+                    "duration_ms": round((time.time() - t0) * 1000, 1),
+                })
             if shape == "anthropic":
                 cur_body = _build_followup_body_anthropic(cur_body, cur_resp, executed)
             else:
@@ -6528,7 +6888,9 @@ async def proxy(full_path: str, request: Request):
                 fu_obj = json.loads(fu_text)
                 cur_resp = fu_obj if isinstance(fu_obj, dict) else cur_resp
             except Exception:
+                _persist_log()
                 return cur_resp, i + 1
+        _persist_log()
         return cur_resp, max_iter
 
     if treat_as_stream:
