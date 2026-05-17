@@ -96,6 +96,7 @@
   .compare-tool-pair .pair-grid .empty { color: #666; font-style: italic; padding: 6px 8px; }
   td.method { font-weight: 600; color: #88c0d0; }
   td.ms, td.num { text-align: right; color: #888; font-variant-numeric: tabular-nums; }
+  th.num, th.ms { text-align: right; }
   #stats { flex: 1; overflow: auto; padding: 18px; display: none; }
   #stats.show { display: block; }
   #main.stats #list, #main.stats #detail { display: none; }
@@ -137,15 +138,16 @@
   tr.row-warn td { background: #2a2418 !important; }
   tr.row-rewrite td { background: #1a2030 !important; }
   tr.row-intercept td { background: #251a30 !important; }
-  #audit, #convs, #system, #setup, #chat, #tasks { flex: 1; overflow: auto; padding: 18px; display: none; }
-  #audit.show, #convs.show, #system.show, #setup.show, #chat.show, #tasks.show { display: flex; flex-direction: column; }
-  #audit.show, #convs.show, #system.show, #setup.show, #tasks.show { display: block; }
-  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup, #main.audit #chat, #main.audit #tasks { display: none; }
-  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup, #main.convs #chat, #main.convs #tasks { display: none; }
-  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup, #main.system #chat, #main.system #tasks { display: none; }
-  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system, #main.setup #chat, #main.setup #tasks { display: none; }
-  #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup, #main.chat #tasks { display: none; }
-  #main.tasks #list, #main.tasks #detail, #main.tasks #stats, #main.tasks #audit, #main.tasks #convs, #main.tasks #system, #main.tasks #setup, #main.tasks #chat { display: none; }
+  #audit, #convs, #system, #setup, #chat, #tasks, #bench { flex: 1; overflow: auto; padding: 18px; display: none; }
+  #audit.show, #convs.show, #system.show, #setup.show, #chat.show, #tasks.show, #bench.show { display: flex; flex-direction: column; }
+  #audit.show, #convs.show, #system.show, #setup.show, #tasks.show, #bench.show { display: block; }
+  #main.audit #list, #main.audit #detail, #main.audit #stats, #main.audit #convs, #main.audit #system, #main.audit #setup, #main.audit #chat, #main.audit #tasks, #main.audit #bench { display: none; }
+  #main.convs #list, #main.convs #detail, #main.convs #stats, #main.convs #audit, #main.convs #system, #main.convs #setup, #main.convs #chat, #main.convs #tasks, #main.convs #bench { display: none; }
+  #main.system #list, #main.system #detail, #main.system #stats, #main.system #audit, #main.system #convs, #main.system #setup, #main.system #chat, #main.system #tasks, #main.system #bench { display: none; }
+  #main.setup #list, #main.setup #detail, #main.setup #stats, #main.setup #audit, #main.setup #convs, #main.setup #system, #main.setup #chat, #main.setup #tasks, #main.setup #bench { display: none; }
+  #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup, #main.chat #tasks, #main.chat #bench { display: none; }
+  #main.tasks #list, #main.tasks #detail, #main.tasks #stats, #main.tasks #audit, #main.tasks #convs, #main.tasks #system, #main.tasks #setup, #main.tasks #chat, #main.tasks #bench { display: none; }
+  #main.bench #list, #main.bench #detail, #main.bench #stats, #main.bench #audit, #main.bench #convs, #main.bench #system, #main.bench #setup, #main.bench #chat, #main.bench #tasks { display: none; }
   /* Chat tab: 2-pane layout with composer pinned at bottom */
   #chat.show { padding: 0; flex-direction: column; height: 100%; }
   #chat .chat-header { padding: 10px 14px; border-bottom: 1px solid #2a2e3a; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; background: #14171f; }
@@ -469,6 +471,7 @@
     <button class="tab" id="tab-convs" onclick="setView('convs')">Conversations</button>
     <button class="tab" id="tab-chat" onclick="setView('chat')">Chat</button>
     <button class="tab" id="tab-tasks" onclick="setView('tasks')">Tasks <span id="tasks-badge" style="display:none;background:#7aaffe;color:#0e1014;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
+    <button class="tab" id="tab-bench" onclick="setView('bench')">Bench</button>
     <button class="tab" id="tab-system" onclick="setView('system')">System</button>
     <button class="tab" id="tab-setup" onclick="setView('setup')">Setup</button>
     <button class="tab" id="tab-stats" onclick="setView('stats')">Stats</button>
@@ -497,6 +500,7 @@
   <div id="system"></div>
   <div id="setup"></div>
   <div id="tasks"></div>
+  <div id="bench"></div>
   <div id="chat">
     <div class="chat-header">
       <span style="font-size:12px;color:#aaa">Model:</span>
@@ -551,7 +555,7 @@
       <div class="chat-empty" id="chat-empty">Pick a model and type below — your messages route through this proxy and the conversation appears in the Requests / Conversations tabs.</div>
     </div>
     <div class="composer">
-      <textarea id="chat-input" rows="1" placeholder="Send a message…" autocomplete="off"></textarea>
+      <textarea id="chat-input" rows="1" placeholder="Send a message… (or /imagine <prompt> for Stable Diffusion)" autocomplete="off"></textarea>
       <button id="chat-send" onclick="chatSend()">Send</button>
     </div>
   </div>
@@ -567,18 +571,22 @@ const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&
 const num = (n) => (n == null ? '' : Number(n).toLocaleString());
 
 const VIEW_KEY = 'ai-proxy-active-view';
-const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks']);
+const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'bench']);
 
 function setView(v) {
   view = v;
-  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks']) {
+  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','bench']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
-  for (const c of ['stats','audit','convs','system','setup','chat','tasks']) {
+  for (const c of ['stats','audit','convs','system','setup','chat','tasks','bench']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
+  // sessionStorage = per-tab. Lets you have Chat in one tab and System in another without
+  // them stomping each other on auto-refresh. localStorage is a parallel write so a fresh
+  // tab still defaults to your most-recently-used view across the whole browser.
+  try { sessionStorage.setItem(VIEW_KEY, v); } catch {}
   try { localStorage.setItem(VIEW_KEY, v); } catch {}
   if (v === 'stats') loadStats();
   else if (v === 'audit') { loadAudit(); refreshAuditBadge().then(dismissAuditBadge); }
@@ -587,6 +595,7 @@ function setView(v) {
   else if (v === 'setup') loadSetup();
   else if (v === 'chat') loadChat();
   else if (v === 'tasks') loadTasks();
+  else if (v === 'bench') loadBench();
   else refresh();
 }
 
@@ -1535,6 +1544,10 @@ async function loadDetail(id) {
 
   const errBlock = d.error ? `<div class="section"><h3>Error</h3><pre class="status-5" data-k="err">${esc(d.error)}</pre></div>` : '';
   const status = d.status || (d.error ? 'ERR' : 'pending');
+  // Show a kill button for in-flight requests (no status set yet, no error).
+  const killBtn = (!d.status && !d.error)
+    ? `<button onclick="killRequest('${esc(d.id)}', this)" style="background:#3a1818;border:1px solid #5a2828;color:#e08080;border-radius:4px;padding:3px 10px;font-size:11px;cursor:pointer;margin-left:8px" title="Drop the upstream connection so Ollama frees the GPU slot">🛑 Kill</button>`
+    : '';
 
   const tokensLine = (d.prompt_tokens != null || d.completion_tokens != null || d.total_tokens != null)
     ? `<div class="row"><span class="label">Tokens</span> prompt: <code>${num(d.prompt_tokens) || '—'}</code> · completion: <code>${num(d.completion_tokens) || '—'}</code> · total: <code>${num(d.total_tokens) || '—'}</code></div>`
@@ -1545,7 +1558,10 @@ async function loadDetail(id) {
     const filled = Math.round(s / 10);
     const bar = '●'.repeat(filled) + '○'.repeat(10 - filled);
     const color = s >= 70 ? '#a3be8c' : s >= 40 ? '#ebcb8b' : '#888';
-    const reasons = (d.downsize_reasons || []).join(' · ') || 'no signals';
+    // downsize_reasons is an array, but PII-redacted rows replace it with a placeholder
+    // string. Coerce defensively so `.join` doesn't blow up.
+    const reasonsArr = Array.isArray(d.downsize_reasons) ? d.downsize_reasons : [];
+    const reasons = reasonsArr.join(' · ') || 'no signals';
     downsizeLine = `<div class="row"><span class="label">Downsize</span> <span style="color:${color};font-family:ui-monospace,monospace">${bar}</span> <code>${s}/100</code> <span style="color:#888;font-size:11px" title="${esc(reasons)}">${esc(reasons)}</span></div>`;
   }
 
@@ -1605,10 +1621,11 @@ async function loadDetail(id) {
     ${shadowBackBanner}
     ${piiBanner}
     <div class="summary">
+      <div class="row"><span class="label">Request ID</span> <code style="user-select:all">${esc(d.id || '?')}</code></div>
       <div class="row"><span class="label">Request</span> <strong class="method">${esc(d.method)}</strong> <code>${esc(d.path)}</code></div>
       <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
       <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code></div>
-      <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${d.duration_ms ? Math.round(d.duration_ms) + ' ms' : '—'}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}</div>
+      <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${d.duration_ms ? Math.round(d.duration_ms) + ' ms' : '—'}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
       <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code></div>
       ${tokensLine}
       ${downsizeLine}
@@ -1749,10 +1766,14 @@ async function loadStats() {
   const flowHtml = _renderTrafficFlow(d, rules, audit);
   const o = d.overall || {};
   const span = (o.first_ts && o.last_ts) ? Math.max(1, o.last_ts - o.first_ts) : 0;
+  const overallTokSec = ((o.total_ms || 0) > 0 && (o.completion_tokens || 0) > 0)
+    ? ((o.completion_tokens || 0) / ((o.total_ms || 0) / 1000)).toFixed(1)
+    : '—';
   const cards = `
     <div class="cards">
       <div class="card"><div class="l">Requests</div><div class="v">${num(o.count || 0)}</div><div class="s">${num(o.errors || 0)} errors · ${num(o.streams || 0)} streamed</div></div>
       <div class="card"><div class="l">Total Tokens</div><div class="v">${num(o.total_tokens || 0)}</div><div class="s">prompt ${num(o.prompt_tokens || 0)} · completion ${num(o.completion_tokens || 0)}</div></div>
+      <div class="card" title="completion tokens per second across all requests"><div class="l">Avg Throughput</div><div class="v">${overallTokSec}<span style="font-size:14px;color:#888"> tok/s</span></div><div class="s">completion / upstream-time</div></div>
       <div class="card"><div class="l">Avg Latency</div><div class="v">${Math.round(o.avg_ms || 0)}<span style="font-size:14px;color:#888"> ms</span></div><div class="s">total ${(((o.total_ms || 0)/1000).toFixed(1))}s upstream time</div></div>
       <div class="card"><div class="l">Window</div><div class="v" style="font-size:14px">${span ? fmtSpan(span) : '—'}</div><div class="s">${o.first_ts ? new Date(o.first_ts*1000).toLocaleString() : ''}</div></div>
     </div>`;
@@ -1814,9 +1835,91 @@ async function loadStats() {
     return `<tr><td><code>${esc(t.name)}</code></td><td class="num">${num(t.calls)}</td><td>${byModel}</td></tr>`;
   }).join('') : '<tr><td colspan="3" class="empty">No tool calls observed yet</td></tr>';
 
+  // Throughput percentile distributions: combined (legacy), generation (decode rate),
+  // and processing (prefill rate). Split rates require ttft_ms which is only populated
+  // on rows captured after the migration; older rows show only in the combined table.
+  const _fmtTps = v => (v == null) ? '—' : (v >= 100 ? Math.round(v) : v.toFixed(1));
+  function _renderTpsRow(d) {
+    return `<tr>
+      <td class="num">${_fmtTps(d.min)}</td>
+      <td class="num">${_fmtTps(d.p10)}</td>
+      <td class="num">${_fmtTps(d.p25)}</td>
+      <td class="num" style="color:#88c0d0;font-weight:600">${_fmtTps(d.p50)}</td>
+      <td class="num">${_fmtTps(d.p75)}</td>
+      <td class="num">${_fmtTps(d.p90)}</td>
+      <td class="num">${_fmtTps(d.max)}</td>
+    </tr>`;
+  }
+  function _renderTpsTable(title, hint, d) {
+    if (!d.samples) return '';
+    return `
+      <div class="stats-section">
+        <h2>${title} <span style="color:#666;font-weight:normal;font-size:11px">${hint} · n=${num(d.samples)}</span></h2>
+        <table style="width:100%">
+          <thead><tr><th class="num">min</th><th class="num">p10</th><th class="num">p25</th><th class="num">p50</th><th class="num">p75</th><th class="num">p90</th><th class="num">max</th></tr></thead>
+          <tbody>${_renderTpsRow(d)}</tbody>
+        </table>
+      </div>`;
+  }
+  const tpSection =
+    _renderTpsTable(
+      'Generation Rate',
+      'completion tokens / decoding time (tok/s)',
+      o.throughput_generation || {}
+    ) +
+    _renderTpsTable(
+      'Processing Rate',
+      'prompt tokens / prefill time (tok/s)',
+      o.throughput_processing || {}
+    ) +
+    _renderTpsTable(
+      'Combined Throughput',
+      'completion / total upstream time — includes prefill (tok/s)',
+      o.throughput || {}
+    );
+
+  const upstreams = d.by_upstream || [];
+  const upstreamRows = upstreams.length ? upstreams.map(u => {
+    const tokSec = (u.total_ms > 0 && u.completion_tokens > 0)
+      ? (u.completion_tokens / (u.total_ms / 1000)).toFixed(1) : '—';
+    const ttftPct = u.count > 0 ? Math.round(100 * (u.with_ttft || 0) / u.count) : 0;
+    return `<tr>
+      <td><code>${esc(u.upstream)}</code></td>
+      <td class="num">${num(u.count)}</td>
+      <td class="num">${num(u.streams || 0)}</td>
+      <td class="num">${num(u.prompt_tokens)}</td>
+      <td class="num">${num(u.completion_tokens)}</td>
+      <td class="num">${num(u.total_tokens)}</td>
+      <td class="num">${Math.round(u.avg_ms || 0)}</td>
+      <td class="num">${tokSec}</td>
+      <td class="num" title="rows with measured TTFT (time-to-first-token)">${num(u.with_ttft || 0)} <span style="color:#666">(${ttftPct}%)</span></td>
+      <td class="num">${u.avg_ttft_ms ? Math.round(u.avg_ttft_ms) : '—'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="10" class="empty">No data yet</td></tr>';
+  const upstreamSection = `
+    <div class="stats-section">
+      <h2>By Upstream</h2>
+      <table style="width:100%">
+        <thead><tr>
+          <th>Upstream</th>
+          <th class="num">Requests</th>
+          <th class="num">Streamed</th>
+          <th class="num">Prompt</th>
+          <th class="num">Completion</th>
+          <th class="num">Total Tokens</th>
+          <th class="num">Avg ms</th>
+          <th class="num" title="completion tokens per second">tok/s</th>
+          <th class="num" title="rows with TTFT measured">w/ TTFT</th>
+          <th class="num" title="average time-to-first-token">Avg TTFT</th>
+        </tr></thead>
+        <tbody>${upstreamRows}</tbody>
+      </table>
+    </div>`;
+
   $('stats').innerHTML = `
     ${flowHtml}
     ${cards}
+    ${tpSection}
     <div class="stats-section">
       <h2>By Model</h2>
       <table style="width:100%">
@@ -1831,6 +1934,7 @@ async function loadStats() {
         <tbody>${pathRows}</tbody>
       </table>
     </div>
+    ${upstreamSection}
     <div class="stats-section">
       <h2>By Client App</h2>
       <table style="width:100%">
@@ -2160,15 +2264,50 @@ async function loadAudit() {
   }
 }
 
+const CONVS_PS_KEY = 'ai-proxy-convs-pagesize';
+let _convsItemsCache = [];
+let _convsPage = 1;
+
+async function killRequest(reqId, btn) {
+  if (!confirm('Drop the upstream connection for this request? Ollama will free the GPU slot.')) return;
+  if (btn) { btn.disabled = true; btn.textContent = 'killing…'; }
+  try {
+    const r = await fetch('/__proxy/api/control/cancel/' + encodeURIComponent(reqId), { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || ('HTTP ' + r.status)); return; }
+    if (btn) btn.textContent = d.already_cancelled ? 'already cancelled' : '✓ killed';
+    // Refresh detail panel after a moment so the new (failed) status shows up.
+    setTimeout(() => { if (selected === reqId) loadDetail(reqId); }, 600);
+  } catch (e) {
+    alert(e.message);
+    if (btn) { btn.disabled = false; btn.textContent = '🛑 Kill'; }
+  }
+}
+
 async function loadConversations() {
   const d = await (await fetch('/__proxy/api/conversations')).json();
-  const items = d.items || [];
-  if (!items.length) {
+  _convsItemsCache = d.items || [];
+  if (!_convsItemsCache.length) {
     $('convs').innerHTML = '<div class="empty" style="padding:40px">No conversations yet. Send some chat completion requests through the proxy.</div>';
     return;
   }
+  $('convs').innerHTML = `
+    <div class="stats-section">
+      <h2>Conversations <span style="color:#666;font-weight:normal;font-size:11px">(${num(_convsItemsCache.length)} total)</span></h2>
+      <div id="convs-wrap"></div>
+    </div>
+    <div id="conv-detail"></div>
+  `;
+  renderConversationsList();
+}
 
-  const rows = items.map(c => {
+function renderConversationsList() {
+  const wrap = $('convs-wrap');
+  if (!wrap) return;
+  const size = _getPageSize(CONVS_PS_KEY, 10);
+  const p = _paginate(_convsItemsCache, _convsPage, size);
+  _convsPage = p.page;
+  const rows = p.slice.map(c => {
     const span = (c.last_ts && c.first_ts) ? fmtSpan(c.last_ts - c.first_ts) : '—';
     return `<tr style="cursor:pointer" data-cid="${esc(c.conversation_id)}">
       <td style="font-size:11px;color:#888">${fmt(c.last_ts)}</td>
@@ -2181,20 +2320,18 @@ async function loadConversations() {
       <td style="color:#aaa;font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.preview || '')}</td>
     </tr>`;
   }).join('');
-
-  $('convs').innerHTML = `
-    <div class="stats-section">
-      <h2>Conversations</h2>
-      <table style="width:100%">
-        <thead><tr><th>Last seen</th><th>ID</th><th class="num">Turns</th><th class="num">Tokens</th><th>Models</th><th>Client</th><th>Span</th><th>First user message</th></tr></thead>
-        <tbody>${rows}</tbody>
-      </table>
-    </div>
-    <div id="conv-detail"></div>
-  `;
-  for (const tr of $('convs').querySelectorAll('tbody tr[data-cid]')) {
+  wrap.innerHTML = `<table style="width:100%">
+    <thead><tr><th>Last seen</th><th>ID</th><th class="num">Turns</th><th class="num">Tokens</th><th>Models</th><th>Client</th><th>Span</th><th>First user message</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>${_pagerHtml('cv', p)}`;
+  for (const tr of wrap.querySelectorAll('tbody tr[data-cid]')) {
     tr.onclick = () => loadConversationDetail(tr.dataset.cid);
   }
+  _wirePager('cv', ({ size, pageDelta }) => {
+    if (size) { _setPageSize(CONVS_PS_KEY, size); _convsPage = 1; }
+    if (pageDelta) _convsPage = Math.max(1, _convsPage + pageDelta);
+    renderConversationsList();
+  });
 }
 
 function _conversationTurnSummary(t, body, userText, assistantText, toolCalls, toolResults) {
@@ -2755,8 +2892,12 @@ function ollamaConfigSection(ollama) {
   const envRows = keys.length
     ? keys.map(k => `<tr><td><code>${esc(k)}</code></td><td><code style="font-size:11px">${esc(env[k])}</code></td></tr>`).join('')
     : `<tr><td colspan="2" class="empty" style="padding:8px">Couldn't read OLLAMA_* env vars. The proxy isn't the same user as the ollama process and the systemd unit lookup also failed. Set <code>OLLAMA_SYSTEMD_UNIT</code> on the proxy if your unit name isn't <code>ollama.service</code>.</td></tr>`;
+  const versionLabel = ollama.version
+    ? (ollama.outdated
+        ? `<span style="background:#4a4020;color:#ebcb8b;border:1px solid #6a5a3a;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)} · upgrade ≥ v${esc(ollama.recommended_version || '')} recommended</span>`
+        : `<span style="background:#1e3a26;color:#a3be8c;border:1px solid #2e5a36;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)}</span>`)
+    : '';
   const meta = [
-    ollama.version ? 'v' + ollama.version : null,
     ollama.pid ? 'pid ' + ollama.pid : null,
     ollama.env_source ? 'from ' + ollama.env_source : null,
   ].filter(Boolean).join(' · ');
@@ -2764,7 +2905,7 @@ function ollamaConfigSection(ollama) {
     <details class="stats-section" open>
       <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
         <span style="color:#888;font-size:10px;width:10px">▾</span>
-        <h2 style="margin:0">Ollama Server Config <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
+        <h2 style="margin:0">Ollama Server Config ${versionLabel} <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
       </summary>
       <table style="width:100%">
         <thead><tr><th>Variable</th><th>Value</th></tr></thead>
@@ -3115,12 +3256,121 @@ function renderSystem() {
       </table>
     </div>
 
+    <div class="stats-section" id="ollama-update-section">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
+        <h2 style="margin:0">Ollama Registry Updates</h2>
+        <button onclick="checkOllamaUpdates(false)" id="ollama-upd-btn" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Check (cached)</button>
+        <button onclick="checkOllamaUpdates(true)" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Force refresh</button>
+        <span id="ollama-upd-status" style="color:#888;font-size:11px;margin-left:auto"></span>
+      </div>
+      <div id="ollama-upd-results" style="color:#666;font-size:12px;padding:6px">Click "Check" to compare local model digests against the Ollama registry.</div>
+    </div>
+
     <div class="stats-section">
       <h2>LM Studio Available (top 25)</h2>
       <table style="width:100%">
         <thead><tr><th>ID</th><th>Type</th><th>State</th></tr></thead>
         <tbody>${lmsAvailable}</tbody>
       </table>
+    </div>
+
+    ${renderComfyUISection(now.comfyui || {})}
+  `;
+}
+
+async function checkOllamaUpdates(force) {
+  const btn = $('ollama-upd-btn');
+  const status = $('ollama-upd-status');
+  const results = $('ollama-upd-results');
+  if (btn) btn.disabled = true;
+  if (status) status.textContent = 'checking…';
+  if (results) results.innerHTML = '<div style="color:#888;padding:6px">Querying registry…</div>';
+  try {
+    const r = await fetch('/__proxy/api/ollama/update-check' + (force ? '?force=1' : ''));
+    const d = await r.json();
+    if (d.error) {
+      results.innerHTML = `<div style="color:#e08080;padding:6px">${esc(d.error)}</div>`;
+      return;
+    }
+    const items = d.items || [];
+    if (!items.length) {
+      results.innerHTML = '<div class="empty" style="padding:20px">No models found.</div>';
+      return;
+    }
+    const badge = (s) => {
+      const map = {
+        outdated: ['#ebcb8b','#4a4020','#6a5a3a','⚠ update available'],
+        up_to_date: ['#a3be8c','#1e3a26','#2e5a36','✓ up to date'],
+        not_in_registry: ['#888','#2a2e3a','#3a3e4a','— not in registry'],
+        unknown: ['#888','#2a2e3a','#3a3e4a','? unknown'],
+        error: ['#bf616a','#3a1818','#5a2828','✗ error'],
+      };
+      const [fg, bg, br, label] = map[s] || map.error;
+      return `<span style="background:${bg};color:${fg};border:1px solid ${br};padding:1px 6px;border-radius:3px;font-size:11px">${label}</span>`;
+    };
+    const rows = items.map(it => `
+      <tr>
+        <td><code>${esc(it.name)}</code></td>
+        <td>${badge(it.status)}</td>
+        <td><code style="font-size:10px;color:#888">${esc((it.local_digest || '').slice(0,12) || '—')}</code></td>
+        <td><code style="font-size:10px;color:#888">${esc((it.remote_digest || '').slice(0,12) || '—')}</code></td>
+        <td>${it.status === 'outdated' ? `<code style="font-size:11px;color:#88c0d0;user-select:all">ollama pull ${esc(it.name)}</code>` : (it.error ? `<span style="color:#888;font-size:11px" title="${esc(it.error)}">${esc((it.error||'').slice(0,40))}${(it.error||'').length>40?'…':''}</span>` : '')}</td>
+      </tr>
+    `).join('');
+    results.innerHTML = `<table style="width:100%">
+      <thead><tr><th>Model</th><th>Status</th><th>Local</th><th>Remote</th><th>Action</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
+    const outdated = items.filter(i => i.status === 'outdated').length;
+    const checked = new Date((d.checked_ts || 0)*1000).toLocaleTimeString();
+    if (status) status.textContent = `${outdated} outdated · checked ${checked}`;
+  } catch (e) {
+    results.innerHTML = `<div style="color:#bf616a;padding:6px">${esc(e.message)}</div>`;
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+function _fmtBytes(b) {
+  if (b == null) return '—';
+  const u = ['B','KB','MB','GB','TB'];
+  let i = 0;
+  while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; }
+  return `${b.toFixed(b >= 10 ? 0 : 1)} ${u[i]}`;
+}
+
+function renderComfyUISection(comfyui) {
+  const reachable = !!comfyui.reachable;
+  const ramTot = comfyui.ram_total, ramFree = comfyui.ram_free;
+  const ramUsed = (ramTot != null && ramFree != null) ? ramTot - ramFree : null;
+  const ramPct = (ramTot && ramUsed != null) ? Math.round(100 * ramUsed / ramTot) : null;
+  const devices = comfyui.devices || [];
+  const devRows = devices.map(d => {
+    const used = (d.vram_total != null && d.vram_free != null) ? d.vram_total - d.vram_free : null;
+    const pct = (d.vram_total && used != null) ? Math.round(100 * used / d.vram_total) : null;
+    return `<tr>
+      <td>${esc(d.name || '?')}</td>
+      <td><code>${esc(d.type || '?')}</code></td>
+      <td class="num">${used != null ? _fmtBytes(used) : '—'} / ${_fmtBytes(d.vram_total)}${pct != null ? ` <span style="color:#888">(${pct}%)</span>` : ''}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="3" style="color:#666">(no device info)</td></tr>';
+  const queueRunning = comfyui.queue_running ?? '—';
+  const queuePending = comfyui.queue_pending ?? '—';
+  return `
+    <div class="stats-section">
+      <h2><span class="reach-dot ${reachable ? 'ok' : 'bad'}"></span>ComfyUI ${reachable ? '<span style="color:#a3be8c;font-weight:normal;font-size:11px">running</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
+      ${reachable ? `
+        <div class="cards" style="margin-bottom:12px">
+          <div class="card"><div class="l">Queue</div><div class="v">${esc(String(queueRunning))} <span style="color:#888;font-size:13px">running</span> · ${esc(String(queuePending))} <span style="color:#888;font-size:13px">pending</span></div></div>
+          <div class="card"><div class="l">RAM</div><div class="v" style="font-size:13px">${ramUsed != null ? _fmtBytes(ramUsed) : '—'} / ${_fmtBytes(ramTot)}</div><div class="s">${ramPct != null ? ramPct + '%' : ''}</div></div>
+          <div class="card"><div class="l">PyTorch</div><div class="v" style="font-size:13px"><code>${esc(comfyui.pytorch_version || '—')}</code></div></div>
+          <div class="card"><div class="l">Python</div><div class="v" style="font-size:13px"><code>${esc(comfyui.python || '—')}</code></div></div>
+        </div>
+        <table style="width:100%">
+          <thead><tr><th>Device</th><th>Type</th><th class="num">VRAM</th></tr></thead>
+          <tbody>${devRows}</tbody>
+        </table>
+      ` : `<div style="color:#888;font-size:12px;padding:6px">Probed at <code>${esc(comfyui.url || '')}</code> — not reachable. Start ComfyUI to use <code>/imagine</code> in the chat tab.</div>`}
     </div>
   `;
 }
@@ -3876,13 +4126,18 @@ function chatRender() {
   const html = chatMessages.map(m => {
     const cls = 'cmsg ' + m.role + (m.streaming ? ' streaming' : '');
     const content = m.role === 'user' ? esc(m.content) : _chatRenderMarkdown(m.content || '');
+    // Inline images attached to the message (e.g. /imagine output). Each URL is server-
+    // generated under /__proxy/generated/, so it's safe to render directly.
+    const imgs = (m.images || []).map(u =>
+      `<a href="${esc(u)}" target="_blank" rel="noopener"><img src="${esc(u)}" style="max-width:100%;border-radius:6px;margin-top:6px;display:block"></a>`
+    ).join('');
     const metaParts = [];
     if (m.model) metaParts.push(esc(m.model));
     if (m.ms) metaParts.push(`${Math.round(m.ms)}ms`);
     if (m.tokens) metaParts.push(`${num(m.tokens)} tok`);
     return `<div class="${cls}">
       <div class="role">${m.role}</div>
-      <div class="bubble">${content}</div>
+      <div class="bubble">${content}${imgs}</div>
       ${metaParts.length ? `<div class="meta">${metaParts.join(' · ')}</div>` : ''}
     </div>`;
   }).join('');
@@ -3910,6 +4165,53 @@ async function chatSend() {
   const ta = $('chat-input');
   const text = ta.value.trim();
   if (!text) return;
+
+  // /imagine intercept — bypass the LLM entirely and call Stable Diffusion directly.
+  // No tokens, no model needed, no upstream round-trip.
+  if (/^\/imagine\b/i.test(text)) {
+    const prompt = text.replace(/^\/imagine\b\s*/i, '').trim();
+    if (!prompt) { chatStatus('/imagine needs a prompt'); return; }
+    chatMessages.push({ role: 'user', content: text, ts: Date.now() / 1000 });
+    const idx = chatMessages.length;
+    chatMessages.push({ role: 'model', content: '🎨 Generating image…', model: 'stable-diffusion', streaming: true, ts: Date.now() / 1000 });
+    ta.value = '';
+    ta.style.height = 'auto';
+    chatRender();
+    chatSaveState();
+    chatStreaming = true;
+    $('chat-send').disabled = true;
+    chatStatus('Stable Diffusion…');
+    const t0 = performance.now();
+    try {
+      const r = await fetch('/__proxy/api/sd/txt2img', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', 'x-client-name': 'ai-proxy-chat' },
+        body: JSON.stringify({ prompt }),
+      });
+      const d = await r.json();
+      const m = chatMessages[idx];
+      m.streaming = false;
+      m.ms = performance.now() - t0;
+      if (!r.ok) {
+        m.content = `_Error: ${d.error || 'HTTP ' + r.status}_${d.hint ? `\n\n_${d.hint}_` : ''}`;
+      } else {
+        m.content = `**${prompt}**` + (d.seed != null ? `\n_seed: ${d.seed}${d.sampler ? ' · ' + d.sampler : ''}_` : '');
+        m.images = d.files || [];
+      }
+    } catch (e) {
+      const m = chatMessages[idx];
+      m.streaming = false;
+      m.content = `_Error: ${e.message}_`;
+    } finally {
+      chatStreaming = false;
+      $('chat-send').disabled = false;
+      chatStatus('');
+      chatRender();
+      chatSaveState();
+    }
+    return;
+  }
+
   const sel = $('chat-model');
   const modelKey = sel.value;
   if (!modelKey) { chatStatus('Pick a model first'); return; }
@@ -4116,6 +4418,311 @@ function _taskBadge(s) {
   return `<span style="color:${c};font-size:11px">${ic} ${s}</span>`;
 }
 
+// ---------- Bench tab ----------
+let _benchTimer = null;
+let _benchSelected = new Set();  // ids selected for compare
+let _benchOpenDetails = new Set();  // ids whose detail panel is expanded
+let _benchDetailCache = new Map();  // id → rendered detail HTML (survives auto-refresh)
+let _benchInnerOpen = new Set();    // ids whose nested "per-request rows" panel is open
+
+function _benchFmtMs(v) {
+  if (v == null) return '—';
+  if (v >= 1000) return (v/1000).toFixed(2) + 's';
+  return Math.round(v) + 'ms';
+}
+function _benchFmtTps(v) {
+  if (v == null) return '—';
+  if (v >= 100) return Math.round(v).toString();
+  return v.toFixed(1);
+}
+function _benchAgo(ts) {
+  if (!ts) return '';
+  const s = Math.max(0, Date.now()/1000 - ts);
+  if (s < 60) return Math.floor(s) + 's ago';
+  if (s < 3600) return Math.floor(s/60) + 'm ago';
+  if (s < 86400) return Math.floor(s/3600) + 'h ago';
+  return Math.floor(s/86400) + 'd ago';
+}
+
+async function loadBench() {
+  const el = $('bench');
+  if (!el.dataset.bound) {
+    el.dataset.bound = '1';
+    el.innerHTML = `
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
+        <h2 style="margin:0;font-size:14px;flex:1">⏱ Benchmark Runner</h2>
+        <button id="bench-refresh" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+      </div>
+      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:8px;padding:14px;margin-bottom:18px">
+        <div style="font-size:12px;color:#aaa;margin-bottom:10px">Queue a streaming workload against a model. Each request reports TTFT and decode rate; the run rolls up min / p50 / p90 / max.</div>
+        <div style="display:grid;grid-template-columns:auto 1fr auto 1fr;gap:8px 12px;align-items:center;font-size:12px;margin-bottom:10px">
+          <label>Model</label><select id="bench-model" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px"></select>
+          <label>Runs</label><input id="bench-runs" type="number" value="5" min="1" max="50" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px;width:80px">
+          <label>Max tokens</label><input id="bench-maxtok" type="number" value="256" min="16" max="4096" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px;width:80px">
+          <label>Prompt size</label><select id="bench-prompt" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px"><option value="0">short (~80 tok)</option><option value="2000">2K</option><option value="4000">4K</option><option value="8000">8K</option><option value="16000">16K</option><option value="32000">32K</option></select>
+          <label>Concurrency</label><select id="bench-concur" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px"><option value="1">1 (serial)</option><option value="2">2 parallel</option><option value="4">4 parallel</option><option value="8">8 parallel</option></select>
+          <label>Drain (s)</label><input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px;width:80px">
+        </div>
+        <div style="display:flex;gap:14px;align-items:center;font-size:12px;margin-bottom:10px;flex-wrap:wrap">
+          <label><input type="checkbox" id="bench-randomize"> Randomize prompt each run <span style="color:#666">(defeats prompt cache)</span></label>
+          <label><input type="checkbox" id="bench-exclusive"> Exclusive mode <span style="color:#666">(queue all other clients during the bench)</span></label>
+          <button id="bench-go" style="margin-left:auto;background:#2a3e5a;border:1px solid #3a4e6a;color:#d8dee9;border-radius:4px;padding:6px 18px;font-size:13px;cursor:pointer">▶ Run benchmark</button>
+        </div>
+        <div id="bench-go-err" style="color:#e08080;font-size:11px"></div>
+      </div>
+      <div id="bench-compare-bar" style="display:none;background:#12141b;border:1px solid #2a3e5a;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;align-items:center;gap:8px">
+        <span style="flex:1" id="bench-compare-label"></span>
+        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Compare ↔</button>
+        <button id="bench-compare-clear" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Clear</button>
+      </div>
+      <div id="bench-compare-view"></div>
+      <h3 style="font-size:11px;text-transform:uppercase;color:#888;margin:18px 0 8px;letter-spacing:0.5px">History</h3>
+      <div id="bench-history"></div>
+    `;
+    $('bench-refresh').onclick = () => loadBench();
+    $('bench-go').onclick = _benchSubmit;
+    $('bench-compare-btn').onclick = _benchRenderCompare;
+    $('bench-compare-clear').onclick = () => { _benchSelected.clear(); _benchUpdateCompareBar(); loadBench(); };
+    await _benchPopulateModels();
+  }
+  await _benchRefreshHistory();
+  if (_benchTimer) clearInterval(_benchTimer);
+  if (view === 'bench') _benchTimer = setInterval(() => {
+    if (view === 'bench') _benchRefreshHistory();
+    else { clearInterval(_benchTimer); _benchTimer = null; }
+  }, 3000);
+}
+
+async function _benchPopulateModels() {
+  const sel = $('bench-model');
+  sel.innerHTML = '<option value="">(loading…)</option>';
+  try {
+    const sys = await (await fetch('/__proxy/api/system/now')).json();
+    const ps = (sys.ollama && sys.ollama.ps) || [];
+    const tags = (sys.ollama && sys.ollama.tags) || [];
+    const loaded = ps.map(m => m.name || m.model).filter(Boolean);
+    const loadedSet = new Set(loaded);
+    const avail = tags.map(t => t.name).filter(Boolean).filter(n => !loadedSet.has(n)).sort();
+    const groups = [];
+    if (loaded.length) groups.push(`<optgroup label="✓ Loaded">${loaded.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</optgroup>`);
+    if (avail.length) groups.push(`<optgroup label="Available">${avail.map(n => `<option value="${esc(n)}">${esc(n)}</option>`).join('')}</optgroup>`);
+    sel.innerHTML = groups.join('') || '<option disabled>(no models)</option>';
+  } catch {
+    sel.innerHTML = '<option disabled>(failed to fetch models)</option>';
+  }
+}
+
+async function _benchSubmit() {
+  const errEl = $('bench-go-err');
+  errEl.textContent = '';
+  const body = {
+    model: $('bench-model').value,
+    runs: parseInt($('bench-runs').value, 10) || 5,
+    max_tokens: parseInt($('bench-maxtok').value, 10) || 256,
+    prompt_tokens: parseInt($('bench-prompt').value, 10) || 0,
+    concurrency: parseInt($('bench-concur').value, 10) || 1,
+    drain_seconds: parseFloat($('bench-drain').value) || 0,
+    randomize: $('bench-randomize').checked,
+    exclusive: $('bench-exclusive').checked,
+  };
+  if (!body.model) { errEl.textContent = 'pick a model'; return; }
+  if (body.exclusive && !confirm('Exclusive mode will pause all other clients during this bench. Continue?')) return;
+  try {
+    const r = await fetch('/__proxy/api/bench/run', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (!r.ok) { errEl.textContent = d.error || ('HTTP ' + r.status); return; }
+    _benchRefreshHistory();
+  } catch (e) {
+    errEl.textContent = e.message;
+  }
+}
+
+async function _benchRefreshHistory() {
+  const wrap = $('bench-history');
+  if (!wrap) return;
+  try {
+    const r = await fetch('/__proxy/api/bench/runs?limit=50');
+    const d = await r.json();
+    const items = d.items || [];
+    if (!items.length) { wrap.innerHTML = '<div class="empty" style="padding:20px">No bench runs yet.</div>'; return; }
+    wrap.innerHTML = items.map(it => _benchRenderRow(it)).join('');
+    // Wire delete buttons and compare checkboxes only — let the native <details> handle
+    // expansion (no row-level click handler).
+    wrap.querySelectorAll('[data-bench-del]').forEach(btn => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const id = btn.closest('[data-bench-id]').dataset.benchId;
+        if (!confirm('Delete this bench run?')) return;
+        _benchOpenDetails.delete(id);
+        _benchSelected.delete(id);
+        fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id), { method: 'DELETE' }).then(() => _benchRefreshHistory());
+      };
+    });
+    wrap.querySelectorAll('[data-bench-cmp]').forEach(cb => {
+      cb.onclick = (e) => e.stopPropagation();
+      cb.onchange = () => {
+        const id = cb.closest('[data-bench-id]').dataset.benchId;
+        if (cb.checked && _benchSelected.size < 2) _benchSelected.add(id);
+        else _benchSelected.delete(id);
+        _benchUpdateCompareBar();
+      };
+    });
+    // Track which detail panels are open and survive auto-refresh by re-applying state.
+    wrap.querySelectorAll('details[data-bench-detail]').forEach(dt => {
+      const id = dt.dataset.benchDetail;
+      // Re-apply cached detail HTML on re-render (auto-refresh wipes the DOM).
+      const inner = document.getElementById('bench-detail-' + id);
+      if (inner && _benchDetailCache.has(id)) {
+        inner.innerHTML = _benchDetailCache.get(id);
+        _benchApplyInnerState(id);
+      }
+      if (_benchOpenDetails.has(id)) dt.open = true;
+      dt.addEventListener('toggle', async () => {
+        if (dt.open) {
+          _benchOpenDetails.add(id);
+          if (!_benchDetailCache.has(id)) await _benchLoadDetail(id);
+        } else {
+          _benchOpenDetails.delete(id);
+        }
+      });
+    });
+  } catch (e) {
+    wrap.innerHTML = `<div style="color:#bf616a">${esc(e.message)}</div>`;
+  }
+}
+
+function _benchRenderRow(it) {
+  const cfg = it.config || {};
+  const isSelected = _benchSelected.has(it.id);
+  let summaryLine = '';
+  let resultsBlock = '';
+  if (it.status === 'running' || it.status === 'pending') {
+    const total = it.progress_total || cfg.runs || 0;
+    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}`;
+  } else if (it.status === 'failed') {
+    summaryLine = `<span style="color:#e08080">failed</span> · ${esc(it.error || '')}`;
+  } else if (it.status === 'done') {
+    summaryLine = `<span style="color:#5a5">✓ done</span>`;
+  }
+  return `
+    <div data-bench-id="${esc(it.id)}" style="background:#1a1d26;border:1px solid ${isSelected ? '#88c0d0' : '#2a2e3a'};border-radius:6px;padding:10px 12px;margin-bottom:6px;cursor:pointer">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">
+        <input type="checkbox" data-bench-cmp ${isSelected ? 'checked' : ''} title="Select for comparison" onclick="event.stopPropagation()">
+        <code style="color:#88c0d0">${esc(it.model)}</code>
+        <span style="color:#888">${cfg.runs || '?'} runs · prompt=${cfg.prompt_tokens || 'short'} · cc=${cfg.concurrency || 1}${cfg.randomize ? ' · rand' : ''}${cfg.exclusive ? ' · excl' : ''}</span>
+        <span style="margin-left:auto;color:#888">${_benchAgo(it.ts)}</span>
+        <span>${summaryLine}</span>
+        <button data-bench-del style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer" onclick="event.stopPropagation()">🗑</button>
+      </div>
+      <details style="margin-top:6px" data-bench-detail="${esc(it.id)}">
+        <summary style="cursor:pointer;color:#888;font-size:11px;list-style:none">▸ details</summary>
+        <div style="margin-top:8px;font-size:12px" id="bench-detail-${esc(it.id)}">loading…</div>
+      </details>
+    </div>`;
+}
+
+function _benchUpdateCompareBar() {
+  const bar = $('bench-compare-bar');
+  if (_benchSelected.size === 0) { bar.style.display = 'none'; return; }
+  bar.style.display = 'flex';
+  $('bench-compare-label').textContent = `${_benchSelected.size}/2 selected for comparison`;
+  $('bench-compare-btn').disabled = _benchSelected.size !== 2;
+}
+
+async function _benchRenderCompare() {
+  if (_benchSelected.size !== 2) return;
+  const ids = Array.from(_benchSelected);
+  const [a, b] = await Promise.all(ids.map(id => fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id)).then(r => r.json())));
+  const view = $('bench-compare-view');
+  view.innerHTML = `
+    <div class="stats-section" style="background:#12141b;border:1px solid #88c0d0;padding:12px;border-radius:8px;margin-bottom:18px">
+      <h3 style="margin:0 0 10px 0;font-size:13px">↔ Comparison</h3>
+      ${_benchCompareTable(a, b)}
+    </div>`;
+  view.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function _benchCompareTable(a, b) {
+  const ar = (a.results && a.results.summary) || {};
+  const br = (b.results && b.results.summary) || {};
+  const aTtft = ar.ttft_ms || {}, bTtft = br.ttft_ms || {};
+  const aDec = ar.decode_tps || {}, bDec = br.decode_tps || {};
+  const aTot = ar.total_ms || {}, bTot = br.total_ms || {};
+  function row(label, fmt, av, bv, betterIsHigh) {
+    if (av == null || bv == null) return `<tr><td>${label}</td><td>${fmt(av)}</td><td>${fmt(bv)}</td><td>—</td></tr>`;
+    const delta = betterIsHigh ? (bv - av) / av * 100 : (av - bv) / av * 100;
+    const sign = delta >= 0 ? '+' : '';
+    const color = delta > 0 ? '#a3be8c' : (delta < 0 ? '#e08080' : '#888');
+    return `<tr><td>${label}</td><td>${fmt(av)}</td><td>${fmt(bv)}</td><td style="color:${color}">${sign}${delta.toFixed(1)}%</td></tr>`;
+  }
+  const aLabel = `<code>${esc(a.model)}</code> · ${(a.config || {}).runs || '?'} runs · ${_benchAgo(a.ts)}`;
+  const bLabel = `<code>${esc(b.model)}</code> · ${(b.config || {}).runs || '?'} runs · ${_benchAgo(b.ts)}`;
+  return `
+    <div style="font-size:11px;color:#888;margin-bottom:8px"><strong style="color:#aaa">A:</strong> ${aLabel}<br><strong style="color:#aaa">B:</strong> ${bLabel}</div>
+    <table style="width:100%">
+      <thead><tr><th>Metric</th><th>A</th><th>B</th><th>Δ (B vs A)</th></tr></thead>
+      <tbody>
+        ${row('TTFT min', _benchFmtMs, aTtft.min, bTtft.min, false)}
+        ${row('TTFT p50', _benchFmtMs, aTtft.p50, bTtft.p50, false)}
+        ${row('TTFT p90', _benchFmtMs, aTtft.p90, bTtft.p90, false)}
+        ${row('Decode min', _benchFmtTps, aDec.min, bDec.min, true)}
+        ${row('Decode p50', _benchFmtTps, aDec.p50, bDec.p50, true)}
+        ${row('Decode mean', _benchFmtTps, aDec.mean, bDec.mean, true)}
+        ${row('Decode max', _benchFmtTps, aDec.max, bDec.max, true)}
+        ${row('Total p50', _benchFmtMs, aTot.p50, bTot.p50, false)}
+      </tbody>
+    </table>`;
+}
+
+function _benchApplyInnerState(id) {
+  // The nested "per-request rows" <details> sits inside #bench-detail-{id}. Re-open it
+  // if the user previously expanded it (state is wiped each time we innerHTML the wrap),
+  // and bind a toggle handler that keeps the Set in sync.
+  const wrap = document.getElementById('bench-detail-' + id);
+  if (!wrap) return;
+  const inner = wrap.querySelector('details');
+  if (!inner) return;
+  if (_benchInnerOpen.has(id)) inner.open = true;
+  inner.addEventListener('toggle', () => {
+    if (inner.open) _benchInnerOpen.add(id);
+    else _benchInnerOpen.delete(id);
+  });
+}
+
+
+async function _benchLoadDetail(id) {
+  const wrap = document.getElementById('bench-detail-' + id);
+  if (!wrap) return;
+  try {
+    const r = await fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id));
+    const d = await r.json();
+    const cfg = d.config || {};
+    const res = (d.results && d.results.summary) || {};
+    const rows = (d.results && d.results.rows) || [];
+    const tt = res.ttft_ms || {}, dec = res.decode_tps || {}, tot = res.total_ms || {};
+    const html = `
+      <table style="width:auto"><tbody>
+        <tr><td style="color:#888">Config</td><td><code style="font-size:11px">${esc(JSON.stringify(cfg))}</code></td></tr>
+        <tr><td style="color:#888">TTFT</td><td>min ${_benchFmtMs(tt.min)} · p50 ${_benchFmtMs(tt.p50)} · p90 ${_benchFmtMs(tt.p90)} · max ${_benchFmtMs(tt.max)}</td></tr>
+        <tr><td style="color:#888">Decode tok/s</td><td>min ${_benchFmtTps(dec.min)} · p50 ${_benchFmtTps(dec.p50)} · mean ${_benchFmtTps(dec.mean)} · max ${_benchFmtTps(dec.max)}</td></tr>
+        <tr><td style="color:#888">Total ms</td><td>min ${_benchFmtMs(tot.min)} · p50 ${_benchFmtMs(tot.p50)} · max ${_benchFmtMs(tot.max)}</td></tr>
+      </tbody></table>
+      <details style="margin-top:8px"><summary style="cursor:pointer;color:#888;font-size:11px">per-request rows</summary>
+        <pre style="background:#0e1014;padding:8px;border-radius:4px;font-size:11px;max-height:300px;overflow:auto">${esc(JSON.stringify(rows, null, 2))}</pre>
+      </details>`;
+    _benchDetailCache.set(id, html);
+    // For a running/pending bench, refresh detail on the next tick so progress updates.
+    if (d.status === 'running' || d.status === 'pending') _benchDetailCache.delete(id);
+    wrap.innerHTML = html;
+    _benchApplyInnerState(id);
+  } catch (err) {
+    wrap.innerHTML = `<span style="color:#bf616a">${esc(err.message)}</span>`;
+  }
+}
+
 async function loadTasks() {
   const el = $('tasks');
   if (!el.dataset.bound) {
@@ -4228,7 +4835,7 @@ async function _t2PopulateModels() {
   const sel = $('t2-model');
   sel.innerHTML = '<option value="">(first loaded)</option>';
   try {
-    const sys = await (await fetch('/__proxy/api/system')).json();
+    const sys = await (await fetch('/__proxy/api/system/now')).json();
     const ps = (sys.ollama && sys.ollama.ps) || [];
     const tags = (sys.ollama && sys.ollama.tags) || [];
     const loaded = ps.map(m => m.name || m.model).filter(Boolean);
@@ -4328,7 +4935,9 @@ document.addEventListener('input', (e) => {
 loadInfo();
 // Restore last-viewed tab if any; default to Requests.
 let _restoredView = null;
-try { _restoredView = localStorage.getItem(VIEW_KEY); } catch {}
+// sessionStorage wins on reload of the same tab; localStorage is the cross-tab default
+// for newly-opened tabs.
+try { _restoredView = sessionStorage.getItem(VIEW_KEY) || localStorage.getItem(VIEW_KEY); } catch {}
 if (_restoredView && VALID_VIEWS.has(_restoredView) && _restoredView !== 'requests') {
   setView(_restoredView);
 } else {

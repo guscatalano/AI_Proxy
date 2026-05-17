@@ -21,6 +21,12 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
+# Floor below which the System tab flags an upgrade. Bump this when a release lands that
+# materially changes performance (new engine, MoE routing rewrite, scheduler change).
+# Override with `PROXY_OLLAMA_MIN_VERSION` env var if you disagree with my pick.
+OLLAMA_RECOMMENDED_VERSION = os.environ.get("PROXY_OLLAMA_MIN_VERSION", "0.21.0").strip()
+SD_URL = os.environ.get("SD_URL", "http://localhost:8188").rstrip("/")
+SD_MODEL = os.environ.get("SD_MODEL", "").strip()
 ANTHROPIC_URL = os.environ.get("ANTHROPIC_URL", "https://api.anthropic.com").rstrip("/")
 
 # PII redaction: when on, the API redacts request/response bodies, headers, and other content
@@ -62,6 +68,13 @@ _CONTROL_SENDS: dict = {}
 #   {pending_id: {ts, source(extension name), tool_name, arguments, summary, decision, decided_ts}}
 # decision: None | 'allow' | 'deny' | 'always_allow' | 'always_deny'
 _PENDING_TOOLS: dict = {}
+
+# In-flight upstream responses, keyed by req_id. Populated when client.send() returns and
+# cleared in a finally block when the response is fully consumed. The cancel endpoint
+# looks up the entry and calls .aclose() on it to drop the upstream connection mid-stream
+# (which signals Ollama to abort generation).
+#   {req_id: {ts, upstream_resp, cancel_evt}}
+_INFLIGHT_REQUESTS: dict = {}
 
 
 def _load_panic_mode() -> bool:
@@ -168,6 +181,21 @@ CREATE TABLE IF NOT EXISTS tool_permissions (
     created_ts REAL
 );
 
+CREATE TABLE IF NOT EXISTS bench_runs (
+    id TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    model TEXT NOT NULL,
+    config_json TEXT NOT NULL,
+    status TEXT NOT NULL,                -- 'pending' | 'running' | 'done' | 'failed' | 'cancelled'
+    progress INTEGER DEFAULT 0,
+    progress_total INTEGER,
+    results_json TEXT,
+    error TEXT,
+    started_ts REAL,
+    finished_ts REAL,
+    creator_ip TEXT
+);
+
 CREATE TABLE IF NOT EXISTS proxy_personalities (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
@@ -225,6 +253,9 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN shadow_of TEXT",
     "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
     "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
+    "ALTER TABLE system_metrics ADD COLUMN comfyui_json TEXT",
+    "ALTER TABLE requests ADD COLUMN ttft_ms REAL",
+    "ALTER TABLE requests ADD COLUMN upstream TEXT",
 ]
 
 
@@ -469,6 +500,45 @@ def init_db():
                 )
         conn.execute(
             "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v8', '1', ?)",
+            (time.time(),),
+        )
+    # Backfill v11: fix bridged-request rows where path is /v1/messages but the response
+    # actually came from Ollama (protocol_bridge fired but earlier code didn't update the
+    # upstream column at that time, or backfill_v10 used the path heuristic). Sniff
+    # 'fp_ollama' / 'chat.completion.chunk' markers in response_body/stream_chunks to
+    # recognize a bridged request and re-tag it as upstream='ollama'.
+    done_v11 = conn.execute("SELECT value FROM settings WHERE key='backfill_v11'").fetchone()
+    if not done_v11:
+        conn.execute(
+            """UPDATE requests SET upstream='ollama'
+               WHERE upstream != 'ollama'
+                 AND path LIKE '/v1/messages%'
+                 AND (stream_chunks LIKE '%fp_ollama%'
+                      OR response_body LIKE '%fp_ollama%'
+                      OR stream_chunks LIKE '%chat.completion.chunk%')"""
+        )
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v11', '1', ?)",
+            (time.time(),),
+        )
+    # Backfill v10: populate upstream column on historical rows. We can derive it from the
+    # path: /v1/messages* → anthropic, /api/* and /v1/chat/completions/* → ollama, the rest
+    # → 'unknown'. Future rows are populated at request time.
+    done_v10 = conn.execute("SELECT value FROM settings WHERE key='backfill_v10'").fetchone()
+    if not done_v10:
+        # Set upstream from path heuristic for any row missing it.
+        conn.execute(
+            "UPDATE requests SET upstream='anthropic' WHERE upstream IS NULL AND path LIKE '/v1/messages%'"
+        )
+        conn.execute(
+            "UPDATE requests SET upstream='ollama' WHERE upstream IS NULL AND "
+            "(path LIKE '/api/%' OR path LIKE '/v1/chat/%' OR path LIKE '/v1/completions%' OR path = '/v1/models')"
+        )
+        conn.execute(
+            "UPDATE requests SET upstream='other' WHERE upstream IS NULL"
+        )
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v10', '1', ?)",
             (time.time(),),
         )
     # Backfill v9: re-classify rows still tagged 'unknown' using the latest detector
@@ -991,8 +1061,27 @@ def _read_systemd_env() -> dict:
     return env
 
 
+def _semver_tuple(v: str) -> tuple:
+    """Parse a dotted version like '0.21.0' into a tuple of ints for comparison. Anything
+    non-numeric becomes 0 so we don't crash on pre-release suffixes."""
+    if not v:
+        return (0, 0, 0)
+    parts = re.split(r"[.\-+]", str(v).lstrip("v"))
+    out: list[int] = []
+    for p in parts[:3]:
+        try:
+            out.append(int(re.sub(r"[^\d].*$", "", p) or "0"))
+        except (ValueError, TypeError):
+            out.append(0)
+    while len(out) < 3:
+        out.append(0)
+    return tuple(out)
+
+
 async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
-    out: dict = {"reachable": False, "ps": [], "tags": [], "env": {}, "env_source": None, "pid": None, "version": None}
+    out: dict = {"reachable": False, "ps": [], "tags": [], "env": {}, "env_source": None,
+                 "pid": None, "version": None, "recommended_version": OLLAMA_RECOMMENDED_VERSION,
+                 "outdated": False}
     pid = _find_ollama_pid()
     if pid:
         out["pid"] = pid
@@ -1012,6 +1101,8 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
             out["version"] = (r.json() or {}).get("version")
     except (httpx.RequestError, ValueError):
         pass
+    if out["version"] and OLLAMA_RECOMMENDED_VERSION:
+        out["outdated"] = _semver_tuple(out["version"]) < _semver_tuple(OLLAMA_RECOMMENDED_VERSION)
     try:
         r = await client.get(f"{OLLAMA_URL}/api/ps")
         if r.status_code == 200:
@@ -1084,21 +1175,174 @@ async def _lmstudio_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+# Priority queue: per-bucket semaphores. Initialized lazily on first request after config
+# load so OLLAMA_NUM_PARALLEL is readable. Reset whenever rules.json changes via the API.
+_PRIORITY_SEMS: dict[str, asyncio.Semaphore | None] = {}
+_PRIORITY_CAPS_USED: dict[str, int | None] = {}
+
+
+def _ollama_num_parallel() -> int | None:
+    """Best-effort read of OLLAMA_NUM_PARALLEL from /proc env or systemd unit. Returns None
+    if not detectable (in which case priority caps fall back to hardcoded defaults)."""
+    try:
+        env: dict = {}
+        pid = _find_ollama_pid()
+        if pid:
+            env = _read_ollama_env(pid)
+        if not env:
+            env = _read_systemd_env()
+        v = env.get("OLLAMA_NUM_PARALLEL")
+        return int(v) if v else None
+    except (ValueError, TypeError, OSError):
+        return None
+
+
+def _resolve_priority_caps() -> dict[str, int | None]:
+    """Return {priority: cap} per current config. cap=None means unlimited."""
+    cfg = (load_rules_config().get("request_priority") or {})
+    caps_cfg = cfg.get("caps") or {}
+    np = _ollama_num_parallel() or 1
+    out: dict[str, int | None] = {}
+    for name, default in (("high", None),
+                          ("normal", max(1, np - 1) if np > 1 else None),
+                          ("low", 1)):
+        if name in caps_cfg:
+            v = caps_cfg[name]
+            out[name] = int(v) if isinstance(v, (int, float)) and v > 0 else None
+        else:
+            out[name] = default
+    return out
+
+
+def _ensure_priority_sems():
+    """Lazily build (or rebuild on cap-change) the per-priority semaphores."""
+    caps = _resolve_priority_caps()
+    if caps == _PRIORITY_CAPS_USED and _PRIORITY_SEMS:
+        return
+    _PRIORITY_CAPS_USED.clear()
+    _PRIORITY_CAPS_USED.update(caps)
+    _PRIORITY_SEMS.clear()
+    for name, cap in caps.items():
+        _PRIORITY_SEMS[name] = asyncio.Semaphore(cap) if cap and cap > 0 else None
+
+
+def _resolve_request_priority(headers: dict, client_app: str | None) -> str:
+    """Pick priority for a request. Header > client_priority map > default_priority."""
+    cfg = (load_rules_config().get("request_priority") or {})
+    h = (headers.get("x-priority") or "").lower().strip()
+    if h in ("high", "normal", "low"):
+        return h
+    cmap = cfg.get("client_priority") or {}
+    if client_app and client_app in cmap and cmap[client_app] in ("high", "normal", "low"):
+        return cmap[client_app]
+    default = cfg.get("default_priority") or "normal"
+    return default if default in ("high", "normal", "low") else "normal"
+
+
+# Cache for the Ollama-registry update-check fan-out. Keeps us from hammering the
+# registry every time the user opens the System tab. TTL = 1 hour.
+_OLLAMA_UPDATE_CACHE: dict[str, dict] = {}
+_OLLAMA_UPDATE_CACHE_TTL_S = 3600
+
+
+async def _check_ollama_registry(client: httpx.AsyncClient, name: str, local_digest: str) -> dict:
+    """For a single model `name:tag`, ask the Ollama registry for its current manifest
+    and compare config-blob digests. Returns a result dict with status
+    'up_to_date' | 'outdated' | 'not_in_registry' | 'error' | 'unknown'."""
+    if ":" in name:
+        base, tag = name.rsplit(":", 1)
+    else:
+        base, tag = name, "latest"
+    # Default namespace is `library/`. User-namespaced models keep their `<user>/<model>` form.
+    ns_path = base if "/" in base else f"library/{base}"
+    url = f"https://registry.ollama.ai/v2/{ns_path}/manifests/{tag}"
+    headers = {"Accept": "application/vnd.docker.distribution.manifest.v2+json"}
+    base_out = {"name": name, "tag": tag, "local_digest": local_digest, "remote_digest": None}
+    try:
+        # HEAD is enough — we only need the `ollama-content-digest` response header. Note
+        # this is a custom Ollama header, NOT the standard Docker-Content-Digest. The
+        # manifest body has its own `config.digest` but that's a different blob and won't
+        # match what Ollama stores in /api/tags.
+        r = await client.head(url, headers=headers, timeout=httpx.Timeout(10.0))
+    except Exception as e:
+        return {**base_out, "status": "error", "error": str(e)}
+    if r.status_code == 404:
+        return {**base_out, "status": "not_in_registry"}
+    if r.status_code != 200:
+        return {**base_out, "status": "error",
+                "error": f"HTTP {r.status_code}"}
+    remote = (r.headers.get("ollama-content-digest") or "").removeprefix("sha256:").strip().lower()
+    if not remote:
+        return {**base_out, "status": "unknown",
+                "error": "registry response missing ollama-content-digest header"}
+    if not local_digest:
+        return {**base_out, "remote_digest": remote, "status": "unknown",
+                "error": "no local digest"}
+    status = "up_to_date" if remote == local_digest.lower() else "outdated"
+    return {**base_out, "remote_digest": remote, "status": status}
+
+
+async def _comfyui_snapshot(client: httpx.AsyncClient) -> dict:
+    """Probe ComfyUI's /system_stats and /queue. Returns reachability, VRAM/RAM usage,
+    queue depth, and checkpoint count. Quiet on failure — ComfyUI being down is normal."""
+    out: dict = {"reachable": False, "url": SD_URL}
+    try:
+        s_task = client.get(f"{SD_URL}/system_stats", timeout=3.0)
+        q_task = client.get(f"{SD_URL}/queue", timeout=3.0)
+        s_resp, q_resp = await asyncio.gather(s_task, q_task, return_exceptions=True)
+    except Exception:
+        return out
+    if isinstance(s_resp, httpx.Response) and s_resp.status_code == 200:
+        out["reachable"] = True
+        try:
+            sj = s_resp.json()
+            sysinfo = sj.get("system") or {}
+            out["python"] = sysinfo.get("python_version")
+            out["os"] = sysinfo.get("os")
+            out["ram_total"] = sysinfo.get("ram_total")
+            out["ram_free"] = sysinfo.get("ram_free")
+            out["pytorch_version"] = sysinfo.get("pytorch_version")
+            out["embedded_python"] = sysinfo.get("embedded_python")
+            out["devices"] = []
+            for d in (sj.get("devices") or []):
+                out["devices"].append({
+                    "name": d.get("name"),
+                    "type": d.get("type"),
+                    "vram_total": d.get("vram_total"),
+                    "vram_free": d.get("vram_free"),
+                    "torch_vram_total": d.get("torch_vram_total"),
+                    "torch_vram_free": d.get("torch_vram_free"),
+                })
+        except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
+            pass
+    if isinstance(q_resp, httpx.Response) and q_resp.status_code == 200:
+        out["reachable"] = True
+        try:
+            qj = q_resp.json()
+            out["queue_running"] = len(qj.get("queue_running") or [])
+            out["queue_pending"] = len(qj.get("queue_pending") or [])
+        except (json.JSONDecodeError, ValueError, AttributeError, TypeError):
+            pass
+    return out
+
+
 async def _collect_once(app: FastAPI):
     cpu = _cpu_pct()
     mem = _mem_snapshot()
     gpus = _gpu_snapshot()
-    ollama, lmstudio = await asyncio.gather(
+    ollama, lmstudio, comfyui = await asyncio.gather(
         _ollama_snapshot(app.state.metrics_client),
         _lmstudio_snapshot(app.state.metrics_client),
+        _comfyui_snapshot(app.state.metrics_client),
         return_exceptions=False,
     )
     ts = time.time()
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO system_metrics
-           (ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb, gpu_json, ollama_json, lmstudio_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb, gpu_json,
+            ollama_json, lmstudio_json, comfyui_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             ts,
             cpu,
@@ -1109,6 +1353,7 @@ async def _collect_once(app: FastAPI):
             json.dumps(gpus) if gpus else None,
             json.dumps(ollama),
             json.dumps(lmstudio),
+            json.dumps(comfyui),
         ),
     )
     # Retention
@@ -1150,6 +1395,37 @@ DEFAULT_RULES_CONFIG = {
         "strict_types": True,
         "reject_unknown_fields": False,
     },
+    "tool_call_xml_retry": {
+        # When Ollama's tool-call parser rejects a model output with "XML syntax error"
+        # (typically a missing </parameter> close from qwen-style models), we transparently
+        # retry the same request with an extra system message telling the model exactly
+        # what it screwed up. Manual retry doesn't help because the model has no signal
+        # that anything went wrong on the prior attempt; the corrective hint is what makes
+        # the retry land. Off by default; enable per-model if you hit this a lot.
+        "enabled": False,
+        "max_retries": 1,
+        "error_patterns": [
+            "XML syntax error",
+            "element <parameter> closed by",
+        ],
+        "applies_to_upstream": ["ollama"],
+        "corrective_hint": (
+            "Your previous tool call output had malformed XML — most likely a missing "
+            "</parameter> close tag before </function>. Output complete, properly-closed "
+            "XML for every tool call. Each <parameter name=\"...\"> must be closed with "
+            "</parameter> before the enclosing </function>."
+        ),
+    },
+    "xml_autofix": {
+        # Post-flight: when the model emits XML-ish content in its text response that
+        # doesn't parse cleanly (unclosed tags, unescaped &, etc.), record findings
+        # in the audit log. v1 is audit-only — no payload mutation. Future `fix` mode
+        # would auto-repair before the response leaves the proxy.
+        "enabled": False,
+        "action": "audit",   # 'audit' = log only; 'silent' = detect but don't log; 'fix' = (future)
+        "min_tags": 2,       # skip responses with fewer than this many XML-ish tags
+        "ignore_tags": ["br", "hr", "img", "input", "meta", "link"],  # HTML void tags, never need closing
+    },
     "tool_args_autofix": {
         # Post-flight: when the model emits a tool_call missing required fields,
         # patch the arguments with configured defaults BEFORE forwarding to the client.
@@ -1188,6 +1464,11 @@ DEFAULT_RULES_CONFIG = {
         #   has_tools: bool                     request includes a non-empty tools[] array
         #   path_prefix: string                 match URL path prefix
         "rules": [],
+        # When True, rewrites the `model` field in upstream responses (and streamed chunks)
+        # back to the original requested model name. Hides the rewrite from clients that
+        # hard-check the response model. Off by default — clients see the actual upstream
+        # model and an X-Proxy-Model-Rewrite response header indicating the swap.
+        "preserve_response_model_name": False,
     },
     "ollama_options": {
         # Inject generation parameters into outgoing requests when the client didn't set them.
@@ -1248,6 +1529,55 @@ DEFAULT_RULES_CONFIG = {
         #   {"if": {"from_model": "claude-opus-4-7"}, "shadow_to": "qwen3-coder-next:latest"}
         "enabled": False,
         "rules": [],
+    },
+    "request_priority": {
+        # Soft priority via per-bucket concurrency caps. Each request is assigned a priority
+        # ('high' | 'normal' | 'low'), which selects an asyncio.Semaphore. Requests beyond
+        # the cap wait in line at the proxy instead of piling onto the upstream. Caps are
+        # auto-set from OLLAMA_NUM_PARALLEL when not specified explicitly:
+        #   high   = unlimited (always go through)
+        #   normal = OLLAMA_NUM_PARALLEL - 1 (leave one slot for high-priority traffic)
+        #   low    = 1
+        # Override `caps` to taste; null = unlimited. Priority is resolved per request:
+        #   1. X-Priority header ('high'|'normal'|'low')
+        #   2. client_priority map (e.g. claude-code → high, background-job → low)
+        #   3. default_priority
+        # `max_wait_s` caps how long a request will queue for a priority slot. After this,
+        # the request proceeds without one — protecting streaming clients whose read
+        # timeouts would otherwise fire before they see any bytes. Set to None for the
+        # strict-queueing behavior (slot or wait forever).
+        "enabled": False,
+        "caps": {},  # {} = derive from OLLAMA_NUM_PARALLEL; explicit dict overrides
+        "default_priority": "normal",
+        "client_priority": {},  # e.g. {"claude-code": "high", "background-job": "low"}
+        "max_wait_s": 0,
+    },
+    "compaction_nudge": {
+        # When a request's estimated prompt size crosses `threshold_pct`% of the effective
+        # num_ctx, nudge the client/model to compact. Strategy depends on client_app:
+        #   "system_reminder"        → inject a <system-reminder> tag into the system msg
+        #                              (Claude Code is trained to respect this tag strongly)
+        #   "system_reminder_plain"  → inject a plain English reminder into the system msg
+        #                              (works on any model; less reliable than the tag)
+        #   "synthetic_response"     → short-circuit with a synthetic assistant message
+        #                              telling the user to summarize/start a new chat
+        #                              (only used for non-streaming; streams fall back to
+        #                              system_reminder_plain)
+        # Plus an `X-Proxy-Suggest: compact` response header on every nudged request, so
+        # clients that read response headers can render their own banner.
+        "enabled": False,
+        "threshold_pct": 70,
+        "chars_per_token": 3.5,
+        "assumed_default_num_ctx": 32768,
+        "default_strategy": "synthetic_response",
+        "client_strategies": {
+            "claude-code": "system_reminder",
+            "vscode-copilot": "system_reminder_plain",
+            "github-copilot": "system_reminder_plain",
+            "cursor": "system_reminder_plain",
+            "continue.dev": "system_reminder_plain",
+            "ai-proxy-chat": "system_reminder_plain",
+        },
     },
     "tool_injector": {
         # Adds proxy-owned tools to outgoing requests and executes them server-side. The model
@@ -1685,7 +2015,186 @@ def _post_flight_active(request_body) -> bool:
     sv = (cfg.get("schema_validator") or {}).get("enabled")
     ht = (cfg.get("hallucinated_tool") or {}).get("enabled")
     af = (cfg.get("tool_args_autofix") or {}).get("enabled")
-    return bool(sv or ht or af)
+    xa = (cfg.get("xml_autofix") or {}).get("enabled")
+    return bool(sv or ht or af or xa)
+
+
+_XML_TAG_RE = re.compile(r"<\s*/?\s*([A-Za-z][\w.\-:]*)\b[^>]*?(/?)>", re.DOTALL)
+_XML_ENTITY_OR_AMP_RE = re.compile(r"&(?:#\d+|#x[0-9A-Fa-f]+|[A-Za-z]+);")
+
+
+def _xml_detect_errors(text: str) -> list[dict]:
+    """Best-effort scan for malformed XML in an assistant text response. Walks tags with a
+    stack to find unclosed/mismatched. Reports unescaped `&` outside known entities.
+    Returns a list of {kind, detail, ...}; empty if the content looks clean (or has too
+    few XML tags to bother checking)."""
+    if not text or not isinstance(text, str):
+        return []
+    cfg = (load_rules_config().get("xml_autofix") or {})
+    min_tags = max(1, int(cfg.get("min_tags", 2) or 2))
+    ignore = {str(t).lower() for t in (cfg.get("ignore_tags") or [])}
+    tags = list(_XML_TAG_RE.finditer(text))
+    if len(tags) < min_tags:
+        return []
+    out: list[dict] = []
+    stack: list[tuple[str, int]] = []  # (tag_name, position)
+    for m in tags:
+        full = m.group(0)
+        name = (m.group(1) or "").lower()
+        self_close = m.group(2) == "/" or full.startswith("</")
+        is_close = full.lstrip().startswith("</")
+        is_self = m.group(2) == "/"
+        if name in ignore or is_self:
+            continue
+        if is_close:
+            if not stack:
+                out.append({"kind": "stray_close", "tag": name, "pos": m.start()})
+                continue
+            top_name, _ = stack[-1]
+            if top_name == name:
+                stack.pop()
+            else:
+                out.append({"kind": "mismatched_close",
+                            "expected": top_name, "got": name, "pos": m.start()})
+                # Try to recover: if the close tag matches anything in the stack, unwind
+                # everything above it. Otherwise treat as stray.
+                if any(t == name for t, _ in stack):
+                    while stack and stack[-1][0] != name:
+                        unclosed_name, unclosed_pos = stack.pop()
+                        out.append({"kind": "unclosed_tag", "tag": unclosed_name,
+                                    "pos": unclosed_pos})
+                    if stack:
+                        stack.pop()
+        else:
+            stack.append((name, m.start()))
+    for name, pos in stack:
+        out.append({"kind": "unclosed_tag", "tag": name, "pos": pos})
+    # Unescaped `&` not part of an entity. Common LLM mistake when emitting HTML/XML.
+    if "&" in text:
+        for idx, ch in enumerate(text):
+            if ch != "&":
+                continue
+            tail = text[idx:idx + 12]
+            if _XML_ENTITY_OR_AMP_RE.match(tail):
+                continue
+            # Skip if it's inside code-fences (rough heuristic — count fences before idx).
+            fences_before = text[:idx].count("```")
+            if fences_before % 2 == 1:
+                continue
+            out.append({"kind": "unescaped_amp", "pos": idx,
+                        "context": text[max(0, idx-10):idx+20]})
+    return out
+
+
+def _extract_assistant_text(resp_obj: dict) -> str:
+    """Pull the assistant's text content from an OpenAI or Anthropic response object."""
+    if not isinstance(resp_obj, dict):
+        return ""
+    parts: list[str] = []
+    for c in (resp_obj.get("choices") or []):
+        msg = c.get("message") or {}
+        if isinstance(msg.get("content"), str):
+            parts.append(msg["content"])
+    if resp_obj.get("type") == "message":
+        for blk in (resp_obj.get("content") or []):
+            if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                parts.append(blk["text"])
+    return "\n".join(parts)
+
+
+def _xml_apply_fixes(text: str) -> tuple[str, list[dict]]:
+    """Apply repairs to malformed XML text. Returns (fixed_text, fixes_list).
+    Fixes applied:
+      - unescaped & not part of a known entity → &amp;
+      - unclosed tags → append closing tags in reverse stack order at end of text
+    Stray-close and mismatched-close findings are noted but not auto-repaired — they
+    usually indicate the model meant a different tag, and we don't want to guess."""
+    if not text or not isinstance(text, str):
+        return text, []
+    fixes: list[dict] = []
+    out = text
+    # Step 1: escape stray &. Walk the string, replace each & that isn't already part of
+    # an entity. Skip code fences to avoid mangling code that legitimately uses & in
+    # operators (`a && b`, etc.).
+    new_chars: list[str] = []
+    i = 0
+    in_fence = False
+    amp_fixed = 0
+    while i < len(out):
+        # Toggle fence state on ``` boundaries.
+        if out[i:i+3] == "```":
+            in_fence = not in_fence
+            new_chars.append("```")
+            i += 3
+            continue
+        ch = out[i]
+        if ch == "&" and not in_fence:
+            if _XML_ENTITY_OR_AMP_RE.match(out[i:i+12]):
+                new_chars.append("&")
+            else:
+                new_chars.append("&amp;")
+                amp_fixed += 1
+            i += 1
+        else:
+            new_chars.append(ch)
+            i += 1
+    if amp_fixed:
+        out = "".join(new_chars)
+        fixes.append({"kind": "escape_amp", "count": amp_fixed})
+
+    # Step 2: append closing tags for unclosed. Re-walk after the & fixes (positions
+    # changed). Build the same stack the detector uses, then append closes for what's
+    # left at the end.
+    cfg = (load_rules_config().get("xml_autofix") or {})
+    ignore = {str(t).lower() for t in (cfg.get("ignore_tags") or [])}
+    stack: list[str] = []
+    for m in _XML_TAG_RE.finditer(out):
+        full = m.group(0)
+        name = (m.group(1) or "").lower()
+        is_close = full.lstrip().startswith("</")
+        is_self = m.group(2) == "/"
+        if name in ignore or is_self:
+            continue
+        if is_close:
+            # Pop matching tag if present (mismatches just get stray-closed; we don't try
+            # to fix them, just unwind to keep our stack accurate for later tags).
+            if name in stack:
+                while stack and stack[-1] != name:
+                    stack.pop()
+                if stack:
+                    stack.pop()
+        else:
+            stack.append(name)
+    if stack:
+        closes = "".join(f"</{t}>" for t in reversed(stack))
+        out = out + closes
+        fixes.append({"kind": "close_tags", "tags": list(reversed(stack))})
+    return out, fixes
+
+
+def _xml_fix_resp_obj(resp_obj: dict) -> list[dict]:
+    """Apply XML fixes in place to assistant text within a response object. Returns the
+    aggregated list of fixes applied across all text blocks (empty if nothing changed)."""
+    if not isinstance(resp_obj, dict):
+        return []
+    all_fixes: list[dict] = []
+    # OpenAI shape: choices[i].message.content
+    for c in (resp_obj.get("choices") or []):
+        msg = c.get("message") or {}
+        if isinstance(msg.get("content"), str):
+            fixed, applied = _xml_apply_fixes(msg["content"])
+            if applied:
+                msg["content"] = fixed
+                all_fixes.extend(applied)
+    # Anthropic shape: content[i] where type=='text'
+    if resp_obj.get("type") == "message":
+        for blk in (resp_obj.get("content") or []):
+            if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
+                fixed, applied = _xml_apply_fixes(blk["text"])
+                if applied:
+                    blk["text"] = fixed
+                    all_fixes.extend(applied)
+    return all_fixes
 
 
 def _autofix_tool_calls(response_obj: dict, request_body) -> list[dict]:
@@ -2177,6 +2686,134 @@ def evaluate_context_overflow(body, ctx) -> dict | None:
             "reason": f"prompt ~{est_tokens} tok exceeds num_ctx={num_ctx} (will be silently truncated by Ollama)"}
 
 
+def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
+    """When the prompt is creeping toward num_ctx, return an action describing how to nudge
+    the client/model to compact. Strategy depends on client_app — Claude Code respects the
+    <system-reminder> tag strongly; other clients get either a plain reminder or (when not
+    streaming) a synthetic assistant response asking the user to summarize."""
+    if not isinstance(body, dict):
+        return None
+    cfg = load_rules_config().get("compaction_nudge") or {}
+    if not cfg.get("enabled", False):
+        return None
+    threshold_pct = float(cfg.get("threshold_pct", 70) or 70)
+    chars_per_token = float(cfg.get("chars_per_token", 3.5) or 3.5)
+    is_native = "/api/" in (ctx.get("path") or "")
+    est = _estimate_prompt_tokens(body, chars_per_token)
+    if est <= 0:
+        return None
+    num_ctx = _get_num_ctx(body, is_native)
+    if num_ctx is None:
+        num_ctx = int(cfg.get("assumed_default_num_ctx", 32768) or 32768)
+    threshold = int(num_ctx * threshold_pct / 100.0)
+    if est < threshold:
+        return None
+    client_app = ctx.get("client_app") or "unknown"
+    strategies = cfg.get("client_strategies") or {}
+    strategy = strategies.get(client_app, cfg.get("default_strategy") or "synthetic_response")
+    is_stream = bool(body.get("stream"))
+    if strategy == "synthetic_response" and is_stream:
+        strategy = "system_reminder_plain"  # synthetic only works for non-streaming
+    pct = int(est * 100 / max(1, num_ctx))
+    base = {
+        "estimated_tokens": est, "num_ctx": num_ctx, "threshold_pct": threshold_pct,
+        "client_app": client_app, "pct": pct, "strategy": strategy,
+    }
+    if strategy == "system_reminder":
+        text = (
+            f"<system-reminder>This conversation has used ~{est} tokens "
+            f"(~{pct}% of the {num_ctx}-token context window). Strongly suggest the user "
+            f"run /compact to summarize older turns before continuing, or start a new chat.</system-reminder>"
+        )
+        return {**base, "action": "system_reminder", "text": text,
+                "reason": f"prompt ~{est} tok ({pct}%) — injecting <system-reminder> for {client_app}"}
+    if strategy == "system_reminder_plain":
+        text = (
+            f"NOTE: this conversation has used ~{est} tokens (~{pct}% of the available "
+            f"context). Before continuing, advise the user to summarize earlier turns or "
+            f"start a fresh conversation. Long conversations cause silent truncation and "
+            f"degrade response quality."
+        )
+        return {**base, "action": "system_reminder", "text": text,
+                "reason": f"prompt ~{est} tok ({pct}%) — injecting plain reminder for {client_app}"}
+    if strategy == "synthetic_response":
+        msg = (
+            f"⚠ This conversation has grown to ~{est} tokens (~{pct}% of the context window). "
+            f"To preserve response quality, please summarize what we've covered so far and "
+            f"start a new chat with that summary — or use your client's compact/summarize "
+            f"feature. (This message comes from the AI Proxy's compaction_nudge rule, not "
+            f"from the model.)"
+        )
+        return {**base, "action": "synthetic_response", "text": msg,
+                "reason": f"prompt ~{est} tok ({pct}%) — synthetic nudge for {client_app}"}
+    return None
+
+
+def _inject_system_reminder(body: dict, reminder: str) -> bool:
+    """Append `reminder` to the body's system message. Returns True if mutated. Handles
+    OpenAI shape (messages[0] with role='system') and Anthropic shape (body['system'] as
+    str or list of content blocks)."""
+    if not isinstance(body, dict) or not reminder:
+        return False
+    # Anthropic shape: top-level `system`
+    if "system" in body or "messages" in body and isinstance(body.get("system"), (str, list)):
+        sys_field = body.get("system")
+        if isinstance(sys_field, str):
+            body["system"] = sys_field.rstrip() + "\n\n" + reminder
+            return True
+        if isinstance(sys_field, list):
+            sys_field.append({"type": "text", "text": reminder})
+            return True
+    # OpenAI shape: prepend or append to first system message in messages[]
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "system":
+                c = m.get("content")
+                if isinstance(c, str):
+                    m["content"] = c.rstrip() + "\n\n" + reminder
+                    return True
+                if isinstance(c, list):
+                    c.append({"type": "text", "text": reminder})
+                    return True
+        # No system message — insert one at the front.
+        msgs.insert(0, {"role": "system", "content": reminder})
+        return True
+    return False
+
+
+def _build_synthetic_response(body: dict, text: str) -> tuple[bytes, str]:
+    """Build a response body in the upstream's shape that looks like a normal assistant
+    message containing `text`. Returns (raw_bytes, content_type)."""
+    is_anthropic = isinstance(body, dict) and ("system" in body or "max_tokens" in body and "messages" in body and "model" in body and not body.get("messages") is None)
+    # Heuristic: presence of `system` or `max_tokens` typically marks Anthropic shape.
+    if isinstance(body, dict) and ("system" in body or ("max_tokens" in body and "tools" not in body and "stream_options" not in body)):
+        resp = {
+            "id": "msg_proxy_" + uuid.uuid4().hex[:16],
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "model": body.get("model") or "proxy-synthetic",
+            "stop_reason": "end_turn",
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        }
+    else:
+        resp = {
+            "id": "chatcmpl-proxy-" + uuid.uuid4().hex[:12],
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": body.get("model") if isinstance(body, dict) else "proxy-synthetic",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+        }
+    return json.dumps(resp).encode("utf-8"), "application/json"
+
+
 def _tool_names_from_body(body) -> list[str]:
     """Names of tools declared in body['tools']. Handles OpenAI (tools[i].function.name) and
     Anthropic (tools[i].name)."""
@@ -2626,12 +3263,12 @@ async def system_now():
     conn = db()
     row = conn.execute(
         """SELECT ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb,
-                  gpu_json, ollama_json, lmstudio_json
+                  gpu_json, ollama_json, lmstudio_json, comfyui_json
            FROM system_metrics ORDER BY ts DESC LIMIT 1"""
     ).fetchone()
     conn.close()
     if not row:
-        return {"ts": None, "cpu_pct": None, "mem": None, "gpus": [], "ollama": {}, "lmstudio": {}}
+        return {"ts": None, "cpu_pct": None, "mem": None, "gpus": [], "ollama": {}, "lmstudio": {}, "comfyui": {}}
     d = dict(row)
     return {
         "ts": d["ts"],
@@ -2641,7 +3278,51 @@ async def system_now():
         "gpus": json.loads(d["gpu_json"]) if d["gpu_json"] else [],
         "ollama": json.loads(d["ollama_json"]) if d["ollama_json"] else {},
         "lmstudio": json.loads(d["lmstudio_json"]) if d["lmstudio_json"] else {},
+        "comfyui": json.loads(d["comfyui_json"]) if d["comfyui_json"] else {},
     }
+
+
+@app.get("/__proxy/api/ollama/update-check")
+async def ollama_update_check(force: int = 0):
+    """Compare local model digests against the Ollama registry. Cached for an hour;
+    pass `?force=1` to skip the cache. Returns `{items: [...], checked_ts}`."""
+    now = time.time()
+    client = httpx.AsyncClient(timeout=httpx.Timeout(15.0))
+    try:
+        try:
+            r = await client.get(OLLAMA_URL + "/api/tags", timeout=httpx.Timeout(5.0))
+            tags = ((r.json() or {}).get("models") or []) if r.status_code == 200 else []
+        except Exception as e:
+            return {"items": [], "error": f"could not reach ollama at {OLLAMA_URL}: {e}"}
+        items: list[dict] = []
+        to_check: list[tuple[str, str]] = []
+        for m in tags:
+            name = m.get("name") or m.get("model") or ""
+            digest = (m.get("digest") or "").removeprefix("sha256:")
+            if not name:
+                continue
+            cached = _OLLAMA_UPDATE_CACHE.get(name)
+            if cached and not force and (now - cached.get("checked_ts", 0) < _OLLAMA_UPDATE_CACHE_TTL_S):
+                items.append(cached)
+                continue
+            to_check.append((name, digest))
+        if to_check:
+            results = await asyncio.gather(
+                *[_check_ollama_registry(client, n, d) for n, d in to_check],
+                return_exceptions=False,
+            )
+            for res in results:
+                res["checked_ts"] = now
+                _OLLAMA_UPDATE_CACHE[res["name"]] = res
+                items.append(res)
+        items.sort(key=lambda x: (
+            {"outdated": 0, "up_to_date": 1, "unknown": 2,
+             "not_in_registry": 3, "error": 4}.get(x.get("status", "error"), 5),
+            x.get("name", ""),
+        ))
+        return {"items": items, "checked_ts": now}
+    finally:
+        await client.aclose()
 
 
 @app.get("/__proxy/api/system/history")
@@ -3105,7 +3786,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "tool_injector", "schema_validator", "hallucinated_tool", "tool_args_autofix"]
+    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -3143,8 +3824,17 @@ async def reset_rules():
     return {"ok": True, "config": load_rules_config(), "source": "defaults"}
 
 
+_STATS_CACHE: dict = {"ts": 0.0, "data": None}
+_STATS_CACHE_TTL_S = 10.0
+
+
 @app.get("/__proxy/api/stats")
 async def stats():
+    # Cheap TTL cache. Stats are expensive (5000-row table scans) and the UI auto-refreshes
+    # every 1.5s; without this we re-query the whole world ~40×/min per viewer.
+    now = time.time()
+    if _STATS_CACHE["data"] is not None and (now - _STATS_CACHE["ts"]) < _STATS_CACHE_TTL_S:
+        return _STATS_CACHE["data"]
     conn = db()
     overall = dict(conn.execute(
         """SELECT COUNT(*) AS count,
@@ -3191,6 +3881,23 @@ async def stats():
            FROM requests GROUP BY status ORDER BY status"""
     ).fetchall()]
 
+    by_upstream = [dict(r) for r in conn.execute(
+        """SELECT COALESCE(upstream, '(unknown)') AS upstream,
+                  COUNT(*) AS count,
+                  COALESCE(SUM(prompt_tokens), 0) AS prompt_tokens,
+                  COALESCE(SUM(completion_tokens), 0) AS completion_tokens,
+                  COALESCE(SUM(total_tokens), 0) AS total_tokens,
+                  COALESCE(AVG(duration_ms), 0) AS avg_ms,
+                  COALESCE(SUM(duration_ms), 0) AS total_ms,
+                  COALESCE(AVG(ttft_ms), 0) AS avg_ttft_ms,
+                  SUM(CASE WHEN ttft_ms IS NOT NULL THEN 1 ELSE 0 END) AS with_ttft,
+                  SUM(CASE WHEN is_stream = 1 THEN 1 ELSE 0 END) AS streams,
+                  MAX(ts) AS last_ts
+           FROM requests
+           GROUP BY upstream
+           ORDER BY count DESC"""
+    ).fetchall()]
+
     by_client = [dict(r) for r in conn.execute(
         """SELECT COALESCE(client_ip, '(unknown)') AS client_ip,
                   COUNT(*) AS count,
@@ -3220,10 +3927,15 @@ async def stats():
     ).fetchall()]
 
     # Tool usage requires parsing response bodies — scan up to a bounded set.
+    # Trimmed from 5000 → 500 and limited to the last 7 days. With multi-MB response
+    # bodies, the old query was loading hundreds of MB and JSON-parsing every row, which
+    # dominated the stats endpoint latency. The most recent 500 is representative.
+    _tool_cutoff = time.time() - 7 * 86400
     tool_rows = conn.execute(
         """SELECT model, response_body, stream_chunks FROM requests
-           WHERE response_body IS NOT NULL OR stream_chunks IS NOT NULL
-           ORDER BY ts DESC LIMIT 5000"""
+           WHERE ts > ? AND (response_body IS NOT NULL OR stream_chunks IS NOT NULL)
+           ORDER BY ts DESC LIMIT 500""",
+        (_tool_cutoff,),
     ).fetchall()
     by_tool: dict[str, dict] = {}
     for r in tool_rows:
@@ -3239,16 +3951,84 @@ async def stats():
         reverse=True,
     )
 
+    # Throughput percentile distributions, split into:
+    #   - generation rate: completion_tokens / (duration - ttft)  (pure decoding speed)
+    #   - processing rate: prompt_tokens / ttft                  (prefill speed)
+    #   - combined:       completion_tokens / duration           (legacy single-number metric;
+    #                                                             includes prefill in denominator)
+    # Filter zero-duration rows and errors. For split rates, also require a recorded TTFT.
+    tps_rows = conn.execute(
+        """SELECT prompt_tokens, completion_tokens, duration_ms, ttft_ms, upstream FROM requests
+           WHERE completion_tokens IS NOT NULL AND completion_tokens > 0
+             AND duration_ms IS NOT NULL AND duration_ms > 50
+             AND (status IS NULL OR status < 400) AND error IS NULL"""
+    ).fetchall()
+    combined_values: list[float] = []
+    generation_values: list[float] = []
+    processing_values: list[float] = []
+    # Anthropic batches its SSE output, so (duration − ttft) is transfer time, not
+    # decoding time. Exclude it from the generation-rate distribution to keep that metric
+    # meaningful. Processing-rate (prefill) and combined-throughput are still valid.
+    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio"}
+    for r in tps_rows:
+        ct = r["completion_tokens"] or 0
+        pt = r["prompt_tokens"] or 0
+        dur = r["duration_ms"] or 0
+        ttft = r["ttft_ms"]
+        ups = r["upstream"]
+        if dur > 0 and ct > 0:
+            combined_values.append(ct / (dur / 1000.0))
+        if (ttft is not None and ttft > 0 and dur > ttft and ct > 0
+                and (ups in GENERATION_RATE_UPSTREAMS or ups is None)):
+            # Older rows pre-backfill have ups=None; let those through so we don't lose data.
+            generation_values.append(ct / ((dur - ttft) / 1000.0))
+        if ttft is not None and ttft > 50 and pt > 0:
+            processing_values.append(pt / (ttft / 1000.0))
+    combined_values.sort()
+    generation_values.sort()
+    processing_values.sort()
+
+    def _pct(values, p):
+        if not values:
+            return None
+        if len(values) == 1:
+            return values[0]
+        idx = (len(values) - 1) * p / 100.0
+        lo = int(idx)
+        hi = min(lo + 1, len(values) - 1)
+        frac = idx - lo
+        return values[lo] * (1 - frac) + values[hi] * frac
+
+    def _dist(values):
+        return {
+            "samples": len(values),
+            "min": values[0] if values else None,
+            "max": values[-1] if values else None,
+            "p10": _pct(values, 10),
+            "p25": _pct(values, 25),
+            "p50": _pct(values, 50),
+            "p75": _pct(values, 75),
+            "p90": _pct(values, 90),
+        }
+
+    overall["throughput"] = _dist(combined_values)            # legacy / combined
+    overall["throughput_generation"] = _dist(generation_values)  # decode rate
+    overall["throughput_processing"] = _dist(processing_values)  # prefill rate
+
     conn.close()
-    return {
+    result = {
         "overall": overall,
         "by_model": by_model,
         "by_path": by_path,
         "by_status": by_status,
+        "by_upstream": by_upstream,
         "by_client": by_client,
         "by_app": by_app,
         "by_tool": by_tool_list,
     }
+    _STATS_CACHE["ts"] = now
+    _STATS_CACHE["data"] = result
+    return result
 
 
 @app.get("/__proxy/api/requests/{req_id}")
@@ -4165,6 +4945,43 @@ async def control_panic_status():
     return {"panic": _PANIC_MODE}
 
 
+@app.get("/__proxy/api/control/inflight")
+async def control_inflight_list():
+    """List in-flight requests (those currently streaming from upstream). Used by the UI's
+    Kill button to know which requests can still be cancelled."""
+    now = time.time()
+    items = []
+    for rid, info in _INFLIGHT_REQUESTS.items():
+        items.append({
+            "id": rid,
+            "ts": info.get("ts"),
+            "elapsed_s": round(now - info.get("ts", now), 1),
+            "cancelled": bool(info.get("cancelled")),
+        })
+    return {"items": sorted(items, key=lambda x: x["ts"] or 0, reverse=True)}
+
+
+@app.post("/__proxy/api/control/cancel/{req_id}")
+async def control_cancel_request(req_id: str):
+    """Kill a specific in-flight request by closing its upstream connection. Ollama 0.21+
+    notices the client drop and aborts generation, freeing the GPU slot. The proxy's
+    streamer loop sees the close and ends — the client gets a truncated stream (or an
+    abrupt connection close if no bytes were sent yet)."""
+    info = _INFLIGHT_REQUESTS.get(req_id)
+    if not info:
+        return JSONResponse({"error": "not in-flight (already completed or never existed)"}, status_code=404)
+    if info.get("cancelled"):
+        return {"ok": True, "already_cancelled": True}
+    info["cancelled"] = True
+    upstream_resp = info.get("upstream_resp")
+    if upstream_resp is not None:
+        try:
+            await upstream_resp.aclose()
+        except Exception:
+            pass
+    return {"ok": True, "req_id": req_id}
+
+
 @app.post("/__proxy/api/control/panic")
 async def control_panic_set(request: Request):
     """Toggle panic mode. Body: {"on": bool}. While on, every proxied request returns 503
@@ -4393,6 +5210,106 @@ async def control_task_run_now(task_id: int, request: Request):
     return {"ok": True, "child_task_id": child_id}
 
 
+# -------- Benchmark API --------
+
+def _bench_visible_to(viewer_ip: str | None, creator_ip: str | None) -> bool:
+    if not creator_ip:
+        return True
+    return _ips_share_subnet(viewer_ip, creator_ip)
+
+
+@app.post("/__proxy/api/bench/run")
+async def bench_run(request: Request):
+    """Queue a benchmark. Body: {model, runs?, max_tokens?, prompt_tokens?, concurrency?,
+    randomize?, exclusive?, drain_seconds?}. Returns the bench id; poll /api/bench/runs/{id}
+    for progress and results."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"error": "'model' is required"}, status_code=400)
+    config = {
+        "runs": int(payload.get("runs", 5) or 5),
+        "max_tokens": int(payload.get("max_tokens", 256) or 256),
+        "prompt_tokens": int(payload.get("prompt_tokens", 0) or 0),
+        "concurrency": int(payload.get("concurrency", 1) or 1),
+        "randomize": bool(payload.get("randomize", False)),
+        "exclusive": bool(payload.get("exclusive", False)),
+        "drain_seconds": float(payload.get("drain_seconds", 5.0) or 0.0),
+    }
+    bench_id = "b_" + uuid.uuid4().hex[:12]
+    creator_ip = _client_ip(request)
+    conn = db()
+    conn.execute(
+        """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip)
+           VALUES (?, ?, ?, ?, 'pending', ?)""",
+        (bench_id, time.time(), model, json.dumps(config), creator_ip),
+    )
+    conn.commit()
+    conn.close()
+    asyncio.create_task(_bench_execute(bench_id, request.app))
+    return {"id": bench_id, "model": model, "config": config}
+
+
+@app.get("/__proxy/api/bench/runs")
+async def bench_runs_list(request: Request, limit: int = 50):
+    limit = max(1, min(int(limit or 50), 200))
+    conn = db()
+    rows = conn.execute(
+        "SELECT id, ts, model, config_json, status, progress, progress_total, "
+        "started_ts, finished_ts, error, creator_ip "
+        "FROM bench_runs ORDER BY ts DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    viewer = _client_ip(request)
+    items = []
+    for r in rows:
+        if not _bench_visible_to(viewer, r["creator_ip"]):
+            continue
+        d = dict(r)
+        try:
+            d["config"] = json.loads(d.pop("config_json") or "{}")
+        except (json.JSONDecodeError, TypeError):
+            d["config"] = {}
+        items.append(d)
+    return {"items": items}
+
+
+@app.get("/__proxy/api/bench/runs/{bench_id}")
+async def bench_run_get(bench_id: str, request: Request):
+    conn = db()
+    row = conn.execute("SELECT * FROM bench_runs WHERE id=?", (bench_id,)).fetchone()
+    conn.close()
+    if not row or not _bench_visible_to(_client_ip(request), row["creator_ip"]):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    d = dict(row)
+    try:
+        d["config"] = json.loads(d.pop("config_json") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        d["config"] = {}
+    try:
+        d["results"] = json.loads(d.pop("results_json") or "null")
+    except (json.JSONDecodeError, TypeError):
+        d["results"] = None
+    return d
+
+
+@app.delete("/__proxy/api/bench/runs/{bench_id}")
+async def bench_run_delete(bench_id: str, request: Request):
+    conn = db()
+    row = conn.execute("SELECT creator_ip FROM bench_runs WHERE id=?", (bench_id,)).fetchone()
+    if not row or not _bench_visible_to(_client_ip(request), row["creator_ip"]):
+        conn.close()
+        return JSONResponse({"error": "not found"}, status_code=404)
+    conn.execute("DELETE FROM bench_runs WHERE id=?", (bench_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True}
+
+
 # -------- Chat personalities (server-side, subnet-scoped) --------
 
 def _personality_visible_to(viewer_ip: str | None, creator_ip: str | None) -> bool:
@@ -4539,6 +5456,184 @@ async def personalities_delete(pid: str, request: Request):
     return {"ok": True}
 
 
+# -------- Stable Diffusion bridge (/imagine) --------
+
+GENERATED_DIR = STATIC_DIR / "generated"
+_GENERATED_NAME_RE = re.compile(r"^[a-f0-9]{8,64}\.(png|jpg|jpeg|webp)$")
+
+
+async def _comfyui_pick_checkpoint(client: httpx.AsyncClient) -> str | None:
+    """Discover the first available checkpoint by querying ComfyUI's /object_info."""
+    try:
+        r = await client.get(SD_URL + "/object_info", timeout=10.0)
+        j = r.json()
+        ckpts = j["CheckpointLoaderSimple"]["input"]["required"]["ckpt_name"][0]
+        return ckpts[0] if ckpts else None
+    except (httpx.HTTPError, KeyError, IndexError, json.JSONDecodeError, TypeError):
+        return None
+
+
+def _comfyui_workflow(prompt: str, neg: str, ckpt: str, steps: int, cfg: float,
+                      w: int, h: int, seed: int, sampler: str) -> dict:
+    """Minimal txt2img workflow: CheckpointLoader → CLIPTextEncode (pos+neg) → KSampler →
+    VAEDecode → SaveImage. Node IDs match ComfyUI's "Default" workflow numbering."""
+    return {
+        "3": {"class_type": "KSampler", "inputs": {
+            "seed": seed, "steps": steps, "cfg": cfg, "sampler_name": sampler,
+            "scheduler": "normal", "denoise": 1.0,
+            "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0],
+            "latent_image": ["5", 0],
+        }},
+        "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": ckpt}},
+        "5": {"class_type": "EmptyLatentImage", "inputs": {
+            "width": w, "height": h, "batch_size": 1,
+        }},
+        "6": {"class_type": "CLIPTextEncode", "inputs": {"text": prompt, "clip": ["4", 1]}},
+        "7": {"class_type": "CLIPTextEncode", "inputs": {"text": neg, "clip": ["4", 1]}},
+        "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
+        "9": {"class_type": "SaveImage", "inputs": {
+            "filename_prefix": "ai_proxy", "images": ["8", 0],
+        }},
+    }
+
+
+@app.post("/__proxy/api/sd/txt2img")
+async def sd_txt2img(request: Request):
+    """Submit a txt2img prompt to ComfyUI at SD_URL (default http://localhost:8188). Builds
+    a minimal workflow, queues it via /prompt, polls /history/{prompt_id} until the run
+    finishes, then downloads each output via /view and saves it under static/generated/."""
+    try:
+        payload = await request.json()
+    except Exception as e:
+        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
+    prompt_text = (payload.get("prompt") or "").strip()
+    if not prompt_text:
+        return JSONResponse({"error": "'prompt' is required"}, status_code=400)
+    neg = payload.get("negative_prompt") or ""
+    steps = int(payload.get("steps") or 20)
+    cfg = float(payload.get("cfg_scale") or payload.get("cfg") or 7.0)
+    w = int(payload.get("width") or 512)
+    h = int(payload.get("height") or 512)
+    sampler = payload.get("sampler_name") or "euler"
+    seed = int(payload.get("seed")) if payload.get("seed") is not None else int.from_bytes(os.urandom(4), "big")
+    ckpt = (payload.get("model") or SD_MODEL or "").strip()
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            if not ckpt:
+                ckpt = await _comfyui_pick_checkpoint(client)
+                if not ckpt:
+                    return JSONResponse(
+                        {"error": "no checkpoints found in ComfyUI",
+                         "hint": "Drop a model file into ComfyUI/models/checkpoints/, or set SD_MODEL env var."},
+                        status_code=502,
+                    )
+            wf = _comfyui_workflow(prompt_text, neg, ckpt, steps, cfg, w, h, seed, sampler)
+            client_id = uuid.uuid4().hex
+            try:
+                r = await client.post(
+                    SD_URL + "/prompt",
+                    json={"prompt": wf, "client_id": client_id},
+                )
+            except Exception as e:
+                return JSONResponse(
+                    {"error": f"ComfyUI unreachable at {SD_URL}: {e}",
+                     "hint": "Start ComfyUI or set SD_URL env var to the right host:port."},
+                    status_code=502,
+                )
+            if r.status_code != 200:
+                return JSONResponse(
+                    {"error": f"ComfyUI /prompt HTTP {r.status_code}: {r.text[:400]}"},
+                    status_code=502,
+                )
+            try:
+                pj = r.json()
+            except (json.JSONDecodeError, ValueError):
+                return JSONResponse({"error": "ComfyUI /prompt returned non-JSON"}, status_code=502)
+            pid = pj.get("prompt_id")
+            if not pid:
+                return JSONResponse(
+                    {"error": "ComfyUI didn't return prompt_id", "raw": pj},
+                    status_code=502,
+                )
+            # Poll /history/{pid} until outputs land, capped at 5 minutes.
+            deadline = time.time() + 300
+            outputs = None
+            while time.time() < deadline:
+                await asyncio.sleep(1.0)
+                try:
+                    hr = await client.get(SD_URL + f"/history/{pid}", timeout=10.0)
+                except Exception:
+                    continue
+                if hr.status_code != 200:
+                    continue
+                try:
+                    hj = hr.json()
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                entry = hj.get(pid) or {}
+                if entry.get("outputs"):
+                    outputs = entry["outputs"]
+                    break
+            if not outputs:
+                return JSONResponse({"error": "ComfyUI run timed out after 5 minutes"}, status_code=504)
+            # Collect filenames from any node that produced images (typically SaveImage).
+            image_descs = []
+            for _, out in outputs.items():
+                for img in (out.get("images") or []):
+                    image_descs.append(img)
+            if not image_descs:
+                return JSONResponse(
+                    {"error": "ComfyUI produced no images", "outputs": outputs},
+                    status_code=502,
+                )
+            GENERATED_DIR.mkdir(parents=True, exist_ok=True)
+            files = []
+            for img in image_descs:
+                params = {
+                    "filename": img.get("filename") or "",
+                    "type": img.get("type") or "output",
+                    "subfolder": img.get("subfolder") or "",
+                }
+                if not params["filename"]:
+                    continue
+                try:
+                    img_r = await client.get(SD_URL + "/view", params=params, timeout=30.0)
+                except Exception:
+                    continue
+                if img_r.status_code != 200:
+                    continue
+                fname = uuid.uuid4().hex + ".png"
+                (GENERATED_DIR / fname).write_bytes(img_r.content)
+                files.append("/__proxy/generated/" + fname)
+    except Exception as e:
+        return JSONResponse({"error": f"unexpected: {e}"}, status_code=500)
+    if not files:
+        return JSONResponse({"error": "ComfyUI generated images but none could be downloaded"}, status_code=502)
+    return {
+        "ok": True,
+        "files": files,
+        "prompt": prompt_text,
+        "ms": int((time.time() - t0) * 1000),
+        "seed": seed,
+        "sampler": sampler,
+        "model": ckpt,
+        "backend": "comfyui",
+    }
+
+
+@app.get("/__proxy/generated/{fname}")
+async def generated_image(fname: str):
+    """Serve a previously-generated image by uuid filename. Locked to a strict pattern so
+    the request can't traverse outside the generated directory."""
+    if not _GENERATED_NAME_RE.match(fname):
+        return JSONResponse({"error": "invalid filename"}, status_code=400)
+    p = GENERATED_DIR / fname
+    if not p.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(p)
+
+
 @app.get("/__proxy/remote")
 async def remote_pwa():
     """Mobile-first PWA for sending prompts to registered control endpoints + panic toggle."""
@@ -4549,6 +5644,306 @@ async def remote_pwa():
 @app.get("/__proxy/")
 async def ui_index():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+# -------- Benchmark runner --------
+#
+# In-proxy benchmark feature: queues a configurable streaming workload (N requests at a
+# given prompt size and concurrency), records TTFT + decode-rate + total per request, and
+# stores rolled-up percentiles. Optional exclusive-mode pauses all non-bench traffic for
+# clean uncontended numbers.
+#
+# Exclusive mode mechanics: a process-wide asyncio.Event that's set by default (allows
+# traffic). When a bench with exclusive=True begins, the event clears, making every
+# non-bench request `await` it. Bench requests bypass via x-client-name=ai-proxy-bench.
+# Hard 5-minute safety cap so a hung bench can't lock the proxy forever.
+
+_BENCH_TRAFFIC_OK = asyncio.Event()
+_BENCH_TRAFFIC_OK.set()
+_BENCH_SEM = asyncio.Semaphore(1)  # one bench at a time globally
+_BENCH_EXCLUSIVE_DEADLINE: float = 0.0  # if > now, exclusive mode is active until this ts
+
+
+# Realistic long-context filler (mirrors scripts/bench.py so the in-proxy bench produces
+# comparable numbers to the standalone CLI version).
+_BENCH_FILLER = '''
+# Module: data_pipeline/transforms.py
+from dataclasses import dataclass, field
+from typing import Iterable, Iterator, Callable, TypeVar, Generic, Optional
+import logging
+import time
+
+T = TypeVar("T")
+U = TypeVar("U")
+
+
+@dataclass
+class TransformResult(Generic[T]):
+    """Outcome of running a transform: the value plus diagnostics."""
+    value: Optional[T] = None
+    duration_ms: float = 0.0
+    error: Optional[str] = None
+    metadata: dict = field(default_factory=dict)
+
+
+class Pipeline(Generic[T, U]):
+    """Composes a sequence of stages into a single callable. Each stage takes a T and
+    returns a U; the pipeline propagates results through the stages, short-circuiting on
+    None or on the first error encountered."""
+
+    def __init__(self, stages: list):
+        self.stages = stages
+        self._call_count = 0
+
+    def run(self, item):
+        result = TransformResult(value=item)
+        start = time.perf_counter()
+        for i, stage in enumerate(self.stages):
+            if result.value is None or result.error:
+                break
+            try:
+                result.value = stage(result.value)
+            except Exception as e:
+                result.error = f"stage {i}: {e}"
+                break
+        result.duration_ms = (time.perf_counter() - start) * 1000
+        self._call_count += 1
+        return result
+
+
+def chunked(items, size):
+    """Group items into lists of `size`. Final batch may be smaller."""
+    if size <= 0:
+        raise ValueError("size must be positive")
+    batch = []
+    for item in items:
+        batch.append(item)
+        if len(batch) >= size:
+            yield batch
+            batch = []
+    if batch:
+        yield batch
+'''
+
+_BENCH_BASE_TASK = (
+    "Write a clear, well-commented Python implementation of binary search over a "
+    "sorted list of integers. Include type hints, a docstring, and a small test block "
+    "at the bottom that exercises edge cases. Be thorough."
+)
+
+
+def _bench_build_prompt(prompt_tokens: int, randomize: bool, seq: int) -> str:
+    """Build a prompt of approximately prompt_tokens. randomize=True salts each call so
+    prompt-cache hits don't make later runs trivially fast (which would mask the real
+    prefill cost we're trying to measure)."""
+    if prompt_tokens <= 0:
+        salt = f" [run #{seq}]" if randomize else ""
+        return _BENCH_BASE_TASK + salt
+    target_chars = int(prompt_tokens * 3.5)
+    salt = f"// nonce: {uuid.uuid4().hex}\n" if randomize else ""
+    head = f"Below is a code module. After the module, you'll be given a task.\n\n{salt}<CODE>\n"
+    tail = f"\n</CODE>\n\nTask: {_BENCH_BASE_TASK}"
+    body = ""
+    while len(head) + len(body) + len(tail) < target_chars:
+        body += _BENCH_FILLER
+    return head + body + tail
+
+
+async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
+                         max_tokens: int, prompt: str, run_seq: int) -> dict:
+    """Issue one streaming chat-completion request via the proxy and collect timings."""
+    body = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "max_tokens": max_tokens,
+    }).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "x-client-name": "ai-proxy-bench",
+        "x-priority": "high",
+    }
+    t0 = time.perf_counter()
+    ttft_ms: float | None = None
+    upstream_ct: int | None = None
+    chunk_ct = 0
+    err: str | None = None
+    try:
+        async with client.stream("POST", base + "/v1/chat/completions",
+                                 headers=headers, content=body, timeout=httpx.Timeout(600.0)) as resp:
+            if resp.status_code != 200:
+                err = f"HTTP {resp.status_code}: {(await resp.aread()).decode('utf-8', errors='replace')[:300]}"
+            else:
+                async for line in resp.aiter_lines():
+                    line = (line or "").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        j = json.loads(data)
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    for ch in (j.get("choices") or []):
+                        delta = ch.get("delta") or {}
+                        if delta.get("content"):
+                            if ttft_ms is None:
+                                ttft_ms = (time.perf_counter() - t0) * 1000
+                            chunk_ct += len(re.findall(r"\S+", delta["content"]))
+                    u = j.get("usage")
+                    if isinstance(u, dict) and u.get("completion_tokens"):
+                        upstream_ct = u["completion_tokens"]
+    except Exception as e:
+        err = f"{type(e).__name__}: {e}"
+    total_ms = (time.perf_counter() - t0) * 1000
+    completion_tokens = upstream_ct if upstream_ct is not None else chunk_ct
+    decode_tps: float | None = None
+    if (ttft_ms is not None and total_ms > ttft_ms and completion_tokens > 0):
+        decode_tps = completion_tokens / ((total_ms - ttft_ms) / 1000.0)
+    return {
+        "seq": run_seq,
+        "ttft_ms": ttft_ms,
+        "total_ms": total_ms,
+        "completion_tokens": completion_tokens,
+        "decode_tps": decode_tps,
+        "error": err,
+    }
+
+
+def _bench_pct(values: list, p: float):
+    if not values:
+        return None
+    if len(values) == 1:
+        return values[0]
+    s = sorted(values)
+    idx = (len(s) - 1) * p / 100.0
+    lo = int(idx)
+    hi = min(lo + 1, len(s) - 1)
+    frac = idx - lo
+    return s[lo] * (1 - frac) + s[hi] * frac
+
+
+def _bench_summarize(rows: list[dict]) -> dict:
+    """Roll up per-request timings into min / p50 / p90 / max for TTFT and decode."""
+    successes = [r for r in rows if not r.get("error")]
+    ttfts = [r["ttft_ms"] for r in successes if r["ttft_ms"] is not None]
+    decodes = [r["decode_tps"] for r in successes if r["decode_tps"] is not None]
+    totals = [r["total_ms"] for r in successes]
+    return {
+        "n_total": len(rows),
+        "n_success": len(successes),
+        "ttft_ms": {
+            "min": min(ttfts) if ttfts else None,
+            "p50": _bench_pct(ttfts, 50),
+            "p90": _bench_pct(ttfts, 90),
+            "max": max(ttfts) if ttfts else None,
+        },
+        "decode_tps": {
+            "min": min(decodes) if decodes else None,
+            "p50": _bench_pct(decodes, 50),
+            "p90": _bench_pct(decodes, 90),
+            "max": max(decodes) if decodes else None,
+            "mean": (sum(decodes) / len(decodes)) if decodes else None,
+        },
+        "total_ms": {
+            "min": min(totals) if totals else None,
+            "p50": _bench_pct(totals, 50),
+            "max": max(totals) if totals else None,
+        },
+    }
+
+
+async def _bench_execute(bench_id: str, app: FastAPI):
+    """Run a queued bench. Acquires the global bench semaphore so only one runs at a time.
+    If config.exclusive=True, also pauses non-bench traffic via _BENCH_TRAFFIC_OK."""
+    global _BENCH_EXCLUSIVE_DEADLINE
+    async with _BENCH_SEM:
+        conn = db()
+        row = conn.execute("SELECT * FROM bench_runs WHERE id=?", (bench_id,)).fetchone()
+        if not row or row["status"] != "pending":
+            conn.close()
+            return
+        try:
+            cfg = json.loads(row["config_json"])
+        except (json.JSONDecodeError, TypeError):
+            conn.execute("UPDATE bench_runs SET status='failed', error='invalid config JSON', finished_ts=? WHERE id=?",
+                         (time.time(), bench_id))
+            conn.commit()
+            conn.close()
+            return
+        runs = max(1, min(int(cfg.get("runs", 5)), 50))
+        max_tokens = max(16, min(int(cfg.get("max_tokens", 256)), 4096))
+        prompt_tokens = max(0, min(int(cfg.get("prompt_tokens", 0)), 65536))
+        concurrency = max(1, min(int(cfg.get("concurrency", 1)), 8))
+        randomize = bool(cfg.get("randomize", False))
+        exclusive = bool(cfg.get("exclusive", False))
+        drain_seconds = max(0.0, min(float(cfg.get("drain_seconds", 5.0)), 30.0))
+        model = row["model"]
+        conn.execute(
+            "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=? WHERE id=?",
+            (time.time(), runs, bench_id),
+        )
+        conn.commit()
+        conn.close()
+        # Exclusive mode: clear the gate, optionally drain in-flight requests, run, then re-set.
+        gate_held = False
+        if exclusive:
+            _BENCH_TRAFFIC_OK.clear()
+            _BENCH_EXCLUSIVE_DEADLINE = time.time() + 300  # 5-minute safety cap
+            gate_held = True
+            if drain_seconds > 0:
+                await asyncio.sleep(drain_seconds)
+        try:
+            base = f"http://127.0.0.1:{PROXY_PORT}"
+            client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
+            try:
+                rows: list[dict] = []
+                # Run in batches of `concurrency`. e.g. concurrency=4, runs=8 → 2 waves of 4.
+                seq_counter = 0
+                while seq_counter < runs:
+                    wave_size = min(concurrency, runs - seq_counter)
+                    wave_seqs = list(range(seq_counter + 1, seq_counter + wave_size + 1))
+                    coros = [
+                        _bench_run_one(client, base, model, max_tokens,
+                                       _bench_build_prompt(prompt_tokens, randomize, s), s)
+                        for s in wave_seqs
+                    ]
+                    results = await asyncio.gather(*coros, return_exceptions=False)
+                    rows.extend(results)
+                    seq_counter += wave_size
+                    # Persist progress incrementally so the UI can poll.
+                    conn = db()
+                    conn.execute(
+                        "UPDATE bench_runs SET progress=?, results_json=? WHERE id=?",
+                        (seq_counter, json.dumps({"rows": rows}), bench_id),
+                    )
+                    conn.commit()
+                    conn.close()
+                summary = _bench_summarize(rows)
+                final = {"rows": rows, "summary": summary, "config_used": cfg}
+                conn = db()
+                conn.execute(
+                    "UPDATE bench_runs SET status='done', results_json=?, finished_ts=? WHERE id=?",
+                    (json.dumps(final), time.time(), bench_id),
+                )
+                conn.commit()
+                conn.close()
+            finally:
+                await client.aclose()
+        except Exception as e:
+            conn = db()
+            conn.execute(
+                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                (f"{type(e).__name__}: {e}", time.time(), bench_id),
+            )
+            conn.commit()
+            conn.close()
+        finally:
+            if gate_held:
+                _BENCH_TRAFFIC_OK.set()
+                _BENCH_EXCLUSIVE_DEADLINE = 0.0
 
 
 # -------- Task queue (one-shots + cron/interval recurring) --------
@@ -4830,6 +6225,19 @@ async def _task_worker_loop(app: FastAPI):
 # -------- Transparent proxy --------
 
 REQ_HOP_HEADERS = {"host", "content-length", "connection", "transfer-encoding", "accept-encoding"}
+
+
+_MODEL_FIELD_RE = re.compile(r'"model"\s*:\s*"[^"]*"')
+
+
+def _override_model_in_text(text: str, new_model: str) -> str:
+    """Replace every `"model": "..."` value in a JSON or SSE blob with `new_model`. Used
+    only when model_router.preserve_response_model_name is enabled — clients then see the
+    model name they originally requested, hiding the proxy's rewrite. Off by default."""
+    if not text or not new_model:
+        return text
+    safe = json.dumps(new_model)  # handles quoting/escaping
+    return _MODEL_FIELD_RE.sub(f'"model": {safe}', text)
 RESP_HOP_HEADERS = {"content-length", "content-encoding", "transfer-encoding", "connection"}
 
 
@@ -5024,7 +6432,7 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
     # Caller-supplied identification: if a client sets x-client-name (or x-app-id /
     # x-application-name), trust it. This lets arbitrary scripts label themselves
     # without us having to maintain a UA whitelist.
-    for hk in ("x-client-name", "x-app-id", "x-application-name"):
+    for hk in ("x-client-name", "x-client-app", "x-app-id", "x-application-name"):
         v = (h.get(hk) or "").strip()
         if v:
             slug = re.sub(r"[^a-z0-9._-]+", "-", v.lower())[:40].strip("-")
@@ -5186,15 +6594,15 @@ def _redact_row(row: dict, viewer_ip: str | None, *, originator_ip_field: str = 
     return row
 
 
-def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: str, body_text: str, body_json, model, is_stream: bool):
+def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: str, body_text: str, body_json, model, is_stream: bool, upstream: str | None = None):
     conv_id = _conversation_id(body_json)
     turn = _turn_index(body_json)
     headers_dict = dict(request.headers)
     client_app = _detect_client_app(headers_dict, body_json if isinstance(body_json, dict) else None)
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -5209,6 +6617,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             conv_id,
             turn,
             client_app,
+            upstream,
         ),
     )
     conn.commit()
@@ -6553,13 +7962,53 @@ def _build_followup_body_openai(orig_body: dict, resp_obj: dict, executed: list[
     return new_body
 
 
-def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | None, stream_text: str | None, elapsed_ms: float, error: str | None):
+def _extract_ttft_ms(body_text: str | None, stream_text: str | None) -> float | None:
+    """Pull a precise TTFT (time to first token) from upstream response data when available.
+    For Ollama native API (/api/chat, /api/generate), parse `prompt_eval_duration` (ns) —
+    that's exact prefill time. For other shapes, return None and caller falls back to the
+    streaming-first-chunk timestamp."""
+    for source in (body_text, stream_text):
+        if not source:
+            continue
+        if "prompt_eval_duration" not in source:
+            continue
+        # Ollama native: top-level field on the final response object. Try plain JSON first;
+        # if it's NDJSON (streaming), find the line with the field.
+        try:
+            j = json.loads(source)
+            if isinstance(j, dict) and isinstance(j.get("prompt_eval_duration"), (int, float)):
+                return j["prompt_eval_duration"] / 1_000_000.0
+        except (json.JSONDecodeError, TypeError):
+            pass
+        for line in source.split("\n"):
+            line = line.strip()
+            if not line or "prompt_eval_duration" not in line:
+                continue
+            if line.startswith("data: "):
+                line = line[6:]
+            try:
+                j = json.loads(line)
+                if isinstance(j, dict) and isinstance(j.get("prompt_eval_duration"), (int, float)):
+                    return j["prompt_eval_duration"] / 1_000_000.0
+            except (json.JSONDecodeError, TypeError):
+                continue
+    return None
+
+
+def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | None,
+                 stream_text: str | None, elapsed_ms: float, error: str | None,
+                 ttft_ms: float | None = None):
     pt, ct, tt = _extract_usage(body_text, stream_text)
+    # Prefer the precise Ollama-native TTFT when present; else fall back to whatever the
+    # caller sniffed from the SSE first-chunk arrival time.
+    parsed_ttft = _extract_ttft_ms(body_text, stream_text)
+    if parsed_ttft is not None:
+        ttft_ms = parsed_ttft
     conn = db()
     conn.execute(
         """UPDATE requests
            SET status=?, response_headers=?, response_body=?, stream_chunks=?, duration_ms=?, error=?,
-               prompt_tokens=?, completion_tokens=?, total_tokens=?
+               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?
            WHERE id=?""",
         (
             status,
@@ -6568,13 +8017,14 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
             stream_text,
             elapsed_ms,
             error,
-            pt, ct, tt,
+            pt, ct, tt, ttft_ms,
             req_id,
         ),
     )
     conn.commit()
     conn.close()
     _LIVE_STREAMS.pop(req_id, None)
+    _INFLIGHT_REQUESTS.pop(req_id, None)
 
 
 @app.api_route(
@@ -6595,6 +8045,19 @@ async def proxy(full_path: str, request: Request):
             status_code=503,
             headers={"X-Proxy-Panic": "1"},
         )
+
+    # Bench exclusive-mode gate: when an exclusive bench is running, hold all non-bench
+    # requests until it finishes. Bench requests self-identify with x-client-name.
+    if not _BENCH_TRAFFIC_OK.is_set():
+        if (request.headers.get("x-client-name") or "").lower() != "ai-proxy-bench":
+            # Hard cap so a hung bench can't lock the proxy forever.
+            wait_until = _BENCH_EXCLUSIVE_DEADLINE or (time.time() + 300)
+            timeout = max(1.0, wait_until - time.time())
+            try:
+                await asyncio.wait_for(_BENCH_TRAFFIC_OK.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                # Safety release: bench overran its window; fail open.
+                _BENCH_TRAFFIC_OK.set()
 
     req_id = uuid.uuid4().hex
     start = time.perf_counter()
@@ -6618,7 +8081,7 @@ async def proxy(full_path: str, request: Request):
         except json.JSONDecodeError:
             pass
 
-    _save_pending(req_id, request, full_path, upstream_url, body_text, body_json, model, is_stream)
+    _save_pending(req_id, request, full_path, upstream_url, body_text, body_json, model, is_stream, upstream=upstream_label)
 
     # Snapshot the body before any rule mutates it — shadows always see the original request.
     body_snapshot_for_shadows = json.loads(body_text) if isinstance(body_json, dict) else None
@@ -6651,6 +8114,20 @@ async def proxy(full_path: str, request: Request):
         router_ctx["upstream"] = upstream_label
         is_stream = bool(body_json.get("stream"))
         model = body_json.get("model")
+        # Bridge changed which upstream we're talking to — keep the saved row in sync
+        # for BOTH `upstream` and `upstream_url`. Without this, audit/stats queries that
+        # join by upstream report the original (anthropic) destination even though the
+        # bytes flowed to ollama.
+        try:
+            _conn = db()
+            _conn.execute(
+                "UPDATE requests SET upstream=?, upstream_url=? WHERE id=?",
+                (upstream_label, upstream_url, req_id),
+            )
+            _conn.commit()
+            _conn.close()
+        except Exception:
+            pass
 
     options_inject = (evaluate_ollama_options(body_json, router_ctx)
                       if isinstance(body_json, dict) and upstream_label != "anthropic" else None)
@@ -6681,8 +8158,24 @@ async def proxy(full_path: str, request: Request):
         _ti_ctx["memory_scope"] = _xms[:200]
     tool_injection_count = _inject_proxy_tools(body_json, _ti_ctx) if isinstance(body_json, dict) else 0
     tool_injection_active = tool_injection_count > 0
+    # compaction_nudge: per-client strategy. Returns either a 'system_reminder' (mutates
+    # body, forwards upstream) or 'synthetic_response' (short-circuits with a synthetic
+    # assistant message — handled below).
+    compaction = (evaluate_compaction_nudge(body_json, {**router_ctx, "client_app": _ti_ctx.get("client_app")})
+                  if isinstance(body_json, dict) else None)
+    compaction_reminder_injected = False
+    if compaction and compaction.get("action") == "system_reminder":
+        compaction_reminder_injected = _inject_system_reminder(body_json, compaction.get("text") or "")
+        if compaction_reminder_injected:
+            _save_gate(req_id, {
+                "verdict": "rewrite",
+                "rule": "compaction_nudge",
+                "reason": compaction.get("reason"),
+                "details": compaction,
+            })
     body_mutated = bool(
         rewrite or options_inject or bridge_active or tool_injection_active
+        or compaction_reminder_injected
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
     )
@@ -6703,6 +8196,25 @@ async def proxy(full_path: str, request: Request):
             conn.execute("UPDATE requests SET model=? WHERE id=?", (model, req_id))
         conn.commit()
         conn.close()
+
+    # compaction_nudge synthetic short-circuit: build a fake assistant response and return
+    # it directly, never hitting upstream. Only used for non-streaming requests with
+    # unknown clients (the evaluator already swapped to system_reminder_plain for streams).
+    if compaction and compaction.get("action") == "synthetic_response":
+        synth_body, synth_ct = _build_synthetic_response(body_json or {}, compaction.get("text") or "")
+        elapsed = (time.perf_counter() - start) * 1000
+        _save_gate(req_id, {
+            "verdict": "intercept",
+            "rule": "compaction_nudge",
+            "reason": compaction.get("reason"),
+            "details": compaction,
+        })
+        _save_finish(req_id, 200, {"content-type": synth_ct}, synth_body.decode("utf-8", errors="replace"), None, elapsed, None)
+        return Response(
+            content=synth_body, status_code=200,
+            headers={"content-type": synth_ct, "x-proxy-suggest": "compact",
+                     "x-proxy-rule": "compaction_nudge"},
+        )
 
     # Phase 2: block/warn rules.
     gate = evaluate_rules(body_json)
@@ -6800,12 +8312,49 @@ async def proxy(full_path: str, request: Request):
     # Pre-flight overhead = everything up to handing off to upstream.
     _overhead_samples.append((time.perf_counter() - start) * 1000)
 
+    # request_priority: soft concurrency cap per priority bucket. Held until upstream
+    # returns and (for streaming) the body is fully consumed. Released in the streamer's
+    # finally block, or below for the non-streaming path.
+    _pri_cfg = (load_rules_config().get("request_priority") or {})
+    _pri_sem = None
+    _pri_label = "off"
+    _pri_acquired = False
+    if _pri_cfg.get("enabled", False):
+        _ensure_priority_sems()
+        _pri_label = _resolve_request_priority(dict(request.headers), _ti_ctx.get("client_app"))
+        _pri_sem = _PRIORITY_SEMS.get(_pri_label)
+    if _pri_sem is not None:
+        # Try to acquire with a bounded wait. If the slot doesn't free up in time, proceed
+        # WITHOUT the slot so streaming clients don't time out before seeing any bytes.
+        # max_wait_s=None means classic blocking behavior. 0 means non-blocking try.
+        max_wait_s = _pri_cfg.get("max_wait_s", 3.0)
+        if max_wait_s is None:
+            await _pri_sem.acquire()
+            _pri_acquired = True
+        elif max_wait_s <= 0:
+            _pri_acquired = _pri_sem.locked() is False and _pri_sem._value > 0
+            if _pri_acquired:
+                await _pri_sem.acquire()
+        else:
+            try:
+                await asyncio.wait_for(_pri_sem.acquire(), timeout=float(max_wait_s))
+                _pri_acquired = True
+            except asyncio.TimeoutError:
+                _pri_acquired = False  # proceed without the slot
+    _pri_released = False
+    def _release_pri_slot():
+        nonlocal _pri_released
+        if _pri_acquired and _pri_sem is not None and not _pri_released:
+            _pri_sem.release()
+            _pri_released = True
+
     try:
         upstream_req = client.build_request(
             request.method, upstream_url, headers=headers_out, content=body or None
         )
         upstream_resp = await client.send(upstream_req, stream=True)
     except Exception as e:
+        _release_pri_slot()
         elapsed = (time.perf_counter() - start) * 1000
         _save_finish(req_id, 0, {}, None, None, elapsed, f"upstream error: {e!r}")
         return JSONResponse(
@@ -6813,10 +8362,93 @@ async def proxy(full_path: str, request: Request):
             status_code=502,
         )
 
+    # Register this in-flight request so /api/control/cancel/{req_id} can find it.
+    _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": upstream_resp,
+                                  "cancelled": False}
+
+    # tool_call_xml_retry: when Ollama returns 500 with an XML-parse error in the body
+    # (qwen-style models occasionally emit `<parameter>...</function>` without closing the
+    # parameter tag), append a corrective system message to the request and re-send. A
+    # plain manual retry doesn't help because the model has no context that anything went
+    # wrong; the corrective hint is what makes the retry succeed.
+    _tcr_cfg = (load_rules_config().get("tool_call_xml_retry") or {})
+    _tcr_attempted = False
+    if (_tcr_cfg.get("enabled") and not _tcr_attempted
+            and upstream_resp.status_code == 500
+            and upstream_label in (_tcr_cfg.get("applies_to_upstream") or ["ollama"])
+            and isinstance(body_json, dict) and isinstance(body_json.get("messages"), list)):
+        # Read the error body up-front so we can inspect the message. This eats a stream
+        # response but it's a 500 — there's nothing useful to stream anyway.
+        err_body = (await upstream_resp.aread()).decode("utf-8", errors="replace")
+        await upstream_resp.aclose()
+        patterns = _tcr_cfg.get("error_patterns") or ["XML syntax error"]
+        if any(p in err_body for p in patterns):
+            hint = _tcr_cfg.get("corrective_hint") or (
+                "Your previous tool call had malformed XML. Output complete, "
+                "properly-closed XML for every tool call."
+            )
+            retry_body = json.loads(json.dumps(body_json))  # deep copy
+            retry_body["messages"] = list(retry_body["messages"]) + [
+                {"role": "system", "content": hint}
+            ]
+            retry_bytes = json.dumps(retry_body).encode("utf-8")
+            try:
+                retry_req = client.build_request(
+                    request.method, upstream_url, headers=headers_out, content=retry_bytes
+                )
+                retry_resp = await client.send(retry_req, stream=True)
+                _tcr_attempted = True
+                _save_gate(req_id, {
+                    "verdict": "rewrite",
+                    "rule": "tool_call_xml_retry",
+                    "reason": f"retried after Ollama XML parse error ({len(err_body)} byte body)",
+                    "details": {
+                        "first_status": 500,
+                        "retry_status": retry_resp.status_code,
+                        "error_excerpt": err_body[:300],
+                    },
+                })
+                upstream_resp = retry_resp
+                body = retry_bytes  # so re-serialize / audit reflects what actually went up
+            except Exception as e:
+                # Retry failed entirely; reconstruct a synthetic response carrying the
+                # original error so the client at least sees what happened.
+                _release_pri_slot()
+                elapsed = (time.perf_counter() - start) * 1000
+                _save_finish(req_id, 500, {"content-type": "application/json"}, err_body,
+                             None, elapsed, f"xml-retry-failed: {e!r}")
+                return Response(content=err_body.encode("utf-8"), status_code=500,
+                                media_type="application/json",
+                                headers={"x-proxy-rule": "tool_call_xml_retry"})
+        else:
+            # Not the XML-parse error we know about — return the original 500 as-is.
+            _release_pri_slot()
+            elapsed = (time.perf_counter() - start) * 1000
+            _save_finish(req_id, 500, {"content-type": "application/json"}, err_body,
+                         None, elapsed, None)
+            return Response(content=err_body.encode("utf-8"), status_code=500,
+                            media_type="application/json")
+
     resp_headers_full = dict(upstream_resp.headers)
     out_headers = dict(_filter(upstream_resp.headers, RESP_HOP_HEADERS))
     content_type = upstream_resp.headers.get("content-type", "")
     treat_as_stream = ("text/event-stream" in content_type) or ("application/x-ndjson" in content_type) or is_stream
+
+    # Surface model rewrites to the client. The X-Proxy-Model-Rewrite header is informational
+    # (clients can choose to act on it or ignore); the body's `model` field still carries the
+    # upstream's actual model unless preserve_response_model_name is enabled.
+    _rewrite_from: str | None = None
+    _rewrite_to: str | None = None
+    if rewrite:
+        _rewrite_from = rewrite.get("from")
+        _rewrite_to = rewrite.get("to")
+    elif bridge_active and bridge_original_model:
+        _rewrite_from = bridge_original_model
+        _rewrite_to = body_json.get("model") if isinstance(body_json, dict) else None
+    if _rewrite_from and _rewrite_to and _rewrite_from != _rewrite_to:
+        out_headers["x-proxy-model-rewrite"] = f"{_rewrite_from}→{_rewrite_to}"
+    _preserve_model = bool((load_rules_config().get("model_router") or {}).get("preserve_response_model_name", False))
+    _restore_model_name = _rewrite_from if (_preserve_model and _rewrite_from and _rewrite_to) else None
 
     # Helper used by both streaming and non-streaming paths: iteratively call upstream,
     # execute proxy-owned tools, append tool_results, and re-call until the model stops
@@ -6898,11 +8530,54 @@ async def proxy(full_path: str, request: Request):
         # Bridge translation AND tool-injection both require the full upstream stream first.
         do_buffer = do_intercept or bridge_active or tool_injection_active
 
+        # Emit keepalive bytes every N seconds while we're waiting on upstream. Prevents
+        # client-side read timeouts during long prefills (claude-code times out after ~30s
+        # with no data — the keepalive resets that clock).
+        # Shape matters: bare SSE comments work for vanilla clients but Anthropic's SDK
+        # requires actual event-shaped messages to recognize the stream as alive, so when
+        # the client is talking Anthropic (path=/v1/messages*, OR bridge_active which
+        # delivers Anthropic-shape output), we emit a proper `event: ping\ndata: {...}`
+        # block. Otherwise a generic SSE comment line.
+        _ka_is_sse = "text/event-stream" in (content_type or "")
+        _ka_anthropic = bridge_active or full_path.startswith("v1/messages")
+        if _ka_anthropic:
+            _ka_payload = b'event: ping\ndata: {"type":"ping"}\n\n'
+        else:
+            _ka_payload = b": ai-proxy keepalive\n\n"
+        # Claude Code's SDK has a read timeout somewhere around 10-13 seconds based on
+        # observed retry intervals, so 15s was too slow. 5s gives us 2-3 keepalives before
+        # any realistic client times out.
+        _ka_interval_s = 5.0
+
         async def streamer():
             chunks: list[bytes] = []
             err: str | None = None
+            first_chunk_ms: float | None = None
+            iterator = upstream_resp.aiter_raw()
+            pending: asyncio.Task | None = None
+            # Fire one keepalive immediately so the client sees bytes within ms, not seconds.
+            # Some HTTP clients have a "time to first byte" timeout separate from the
+            # inter-message read timeout — this satisfies both.
+            if _ka_is_sse:
+                yield _ka_payload
             try:
-                async for chunk in upstream_resp.aiter_raw():
+                while True:
+                    if pending is None:
+                        pending = asyncio.create_task(iterator.__anext__())
+                    done, _pending_set = await asyncio.wait({pending}, timeout=_ka_interval_s)
+                    if not done:
+                        # Timeout fired with no chunk — emit a keepalive if appropriate and
+                        # keep waiting on the same task next loop (don't cancel it).
+                        if _ka_is_sse:
+                            yield _ka_payload
+                        continue
+                    try:
+                        chunk = pending.result()
+                        pending = None
+                    except StopAsyncIteration:
+                        break
+                    if first_chunk_ms is None and chunk:
+                        first_chunk_ms = (time.perf_counter() - start) * 1000
                     chunks.append(chunk)
                     try:
                         _live_update_from_chunk(req_id, chunk.decode("utf-8", errors="replace"))
@@ -6912,6 +8587,8 @@ async def proxy(full_path: str, request: Request):
                         yield chunk
             except Exception as e:
                 err = f"stream error: {e!r}"
+                if pending is not None and not pending.done():
+                    pending.cancel()
             try:
                 await upstream_resp.aclose()
             except Exception:
@@ -6924,10 +8601,27 @@ async def proxy(full_path: str, request: Request):
 
             # Phase 2: post-flight on the assembled OpenAI response (autofix → validate).
             # Runs BEFORE bridge translation, so validators see the OpenAI tool_call shape they expect.
+            xml_findings: list[dict] = []
+            xml_applied_s: list[dict] = []
             if do_intercept and not err:
                 resp_obj = _assemble_streaming_response(full)
                 fixes = _autofix_tool_calls(resp_obj, body_json)
                 findings = _validate_response_tool_calls(resp_obj, body_json)
+                # XML autofix.
+                _xa_cfg = (load_rules_config().get("xml_autofix") or {})
+                _xa_act_s = _xa_cfg.get("action", "audit")
+                if _xa_cfg.get("enabled") and _xa_act_s != "silent":
+                    if _xa_act_s == "fix":
+                        xml_applied_s = _xml_fix_resp_obj(resp_obj)
+                        if xml_applied_s:
+                            # Replace buffered SSE with a synthetic stream of the fixed response.
+                            synth_bytes = _synth_response_stream(resp_obj)
+                            full = synth_bytes.decode("utf-8", errors="replace")
+                            replaced = True
+                            if not bridge_active:
+                                yield synth_bytes
+                    else:
+                        xml_findings = _xml_detect_errors(_extract_assistant_text(resp_obj))
                 if findings:
                     completion_id = resp_obj.get("id") or f"proxy-{uuid.uuid4().hex[:12]}"
                     model_name = resp_obj.get("model") or model
@@ -7005,10 +8699,47 @@ async def proxy(full_path: str, request: Request):
                     "reason": "; ".join(f"{f['tool_name']}: filled {', '.join(f['fixed_fields'].keys())}" for f in fixes),
                     "details": {"fixes": fixes, "streaming": True, "replaced": replaced},
                 })
-            _save_finish(req_id, upstream_resp.status_code, resp_headers_full, None, full, elapsed, err)
+            if xml_findings and (load_rules_config().get("xml_autofix") or {}).get("action", "audit") == "audit":
+                _kinds: dict = {}
+                for f in xml_findings:
+                    _kinds[f["kind"]] = _kinds.get(f["kind"], 0) + 1
+                _save_gate(req_id, {
+                    "verdict": "warn",
+                    "rule": "xml_autofix",
+                    "reason": f"{len(xml_findings)} XML issue(s): " + ", ".join(f"{k}={v}" for k, v in _kinds.items()),
+                    "details": {"findings": xml_findings[:50], "streaming": True},
+                })
+            elif xml_applied_s:
+                _save_gate(req_id, {
+                    "verdict": "rewrite",
+                    "rule": "xml_autofix",
+                    "reason": f"{len(xml_applied_s)} XML fix(es): " + ", ".join(
+                        f"{f['kind']}" + (f"({f.get('count')})" if f.get('count') else "")
+                        for f in xml_applied_s
+                    ),
+                    "details": {"fixes": xml_applied_s, "streaming": True, "replaced": True},
+                })
+            _save_finish(req_id, upstream_resp.status_code, resp_headers_full, None, full, elapsed, err, ttft_ms=first_chunk_ms)
+
+        # Wrap streamer to (a) release the priority slot even on disconnect/error, and
+        # (b) optionally rewrite the `model` field in every emitted chunk when the user
+        # asked for it (preserve_response_model_name).
+        async def _gen_with_release():
+            try:
+                async for chunk in streamer():
+                    if _restore_model_name and chunk:
+                        try:
+                            chunk = _override_model_in_text(
+                                chunk.decode("utf-8", errors="replace"), _restore_model_name
+                            ).encode("utf-8")
+                        except Exception:
+                            pass
+                    yield chunk
+            finally:
+                _release_pri_slot()
 
         return StreamingResponse(
-            streamer(),
+            _gen_with_release(),
             status_code=upstream_resp.status_code,
             headers=out_headers,
             media_type=content_type or "text/event-stream",
@@ -7016,6 +8747,7 @@ async def proxy(full_path: str, request: Request):
 
     body_bytes = await upstream_resp.aread()
     await upstream_resp.aclose()
+    _release_pri_slot()
     elapsed = (time.perf_counter() - start) * 1000
     body_text_resp = body_bytes.decode("utf-8", errors="replace")
 
@@ -7052,6 +8784,36 @@ async def proxy(full_path: str, request: Request):
                         "reason": "; ".join(f"{f['tool_name']}: filled {', '.join(f['fixed_fields'].keys())}" for f in fixes),
                         "details": {"fixes": fixes, "streaming": False},
                     })
+            # XML autofix (non-streaming).
+            _xa_cfg_n = (load_rules_config().get("xml_autofix") or {})
+            _xa_act = _xa_cfg_n.get("action", "audit")
+            if _xa_cfg_n.get("enabled") and _xa_act != "silent":
+                if _xa_act == "fix":
+                    xml_applied = _xml_fix_resp_obj(resp_obj)
+                    if xml_applied:
+                        body_text_resp = json.dumps(resp_obj)
+                        body_bytes = body_text_resp.encode("utf-8")
+                        _save_gate(req_id, {
+                            "verdict": "rewrite",
+                            "rule": "xml_autofix",
+                            "reason": f"{len(xml_applied)} XML fix(es): " + ", ".join(
+                                f"{f['kind']}" + (f"({f.get('count')})" if f.get('count') else "")
+                                for f in xml_applied
+                            ),
+                            "details": {"fixes": xml_applied, "streaming": False},
+                        })
+                else:
+                    xml_findings_n = _xml_detect_errors(_extract_assistant_text(resp_obj))
+                    if xml_findings_n:
+                        _kinds_n: dict = {}
+                        for f in xml_findings_n:
+                            _kinds_n[f["kind"]] = _kinds_n.get(f["kind"], 0) + 1
+                        _save_gate(req_id, {
+                            "verdict": "warn",
+                            "rule": "xml_autofix",
+                            "reason": f"{len(xml_findings_n)} XML issue(s): " + ", ".join(f"{k}={v}" for k, v in _kinds_n.items()),
+                            "details": {"findings": xml_findings_n[:50], "streaming": False},
+                        })
 
     # Proxy-tool execution loop (non-streaming): if the model called a proxy-injected tool,
     # run it, append a tool_result, and re-call upstream until done (capped at max_iterations).
@@ -7084,6 +8846,16 @@ async def proxy(full_path: str, request: Request):
             anthropic_obj = _openai_to_anthropic_response(o_obj, fallback_model=bridge_original_model)
             body_text_resp = json.dumps(anthropic_obj)
             body_bytes = body_text_resp.encode("utf-8")
+
+    # preserve_response_model_name: rewrite the body's `model` field back to what the
+    # client originally requested. Off by default; flips to "hide the rewrite" mode.
+    if _restore_model_name and body_bytes:
+        try:
+            body_bytes = _override_model_in_text(
+                body_bytes.decode("utf-8", errors="replace"), _restore_model_name
+            ).encode("utf-8")
+        except Exception:
+            pass
 
     _save_finish(req_id, upstream_resp.status_code, resp_headers_full, body_text_resp, None, elapsed, None)
 
@@ -7297,6 +9069,7 @@ def _render_digest_markdown(data: dict, samples: int, include_bodies: bool, reda
     lines.append("- `model_router` (transform): rewrite the model name. Keys: `enabled`, `aliases` ({from: to}), `rules` ([{if: {from_model, from_client, prompt_chars_lt, prompt_chars_gt, has_tools, path_prefix}, then: <model>}]).")
     lines.append("- `ollama_options` (transform): inject generation defaults (`num_ctx`, `temperature`, `keep_alive`, etc) when the client didn't set them. Keys: `enabled`, `defaults`, `per_model`, `per_client`, `rules`.")
     lines.append("- `context_overflow_guard` (transform): estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window (prevents Ollama silent truncation). Keys: `enabled`, `action` (warn|bump|trim|block), `chars_per_token`, `headroom_ratio`, `max_ctx`, `bump_to`, `min_keep_messages`, `assumed_default_num_ctx`.")
+    lines.append("- `compaction_nudge` (transform + intercept): when prompt size crosses `threshold_pct`% of num_ctx, nudge the client/model to compact. Strategy is per-client: `system_reminder` injects a `<system-reminder>` tag (Claude Code respects this strongly), `system_reminder_plain` injects a plain text reminder, `synthetic_response` short-circuits non-streaming requests with a synthetic assistant message. Streams fall back to `system_reminder_plain`. Adds `X-Proxy-Suggest: compact` response header on synthetic responses. Keys: `enabled`, `threshold_pct`, `chars_per_token`, `assumed_default_num_ctx`, `default_strategy`, `client_strategies` (map of client_app → strategy).")
     lines.append("- `tool_pruner` (transform): drop tool definitions the model has been offered repeatedly in this conversation but never invoked, cutting prompt tokens and reducing tool-selection noise. Keys: `enabled`, `action` (prune|warn), `min_turns_offered`, `min_history_turns`, `always_keep` (names), `max_prune_ratio`, `include_hint`.")
     lines.append("- `protocol_bridge` (transform): when an Anthropic-shape request gets routed (via `model_router`) to a non-Claude model, translate the body to OpenAI shape, send to OLLAMA_URL, and translate the response back. Lets Claude Code & Anthropic SDKs drive any OpenAI-compatible backend. Keys: `enabled`.")
     lines.append("- `tool_injector` (transform + post-flight): inject proxy-owned tools (memory: `remember`/`recall`/`list_memory`/`forget`; todos: `set_todos`/`get_todos`/`add_todo`/`complete_todo`) into outgoing requests, then intercept tool_use of those names, execute server-side, append tool_result, and re-call upstream so the model sees the answer and continues. Capped at `max_iterations`. Keys: `enabled`, `memory`, `todos`, `max_iterations`, `scopes`. `scopes` is a list of `{match, enabled?, memory?, todos?, max_iterations?}`; first matching scope wins. `match` accepts `ip`, `ip_cidr`, `user_agent` (substring), `client_app` (exact label).")
