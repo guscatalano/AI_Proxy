@@ -115,7 +115,7 @@ All rules are configured via a single JSON object, edited in the **Audit tab →
 |---|---|---|
 | `model_router` | transform | Rewrite `model` based on conditions (from_model, prompt size, has_tools, client IP). |
 | `ollama_options` | transform | Inject Ollama options (`num_ctx`, `keep_alive`, `cache_prompt`, etc.) when client didn't set them. |
-| `protocol_bridge` | transform | When an Anthropic-shape request gets routed to a non-Claude model, translate body to OpenAI shape and route to Ollama; translate the SSE stream back on the way out. |
+| `protocol_bridge` | transform | When an Anthropic-shape request gets routed to a non-Claude model, translate body to OpenAI shape and route to Ollama; translate the SSE stream back on the way out. Set `force: true` to always bridge regardless of the target model. |
 | `tool_pruner` | transform | Drop tool definitions the model has been offered repeatedly but never invoked in this conversation. |
 | `context_overflow_guard` | transform | Estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window. |
 | `shadow_router` | transform | Fan out a parallel shadow request to a comparison model. Best-effort, never blocks the primary. |
