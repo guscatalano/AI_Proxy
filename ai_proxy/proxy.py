@@ -19,6 +19,8 @@ from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
+
+from ._version import __version__
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
@@ -3265,7 +3267,7 @@ def _save_gate(req_id: str, gate: dict):
 
 @app.get("/__proxy/api/info")
 async def info():
-    return {"upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL, "lmstudio": LMSTUDIO_URL, "port": PROXY_PORT}
+    return {"version": __version__, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL, "lmstudio": LMSTUDIO_URL, "port": PROXY_PORT}
 
 
 def _read_proc_self_status() -> dict:

@@ -30,13 +30,29 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
       - id: v
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+            VERSION="${{ github.event.inputs.version }}"
           else
-            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+            VERSION="${GITHUB_REF_NAME#v}"
           fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          # Enforce the bump-script workflow: the committed sources must already match
+          # the release version. This keeps PyPI (ai_proxy/_version.py) and npm
+          # (package.json) in lockstep with the tag.
+          PYVER=$(sed -n 's/^__version__ *= *"\(.*\)"/\1/p' ai_proxy/_version.py)
+          NPMVER=$(node -p "require('./npm/ai-proxy/package.json').version")
+          fail=0
+          [ "$PYVER" = "$VERSION" ] || { echo "::error::ai_proxy/_version.py is $PYVER, expected $VERSION"; fail=1; }
+          [ "$NPMVER" = "$VERSION" ] || { echo "::error::npm/ai-proxy/package.json is $NPMVER, expected $VERSION"; fail=1; }
+          if [ "$fail" = 1 ]; then
+            echo "::error::Run 'python scripts/bump_version.py $VERSION --commit --tag' and push the tag."
+            exit 1
+          fi
+          echo "Version check OK: $VERSION"
 
   build:
     needs: version
@@ -121,20 +137,12 @@ jobs:
             npm publish --access public "$dir"
           done
 
-      - name: Stamp main package version + optional deps, then publish
+      - name: Publish main launcher package
+        # Version + optionalDependencies are already correct in the committed
+        # package.json (verified by the `version` job).
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          VERSION: ${{ needs.version.outputs.version }}
-        run: |
-          cd npm/ai-proxy
-          npm version "$VERSION" --no-git-tag-version --allow-same-version
-          node -e '
-            const fs=require("fs"),p="package.json";
-            const j=JSON.parse(fs.readFileSync(p));
-            for (const k of Object.keys(j.optionalDependencies||{})) j.optionalDependencies[k]=process.env.VERSION;
-            fs.writeFileSync(p, JSON.stringify(j,null,2)+"\n");
-          '
-          npm publish --access public
+        run: npm publish --access public npm/ai-proxy
 
   publish-pypi:
     needs: version
@@ -144,10 +152,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Stamp version + build
+      - name: Build sdist + wheel
+        # Version comes from ai_proxy/_version.py via pyproject dynamic metadata
+        # (verified against the tag by the `version` job).
         run: |
           python -m pip install --upgrade build twine
-          sed -i "s/^version = .*/version = \"${{ needs.version.outputs.version }}\"/" pyproject.toml
           python -m build
       - name: Publish to PyPI (skip if already uploaded)
         env:

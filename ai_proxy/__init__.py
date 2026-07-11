@@ -5,6 +5,7 @@ launched as ``ai-proxy`` (console script), ``python -m ai_proxy``, or imported a
 ``ai_proxy.proxy:app`` by an ASGI server.
 """
 
+from ._version import __version__
 from .proxy import app, main
 
-__all__ = ["app", "main"]
+__all__ = ["app", "main", "__version__"]
