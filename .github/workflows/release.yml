@@ -53,8 +53,6 @@ jobs:
         include:
           - os: windows-latest
             key: win32-x64
-          - os: macos-13
-            key: darwin-x64
           - os: macos-14
             key: darwin-arm64
           - os: ubuntu-latest

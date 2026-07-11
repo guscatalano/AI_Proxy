@@ -47,7 +47,8 @@ PyInstaller. Those binaries are published as platform-gated optional dependencie
 (`guscatalano-ai-proxy-<platform>-<arch>`); npm installs only the one matching your
 machine, and this package's `ai-proxy` launcher execs it.
 
-Supported platforms: `win32-x64`, `darwin-x64`, `darwin-arm64`, `linux-x64`, `linux-arm64`.
+Supported platforms: `win32-x64`, `darwin-arm64` (Apple Silicon), `linux-x64`,
+`linux-arm64`. On Intel Macs (and any other platform), install the Python build instead.
 
 Prefer Python? `pipx install guscatalano-ai-proxy`.
 

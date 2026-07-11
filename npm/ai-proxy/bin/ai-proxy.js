@@ -10,7 +10,7 @@ const { spawn } = require("child_process");
 const path = require("path");
 
 const PKG = "guscatalano-ai-proxy";
-const SUPPORTED = ["win32-x64", "darwin-x64", "darwin-arm64", "linux-x64", "linux-arm64"];
+const SUPPORTED = ["win32-x64", "darwin-arm64", "linux-x64", "linux-arm64"];
 
 function resolveBinary() {
   const key = `${process.platform}-${process.arch}`;
