@@ -5,8 +5,9 @@ All notable changes to this project are documented here. The format is based on
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 The version is single-sourced in `ai_proxy/_version.py`. Bump it with
-`python scripts/bump_version.py <version|major|minor|patch> --commit --tag`, then push
-the tag to trigger the release workflow (publishes to PyPI and npm).
+`python scripts/bump_version.py <version|major|minor|patch> --commit` on `main`, then
+promote `main` to the `release` branch (`git push origin main:release`) to trigger the
+release workflow (publishes to PyPI and npm, and creates a `vX.Y.Z` GitHub Release).
 
 ## [Unreleased]
 

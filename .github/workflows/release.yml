@@ -1,11 +1,16 @@
 name: Release
 
-# Publishes on a version tag (e.g. v0.1.0):
+# Publishes when the `release` branch is updated (fast-forward main -> release):
 #   - one self-contained PyInstaller binary per platform, wrapped as an npm
 #     sub-package (guscatalano-ai-proxy-<platform>) and published to npm
 #   - the main npm launcher package (guscatalano-ai-proxy)
 #   - the Python sdist+wheel to PyPI
-#   - the raw binaries attached to a GitHub Release
+#   - a GitHub Release (tag vX.Y.Z) with the raw binaries attached
+#
+# The published version is read from the committed sources (ai_proxy/_version.py and
+# npm/ai-proxy/package.json, which must match). Bump with scripts/bump_version.py on
+# main, then merge main -> release. Publishing is idempotent: re-running without a
+# version bump skips already-published artifacts, so re-triggering is safe.
 #
 # Required repo secrets:
 #   NPM_TOKEN        - npm automation token with publish rights
@@ -13,13 +18,9 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - "release"
   workflow_dispatch:
-    inputs:
-      version:
-        description: "Version to build (without leading v), e.g. 0.1.0"
-        required: true
 
 permissions:
   contents: write
@@ -33,26 +34,16 @@ jobs:
       - uses: actions/checkout@v4
       - id: v
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-          else
-            VERSION="${GITHUB_REF_NAME#v}"
-          fi
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-          # Enforce the bump-script workflow: the committed sources must already match
-          # the release version. This keeps PyPI (ai_proxy/_version.py) and npm
-          # (package.json) in lockstep with the tag.
+          # Version is single-sourced in the committed files; Python and npm must match.
           PYVER=$(sed -n 's/^__version__ *= *"\(.*\)"/\1/p' ai_proxy/_version.py)
           NPMVER=$(node -p "require('./npm/ai-proxy/package.json').version")
-          fail=0
-          [ "$PYVER" = "$VERSION" ] || { echo "::error::ai_proxy/_version.py is $PYVER, expected $VERSION"; fail=1; }
-          [ "$NPMVER" = "$VERSION" ] || { echo "::error::npm/ai-proxy/package.json is $NPMVER, expected $VERSION"; fail=1; }
-          if [ "$fail" = 1 ]; then
-            echo "::error::Run 'python scripts/bump_version.py $VERSION --commit --tag' and push the tag."
+          if [ "$PYVER" != "$NPMVER" ]; then
+            echo "::error::version drift: ai_proxy/_version.py=$PYVER but npm package.json=$NPMVER."
+            echo "::error::Run 'python scripts/bump_version.py <version>' to resync, then merge to release."
             exit 1
           fi
-          echo "Version check OK: $VERSION"
+          echo "version=$PYVER" >> "$GITHUB_OUTPUT"
+          echo "Releasing version $PYVER"
 
   build:
     needs: version
@@ -128,21 +119,33 @@ jobs:
           pattern: pkg-*
           path: out
 
-      - name: Publish platform packages
+      - name: Publish platform packages (skip already-published)
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: |
           for dir in out/pkg-*; do
-            echo "Publishing $dir"
-            npm publish --access public "$dir"
+            name=$(node -p "require('./$dir/package.json').name")
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "skip: $name@$VERSION already published"
+            else
+              echo "publishing $name@$VERSION"
+              npm publish --access public "$dir"
+            fi
           done
 
-      - name: Publish main launcher package
+      - name: Publish main launcher package (skip if already published)
         # Version + optionalDependencies are already correct in the committed
         # package.json (verified by the `version` job).
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public npm/ai-proxy
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          if npm view "guscatalano-ai-proxy@$VERSION" version >/dev/null 2>&1; then
+            echo "skip: guscatalano-ai-proxy@$VERSION already published"
+          else
+            npm publish --access public npm/ai-proxy
+          fi
 
   publish-pypi:
     needs: version
@@ -154,7 +157,7 @@ jobs:
           python-version: "3.12"
       - name: Build sdist + wheel
         # Version comes from ai_proxy/_version.py via pyproject dynamic metadata
-        # (verified against the tag by the `version` job).
+        # (Python/npm match verified by the `version` job).
         run: |
           python -m pip install --upgrade build twine
           python -m build
@@ -187,8 +190,10 @@ jobs:
               fi
             done
           done
-      - name: Attach to GitHub Release
+      - name: Create/update GitHub Release with binaries
         uses: softprops/action-gh-release@v2
-        if: github.event_name == 'push'
         with:
+          tag_name: v${{ needs.version.outputs.version }}
+          name: v${{ needs.version.outputs.version }}
           files: release/*
+          fail_on_unmatched_files: true

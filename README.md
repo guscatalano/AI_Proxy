@@ -181,13 +181,19 @@ per-platform binary build.
 
 ### Cutting a release
 
+Bump the version on `main`, then promote `main` to the `release` branch:
+
 ```bash
-python scripts/bump_version.py minor --commit --tag   # or: major | patch | 1.2.3
-git push origin main --tags
+python scripts/bump_version.py minor --commit   # or: major | patch | 1.2.3
+git push origin main
+git push origin main:release                    # fast-forward release -> triggers publish
 ```
 
-Pushing the `vX.Y.Z` tag triggers the release workflow, which builds a self-contained
-binary per platform and publishes to npm and PyPI. See [CHANGELOG.md](CHANGELOG.md).
+Updating the `release` branch triggers the release workflow, which builds a
+self-contained binary per platform, publishes to npm and PyPI, and creates a
+`vX.Y.Z` GitHub Release with the binaries. It reads the version from the committed
+files and skips anything already published, so re-triggering is safe. See
+[CHANGELOG.md](CHANGELOG.md).
 
 ---
 
