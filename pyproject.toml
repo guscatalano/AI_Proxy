@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-proxy"
+version = "0.1.0"
+description = "A transparent inspector and rule engine that sits between AI clients and their upstreams."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Gus Catalano" }]
+keywords = ["llm", "proxy", "anthropic", "openai", "ollama", "observability", "claude", "inspector"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Software Development :: Debuggers",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.27",
+]
+
+[project.urls]
+Homepage = "https://github.com/guscatalano/AI_Proxy"
+Issues = "https://github.com/guscatalano/AI_Proxy/issues"
+
+[project.scripts]
+ai-proxy = "ai_proxy:main"
+
+[tool.setuptools]
+packages = ["ai_proxy"]
+
+[tool.setuptools.package-data]
+ai_proxy = ["static/*", "static/**/*"]

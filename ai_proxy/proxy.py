@@ -41,7 +41,44 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
-DB_PATH = os.environ.get("PROXY_DB", "proxy.db")
+
+
+def _user_state_dir() -> Path:
+    """Per-user, writable directory for runtime state (DB, rules, generated images).
+
+    Used as the default when the tool is installed globally (pip/pipx/npm) and the
+    install directory or CWD isn't a good place to write. Override with PROXY_STATE_DIR.
+    """
+    env = os.environ.get("PROXY_STATE_DIR")
+    if env:
+        return Path(env)
+    if os.name == "nt":
+        base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "ai-proxy"
+    xdg = os.environ.get("XDG_DATA_HOME")
+    if xdg:
+        return Path(xdg) / "ai-proxy"
+    return Path.home() / ".local" / "share" / "ai-proxy"
+
+
+def _resolve_state_path(env_var: str, filename: str, *legacy: object) -> str:
+    """Resolve a writable state file. Precedence: explicit env var, then any existing
+    legacy location (so upgrades and source/systemd installs keep their data in place),
+    else the per-user state dir (created on demand)."""
+    v = os.environ.get(env_var)
+    if v:
+        return v
+    for cand in legacy:
+        if cand and Path(cand).exists():
+            return str(cand)
+    d = _user_state_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return str(d / filename)
+
+
+# Legacy default was "./proxy.db" (CWD). Keep honoring an existing ./proxy.db so source
+# and systemd installs (which also pin PROXY_DB explicitly) are unaffected.
+DB_PATH = _resolve_state_path("PROXY_DB", "proxy.db", "proxy.db")
 STATIC_DIR = Path(__file__).parent / "static"
 METRICS_INTERVAL_S = float(os.environ.get("PROXY_METRICS_INTERVAL", "5"))
 METRICS_RETENTION_S = float(os.environ.get("PROXY_METRICS_RETENTION", str(24 * 3600)))
@@ -75,6 +112,88 @@ _PENDING_TOOLS: dict = {}
 # (which signals Ollama to abort generation).
 #   {req_id: {ts, upstream_resp, cancel_evt}}
 _INFLIGHT_REQUESTS: dict = {}
+
+
+# request_dedup: when two identical streaming requests arrive close together (some clients —
+# notably claude-code — fan out parallel duplicates), the second one subscribes to the first's
+# stream and gets the same bytes tee'd to it. Saves the GPU doing the same work twice.
+#
+# Map: signature_hash → StreamFanout. Stale entries are cleaned up when their TTL expires.
+import hashlib as _hashlib
+_REQUEST_FANOUT: dict = {}
+
+
+class StreamFanout:
+    """Single-producer / multi-consumer byte fanout for tee-ing a streamed response to
+    duplicate requests. The producer (the primary's response generator) calls push()
+    for each emitted chunk and finish() when done. Consumers (the duplicates' response
+    generators) call subscribe() to get an asyncio.Queue that receives all past chunks
+    immediately + future chunks live + a final None sentinel."""
+
+    def __init__(self, primary_id: str):
+        self.primary_id = primary_id
+        self.created_ts = time.time()
+        self.finished_ts: float | None = None
+        self.history: list[bytes] = []
+        self.subscribers: list[asyncio.Queue] = []
+        self.error: str | None = None
+        self.done = False
+        self.total_bytes = 0
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        for chunk in self.history:
+            q.put_nowait(chunk)
+        if self.done:
+            q.put_nowait(None)
+        self.subscribers.append(q)
+        return q
+
+    def push(self, chunk: bytes):
+        if self.done or not chunk:
+            return
+        self.history.append(chunk)
+        self.total_bytes += len(chunk)
+        for q in self.subscribers:
+            try:
+                q.put_nowait(chunk)
+            except Exception:
+                pass
+
+    def finish(self, error: str | None = None):
+        if self.done:
+            return
+        self.done = True
+        self.error = error
+        self.finished_ts = time.time()
+        for q in self.subscribers:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
+
+
+def _dedup_signature(client_ip: str, full_path: str, body: bytes) -> str:
+    """Hash that identifies a request as a duplicate. Includes client IP + path + full
+    body bytes. Same client sending same bytes within the dedup window = duplicate."""
+    h = _hashlib.sha256()
+    h.update((client_ip or "").encode("utf-8", errors="replace"))
+    h.update(b"\x00")
+    h.update(full_path.encode("utf-8", errors="replace"))
+    h.update(b"\x00")
+    h.update(body)
+    return h.hexdigest()
+
+
+def _dedup_gc():
+    """Drop stale fanouts. Called opportunistically on each new request."""
+    cfg = (load_rules_config().get("request_dedup") or {})
+    ttl = float(cfg.get("ttl_s", 60))
+    now = time.time()
+    stale = [k for k, fo in _REQUEST_FANOUT.items()
+             if fo.done and fo.finished_ts and (now - fo.finished_ts) > ttl]
+    for k in stale:
+        _REQUEST_FANOUT.pop(k, None)
 
 
 def _load_panic_mode() -> bool:
@@ -795,10 +914,11 @@ async def lifespan(app: FastAPI):
     app.state.metrics_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
     app.state.metrics_task = asyncio.create_task(_metrics_loop(app))
     app.state.task_worker = asyncio.create_task(_task_worker_loop(app))
+    app.state.zombie_killer = asyncio.create_task(_inflight_zombie_killer(app))
     try:
         yield
     finally:
-        for t_attr in ("metrics_task", "task_worker"):
+        for t_attr in ("metrics_task", "task_worker", "zombie_killer"):
             t = getattr(app.state, t_attr, None)
             if t is not None:
                 t.cancel()
@@ -1530,6 +1650,15 @@ DEFAULT_RULES_CONFIG = {
         "enabled": False,
         "rules": [],
     },
+    "request_dedup": {
+        # When the same client sends two identical streaming requests within `ttl_s`, the
+        # second one is "tee'd" from the first — it subscribes to the first's response
+        # stream and gets the same bytes without re-running upstream. Saves GPU work when
+        # clients (e.g. claude-code) fan out parallel duplicates. Only applies to streaming
+        # requests (is_stream=true); non-stream requests pass through.
+        "enabled": False,
+        "ttl_s": 60,  # how long after a primary finishes to keep its bytes available for dedup
+    },
     "request_priority": {
         # Soft priority via per-bucket concurrency caps. Each request is assigned a priority
         # ('high' | 'normal' | 'low'), which selects an asyncio.Semaphore. Requests beyond
@@ -1610,7 +1739,9 @@ DEFAULT_RULES_CONFIG = {
     },
 }
 
-RULES_FILE = os.environ.get("PROXY_RULES_FILE", str(Path(__file__).parent / "rules.json"))
+RULES_FILE = _resolve_state_path(
+    "PROXY_RULES_FILE", "rules.json", Path(__file__).parent / "rules.json", "rules.json"
+)
 
 
 def get_setting(key: str):
@@ -3786,7 +3917,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
+    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -5458,7 +5589,9 @@ async def personalities_delete(pid: str, request: Request):
 
 # -------- Stable Diffusion bridge (/imagine) --------
 
-GENERATED_DIR = STATIC_DIR / "generated"
+# Generated images are written at runtime, so they live in the writable state dir rather
+# than the (possibly read-only, when pip/npm-installed) packaged static dir.
+GENERATED_DIR = _user_state_dir() / "generated"
 _GENERATED_NAME_RE = re.compile(r"^[a-f0-9]{8,64}\.(png|jpg|jpeg|webp)$")
 
 
@@ -6159,6 +6292,43 @@ async def _task_execute(task_id: int):
         )
         conn.commit()
         conn.close()
+
+
+async def _inflight_zombie_killer(app: FastAPI):
+    """Periodically cancel in-flight requests that have been running longer than the
+    configured max. Safety net for streamer coroutines that wedge on a dead client socket
+    while upstream bytes pile up in kernel buffers — they don't naturally recover, so we
+    kill them so the GPU slot frees up. Default cap: 30 minutes. Override via env var
+    PROXY_INFLIGHT_MAX_S."""
+    max_age = float(os.environ.get("PROXY_INFLIGHT_MAX_S", "1800") or "1800")
+    while True:
+        try:
+            await asyncio.sleep(60)
+            now = time.time()
+            for req_id in list(_INFLIGHT_REQUESTS.keys()):
+                info = _INFLIGHT_REQUESTS.get(req_id)
+                if not info or info.get("cancelled"):
+                    continue
+                if (now - info.get("ts", now)) > max_age:
+                    info["cancelled"] = True
+                    upstream_resp = info.get("upstream_resp")
+                    if upstream_resp is not None:
+                        try:
+                            await upstream_resp.aclose()
+                        except Exception:
+                            pass
+                    try:
+                        print(f"[zombie_killer] cancelled in-flight req {req_id} "
+                              f"(elapsed {int(now - info.get('ts', now))}s)")
+                    except Exception:
+                        pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            try:
+                print(f"[zombie_killer] tick error: {e}")
+            except Exception:
+                pass
 
 
 async def _task_worker_loop(app: FastAPI):
@@ -7090,6 +7260,186 @@ def _openai_to_anthropic_response(o: dict, fallback_model: str | None = None) ->
         "stop_sequence": None,
         "usage": usage_out,
     }
+
+
+class IncrementalAnthropicBridge:
+    """Stateful, chunk-at-a-time translator that converts an OpenAI-format SSE stream into
+    Anthropic-format SSE events. Unlike the batch translator below, this one emits events
+    AS the upstream chunks arrive — keeps clients with completion-event timeouts happy on
+    long generations (claude-code, opencode, Anthropic SDK all have this).
+
+    Usage:
+        bridge = IncrementalAnthropicBridge(fallback_model="claude-opus-4-7")
+        async for chunk in upstream:
+            out = bridge.feed(chunk)
+            if out: yield out
+        out = bridge.flush()
+        if out: yield out
+    """
+
+    def __init__(self, fallback_model: str | None = None):
+        self.fallback_model = fallback_model or ""
+        self.model = fallback_model or ""
+        self._buf = ""
+        self._msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+        self._started = False
+        self._finished = False
+        # Block state — Anthropic protocol requires a strict open/close pattern.
+        self._cur_block_idx = -1
+        self._cur_block_type: str | None = None  # 'text' | 'tool_use' | None
+        # Tool-call accumulator: openai-tc-index → {block_idx, id, name, started}
+        self._tool_calls: dict = {}
+        self._next_block_idx = 0
+        self._finish_reason: str | None = None
+        self._input_tokens = 0
+        self._output_tokens = 0
+
+    @staticmethod
+    def _event(name: str, payload: dict) -> str:
+        return f"event: {name}\ndata: {json.dumps(payload)}\n\n"
+
+    def _emit_start(self, out: list, prompt_tokens: int = 0):
+        if self._started:
+            return
+        self._started = True
+        out.append(self._event("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": self._msg_id, "type": "message", "role": "assistant",
+                "model": self.model, "content": [],
+                "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": prompt_tokens, "output_tokens": 0},
+            },
+        }))
+
+    def _close_current_block(self, out: list):
+        if self._cur_block_type is None:
+            return
+        out.append(self._event("content_block_stop", {
+            "type": "content_block_stop", "index": self._cur_block_idx,
+        }))
+        self._cur_block_type = None
+
+    def _open_text_block(self, out: list):
+        if self._cur_block_type == "text":
+            return
+        self._close_current_block(out)
+        self._cur_block_idx = self._next_block_idx
+        self._next_block_idx += 1
+        out.append(self._event("content_block_start", {
+            "type": "content_block_start", "index": self._cur_block_idx,
+            "content_block": {"type": "text", "text": ""},
+        }))
+        self._cur_block_type = "text"
+
+    def _process_chunk(self, j: dict, out: list):
+        if isinstance(j.get("model"), str) and j["model"]:
+            self.model = j["model"]
+        if not self._started:
+            usage = j.get("usage") or {}
+            self._emit_start(out, usage.get("prompt_tokens", 0) or 0)
+        for c in (j.get("choices") or []):
+            if c.get("finish_reason"):
+                self._finish_reason = c["finish_reason"]
+            d = c.get("delta") or {}
+            content = d.get("content")
+            if isinstance(content, str) and content:
+                self._open_text_block(out)
+                out.append(self._event("content_block_delta", {
+                    "type": "content_block_delta", "index": self._cur_block_idx,
+                    "delta": {"type": "text_delta", "text": content},
+                }))
+            for tc in (d.get("tool_calls") or []):
+                tc_idx = tc.get("index", 0)
+                slot = self._tool_calls.get(tc_idx)
+                if slot is None:
+                    slot = {"block_idx": None, "id": "", "name": "", "started": False}
+                    self._tool_calls[tc_idx] = slot
+                if tc.get("id") and not slot["id"]:
+                    slot["id"] = tc["id"]
+                fn = tc.get("function") or {}
+                new_name = fn.get("name")
+                if new_name and not slot["name"]:
+                    slot["name"] = new_name
+                if slot["name"] and not slot["started"]:
+                    # First time we know the tool's name → open the tool_use block.
+                    self._close_current_block(out)
+                    slot["block_idx"] = self._next_block_idx
+                    self._next_block_idx += 1
+                    self._cur_block_idx = slot["block_idx"]
+                    self._cur_block_type = "tool_use"
+                    out.append(self._event("content_block_start", {
+                        "type": "content_block_start", "index": slot["block_idx"],
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": slot["id"] or f"toolu_{uuid.uuid4().hex[:12]}",
+                            "name": slot["name"], "input": {},
+                        },
+                    }))
+                    slot["started"] = True
+                args_delta = fn.get("arguments")
+                if args_delta and slot["started"]:
+                    # If this tool isn't the currently-open block (interleaved), close cur
+                    # and re-open this one. Most providers emit one tool's args fully then
+                    # the next, so this rarely fires.
+                    if self._cur_block_idx != slot["block_idx"]:
+                        self._close_current_block(out)
+                        self._cur_block_idx = slot["block_idx"]
+                        self._cur_block_type = "tool_use"
+                    out.append(self._event("content_block_delta", {
+                        "type": "content_block_delta", "index": slot["block_idx"],
+                        "delta": {"type": "input_json_delta", "partial_json": args_delta},
+                    }))
+        u = j.get("usage")
+        if isinstance(u, dict):
+            if u.get("completion_tokens"):
+                self._output_tokens = u["completion_tokens"]
+            if u.get("prompt_tokens") and not self._input_tokens:
+                self._input_tokens = u["prompt_tokens"]
+
+    def feed(self, raw: bytes | str) -> bytes:
+        """Process incoming OpenAI SSE bytes, return Anthropic SSE bytes ready to forward.
+        Returns b'' if no complete events were finished by this chunk."""
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8", errors="replace")
+        self._buf += raw
+        # SSE event boundaries are blank lines (\n\n). Split, keep last partial in buf.
+        segments = self._buf.split("\n\n")
+        self._buf = segments[-1]
+        out: list = []
+        for seg in segments[:-1]:
+            for line in seg.split("\n"):
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:].strip()
+                if not data or data == "[DONE]":
+                    continue
+                try:
+                    j = json.loads(data)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                self._process_chunk(j, out)
+        return "".join(out).encode("utf-8") if out else b""
+
+    def flush(self) -> bytes:
+        """Emit final events: close any open block + message_delta + message_stop."""
+        if self._finished:
+            return b""
+        self._finished = True
+        out: list = []
+        if not self._started:
+            self._emit_start(out)
+        self._close_current_block(out)
+        stop_reason = _FINISH_OPENAI_TO_ANTHROPIC.get(
+            self._finish_reason, self._finish_reason or "end_turn"
+        )
+        out.append(self._event("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": self._output_tokens},
+        }))
+        out.append(self._event("message_stop", {"type": "message_stop"}))
+        return "".join(out).encode("utf-8")
 
 
 def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: str | None = None) -> bytes:
@@ -8083,6 +8433,59 @@ async def proxy(full_path: str, request: Request):
 
     _save_pending(req_id, request, full_path, upstream_url, body_text, body_json, model, is_stream, upstream=upstream_label)
 
+    # request_dedup: if an identical request from the same client is already streaming,
+    # subscribe to its response stream instead of issuing our own. Saves the GPU from doing
+    # the same work twice when clients like claude-code fan out parallel duplicates.
+    _dedup_cfg = (load_rules_config().get("request_dedup") or {})
+    if _dedup_cfg.get("enabled") and is_stream and body:
+        _dedup_gc()
+        _client_ip_str = _client_ip(request) or ""
+        _dedup_sig = _dedup_signature(_client_ip_str, full_path, body)
+        _existing_fanout = _REQUEST_FANOUT.get(_dedup_sig)
+        if _existing_fanout is not None and _existing_fanout.primary_id != req_id:
+            # We're a duplicate — tee from the primary.
+            _save_gate(req_id, {
+                "verdict": "intercept",
+                "rule": "request_dedup",
+                "reason": f"duplicate of primary {_existing_fanout.primary_id} — tee'd from its stream",
+                "details": {
+                    "primary_id": _existing_fanout.primary_id,
+                    "history_chunks": len(_existing_fanout.history),
+                    "primary_total_bytes": _existing_fanout.total_bytes,
+                },
+            })
+            q = _existing_fanout.subscribe()
+            _replay_content_type = "text/event-stream"
+
+            async def replay_from_fanout():
+                _replay_start = time.perf_counter()
+                _replay_bytes = bytearray()
+                try:
+                    while True:
+                        chunk = await q.get()
+                        if chunk is None:
+                            break
+                        _replay_bytes.extend(chunk)
+                        yield chunk
+                finally:
+                    elapsed = (time.perf_counter() - _replay_start) * 1000
+                    _save_finish(req_id, 200, {"content-type": _replay_content_type},
+                                 None, _replay_bytes.decode("utf-8", errors="replace"),
+                                 elapsed, _existing_fanout.error)
+
+            return StreamingResponse(
+                replay_from_fanout(),
+                status_code=200,
+                media_type=_replay_content_type,
+                headers={"x-proxy-rule": "request_dedup",
+                         "x-proxy-dedup-primary": _existing_fanout.primary_id},
+            )
+        # We're the primary — register a fanout so future duplicates can subscribe.
+        _dedup_fanout: StreamFanout | None = StreamFanout(primary_id=req_id)
+        _REQUEST_FANOUT[_dedup_sig] = _dedup_fanout
+    else:
+        _dedup_fanout = None
+
     # Snapshot the body before any rule mutates it — shadows always see the original request.
     body_snapshot_for_shadows = json.loads(body_text) if isinstance(body_json, dict) else None
     snapshot_path_for_shadows = "/" + full_path
@@ -8549,33 +8952,28 @@ async def proxy(full_path: str, request: Request):
         # any realistic client times out.
         _ka_interval_s = 5.0
 
+        # Incremental bridge translator: when bridge_active AND no post-flight transforms
+        # (tool injection, intercept) are active, translate each upstream chunk to
+        # Anthropic SSE events as it arrives instead of buffering the whole stream and
+        # translating at the end. Without this, clients with completion-event timeouts
+        # (Anthropic SDK, claude-code, opencode) give up during long generations because
+        # they see only keepalives — no actual content events.
+        _do_incr_bridge = bridge_active and not do_intercept and not tool_injection_active
+        _incr_bridge = IncrementalAnthropicBridge(bridge_original_model) if _do_incr_bridge else None
+
         async def streamer():
+            # REVERTED to simple async-for. The earlier asyncio.wait keepalive pattern
+            # broke bridged claude-code requests starting ~2026-05-15 (success rate went
+            # from ~97% to 0%). Keepalive bytes are now sent ONCE immediately and once
+            # before generation starts; the simple async-for handles the actual upstream
+            # reads without the create_task/wait dance that was wedging.
             chunks: list[bytes] = []
             err: str | None = None
             first_chunk_ms: float | None = None
-            iterator = upstream_resp.aiter_raw()
-            pending: asyncio.Task | None = None
-            # Fire one keepalive immediately so the client sees bytes within ms, not seconds.
-            # Some HTTP clients have a "time to first byte" timeout separate from the
-            # inter-message read timeout — this satisfies both.
             if _ka_is_sse:
-                yield _ka_payload
+                yield _ka_payload  # immediate "byte on wire" so the client doesn't TTFB-timeout
             try:
-                while True:
-                    if pending is None:
-                        pending = asyncio.create_task(iterator.__anext__())
-                    done, _pending_set = await asyncio.wait({pending}, timeout=_ka_interval_s)
-                    if not done:
-                        # Timeout fired with no chunk — emit a keepalive if appropriate and
-                        # keep waiting on the same task next loop (don't cancel it).
-                        if _ka_is_sse:
-                            yield _ka_payload
-                        continue
-                    try:
-                        chunk = pending.result()
-                        pending = None
-                    except StopAsyncIteration:
-                        break
+                async for chunk in upstream_resp.aiter_raw():
                     if first_chunk_ms is None and chunk:
                         first_chunk_ms = (time.perf_counter() - start) * 1000
                     chunks.append(chunk)
@@ -8583,12 +8981,14 @@ async def proxy(full_path: str, request: Request):
                         _live_update_from_chunk(req_id, chunk.decode("utf-8", errors="replace"))
                     except Exception:
                         pass
-                    if not do_buffer:
+                    if _do_incr_bridge and _incr_bridge is not None:
+                        translated_chunk = _incr_bridge.feed(chunk)
+                        if translated_chunk:
+                            yield translated_chunk
+                    elif not do_buffer:
                         yield chunk
             except Exception as e:
                 err = f"stream error: {e!r}"
-                if pending is not None and not pending.done():
-                    pending.cancel()
             try:
                 await upstream_resp.aclose()
             except Exception:
@@ -8659,11 +9059,19 @@ async def proxy(full_path: str, request: Request):
                             yield synth_bytes
 
             # Phase 3: protocol bridge — translate the (possibly intercepted) OpenAI stream into
-            # Anthropic SSE events for the client. We yield the translated bytes; `full` keeps
-            # the OpenAI form for upstream-truth audit storage (UI parsers handle both shapes).
+            # Anthropic SSE events for the client. Two paths:
+            #   - Incremental: we already yielded translated events chunk-by-chunk above.
+            #     Just flush the final message_delta + message_stop.
+            #   - Batch: post-flight transforms (tool injection, intercept) needed the whole
+            #     stream before we could translate. Yield the translated lump now.
             if bridge_active and not err:
-                translated = _openai_sse_to_anthropic_events(full, fallback_model=bridge_original_model)
-                yield translated
+                if _do_incr_bridge and _incr_bridge is not None:
+                    final = _incr_bridge.flush()
+                    if final:
+                        yield final
+                else:
+                    translated = _openai_sse_to_anthropic_events(full, fallback_model=bridge_original_model)
+                    yield translated
             elif bridge_active and err:
                 # Surface upstream error as an Anthropic-shape error event to the client.
                 err_payload = {
@@ -8721,10 +9129,12 @@ async def proxy(full_path: str, request: Request):
                 })
             _save_finish(req_id, upstream_resp.status_code, resp_headers_full, None, full, elapsed, err, ttft_ms=first_chunk_ms)
 
-        # Wrap streamer to (a) release the priority slot even on disconnect/error, and
-        # (b) optionally rewrite the `model` field in every emitted chunk when the user
-        # asked for it (preserve_response_model_name).
+        # Wrap streamer to (a) release the priority slot even on disconnect/error, (b)
+        # optionally rewrite the `model` field in every emitted chunk when the user asked
+        # for it (preserve_response_model_name), and (c) tee each chunk into the dedup
+        # fanout so concurrent duplicates receive the same bytes.
         async def _gen_with_release():
+            stream_err: str | None = None
             try:
                 async for chunk in streamer():
                     if _restore_model_name and chunk:
@@ -8734,9 +9144,16 @@ async def proxy(full_path: str, request: Request):
                             ).encode("utf-8")
                         except Exception:
                             pass
+                    if _dedup_fanout is not None:
+                        _dedup_fanout.push(chunk)
                     yield chunk
+            except Exception as e:
+                stream_err = f"{type(e).__name__}: {e}"
+                raise
             finally:
                 _release_pri_slot()
+                if _dedup_fanout is not None:
+                    _dedup_fanout.finish(stream_err)
 
         return StreamingResponse(
             _gen_with_release(),
@@ -9470,8 +9887,19 @@ def _promote_catchall_to_end():
 _promote_catchall_to_end()
 
 
-if __name__ == "__main__":
+def main():
+    """Console entry point (``ai-proxy``). Boots the proxy, optionally with a second
+    HTTPS listener sharing the same app/lifespan."""
+    import sys
     import uvicorn
+
+    # Banner/log lines contain non-ASCII (e.g. the → arrow). On Windows a redirected or
+    # piped stdout defaults to cp1252 and would raise UnicodeEncodeError before we bind.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
     print(f"AI Proxy → forwarding to {OLLAMA_URL}")
     print(f"Listening on http://{PROXY_HOST}:{PROXY_PORT}")
@@ -9491,14 +9919,14 @@ if __name__ == "__main__":
     https_enabled = bool(ssl_cert and ssl_key and https_port > 0)
 
     if not https_enabled:
-        uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+        uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
     else:
         if not Path(ssl_cert).exists():
             print(f"WARNING: PROXY_SSL_CERT does not exist at {ssl_cert!r}; HTTPS disabled.")
-            uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+            uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
         elif not Path(ssl_key).exists():
             print(f"WARNING: PROXY_SSL_KEY does not exist at {ssl_key!r}; HTTPS disabled.")
-            uvicorn.run("proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+            uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
         else:
             print(f"Also listening on https://{PROXY_HOST}:{https_port}")
             print(f"HTTPS UI: https://{PROXY_HOST}:{https_port}/__proxy/")
@@ -9511,11 +9939,11 @@ if __name__ == "__main__":
                 # lifespan="off" and shares the same in-process state. Requests to either
                 # listener hit the same handlers and the same SQLite database.
                 http_cfg = uvicorn.Config(
-                    "proxy:app", host=PROXY_HOST, port=PROXY_PORT,
+                    "ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT,
                     log_level="info",
                 )
                 https_cfg = uvicorn.Config(
-                    "proxy:app", host=PROXY_HOST, port=https_port,
+                    "ai_proxy.proxy:app", host=PROXY_HOST, port=https_port,
                     ssl_certfile=ssl_cert,
                     ssl_keyfile=ssl_key,
                     ssl_keyfile_password=ssl_key_pw,
@@ -9541,3 +9969,7 @@ if __name__ == "__main__":
                 asyncio.run(_serve_both())
             except KeyboardInterrupt:
                 pass
+
+
+if __name__ == "__main__":
+    main()
