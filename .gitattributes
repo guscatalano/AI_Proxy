@@ -1,0 +1,7 @@
+# Linux deployment artifacts must keep LF endings even when authored/checked out on
+# Windows — CRLF would break the shell script and inject \r into rendered systemd units.
+*.sh text eol=lf
+*.in text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+deploy/ai-proxy.env.example text eol=lf

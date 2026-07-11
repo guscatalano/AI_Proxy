@@ -40,6 +40,29 @@ jobs:
           path: coverage.xml
           if-no-files-found: warn
 
+      - name: Shellcheck deploy installer
+        run: shellcheck deploy/install-service.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t ai-proxy:ci .
+      - name: Smoke test container
+        run: |
+          set -euo pipefail
+          docker run -d --name ai-proxy-ci -p 8000:8000 ai-proxy:ci
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/__proxy/api/health > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          curl -sf -o /dev/null -w "UI HTTP %{http_code}\n" http://127.0.0.1:8000/__proxy/ || true
+          echo "----- container logs -----"; docker logs ai-proxy-ci || true
+          docker rm -f ai-proxy-ci > /dev/null 2>&1 || true
+          [ "$ok" = "1" ] || { echo "container did not become healthy"; exit 1; }
+
   build-and-smoke:
     needs: test
     strategy:

@@ -144,16 +144,45 @@ The Audit tab includes a one-click toggle between three modes (with auto-detecti
 
 ## Deployment
 
-### Linux (systemd)
+### Linux (systemd) — one command
+
+The installer creates an isolated venv, installs the app, writes a systemd unit and a
+config file, and enables the service.
 
 ```bash
-sudo cp ai_proxy.service /etc/systemd/system/
-# Edit the Environment= lines for your paths/ports
-sudo systemctl daemon-reload
-sudo systemctl enable --now ai_proxy
+# System service (boots at startup, runs as a dedicated 'ai-proxy' user)
+sudo ./deploy/install-service.sh
+
+# ...or a per-user service (no root)
+./deploy/install-service.sh --user
+loginctl enable-linger "$USER"   # optional: keep running after logout / across reboots
 ```
 
-The proxy supports self-restart via the System tab's "↻ Restart proxy" button when running under systemd (it exits with code 1; `Restart=on-failure` brings it back).
+Then edit the generated config and restart:
+
+- System: `/etc/ai-proxy/ai-proxy.env` → `sudo systemctl restart ai-proxy`
+- User: `~/.config/ai-proxy/ai-proxy.env` → `systemctl --user restart ai-proxy`
+
+Add `--pypi` to install the published release instead of this checkout. The service
+self-restarts via the System tab's "↻ Restart proxy" button (it exits non-zero;
+`Restart=on-failure` brings it back).
+
+### Docker
+
+```bash
+docker compose up -d          # UI at http://localhost:8000/__proxy/
+```
+
+State (DB, rules, generated images) persists in the `ai-proxy-data` volume. The compose
+file reaches an Ollama on the host via `host.docker.internal`; edit `OLLAMA_URL` /
+`ANTHROPIC_URL` for your setup. Or without compose:
+
+```bash
+docker build -t ai-proxy .
+docker run -d -p 8000:8000 -v ai-proxy-data:/data \
+  -e OLLAMA_URL=http://host.docker.internal:11434 \
+  --add-host host.docker.internal:host-gateway ai-proxy
+```
 
 ### Windows
 
