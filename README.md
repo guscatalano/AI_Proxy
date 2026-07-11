@@ -160,9 +160,34 @@ The proxy supports self-restart via the System tab's "↻ Restart proxy" button 
 ```powershell
 # Run as Administrator
 New-Service -Name "AIProxy" `
-  -BinaryPathName "C:\path\to\python.exe C:\path\to\proxy.py" `
+  -BinaryPathName "C:\path\to\python.exe -m ai_proxy" `
   -DisplayName "AI Proxy" -StartupType Automatic
 ```
+
+---
+
+## Development
+
+```bash
+# from a source checkout
+pip install -e ".[dev]"
+pytest
+```
+
+The suite (in `tests/`) covers the proxy's API endpoints, the Anthropic↔OpenAI
+translation, the writable-state path resolution, and the version single-source
+invariant — all offline, no upstream required. CI runs it on every push before the
+per-platform binary build.
+
+### Cutting a release
+
+```bash
+python scripts/bump_version.py minor --commit --tag   # or: major | patch | 1.2.3
+git push origin main --tags
+```
+
+Pushing the `vX.Y.Z` tag triggers the release workflow, which builds a self-contained
+binary per platform and publishes to npm and PyPI. See [CHANGELOG.md](CHANGELOG.md).
 
 ---
 

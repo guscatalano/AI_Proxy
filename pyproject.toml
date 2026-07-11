@@ -24,9 +24,15 @@ dependencies = [
     "httpx>=0.27",
 ]
 
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
 [project.urls]
 Homepage = "https://github.com/guscatalano/AI_Proxy"
 Issues = "https://github.com/guscatalano/AI_Proxy/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
 
 [project.scripts]
 ai-proxy = "ai_proxy:main"
