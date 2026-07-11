@@ -1,0 +1,40 @@
+{
+  "name": "guscatalano-ai-proxy",
+  "version": "0.1.0",
+  "description": "A transparent inspector and rule engine that sits between AI clients (Claude Code, Copilot, Cursor) and their upstreams (Anthropic, Ollama, OpenAI-compatible). Ships as a self-contained binary — no Python required.",
+  "keywords": [
+    "llm",
+    "proxy",
+    "anthropic",
+    "claude",
+    "openai",
+    "ollama",
+    "observability",
+    "inspector",
+    "debug"
+  ],
+  "homepage": "https://github.com/guscatalano/AI_Proxy",
+  "bugs": "https://github.com/guscatalano/AI_Proxy/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/guscatalano/AI_Proxy.git"
+  },
+  "license": "MIT",
+  "author": "Gus Catalano",
+  "bin": {
+    "ai-proxy": "bin/ai-proxy.js"
+  },
+  "files": [
+    "bin/ai-proxy.js"
+  ],
+  "engines": {
+    "node": ">=16"
+  },
+  "optionalDependencies": {
+    "guscatalano-ai-proxy-win32-x64": "0.1.0",
+    "guscatalano-ai-proxy-darwin-x64": "0.1.0",
+    "guscatalano-ai-proxy-darwin-arm64": "0.1.0",
+    "guscatalano-ai-proxy-linux-x64": "0.1.0",
+    "guscatalano-ai-proxy-linux-arm64": "0.1.0"
+  }
+}

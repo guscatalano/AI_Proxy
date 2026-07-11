@@ -1,5 +1,6 @@
 import os
 import re
+import sys
 import json
 import time
 import sqlite3
@@ -79,7 +80,13 @@ def _resolve_state_path(env_var: str, filename: str, *legacy: object) -> str:
 # Legacy default was "./proxy.db" (CWD). Keep honoring an existing ./proxy.db so source
 # and systemd installs (which also pin PROXY_DB explicitly) are unaffected.
 DB_PATH = _resolve_state_path("PROXY_DB", "proxy.db", "proxy.db")
-STATIC_DIR = Path(__file__).parent / "static"
+
+# When frozen by PyInstaller, bundled data lives under sys._MEIPASS, not next to the
+# (compiled-away) source module. The spec adds static/ at "ai_proxy/static".
+if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+    STATIC_DIR = Path(sys._MEIPASS) / "ai_proxy" / "static"
+else:
+    STATIC_DIR = Path(__file__).parent / "static"
 METRICS_INTERVAL_S = float(os.environ.get("PROXY_METRICS_INTERVAL", "5"))
 METRICS_RETENTION_S = float(os.environ.get("PROXY_METRICS_RETENTION", str(24 * 3600)))
 MCP_ALLOW_WRITE = os.environ.get("MCP_ALLOW_WRITE", "false").lower() in ("1", "true", "yes")

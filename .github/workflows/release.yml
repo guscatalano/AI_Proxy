@@ -1,0 +1,185 @@
+name: Release
+
+# Publishes on a version tag (e.g. v0.1.0):
+#   - one self-contained PyInstaller binary per platform, wrapped as an npm
+#     sub-package (guscatalano-ai-proxy-<platform>) and published to npm
+#   - the main npm launcher package (guscatalano-ai-proxy)
+#   - the Python sdist+wheel to PyPI
+#   - the raw binaries attached to a GitHub Release
+#
+# Required repo secrets:
+#   NPM_TOKEN        - npm automation token with publish rights
+#   PYPI_API_TOKEN   - PyPI API token (username is __token__)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to build (without leading v), e.g. 0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            key: win32-x64
+          - os: macos-13
+            key: darwin-x64
+          - os: macos-14
+            key: darwin-arm64
+          - os: ubuntu-latest
+            key: linux-x64
+          # Free public ARM runner for Linux arm64. Drop this entry if unavailable.
+          - os: ubuntu-24.04-arm
+            key: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install app + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+
+      - name: Freeze binary
+        run: pyinstaller packaging/ai_proxy.spec --distpath dist/bin --workpath build/pyi --noconfirm
+
+      - name: Assemble platform npm package
+        shell: bash
+        run: |
+          BIN="dist/bin/ai-proxy"
+          [ "${{ matrix.key }}" = "win32-x64" ] && BIN="dist/bin/ai-proxy.exe"
+          node npm/build-platform-package.js "${{ matrix.key }}" "$BIN" "out/${{ matrix.key }}" "${{ needs.version.outputs.version }}"
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.key }}
+          path: out/${{ matrix.key }}
+          if-no-files-found: error
+
+      - name: Upload raw binary artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.key }}
+          path: dist/bin/*
+
+  publish-npm:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download platform packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: out
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for dir in out/pkg-*; do
+            echo "Publishing $dir"
+            npm publish --access public "$dir"
+          done
+
+      - name: Stamp main package version + optional deps, then publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          cd npm/ai-proxy
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          node -e '
+            const fs=require("fs"),p="package.json";
+            const j=JSON.parse(fs.readFileSync(p));
+            for (const k of Object.keys(j.optionalDependencies||{})) j.optionalDependencies[k]=process.env.VERSION;
+            fs.writeFileSync(p, JSON.stringify(j,null,2)+"\n");
+          '
+          npm publish --access public
+
+  publish-pypi:
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Stamp version + build
+        run: |
+          python -m pip install --upgrade build twine
+          sed -i "s/^version = .*/version = \"${{ needs.version.outputs.version }}\"/" pyproject.toml
+          python -m build
+      - name: Publish to PyPI (skip if already uploaded)
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+        run: python -m twine upload --skip-existing dist/*
+
+  github-release:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bin-*
+          path: bins
+      - name: Rename per-platform binaries
+        run: |
+          mkdir -p release
+          for dir in bins/bin-*; do
+            key="${dir#bins/bin-}"
+            for f in "$dir"/*; do
+              base="$(basename "$f")"
+              if [ "$base" = "ai-proxy.exe" ]; then
+                cp "$f" "release/ai-proxy-${key}.exe"
+              else
+                cp "$f" "release/ai-proxy-${key}"
+              fi
+            done
+          done
+      - name: Attach to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: github.event_name == 'push'
+        with:
+          files: release/*
