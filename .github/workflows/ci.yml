@@ -1,0 +1,87 @@
+name: CI
+
+# Build + smoke-test the frozen binary and the npm launcher on every supported
+# platform. Does NOT publish anything — this is the safe pre-release check.
+# release.yml (tag-triggered) does the actual publishing.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            key: win32-x64
+          - os: macos-13
+            key: darwin-x64
+          - os: macos-14
+            key: darwin-arm64
+          - os: ubuntu-latest
+            key: linux-x64
+          - os: ubuntu-24.04-arm
+            key: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install app + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+
+      - name: Freeze binary
+        run: pyinstaller packaging/ai_proxy.spec --distpath dist/bin --workpath build/pyi --noconfirm
+
+      - name: Assemble platform npm package
+        shell: bash
+        run: |
+          BIN="dist/bin/ai-proxy"
+          [ "${{ matrix.key }}" = "win32-x64" ] && BIN="dist/bin/ai-proxy.exe"
+          node npm/build-platform-package.js "${{ matrix.key }}" "$BIN" "out/${{ matrix.key }}"
+
+      - name: Smoke test via npm launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p _tarballs
+          (cd "out/${{ matrix.key }}" && npm pack --pack-destination "$PWD/../../_tarballs")
+          (cd npm/ai-proxy && npm pack --pack-destination "$PWD/../../_tarballs")
+          rm -rf _consumer && mkdir _consumer && cd _consumer
+          echo '{"name":"consumer","version":"1.0.0","private":true}' > package.json
+          # Install main launcher + this platform's binary package from local tarballs.
+          # --no-optional skips the (unpublished) optional deps; we provide the binary
+          # package explicitly, which is what the launcher resolves at runtime.
+          npm install --no-audit --no-fund --no-optional ../_tarballs/*.tgz
+          export PROXY_HOST=127.0.0.1 PROXY_PORT=8137 PROXY_STATE_DIR="$PWD/_state"
+          node node_modules/guscatalano-ai-proxy/bin/ai-proxy.js > server.log 2>&1 &
+          SRV=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -sf "http://127.0.0.1:8137/__proxy/api/health" > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          code=0
+          if [ "$ok" = "1" ]; then
+            curl -sf -o /dev/null -w "UI HTTP %{http_code}\n" "http://127.0.0.1:8137/__proxy/" || code=1
+            echo "health OK"
+          else
+            echo "!! server did not become healthy"; code=1
+          fi
+          kill "$SRV" 2>/dev/null || true
+          echo "----- server.log -----"; cat server.log || true
+          exit $code
