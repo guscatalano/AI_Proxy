@@ -1,3 +1,5 @@
+<img src="docs/logo.png" alt="AI Proxy" width="96" align="right">
+
 # AI Proxy
 
 A transparent inspector and rule engine that sits between your AI clients (Claude Code, GitHub Copilot Chat, Cursor, raw SDKs) and their upstreams (Anthropic, Ollama, LM Studio, anything OpenAI-compatible). Logs every request, surfaces conversations and tool calls, applies configurable rules, and gives you a live web UI to see what's actually happening.

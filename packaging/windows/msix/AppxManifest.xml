@@ -39,7 +39,7 @@
       <uap:VisualElements
           DisplayName="AI Proxy"
           Description="A transparent inspector and rule engine for AI API traffic. UI at http://127.0.0.1:8000/__proxy/"
-          BackgroundColor="#1b1f2a"
+          BackgroundColor="#191d29"
           Square150x150Logo="assets\Square150x150Logo.png"
           Square44x44Logo="assets\Square44x44Logo.png" />
     </Application>
