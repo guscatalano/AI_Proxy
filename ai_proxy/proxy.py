@@ -102,6 +102,9 @@ MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip() or None
 MAX_STORED_BODY = int(os.environ.get("PROXY_MAX_STORED_BODY", str(256 * 1024)) or 0)
 REQUEST_RETENTION_DAYS = float(os.environ.get("PROXY_REQUEST_RETENTION_DAYS", "30") or 0)
 ANALYTICS_CACHE_TTL_S = float(os.environ.get("PROXY_ANALYTICS_CACHE_TTL", "5") or 0)
+# Cap uvicorn's graceful shutdown so a lingering connection (e.g. the UI's live SSE feed
+# or an in-flight stream) can't hang a `systemctl restart` forever. 0 = wait indefinitely.
+GRACEFUL_SHUTDOWN_S = int(float(os.environ.get("PROXY_GRACEFUL_SHUTDOWN", "10") or 0))
 _last_request_prune = 0.0
 _ANALYTICS_CACHE: dict = {}
 
@@ -9977,14 +9980,14 @@ def main():
     https_enabled = bool(ssl_cert and ssl_key and https_port > 0)
 
     if not https_enabled:
-        uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+        uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S or None)
     else:
         if not Path(ssl_cert).exists():
             print(f"WARNING: PROXY_SSL_CERT does not exist at {ssl_cert!r}; HTTPS disabled.")
-            uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+            uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S or None)
         elif not Path(ssl_key).exists():
             print(f"WARNING: PROXY_SSL_KEY does not exist at {ssl_key!r}; HTTPS disabled.")
-            uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False)
+            uvicorn.run("ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT, reload=False, timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S or None)
         else:
             print(f"Also listening on https://{PROXY_HOST}:{https_port}")
             print(f"HTTPS UI: https://{PROXY_HOST}:{https_port}/__proxy/")
@@ -9998,7 +10001,7 @@ def main():
                 # listener hit the same handlers and the same SQLite database.
                 http_cfg = uvicorn.Config(
                     "ai_proxy.proxy:app", host=PROXY_HOST, port=PROXY_PORT,
-                    log_level="info",
+                    log_level="info", timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S or None,
                 )
                 https_cfg = uvicorn.Config(
                     "ai_proxy.proxy:app", host=PROXY_HOST, port=https_port,
@@ -10006,7 +10009,7 @@ def main():
                     ssl_keyfile=ssl_key,
                     ssl_keyfile_password=ssl_key_pw,
                     lifespan="off",
-                    log_level="info",
+                    log_level="info", timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_S or None,
                 )
                 http_server = uvicorn.Server(http_cfg)
                 https_server = uvicorn.Server(https_cfg)
