@@ -63,6 +63,49 @@ jobs:
           docker rm -f ai-proxy-ci > /dev/null 2>&1 || true
           [ "$ok" = "1" ] || { echo "container did not become healthy"; exit 1; }
 
+  ui-smoke:
+    # Renders the UI in headless Chromium and asserts it actually works (populated
+    # table, client filter, tab switch, no JS/asset errors) — not just HTTP 200.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install app
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Install Playwright + Chromium
+        working-directory: tests/ui
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Start app, seed a request, run UI smoke test
+        run: |
+          set -euo pipefail
+          export PROXY_PORT=8137 PROXY_HOST=127.0.0.1 PROXY_DB="$PWD/ui.db" PROXY_STATE_DIR="$PWD/ui_state"
+          ai-proxy > ui_app.log 2>&1 &
+          APP=$!
+          trap 'kill $APP 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do curl -sf "http://127.0.0.1:8137/__proxy/api/health" > /dev/null && break; sleep 1; done
+          python - <<'PY'
+          import sqlite3, time, os
+          c = sqlite3.connect(os.environ["PROXY_DB"]); now = time.time()
+          c.executemany(
+              "INSERT INTO requests (id,ts,method,path,upstream_url,model,status,duration_ms,client_ip,client_app) "
+              "VALUES (?,?,?,?,?,?,?,?,?,?)",
+              [(f"ui-{i}", now - i, "POST", "/v1/messages", "http://x", "test-model", 200, 42.0,
+                "127.0.0.1", "claude-code" if i % 2 else "openai-sdk") for i in range(6)],
+          )
+          c.commit(); c.close(); print("seeded 6 requests")
+          PY
+          UI_URL="http://127.0.0.1:8137/__proxy/" node tests/ui/smoke.mjs \
+            || { echo "----- app log -----"; cat ui_app.log; exit 1; }
+
   build-and-smoke:
     needs: test
     strategy:
