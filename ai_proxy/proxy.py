@@ -1687,6 +1687,10 @@ DEFAULT_RULES_CONFIG = {
         # Triggers automatically when model_router rewrites the request's model from a Claude
         # name to a non-Claude one. Disable to leave Anthropic traffic untranslated.
         "enabled": True,
+        # When True, always bridge Anthropic-shape traffic regardless of the target model —
+        # even Claude model names get translated to OpenAI shape and routed to OLLAMA_URL.
+        # Useful when the OpenAI-compatible backend is itself serving a Claude model.
+        "force": False,
     },
     "shadow_router": {
         # Fan out incoming requests to one or more SHADOW models in parallel. The client
@@ -8575,10 +8579,12 @@ async def proxy(full_path: str, request: Request):
     # gets translated back on the way out (see streaming/non-streaming branches below).
     bridge_active = False
     bridge_original_model: str | None = None
+    _bridge_cfg = load_rules_config().get("protocol_bridge") or {}
     if (isinstance(body_json, dict)
-            and (load_rules_config().get("protocol_bridge") or {}).get("enabled", True)
+            and _bridge_cfg.get("enabled", True)
             and upstream_label == "anthropic"
-            and not _is_claude_model(body_json.get("model"))):
+            and (_bridge_cfg.get("force", False)
+                 or not _is_claude_model(body_json.get("model")))):
         bridge_original_model = body_json.get("model")
         body_json = _anthropic_to_openai_request(body_json)
         bridge_active = True
@@ -8924,7 +8930,10 @@ async def proxy(full_path: str, request: Request):
         _rewrite_from = bridge_original_model
         _rewrite_to = body_json.get("model") if isinstance(body_json, dict) else None
     if _rewrite_from and _rewrite_to and _rewrite_from != _rewrite_to:
-        out_headers["x-proxy-model-rewrite"] = f"{_rewrite_from}→{_rewrite_to}"
+        # ASCII-only value: HTTP header values must be latin-1 encodable. A Unicode arrow
+        # (U+2192) here crashes response serialization (Starlette/uvicorn encode headers as
+        # latin-1), which broke every request where a model rewrite actually changed the model.
+        out_headers["x-proxy-model-rewrite"] = f"{_rewrite_from}->{_rewrite_to}"
     _preserve_model = bool((load_rules_config().get("model_router") or {}).get("preserve_response_model_name", False))
     _restore_model_name = _rewrite_from if (_preserve_model and _rewrite_from and _rewrite_to) else None
 
@@ -9563,7 +9572,7 @@ def _render_digest_markdown(data: dict, samples: int, include_bodies: bool, reda
     lines.append("- `context_overflow_guard` (transform): estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window (prevents Ollama silent truncation). Keys: `enabled`, `action` (warn|bump|trim|block), `chars_per_token`, `headroom_ratio`, `max_ctx`, `bump_to`, `min_keep_messages`, `assumed_default_num_ctx`.")
     lines.append("- `compaction_nudge` (transform + intercept): when prompt size crosses `threshold_pct`% of num_ctx, nudge the client/model to compact. Strategy is per-client: `system_reminder` injects a `<system-reminder>` tag (Claude Code respects this strongly), `system_reminder_plain` injects a plain text reminder, `synthetic_response` short-circuits non-streaming requests with a synthetic assistant message. Streams fall back to `system_reminder_plain`. Adds `X-Proxy-Suggest: compact` response header on synthetic responses. Keys: `enabled`, `threshold_pct`, `chars_per_token`, `assumed_default_num_ctx`, `default_strategy`, `client_strategies` (map of client_app → strategy).")
     lines.append("- `tool_pruner` (transform): drop tool definitions the model has been offered repeatedly in this conversation but never invoked, cutting prompt tokens and reducing tool-selection noise. Keys: `enabled`, `action` (prune|warn), `min_turns_offered`, `min_history_turns`, `always_keep` (names), `max_prune_ratio`, `include_hint`.")
-    lines.append("- `protocol_bridge` (transform): when an Anthropic-shape request gets routed (via `model_router`) to a non-Claude model, translate the body to OpenAI shape, send to OLLAMA_URL, and translate the response back. Lets Claude Code & Anthropic SDKs drive any OpenAI-compatible backend. Keys: `enabled`.")
+    lines.append("- `protocol_bridge` (transform): when an Anthropic-shape request gets routed (via `model_router`) to a non-Claude model, translate the body to OpenAI shape, send to OLLAMA_URL, and translate the response back. Lets Claude Code & Anthropic SDKs drive any OpenAI-compatible backend. Keys: `enabled`, `force` (when true, always bridge regardless of the target model — even Claude model names).")
     lines.append("- `tool_injector` (transform + post-flight): inject proxy-owned tools (memory: `remember`/`recall`/`list_memory`/`forget`; todos: `set_todos`/`get_todos`/`add_todo`/`complete_todo`) into outgoing requests, then intercept tool_use of those names, execute server-side, append tool_result, and re-call upstream so the model sees the answer and continues. Capped at `max_iterations`. Keys: `enabled`, `memory`, `todos`, `max_iterations`, `scopes`. `scopes` is a list of `{match, enabled?, memory?, todos?, max_iterations?}`; first matching scope wins. `match` accepts `ip`, `ip_cidr`, `user_agent` (substring), `client_app` (exact label).")
     lines.append("- `schema_validator` (post-flight): validate tool_call args against the request's `tools[].parameters` schema; replace bad calls with a corrective assistant message. Keys: `enabled`, `action`, `strict_types`, `reject_unknown_fields`.")
     lines.append("- `hallucinated_tool` (post-flight): same intercept for tool names not declared in the request.")
