@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  WiX v5 source for the AI Proxy MSI installer. Installs the self-contained
+  ai-proxy.exe (PyInstaller binary — no Python required) into Program Files with a
+  Start Menu shortcut and a standard uninstaller.
+
+  Build:
+    wix build packaging/windows/msi/ai-proxy.wxs -bindpath dist/bin ^
+      -d Version=0.1.0 -o dist/ai-proxy-0.1.0.msi
+
+  Installs unsigned (SmartScreen shows an "unknown publisher" prompt). To remove that,
+  sign the .msi with signtool using a code-signing certificate.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="AI Proxy"
+           Manufacturer="Gus Catalano"
+           Version="$(Version)"
+           UpgradeCode="83957817-6c60-43df-aba8-9c2db4bb81bc"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of AI Proxy is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Property Id="ARPHELPLINK" Value="https://github.com/guscatalano/AI_Proxy" />
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/guscatalano/AI_Proxy" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="AI Proxy">
+        <Component Id="MainExe" Guid="*">
+          <File Id="AiProxyExe" Source="ai-proxy.exe" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Directory Id="AppShortcutFolder" Name="AI Proxy">
+        <Component Id="StartMenuShortcut" Guid="*">
+          <Shortcut Id="StartMenuExe"
+                    Name="AI Proxy"
+                    Description="Start the AI Proxy server (UI at http://127.0.0.1:8000/__proxy/)"
+                    Target="[INSTALLFOLDER]ai-proxy.exe"
+                    WorkingDirectory="INSTALLFOLDER" />
+          <RemoveFolder Id="RemoveAppShortcutFolder" On="uninstall" />
+          <RegistryValue Root="HKCU" Key="Software\AI Proxy" Name="installed"
+                         Type="integer" Value="1" KeyPath="yes" />
+        </Component>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="AI Proxy" Level="1">
+      <ComponentRef Id="MainExe" />
+      <ComponentRef Id="StartMenuShortcut" />
+    </Feature>
+  </Package>
+</Wix>
