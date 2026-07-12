@@ -122,6 +122,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "NPM_TOKEN not set — skipping npm publish"; exit 0; fi
           for dir in out/pkg-*; do
             name=$(node -p "require('./$dir/package.json').name")
             if npm view "$name@$VERSION" version >/dev/null 2>&1; then
@@ -139,6 +140,7 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ needs.version.outputs.version }}
         run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then echo "NPM_TOKEN not set — skipping npm publish"; exit 0; fi
           if npm view "guscatalano-ai-proxy@$VERSION" version >/dev/null 2>&1; then
             echo "skip: guscatalano-ai-proxy@$VERSION already published"
           else
@@ -159,14 +161,55 @@ jobs:
         run: |
           python -m pip install --upgrade build twine
           python -m build
-      - name: Publish to PyPI (skip if already uploaded)
+      - name: Publish to PyPI (skip if already uploaded / no token)
         env:
           TWINE_USERNAME: __token__
           TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-        run: python -m twine upload --skip-existing dist/*
+        run: |
+          if [ -z "$TWINE_PASSWORD" ]; then echo "PYPI_API_TOKEN not set — skipping PyPI publish"; exit 0; fi
+          python -m twine upload --skip-existing dist/*
+
+  windows-installers:
+    # Build the MSI (attached to the release) and the MSIX (a workflow artifact for
+    # Microsoft Store submission) from the frozen win32-x64 binary.
+    needs: [version, build]
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download win32-x64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: bin-win32-x64
+          path: dist/bin
+      - name: Build MSI (WiX)
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+          wix build packaging/windows/msi/ai-proxy.wxs -bindpath dist/bin `
+            -d Version=${{ needs.version.outputs.version }} `
+            -o dist/ai-proxy-${{ needs.version.outputs.version }}.msi
+      - name: Build MSIX (unsigned, for Store submission)
+        shell: pwsh
+        run: |
+          pwsh packaging/windows/msix/build-msix.ps1 `
+            -Version ${{ needs.version.outputs.version }} -BinDir dist/bin `
+            -OutFile dist/ai-proxy-${{ needs.version.outputs.version }}.msix
+      - name: Upload MSI (for the GitHub Release)
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-msi
+          path: dist/*.msi
+          if-no-files-found: error
+      - name: Upload MSIX (Store submission artifact)
+        uses: actions/upload-artifact@v4
+        with:
+          name: installer-msix
+          path: dist/*.msix
+          if-no-files-found: error
 
   github-release:
-    needs: [version, build]
+    needs: [version, build, windows-installers]
     runs-on: ubuntu-latest
     steps:
       - name: Download binaries
@@ -174,7 +217,12 @@ jobs:
         with:
           pattern: bin-*
           path: bins
-      - name: Rename per-platform binaries
+      - name: Download MSI
+        uses: actions/download-artifact@v4
+        with:
+          name: installer-msi
+          path: msi
+      - name: Assemble release files
         run: |
           mkdir -p release
           for dir in bins/bin-*; do
@@ -188,6 +236,7 @@ jobs:
               fi
             done
           done
+          cp msi/*.msi release/ 2>/dev/null || true
       - name: Create/update GitHub Release with binaries
         uses: softprops/action-gh-release@v2
         with:
