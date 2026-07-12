@@ -93,6 +93,38 @@ METRICS_INTERVAL_S = float(os.environ.get("PROXY_METRICS_INTERVAL", "5"))
 METRICS_RETENTION_S = float(os.environ.get("PROXY_METRICS_RETENTION", str(24 * 3600)))
 MCP_ALLOW_WRITE = os.environ.get("MCP_ALLOW_WRITE", "false").lower() in ("1", "true", "yes")
 MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip() or None
+# Performance guards (see the analytics endpoints and the request save path):
+#   - MAX_STORED_BODY caps how much of each request/response body is persisted, so a few
+#     huge turns can't bloat the DB and slow the analytics scans. 0 = unlimited.
+#   - REQUEST_RETENTION_DAYS prunes old rows periodically. 0 = keep forever.
+#   - ANALYTICS_CACHE_TTL_S memoizes the expensive stats/suggestions endpoints briefly so
+#     rapid UI polling doesn't recompute them every time.
+MAX_STORED_BODY = int(os.environ.get("PROXY_MAX_STORED_BODY", str(256 * 1024)) or 0)
+REQUEST_RETENTION_DAYS = float(os.environ.get("PROXY_REQUEST_RETENTION_DAYS", "30") or 0)
+ANALYTICS_CACHE_TTL_S = float(os.environ.get("PROXY_ANALYTICS_CACHE_TTL", "5") or 0)
+_last_request_prune = 0.0
+_ANALYTICS_CACHE: dict = {}
+
+
+def _truncate_for_store(s):
+    """Cap an oversized body before persisting. Keeps the head (usually the useful part)
+    and appends a marker. Returns the input unchanged when under the cap or capping is off."""
+    if not s or not MAX_STORED_BODY or len(s) <= MAX_STORED_BODY:
+        return s
+    return s[:MAX_STORED_BODY] + f"\n…[truncated by ai-proxy: {len(s) - MAX_STORED_BODY} of {len(s)} bytes omitted]"
+
+
+def _analytics_cache_get(key):
+    e = _ANALYTICS_CACHE.get(key)
+    if e and ANALYTICS_CACHE_TTL_S and (time.time() - e[0]) < ANALYTICS_CACHE_TTL_S:
+        return e[1]
+    return None
+
+
+def _analytics_cache_put(key, val):
+    if ANALYTICS_CACHE_TTL_S:
+        _ANALYTICS_CACHE[key] = (time.time(), val)
+    return val
 
 # Rolling window of per-request proxy overhead (ms). Used by /__proxy/api/health.
 _overhead_samples: collections.deque = collections.deque(maxlen=2000)
@@ -1487,6 +1519,12 @@ async def _collect_once(app: FastAPI):
     )
     # Retention
     conn.execute("DELETE FROM system_metrics WHERE ts < ?", (ts - METRICS_RETENTION_S,))
+    # Prune old requests periodically (throttled; indexed on ts so it's cheap) to bound
+    # the DB size. Freed pages are reused, so the file stays roughly stable.
+    global _last_request_prune
+    if REQUEST_RETENTION_DAYS > 0 and (ts - _last_request_prune) > 600:
+        _last_request_prune = ts
+        conn.execute("DELETE FROM requests WHERE ts < ?", (ts - REQUEST_RETENTION_DAYS * 86400,))
     conn.commit()
     conn.close()
 
@@ -3466,7 +3504,9 @@ async def ollama_update_check(force: int = 0):
 
 
 @app.get("/__proxy/api/system/history")
-async def system_history(minutes: int = 60):
+# Sync handler: runs in Starlette's threadpool so its blocking DB query can't stall the
+# event loop (and thus in-flight request proxying). See the analytics endpoints below.
+def system_history(minutes: int = 60):
     minutes = max(1, min(int(minutes), 1440))
     cutoff = time.time() - minutes * 60
     conn = db()
@@ -3494,7 +3534,13 @@ async def system_history(minutes: int = 60):
             "gpu_mem_used_mb": primary["mem_used_mb"] if primary else None,
             "gpu_mem_total_mb": primary["mem_total_mb"] if primary else None,
         })
-    return {"minutes": minutes, "samples": out}
+    # Downsample so a wide window doesn't ship tens of thousands of points (a multi-MB
+    # payload) to the browser on every poll — the charts don't need finer resolution.
+    total = len(out)
+    if total > 800:
+        stride = total // 800 + 1
+        out = out[::stride]
+    return {"minutes": minutes, "samples": out, "total_samples": total}
 
 
 @app.get("/__proxy/api/requests")
@@ -3529,7 +3575,7 @@ async def list_requests(request: Request, limit: int = 200, offset: int = 0, inc
 
 
 @app.get("/__proxy/api/audit")
-async def audit(request: Request, limit: int = 200, offset: int = 0, include_allow: bool = False):
+def audit(request: Request, limit: int = 200, offset: int = 0, include_allow: bool = False):  # sync → threadpool
     viewer = _client_ip(request)
     limit = max(1, min(int(limit or 200), 1000))
     offset = max(0, int(offset or 0))
@@ -3554,7 +3600,7 @@ async def audit(request: Request, limit: int = 200, offset: int = 0, include_all
 
 
 @app.get("/__proxy/api/conversations")
-async def list_conversations(request: Request, limit: int = 100):
+def list_conversations(request: Request, limit: int = 100):  # sync → threadpool
     viewer = _client_ip(request)
     conn = db()
     rows = conn.execute(
@@ -3603,7 +3649,7 @@ async def list_conversations(request: Request, limit: int = 100):
 
 
 @app.get("/__proxy/api/conversations/{conv_id}")
-async def get_conversation(conv_id: str, request: Request):
+def get_conversation(conv_id: str, request: Request):  # sync → threadpool
     viewer = _client_ip(request)
     conn = db()
     rows = conn.execute(
@@ -3622,8 +3668,11 @@ async def get_conversation(conv_id: str, request: Request):
 
 
 @app.get("/__proxy/api/suggestions")
-async def suggestions():
+def suggestions():  # sync → threadpool
     """Scan recent traffic and surface config tuning recommendations."""
+    cached = _analytics_cache_get("suggestions")
+    if cached is not None:
+        return cached
     conn = db()
     cutoff = time.time() - 30 * 86400
     rows = conn.execute(
@@ -3917,7 +3966,7 @@ async def suggestions():
                 },
             })
 
-    return {"sample_size": len(rows), "items": out}
+    return _analytics_cache_put("suggestions", {"sample_size": len(rows), "items": out})
 
 
 @app.get("/__proxy/api/rules")
@@ -3969,7 +4018,7 @@ _STATS_CACHE_TTL_S = 10.0
 
 
 @app.get("/__proxy/api/stats")
-async def stats():
+def stats():  # sync → threadpool
     # Cheap TTL cache. Stats are expensive (5000-row table scans) and the UI auto-refreshes
     # every 1.5s; without this we re-query the whole world ~40×/min per viewer.
     now = time.time()
@@ -6789,7 +6838,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             "/" + full_path,
             upstream_url,
             json.dumps(headers_dict),
-            body_text,
+            _truncate_for_store(body_text),
             model,
             int(is_stream),
             _client_ip(request),
@@ -8372,8 +8421,8 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
         (
             status,
             json.dumps(resp_headers) if resp_headers else None,
-            body_text,
-            stream_text,
+            _truncate_for_store(body_text),
+            _truncate_for_store(stream_text),
             elapsed_ms,
             error,
             pt, ct, tt, ttft_ms,

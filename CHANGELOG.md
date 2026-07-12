@@ -11,6 +11,19 @@ release workflow (publishes to PyPI and npm, and creates a `vX.Y.Z` GitHub Relea
 
 ## [Unreleased]
 
+### Fixed
+- **Proxy timeouts under a growing database.** The analytics endpoints (`stats`,
+  `suggestions`, `system_history`, `audit`, conversation list/detail) ran blocking
+  SQLite queries directly on the asyncio event loop; as the DB grew, a single slow
+  query (hundreds of ms to ~1 s) stalled the loop and in-flight request proxying,
+  causing timeouts. Those handlers now run in Starlette's threadpool.
+
+### Added
+- Data-growth guards (env-tunable): `PROXY_MAX_STORED_BODY` caps persisted body size
+  (default 256 KB), `PROXY_REQUEST_RETENTION_DAYS` prunes old requests (default 30),
+  `PROXY_ANALYTICS_CACHE_TTL` memoizes stats/suggestions. `system_history` is
+  downsampled to ≤800 points per response.
+
 ## [0.1.0]
 
 Initial packaged release.
