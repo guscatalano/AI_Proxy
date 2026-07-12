@@ -37,6 +37,36 @@ def test_stats_endpoint_ok(client):
     r.json()
 
 
+def test_requests_client_filter_and_pagination(client):
+    from ai_proxy import proxy as P
+
+    conn = P.db()
+    import time as _t
+    now = _t.time()
+    conn.executemany(
+        "INSERT INTO requests (id, ts, method, path, upstream_url, client_app) "
+        "VALUES (?, ?, 'POST', '/v1/messages', 'http://x', ?)",
+        [(f"rf-{i}", now - i, "claude-code" if i % 2 == 0 else "openai-sdk") for i in range(10)],
+    )
+    conn.commit()
+    conn.close()
+
+    # Unfiltered: clients list surfaces both apps.
+    d = client.get("/__proxy/api/requests?limit=100").json()
+    apps = {c["app"] for c in d["clients"]}
+    assert {"claude-code", "openai-sdk"} <= apps
+
+    # Filtered by client: only that app's rows come back.
+    f = client.get("/__proxy/api/requests?limit=100&client=claude-code").json()
+    assert f["total"] >= 5
+    assert all(it["client_app"] == "claude-code" for it in f["items"])
+
+    # Pagination: page 2 (offset) returns different ids than page 1.
+    p1 = client.get("/__proxy/api/requests?limit=3&offset=0&client=claude-code").json()
+    p2 = client.get("/__proxy/api/requests?limit=3&offset=3&client=claude-code").json()
+    assert {i["id"] for i in p1["items"]}.isdisjoint({i["id"] for i in p2["items"]})
+
+
 def test_unknown_proxy_api_404(client):
     # A path under the reserved __proxy namespace that isn't a route should 404,
     # not get forwarded upstream.

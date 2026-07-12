@@ -485,6 +485,9 @@
 </header>
 <div id="main">
   <div id="list">
+    <div id="requests-filter" style="display:flex;gap:6px;align-items:center;font-size:11px;color:#888;margin-bottom:6px">
+      <label>Client <select id="req-client" style="background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 6px;border-radius:3px;font-size:11px"><option value="">all clients</option></select></label>
+    </div>
     <div id="requests-pager"></div>
     <table>
       <thead><tr><th>Time</th><th>Client</th><th>Method</th><th>Path</th><th>Model</th><th>Status</th><th class="num">tokens</th><th class="ms">ms</th></tr></thead>
@@ -611,14 +614,33 @@ async function loadInfo() {
 const REQ_PS_KEY = 'ai-proxy-requests-pagesize';
 let _reqPage = 1;
 let _reqTotal = 0;
+let _reqClient = '';
+let _reqClientSig = '';
+
+function populateReqClientFilter(clients) {
+  const sel = $('req-client');
+  if (!sel) return;
+  // Only rebuild when the set of clients changes, so auto-refresh doesn't disrupt an open
+  // dropdown or reset the current selection.
+  const sig = clients.map(c => c.app).sort().join('|');
+  if (sig === _reqClientSig && sel.options.length) return;
+  _reqClientSig = sig;
+  sel.innerHTML = ['<option value="">all clients</option>']
+    .concat(clients.map(c => `<option value="${esc(c.app)}">${esc(c.app)} (${c.count})</option>`))
+    .join('');
+  sel.value = _reqClient;
+  sel.onchange = () => { _reqClient = sel.value; _reqPage = 1; refresh(); };
+}
 
 async function refresh() {
   try {
     const size = _getPageSize(REQ_PS_KEY, 50);
     const offset = Math.max(0, (_reqPage - 1) * size);
-    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}`)).json();
+    const clientQ = _reqClient ? `&client=${encodeURIComponent(_reqClient)}` : '';
+    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}${clientQ}`)).json();
     items = d.items;
     _reqTotal = d.total || 0;
+    populateReqClientFilter(d.clients || []);
     // Snap back to last page if current page is now beyond total (e.g. after Clear).
     const maxPage = Math.max(1, Math.ceil(_reqTotal / size));
     if (_reqPage > maxPage) { _reqPage = maxPage; return refresh(); }
@@ -640,9 +662,10 @@ function renderRequestsPager() {
   const start = _reqTotal ? (_reqPage - 1) * size : 0;
   const end = Math.min(start + size, _reqTotal);
   wrap.innerHTML = _pagerHtml('rq', { total: _reqTotal, totalPages, page: _reqPage, size, start });
-  _wirePager('rq', ({ size, pageDelta }) => {
+  _wirePager('rq', ({ size, pageDelta, page }) => {
     if (size) { _setPageSize(REQ_PS_KEY, size); _reqPage = 1; }
     if (pageDelta) _reqPage = Math.max(1, _reqPage + pageDelta);
+    if (page) _reqPage = Math.max(1, page);
     refresh();
   });
 }
@@ -1994,7 +2017,7 @@ function _pagerHtml(prefix, p) {
     <span style="flex:1"></span>
     <label>Per page <select id="${prefix}-pagesize" style="background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 4px;border-radius:3px;font-size:11px">${opts}</select></label>
     <button id="${prefix}-prev" ${p.page<=1?'disabled':''} style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page<=1?'opacity:0.4;cursor:not-allowed':''}">‹ prev</button>
-    <span>page ${p.page} / ${p.totalPages}</span>
+    <span>page <input id="${prefix}-jump" type="number" min="1" max="${p.totalPages}" value="${p.page}" title="Type a page number and press Enter" style="width:46px;background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 4px;border-radius:3px;font-size:11px;text-align:center"> / ${p.totalPages}</span>
     <button id="${prefix}-next" ${p.page>=p.totalPages?'disabled':''} style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page>=p.totalPages?'opacity:0.4;cursor:not-allowed':''}">next ›</button>
   </div>`;
 }
@@ -2005,6 +2028,8 @@ function _wirePager(prefix, onChange) {
   if (ps) ps.onchange = (e) => onChange({ size: parseInt(e.target.value, 10) });
   if (prev) prev.onclick = () => onChange({ pageDelta: -1 });
   if (next) next.onclick = () => onChange({ pageDelta: 1 });
+  const jump = $(`${prefix}-jump`);
+  if (jump) jump.onchange = (e) => { const n = parseInt(e.target.value, 10); if (n >= 1) onChange({ page: n }); };
 }
 
 let _auditTotal = 0;
@@ -2054,9 +2079,10 @@ function renderAuditEvents() {
   for (const tr of wrap.querySelectorAll('tbody tr[data-id]')) {
     tr.onclick = () => { setView('requests'); selectItem(tr.dataset.id); };
   }
-  _wirePager('ae', ({ size, pageDelta }) => {
+  _wirePager('ae', ({ size, pageDelta, page }) => {
     if (size) { _setPageSize(AUDIT_EVENTS_PS_KEY, size); _auditPage = 1; }
     if (pageDelta) _auditPage = Math.max(1, _auditPage + pageDelta);
+    if (page) _auditPage = Math.max(1, page);
     fetchAuditEventsPage();
   });
 }
@@ -2118,9 +2144,10 @@ function renderSuggestions() {
     </details>`;
   }).join('') : `<div class="empty" style="padding:20px">No suggestions on this page.</div>`;
   wrap.innerHTML = html + _pagerHtml('su', p);
-  _wirePager('su', ({ size, pageDelta }) => {
+  _wirePager('su', ({ size, pageDelta, page }) => {
     if (size) { _setPageSize(AUDIT_SUGGS_PS_KEY, size); _suggPage = 1; }
     if (pageDelta) _suggPage = Math.max(1, _suggPage + pageDelta);
+    if (page) _suggPage = Math.max(1, page);
     renderSuggestions();
   });
 }
@@ -2327,9 +2354,10 @@ function renderConversationsList() {
   for (const tr of wrap.querySelectorAll('tbody tr[data-cid]')) {
     tr.onclick = () => loadConversationDetail(tr.dataset.cid);
   }
-  _wirePager('cv', ({ size, pageDelta }) => {
+  _wirePager('cv', ({ size, pageDelta, page }) => {
     if (size) { _setPageSize(CONVS_PS_KEY, size); _convsPage = 1; }
     if (pageDelta) _convsPage = Math.max(1, _convsPage + pageDelta);
+    if (page) _convsPage = Math.max(1, page);
     renderConversationsList();
   });
 }

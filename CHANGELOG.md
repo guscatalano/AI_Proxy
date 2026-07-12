@@ -19,6 +19,11 @@ release workflow (publishes to PyPI and npm, and creates a `vX.Y.Z` GitHub Relea
   causing timeouts. Those handlers now run in Starlette's threadpool.
 
 ### Added
+- Requests view: filter by client (dropdown of detected apps) and jump to a specific
+  page number (the jump input works on the Audit/Suggestions/Conversations pagers too).
+  `GET /api/requests` gains a `client` param and returns the available `clients`.
+- `PROXY_GRACEFUL_SHUTDOWN` (default 10 s) caps uvicorn's shutdown wait so a lingering
+  connection can't hang a `systemctl restart`.
 - Data-growth guards (env-tunable): `PROXY_MAX_STORED_BODY` caps persisted body size
   (default 256 KB), `PROXY_REQUEST_RETENTION_DAYS` prunes old requests (default 30),
   `PROXY_ANALYTICS_CACHE_TTL` memoizes stats/suggestions. `system_history` is

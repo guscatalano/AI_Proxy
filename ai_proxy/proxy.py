@@ -3547,20 +3547,33 @@ def system_history(minutes: int = 60):
 
 
 @app.get("/__proxy/api/requests")
-async def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False):
+def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False, client: str = ""):  # sync → threadpool
     viewer = _client_ip(request)
     conn = db()
-    where = "" if include_shadows else "WHERE shadow_of IS NULL"
+    conds, params = [], []
+    if not include_shadows:
+        conds.append("shadow_of IS NULL")
+    if client:
+        # Match either the detected app (e.g. "claude-code") or the raw client IP.
+        conds.append("(client_app = ? OR client_ip = ?)")
+        params += [client, client]
+    where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, client_ip, client_app,
                   gate_verdict, gate_rule, gate_reason, shadow_of
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
-        (limit, offset),
+        (*params, limit, offset),
     ).fetchall()
     total = conn.execute(
-        f"SELECT COUNT(*) FROM requests {where}"
+        f"SELECT COUNT(*) FROM requests {where}", tuple(params)
     ).fetchone()[0]
+    # Distinct clients (for the filter dropdown), independent of the current client filter.
+    client_rows = conn.execute(
+        "SELECT client_app AS app, COUNT(*) AS count FROM requests WHERE client_app IS NOT NULL"
+        + ("" if include_shadows else " AND shadow_of IS NULL")
+        + " GROUP BY client_app ORDER BY count DESC"
+    ).fetchall()
     conn.close()
     items = []
     for r in rows:
@@ -3574,7 +3587,8 @@ async def list_requests(request: Request, limit: int = 200, offset: int = 0, inc
                 d["tokens_live"] = True
                 d["tokens_estimated"] = live["estimated"]
         items.append(_redact_row(d, viewer))
-    return {"total": total, "items": items, "redacted": REDACT_PII_ENABLED}
+    return {"total": total, "items": items,
+            "clients": [dict(r) for r in client_rows], "redacted": REDACT_PII_ENABLED}
 
 
 @app.get("/__proxy/api/audit")
