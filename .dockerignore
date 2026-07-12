@@ -1,0 +1,23 @@
+# Keep the build context small — only what `pip install .` needs.
+.git
+.github
+.venv
+venv
+dist
+build
+*.egg-info
+__pycache__
+**/__pycache__
+*.pyc
+npm
+tests
+docs
+scripts
+companion
+deploy
+ai-proxy-export-*.json
+*.db
+.coverage
+coverage.xml
+htmlcov
+.pytest_cache

@@ -1,0 +1,9 @@
+{
+  "name": "ai-proxy-ui-smoke",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Headless-browser smoke test for the AI Proxy UI (see smoke.mjs).",
+  "dependencies": {
+    "playwright": "1.48.2"
+  }
+}

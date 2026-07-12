@@ -1,0 +1,180 @@
+name: CI
+
+# Build + smoke-test the frozen binary and the npm launcher on every supported
+# platform. Does NOT publish anything — this is the safe pre-release check.
+# release.yml (tag-triggered) does the actual publishing.
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install with dev deps
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install ".[dev]"
+      - name: Run pytest with coverage
+        run: pytest -q
+
+      - name: Coverage summary
+        if: always()
+        run: |
+          echo '### Coverage' >> "$GITHUB_STEP_SUMMARY"
+          python -c "import xml.etree.ElementTree as ET; r=ET.parse('coverage.xml').getroot(); print(f\"Line coverage: {float(r.get('line-rate'))*100:.1f}%\")" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn
+
+      - name: Shellcheck deploy installer
+        run: shellcheck deploy/install-service.sh
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t ai-proxy:ci .
+      - name: Smoke test container
+        run: |
+          set -euo pipefail
+          docker run -d --name ai-proxy-ci -p 8000:8000 ai-proxy:ci
+          ok=0
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/__proxy/api/health > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          curl -sf -o /dev/null -w "UI HTTP %{http_code}\n" http://127.0.0.1:8000/__proxy/ || true
+          echo "----- container logs -----"; docker logs ai-proxy-ci || true
+          docker rm -f ai-proxy-ci > /dev/null 2>&1 || true
+          [ "$ok" = "1" ] || { echo "container did not become healthy"; exit 1; }
+
+  ui-smoke:
+    # Renders the UI in headless Chromium and asserts it actually works (populated
+    # table, client filter, tab switch, no JS/asset errors) — not just HTTP 200.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Install app
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install .
+      - name: Install Playwright + Chromium
+        working-directory: tests/ui
+        run: |
+          npm install
+          npx playwright install --with-deps chromium
+      - name: Start app, seed a request, run UI smoke test
+        run: |
+          set -euo pipefail
+          export PROXY_PORT=8137 PROXY_HOST=127.0.0.1 PROXY_DB="$PWD/ui.db" PROXY_STATE_DIR="$PWD/ui_state"
+          ai-proxy > ui_app.log 2>&1 &
+          APP=$!
+          trap 'kill $APP 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do curl -sf "http://127.0.0.1:8137/__proxy/api/health" > /dev/null && break; sleep 1; done
+          python - <<'PY'
+          import sqlite3, time, os
+          c = sqlite3.connect(os.environ["PROXY_DB"]); now = time.time()
+          c.executemany(
+              "INSERT INTO requests (id,ts,method,path,upstream_url,model,status,duration_ms,client_ip,client_app) "
+              "VALUES (?,?,?,?,?,?,?,?,?,?)",
+              [(f"ui-{i}", now - i, "POST", "/v1/messages", "http://x", "test-model", 200, 42.0,
+                "127.0.0.1", "claude-code" if i % 2 else "openai-sdk") for i in range(6)],
+          )
+          c.commit(); c.close(); print("seeded 6 requests")
+          PY
+          UI_URL="http://127.0.0.1:8137/__proxy/" node tests/ui/smoke.mjs \
+            || { echo "----- app log -----"; cat ui_app.log; exit 1; }
+
+  build-and-smoke:
+    needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            key: win32-x64
+          - os: macos-14
+            key: darwin-arm64
+          - os: ubuntu-latest
+            key: linux-x64
+          - os: ubuntu-24.04-arm
+            key: linux-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install app + PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . pyinstaller
+
+      - name: Freeze binary
+        run: pyinstaller packaging/ai_proxy.spec --distpath dist/bin --workpath build/pyi --noconfirm
+
+      - name: Assemble platform npm package
+        shell: bash
+        run: |
+          BIN="dist/bin/ai-proxy"
+          [ "${{ matrix.key }}" = "win32-x64" ] && BIN="dist/bin/ai-proxy.exe"
+          node npm/build-platform-package.js "${{ matrix.key }}" "$BIN" "out/${{ matrix.key }}"
+
+      - name: Smoke test via npm launcher
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p _tarballs
+          (cd "out/${{ matrix.key }}" && npm pack --pack-destination "$PWD/../../_tarballs")
+          (cd npm/ai-proxy && npm pack --pack-destination "$PWD/../../_tarballs")
+          rm -rf _consumer && mkdir _consumer && cd _consumer
+          echo '{"name":"consumer","version":"1.0.0","private":true}' > package.json
+          # Install main launcher + this platform's binary package from local tarballs.
+          # --no-optional skips the (unpublished) optional deps; we provide the binary
+          # package explicitly, which is what the launcher resolves at runtime.
+          npm install --no-audit --no-fund --no-optional ../_tarballs/*.tgz
+          export PROXY_HOST=127.0.0.1 PROXY_PORT=8137 PROXY_STATE_DIR="$PWD/_state"
+          node node_modules/guscatalano-ai-proxy/bin/ai-proxy.js > server.log 2>&1 &
+          SRV=$!
+          ok=0
+          for i in $(seq 1 40); do
+            if curl -sf "http://127.0.0.1:8137/__proxy/api/health" > /dev/null; then ok=1; break; fi
+            sleep 1
+          done
+          code=0
+          if [ "$ok" = "1" ]; then
+            curl -sf -o /dev/null -w "UI HTTP %{http_code}\n" "http://127.0.0.1:8137/__proxy/" || code=1
+            echo "health OK"
+          else
+            echo "!! server did not become healthy"; code=1
+          fi
+          kill "$SRV" 2>/dev/null || true
+          echo "----- server.log -----"; cat server.log || true
+          exit $code

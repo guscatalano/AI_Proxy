@@ -1,0 +1,26 @@
+# Run AI Proxy in a container:  docker compose up -d
+# UI: http://localhost:8000/__proxy/
+#
+# By default this reaches an Ollama running on the *host* via host.docker.internal.
+# Point ANTHROPIC_URL / OLLAMA_URL at wherever your upstreams live.
+
+services:
+  ai-proxy:
+    build: .
+    image: ai-proxy
+    container_name: ai-proxy
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      OLLAMA_URL: "http://host.docker.internal:11434"
+      ANTHROPIC_URL: "https://api.anthropic.com"
+      # PROXY_REDACT_PII: "1"
+    volumes:
+      - ai-proxy-data:/data
+    extra_hosts:
+      # Lets the container reach services bound to the host (e.g. Ollama).
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  ai-proxy-data:

@@ -65,7 +65,14 @@ python -m venv .venv
 source .venv/bin/activate
 
 pip install -r requirements.txt
-python proxy.py
+python -m ai_proxy
+```
+
+Or install it as a command (`ai-proxy`) with an isolated environment:
+
+```bash
+pipx install .    # or: pip install .
+ai-proxy
 ```
 
 UI: <http://127.0.0.1:8000/__proxy/>
@@ -137,25 +144,85 @@ The Audit tab includes a one-click toggle between three modes (with auto-detecti
 
 ## Deployment
 
-### Linux (systemd)
+### Linux (systemd) — one command
+
+The installer creates an isolated venv, installs the app, writes a systemd unit and a
+config file, and enables the service.
 
 ```bash
-sudo cp ai_proxy.service /etc/systemd/system/
-# Edit the Environment= lines for your paths/ports
-sudo systemctl daemon-reload
-sudo systemctl enable --now ai_proxy
+# System service (boots at startup, runs as a dedicated 'ai-proxy' user)
+sudo ./deploy/install-service.sh
+
+# ...or a per-user service (no root)
+./deploy/install-service.sh --user
+loginctl enable-linger "$USER"   # optional: keep running after logout / across reboots
 ```
 
-The proxy supports self-restart via the System tab's "↻ Restart proxy" button when running under systemd (it exits with code 1; `Restart=on-failure` brings it back).
+Then edit the generated config and restart:
+
+- System: `/etc/ai-proxy/ai-proxy.env` → `sudo systemctl restart ai-proxy`
+- User: `~/.config/ai-proxy/ai-proxy.env` → `systemctl --user restart ai-proxy`
+
+Add `--pypi` to install the published release instead of this checkout. The service
+self-restarts via the System tab's "↻ Restart proxy" button (it exits non-zero;
+`Restart=on-failure` brings it back).
+
+### Docker
+
+```bash
+docker compose up -d          # UI at http://localhost:8000/__proxy/
+```
+
+State (DB, rules, generated images) persists in the `ai-proxy-data` volume. The compose
+file reaches an Ollama on the host via `host.docker.internal`; edit `OLLAMA_URL` /
+`ANTHROPIC_URL` for your setup. Or without compose:
+
+```bash
+docker build -t ai-proxy .
+docker run -d -p 8000:8000 -v ai-proxy-data:/data \
+  -e OLLAMA_URL=http://host.docker.internal:11434 \
+  --add-host host.docker.internal:host-gateway ai-proxy
+```
 
 ### Windows
 
 ```powershell
 # Run as Administrator
 New-Service -Name "AIProxy" `
-  -BinaryPathName "C:\path\to\python.exe C:\path\to\proxy.py" `
+  -BinaryPathName "C:\path\to\python.exe -m ai_proxy" `
   -DisplayName "AI Proxy" -StartupType Automatic
 ```
+
+---
+
+## Development
+
+```bash
+# from a source checkout
+pip install -e ".[dev]"
+pytest
+```
+
+The suite (in `tests/`) covers the proxy's API endpoints, the Anthropic↔OpenAI
+translation, the writable-state path resolution, and the version single-source
+invariant — all offline, no upstream required. CI runs it on every push before the
+per-platform binary build.
+
+### Cutting a release
+
+Bump the version on `main`, then promote `main` to the `release` branch:
+
+```bash
+python scripts/bump_version.py minor --commit   # or: major | patch | 1.2.3
+git push origin main
+git push origin main:release                    # fast-forward release -> triggers publish
+```
+
+Updating the `release` branch triggers the release workflow, which builds a
+self-contained binary per platform, publishes to npm and PyPI, and creates a
+`vX.Y.Z` GitHub Release with the binaries. It reads the version from the committed
+files and skips anything already published, so re-triggering is safe. See
+[CHANGELOG.md](CHANGELOG.md).
 
 ---
 

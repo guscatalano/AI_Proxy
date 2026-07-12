@@ -1,0 +1,21 @@
+# System-wide systemd unit template. The installer (deploy/install-service.sh) fills in
+# the @PLACEHOLDERS@ and writes the result to /etc/systemd/system/ai-proxy.service.
+# To do it by hand: replace the placeholders, copy this file there, then
+#   sudo systemctl daemon-reload && sudo systemctl enable --now ai-proxy
+[Unit]
+Description=AI Proxy (LLM traffic inspector)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=@USER@
+EnvironmentFile=@ENVFILE@
+ExecStart=@EXECSTART@
+Restart=on-failure
+RestartSec=3
+# State dir, created and owned for the service user by the installer.
+StateDirectory=ai-proxy
+
+[Install]
+WantedBy=multi-user.target

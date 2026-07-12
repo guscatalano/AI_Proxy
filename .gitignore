@@ -60,3 +60,12 @@ temp/
 
 # Local export dumps from /__proxy/api/export
 ai-proxy-export-*.json
+
+# Test / coverage artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# npm (UI smoke test deps)
+node_modules/
