@@ -4,11 +4,11 @@
   ai-proxy.exe runs unsandboxed via Windows.FullTrustApplication + runFullTrust, so
   the local proxy server has no AppContainer loopback restriction).
 
-  IMPORTANT — before submitting to the Microsoft Store, replace Identity/@Name and
-  Identity/@Publisher, and Properties/PublisherDisplayName, with the exact values
-  reserved for this app in Partner Center (Product Identity page). The Store signs the
-  package on upload, so you upload this unsigned. @Version must be four parts (x.y.z.0)
-  and its build script keeps it in sync with ai_proxy/_version.py.
+  Identity/@Name, Identity/@Publisher and Properties/PublisherDisplayName below are the
+  exact values reserved for this app in Partner Center (Store ID 9N00C9KJPXT2 / PFN
+  GusCatalano.AIProxy_hbnb01h0zx9vj) — they must match, or the Store rejects the upload.
+  The Store signs the package on upload, so you upload this unsigned. @Version must be
+  four parts (x.y.z.0); build-msix.ps1 stamps it from ai_proxy/_version.py.
 -->
 <Package
     xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -16,7 +16,7 @@
     xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities">
 
   <Identity Name="GusCatalano.AIProxy"
-            Publisher="CN=Gus Catalano"
+            Publisher="CN=119E0257-3B74-437C-A728-AC7C50256853"
             Version="0.1.0.0"
             ProcessorArchitecture="x64" />
 

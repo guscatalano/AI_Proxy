@@ -39,7 +39,9 @@ Write-Output "built $OutFull"
 if ($SelfSign) {
     $signtool = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" |
         Sort-Object FullName -Descending | Select-Object -First 1 -ExpandProperty FullName
-    $cert = New-SelfSignedCertificate -Type Custom -Subject "CN=Gus Catalano" `
+    # The signing cert subject must match the manifest Publisher exactly.
+    $publisher = ([xml](Get-Content (Join-Path $here 'AppxManifest.xml'))).Package.Identity.Publisher
+    $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher `
         -KeyUsage DigitalSignature -FriendlyName "AI Proxy MSIX test" `
         -CertStoreLocation "Cert:\CurrentUser\My" `
         -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
