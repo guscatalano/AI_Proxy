@@ -1650,6 +1650,11 @@ DEFAULT_RULES_CONFIG = {
         "per_model": {},          # {"qwen2.5:14b": {"num_ctx": 16384}}
         "per_client": {},         # {"10.0.0.20": {"temperature": 0.2}}
         "rules": [],              # [{"if": {...}, "set": {"num_ctx": 16384}}] (first match)
+        # Hard ceiling on num_ctx, applied even to client-set values (unlike the fill-in
+        # options above). Null = no cap. Set e.g. 32768 to stop a client forcing a huge
+        # context (which balloons the KV cache and kills parallelism). Independent of
+        # `enabled` — the cap applies whenever it's a positive int.
+        "num_ctx_max": None,
     },
     "context_overflow_guard": {
         # Pre-flight transform: estimates prompt token count and reacts when it exceeds num_ctx.
@@ -2574,6 +2579,32 @@ def evaluate_router(body: dict, ctx: dict) -> dict | None:
 
 
 _NATIVE_TOP_LEVEL_KEYS = {"keep_alive", "format"}
+
+
+def _cap_num_ctx(body: dict, cap: int) -> int | None:
+    """Clamp a request's num_ctx down to `cap`, wherever it sits — top-level (OpenAI-compat
+    /v1/*) or nested under options (Ollama-native /api/*). Overrides a client-set value
+    (unlike ollama_options' fill-in-only injection). Returns the new value if it changed
+    anything, else None.
+
+    Purpose: a client (e.g. an agent that auto-sets num_ctx to the model's full training
+    context, like 262144) can otherwise force an enormous KV cache that slows every request
+    and starves parallelism. This caps that centrally.
+    """
+    if not isinstance(body, dict) or not isinstance(cap, int) or cap <= 0:
+        return None
+    changed = None
+    v = body.get("num_ctx")
+    if isinstance(v, int) and v > cap:
+        body["num_ctx"] = cap
+        changed = cap
+    opts = body.get("options")
+    if isinstance(opts, dict):
+        ov = opts.get("num_ctx")
+        if isinstance(ov, int) and ov > cap:
+            opts["num_ctx"] = cap
+            changed = cap
+    return changed
 
 
 def evaluate_ollama_options(body: dict, ctx: dict) -> dict | None:
@@ -8657,11 +8688,21 @@ async def proxy(full_path: str, request: Request):
                 "reason": compaction.get("reason"),
                 "details": compaction,
             })
+    # num_ctx ceiling: clamp an over-large context (client-set or injected) for Ollama-bound
+    # traffic, independent of ollama_options.enabled. Applied after all option injection so
+    # it wins over everything.
+    _ctx_cap = (load_rules_config().get("ollama_options") or {}).get("num_ctx_max")
+    ctx_capped = None
+    if (isinstance(body_json, dict) and upstream_label != "anthropic"
+            and isinstance(_ctx_cap, int) and _ctx_cap > 0):
+        ctx_capped = _cap_num_ctx(body_json, _ctx_cap)
+
     body_mutated = bool(
         rewrite or options_inject or bridge_active or tool_injection_active
         or compaction_reminder_injected
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
+        or ctx_capped
     )
     if body_mutated:
         # Re-serialize the body so all mutations are forwarded upstream.

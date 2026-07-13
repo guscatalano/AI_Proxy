@@ -50,6 +50,24 @@ def test_analytics_cache_respects_ttl(monkeypatch):
     assert P._analytics_cache_get("k") is None
 
 
+def test_cap_num_ctx_top_level_and_nested():
+    # top-level (OpenAI-compat /v1/*)
+    b = {"model": "m", "num_ctx": 262144}
+    assert P._cap_num_ctx(b, 32768) == 32768
+    assert b["num_ctx"] == 32768
+    # nested under options (Ollama-native /api/*)
+    b2 = {"model": "m", "options": {"num_ctx": 262144, "temperature": 1}}
+    assert P._cap_num_ctx(b2, 32768) == 32768
+    assert b2["options"]["num_ctx"] == 32768
+    assert b2["options"]["temperature"] == 1  # untouched
+
+
+def test_cap_num_ctx_leaves_small_values_and_absent():
+    assert P._cap_num_ctx({"num_ctx": 8192}, 32768) is None      # under the cap → unchanged
+    assert P._cap_num_ctx({"model": "m"}, 32768) is None          # no num_ctx → nothing
+    assert P._cap_num_ctx({"num_ctx": 262144}, 0) is None         # cap disabled (0)
+
+
 def test_system_history_downsampled(client):
     conn = P.db()
     now = time.time()
