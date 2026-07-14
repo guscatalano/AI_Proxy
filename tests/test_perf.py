@@ -132,6 +132,13 @@ def test_iter_and_strip_request_images():
     assert body["messages"][0]["content"][2]["image_url"]["url"] == "https://example.com/x.jpg"
 
 
+def test_load_images_data():
+    assert P._load_images_data(None) == []
+    assert P._load_images_data("not json") == []
+    assert P._load_images_data('[{"media_type":"image/png","data":"QUJD"}]') == [
+        {"media_type": "image/png", "data": "QUJD"}]
+
+
 def test_body_has_images():
     assert P._body_has_images({"messages": [{"role": "user", "content": [
         {"type": "text", "text": "describe this"},

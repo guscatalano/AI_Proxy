@@ -428,6 +428,10 @@ MIGRATIONS = [
     # 1 if the request carried image/non-text content, so the list can badge it without
     # re-parsing the (large) body per row.
     "ALTER TABLE requests ADD COLUMN has_images INTEGER",
+    # Full-fidelity image payloads pulled out of the request body at save time, as a JSON
+    # array of {media_type, data(base64)}. Kept separate so the 256KB text-body cap can't
+    # truncate (and thereby corrupt) large embedded images. Powers the image reconstruction.
+    "ALTER TABLE requests ADD COLUMN images_data TEXT",
 ]
 
 
@@ -2639,6 +2643,17 @@ def _strip_image_data(body: dict) -> int:
     return n
 
 
+def _load_images_data(images_data_json):
+    """Parse the images_data column (JSON array of {media_type, data}) → list, or []."""
+    if not images_data_json:
+        return []
+    try:
+        v = json.loads(images_data_json)
+        return v if isinstance(v, list) else []
+    except (json.JSONDecodeError, TypeError):
+        return []
+
+
 def _match_router_cond(cond: dict, body: dict, ctx: dict) -> bool:
     """Return True iff every key in `cond` matches the request."""
     if not isinstance(cond, dict):
@@ -4570,10 +4585,16 @@ async def get_request(req_id: str, request: Request):
                                       d.get("ttft_ms"), d.get("prompt_tokens"), d.get("upstream"))
     d["cache_pct"] = _cpct
     d["cache_verdict"] = _cverdict
-    # Images: surface each as metadata (served on demand via .../image/{idx}) and strip the
-    # base64 out of the displayed request_body so the viewer shows a link, not a 700KB blob.
+    # Images: surface each as metadata (served on demand via .../image/{idx}). Prefer the
+    # full-fidelity images_data column; fall back to parsing the body for pre-images_data rows.
     d["images"] = []
-    if d.get("request_body"):
+    _imgs_col = _load_images_data(d.get("images_data"))
+    if _imgs_col:
+        for i, im in enumerate(_imgs_col):
+            b64 = im.get("data") or ""
+            d["images"].append({"index": i, "media_type": im.get("media_type") or "image/png",
+                                "kind": "data", "size_bytes": len(b64) * 3 // 4})
+    elif d.get("request_body"):
         try:
             _bj = json.loads(d["request_body"])
         except (json.JSONDecodeError, TypeError):
@@ -4581,34 +4602,49 @@ async def get_request(req_id: str, request: Request):
         if isinstance(_bj, dict):
             for (i, mt, kind, payload) in _iter_request_images(_bj):
                 if kind == "data":
-                    b64 = payload or ""
                     d["images"].append({"index": i, "media_type": mt, "kind": "data",
-                                        "size_bytes": len(b64) * 3 // 4})
+                                        "size_bytes": len(payload or "") * 3 // 4})
                 else:
                     d["images"].append({"index": i, "media_type": mt or "", "kind": "url",
                                         "url": payload})
             if _strip_image_data(_bj):
                 d["request_body"] = json.dumps(_bj)
+    # Don't ship the raw image column to the client (it's large; images load via the endpoint).
+    d.pop("images_data", None)
     return _redact_row(d, viewer)
+
+
+def _request_image_refs(row):
+    """Image (media_type, kind, payload) tuples for a request row, preferring the full-fidelity
+    images_data column and falling back to parsing the (possibly stripped/truncated) body for
+    rows saved before images_data existed."""
+    imgs = _load_images_data(row["images_data"] if "images_data" in row.keys() else None)
+    if imgs:
+        return [(i, im.get("media_type") or "image/png", "data", im.get("data") or "")
+                for i, im in enumerate(imgs)]
+    try:
+        bj = json.loads(row["request_body"]) if row["request_body"] else None
+    except (json.JSONDecodeError, TypeError):
+        return None  # unparseable (e.g. truncated) and no images_data → unrecoverable
+    return list(_iter_request_images(bj)) if isinstance(bj, dict) else []
 
 
 @app.get("/__proxy/api/requests/{req_id}/image/{idx}")
 def get_request_image(req_id: str, idx: int, request: Request):  # sync → threadpool
-    """Reconstruct and serve the idx-th image from a request's stored body. The base64 lives in
-    the untouched DB row (get_request only strips it from the *displayed* copy)."""
+    """Reconstruct and serve the idx-th image, from the full-fidelity images_data column."""
     conn = db()
-    row = conn.execute("SELECT request_body, client_ip FROM requests WHERE id = ?", (req_id,)).fetchone()
+    row = conn.execute("SELECT request_body, images_data, client_ip FROM requests WHERE id = ?", (req_id,)).fetchone()
     conn.close()
-    if not row or not row["request_body"]:
+    if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
     # Same visibility gate as the request detail: only a viewer who may see this client's content.
     if not _can_view_pii(_client_ip(request), row["client_ip"]):
         return JSONResponse({"error": "forbidden"}, status_code=403)
-    try:
-        bj = json.loads(row["request_body"])
-    except (json.JSONDecodeError, TypeError):
-        return JSONResponse({"error": "request body not stored / unparseable"}, status_code=422)
-    for (i, mt, kind, payload) in _iter_request_images(bj):
+    refs = _request_image_refs(row)
+    if refs is None:
+        return JSONResponse({"error": "image not stored (request predates image capture and the body was truncated)"},
+                            status_code=422)
+    for (i, mt, kind, payload) in refs:
         if i != idx:
             continue
         if kind == "url":
@@ -7202,10 +7238,23 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     # verdict (evaluated vs estimated) without re-parsing the body on every load.
     est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
     has_imgs = 1 if _body_has_images(body_json) else None
+    # Pull inline base64 images into their own column at full size, then store the text body
+    # with them stripped — so the 256KB body cap can't truncate (and corrupt the JSON of) a
+    # ~700KB screenshot. The image bytes stay reconstructable from images_data.
+    images_data = None
+    store_body_text = body_text
+    if isinstance(body_json, dict) and has_imgs:
+        imgs = [{"media_type": mt, "data": payload}
+                for (_i, mt, _k, payload) in _iter_request_images(body_json) if _k == "data"]
+        if imgs:
+            images_data = json.dumps(imgs)
+            body_copy = json.loads(json.dumps(body_json))   # don't mutate the body we forward
+            _strip_image_data(body_copy)
+            store_body_text = json.dumps(body_copy)
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images, images_data)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -7213,7 +7262,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             "/" + full_path,
             upstream_url,
             json.dumps(headers_dict),
-            _truncate_for_store(body_text),
+            _truncate_for_store(store_body_text),
             model,
             int(is_stream),
             _client_ip(request),
@@ -7223,6 +7272,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             upstream,
             est or None,
             has_imgs,
+            images_data,
         ),
     )
     conn.commit()
@@ -9074,10 +9124,14 @@ async def proxy(full_path: str, request: Request):
         # sent upstream (with tools injected, options merged, model rewritten, etc.) rather
         # than the original client-sent body. Without this, the inspector hides anything
         # the proxy added — which makes "did my tool get injected?" hard to verify.
+        # Strip inline images from the SAVED copy (they're preserved in images_data) so a big
+        # screenshot doesn't blow the body cap; the upstream `body` above keeps the real image.
+        save_json = json.loads(json.dumps(body_json))
+        _strip_image_data(save_json)
         conn = db()
         conn.execute(
             "UPDATE requests SET request_body=? WHERE id=?",
-            (body.decode("utf-8", errors="replace"), req_id),
+            (_truncate_for_store(json.dumps(save_json)), req_id),
         )
         if rewrite:
             model = body_json.get("model")
