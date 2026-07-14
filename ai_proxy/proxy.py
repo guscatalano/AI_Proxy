@@ -3,6 +3,8 @@ import re
 import sys
 import json
 import time
+import base64
+import binascii
 import sqlite3
 import uuid
 import hashlib
@@ -423,6 +425,9 @@ MIGRATIONS = [
     # the evaluated prompt_tokens (what the upstream actually prefilled) to derive a cache
     # hit/miss verdict cheaply in the requests list — no body re-parsing needed.
     "ALTER TABLE requests ADD COLUMN est_prompt_tokens INTEGER",
+    # 1 if the request carried image/non-text content, so the list can badge it without
+    # re-parsing the (large) body per row.
+    "ALTER TABLE requests ADD COLUMN has_images INTEGER",
 ]
 
 
@@ -1678,6 +1683,7 @@ DEFAULT_RULES_CONFIG = {
         #   prompt_chars_lt: int                total chars across all message content
         #   prompt_chars_gt: int                total chars across all message content
         #   has_tools: bool                     request includes a non-empty tools[] array
+        #   has_images: bool                    a message carries image content (vision request)
         #   path_prefix: string                 match URL path prefix
         # Optional "upstream": "ollama" | "lmstudio" sends the (rewritten) model to that backend
         # instead of the path-based default — both speak the /v1 shape so no translation needed.
@@ -2554,6 +2560,85 @@ def _prompt_total_chars(body: dict) -> int:
     return n
 
 
+def _body_has_images(body: dict) -> bool:
+    """True if any message carries image content. Handles OpenAI multimodal
+    (content list with {"type":"image_url"}) and Anthropic ({"type":"image"}).
+    Lets the router send vision requests to a multimodal model instead of a
+    text-only one (which would 400 with 'model does not support images')."""
+    if not isinstance(body, dict):
+        return False
+    for m in (body.get("messages") or []):
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") in ("image_url", "image", "input_image"):
+                    return True
+    return False
+
+
+def _iter_request_images(body: dict):
+    """Yield (index, media_type, kind, payload) for each image in a chat request, in order.
+    kind='data' → payload is base64 (from a data: URL or Anthropic source); kind='url' →
+    payload is an external URL. Handles OpenAI (image_url) and Anthropic (image) shapes."""
+    if not isinstance(body, dict):
+        return
+    idx = 0
+    for m in (body.get("messages") or []):
+        c = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(c, list):
+            continue
+        for part in c:
+            if not isinstance(part, dict):
+                continue
+            t = part.get("type")
+            if t == "image_url":
+                url = (part.get("image_url") or {}).get("url") or ""
+                if url.startswith("data:"):
+                    head, _, b64 = url.partition(",")
+                    mt = "image/png"
+                    mm = re.match(r"data:([^;,]+)", head)
+                    if mm:
+                        mt = mm.group(1)
+                    yield (idx, mt, "data", b64); idx += 1
+                elif url:
+                    yield (idx, "", "url", url); idx += 1
+            elif t in ("image", "input_image"):
+                src = part.get("source") if isinstance(part.get("source"), dict) else {}
+                if src.get("data"):
+                    yield (idx, src.get("media_type") or "image/png", "data", src["data"]); idx += 1
+                elif src.get("url") or part.get("image_url"):
+                    yield (idx, "", "url", src.get("url") or part.get("image_url")); idx += 1
+
+
+def _strip_image_data(body: dict) -> int:
+    """Replace inline base64 image payloads with a short placeholder so the DISPLAYED body isn't
+    a multi-hundred-KB blob. Mutates in place; returns how many were replaced. The actual bytes
+    are still reconstructable from the untouched DB row via the image endpoint."""
+    n = 0
+    if not isinstance(body, dict):
+        return 0
+    for m in (body.get("messages") or []):
+        c = m.get("content") if isinstance(m, dict) else None
+        if not isinstance(c, list):
+            continue
+        for part in c:
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "image_url":
+                iu = part.get("image_url")
+                url = (iu or {}).get("url") or ""
+                if isinstance(iu, dict) and url.startswith("data:"):
+                    head, _, b64 = url.partition(",")
+                    iu["url"] = f"{head},…[{len(b64) * 3 // 4} bytes — see Images section]"
+                    n += 1
+            elif part.get("type") in ("image", "input_image"):
+                src = part.get("source") if isinstance(part.get("source"), dict) else None
+                if src and src.get("data"):
+                    src["data"] = f"…[{len(src['data']) * 3 // 4} bytes — see Images section]"
+                    n += 1
+    return n
+
+
 def _match_router_cond(cond: dict, body: dict, ctx: dict) -> bool:
     """Return True iff every key in `cond` matches the request."""
     if not isinstance(cond, dict):
@@ -2582,6 +2667,9 @@ def _match_router_cond(cond: dict, body: dict, ctx: dict) -> bool:
     if "has_tools" in cond:
         actual = bool(body.get("tools"))
         if bool(cond["has_tools"]) != actual:
+            return False
+    if "has_images" in cond:
+        if bool(cond["has_images"]) != _body_has_images(body):
             return False
     if "prompt_chars_lt" in cond or "prompt_chars_gt" in cond:
         n = _prompt_total_chars(body)
@@ -3695,7 +3783,8 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
-                  upstream, client_ip, client_app, gate_verdict, gate_rule, gate_reason, shadow_of
+                  upstream, client_ip, client_app, gate_verdict, gate_rule, gate_reason, shadow_of,
+                  has_images
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -4481,7 +4570,57 @@ async def get_request(req_id: str, request: Request):
                                       d.get("ttft_ms"), d.get("prompt_tokens"), d.get("upstream"))
     d["cache_pct"] = _cpct
     d["cache_verdict"] = _cverdict
+    # Images: surface each as metadata (served on demand via .../image/{idx}) and strip the
+    # base64 out of the displayed request_body so the viewer shows a link, not a 700KB blob.
+    d["images"] = []
+    if d.get("request_body"):
+        try:
+            _bj = json.loads(d["request_body"])
+        except (json.JSONDecodeError, TypeError):
+            _bj = None
+        if isinstance(_bj, dict):
+            for (i, mt, kind, payload) in _iter_request_images(_bj):
+                if kind == "data":
+                    b64 = payload or ""
+                    d["images"].append({"index": i, "media_type": mt, "kind": "data",
+                                        "size_bytes": len(b64) * 3 // 4})
+                else:
+                    d["images"].append({"index": i, "media_type": mt or "", "kind": "url",
+                                        "url": payload})
+            if _strip_image_data(_bj):
+                d["request_body"] = json.dumps(_bj)
     return _redact_row(d, viewer)
+
+
+@app.get("/__proxy/api/requests/{req_id}/image/{idx}")
+def get_request_image(req_id: str, idx: int, request: Request):  # sync → threadpool
+    """Reconstruct and serve the idx-th image from a request's stored body. The base64 lives in
+    the untouched DB row (get_request only strips it from the *displayed* copy)."""
+    conn = db()
+    row = conn.execute("SELECT request_body, client_ip FROM requests WHERE id = ?", (req_id,)).fetchone()
+    conn.close()
+    if not row or not row["request_body"]:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # Same visibility gate as the request detail: only a viewer who may see this client's content.
+    if not _can_view_pii(_client_ip(request), row["client_ip"]):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        bj = json.loads(row["request_body"])
+    except (json.JSONDecodeError, TypeError):
+        return JSONResponse({"error": "request body not stored / unparseable"}, status_code=422)
+    for (i, mt, kind, payload) in _iter_request_images(bj):
+        if i != idx:
+            continue
+        if kind == "url":
+            return JSONResponse({"url": payload}, status_code=200)  # external — client links directly
+        try:
+            raw = base64.b64decode((payload or "") + "=" * (-len(payload or "") % 4))
+        except (ValueError, binascii.Error):
+            return JSONResponse({"error": "image data truncated or not valid base64 — full bytes weren't stored"},
+                                status_code=422)
+        return Response(content=raw, media_type=mt or "image/png",
+                        headers={"Cache-Control": "private, max-age=300"})
+    return JSONResponse({"error": "image index out of range"}, status_code=404)
 
 
 @app.post("/__proxy/api/clear")
@@ -6051,6 +6190,24 @@ async def ui_index():
     return FileResponse(STATIC_DIR / "index.html")
 
 
+# The proxy's logo: two arrows (request out / response back). Same SVG the UI uses for its
+# inline favicon — served here so a browser's automatic /favicon.ico request resolves instead
+# of falling through to the catch-all and getting proxied to Ollama (404).
+_FAVICON_SVG = (
+    b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'>"
+    b"<rect width='64' height='64' rx='12' fill='#1a1d26'/>"
+    b"<path d='M12 22h32m-8-8 8 8-8 8' stroke='#88c0d0' stroke-width='5' fill='none' stroke-linecap='round' stroke-linejoin='round'/>"
+    b"<path d='M52 42H20m8-8-8 8 8 8' stroke='#a3be8c' stroke-width='5' fill='none' stroke-linecap='round' stroke-linejoin='round'/>"
+    b"</svg>"
+)
+
+
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(content=_FAVICON_SVG, media_type="image/svg+xml",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
 # -------- Benchmark runner --------
 #
 # In-proxy benchmark feature: queues a configurable streaming workload (N requests at a
@@ -7044,10 +7201,11 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     # Chars-based prompt-token estimate, persisted so the requests list can derive a cache
     # verdict (evaluated vs estimated) without re-parsing the body on every load.
     est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
+    has_imgs = 1 if _body_has_images(body_json) else None
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -7064,6 +7222,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             client_app,
             upstream,
             est or None,
+            has_imgs,
         ),
     )
     conn.commit()

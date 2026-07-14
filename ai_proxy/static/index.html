@@ -111,6 +111,14 @@
   .stats-section th { text-transform: uppercase; letter-spacing: 0.5px; }
   .bar { display: inline-block; height: 6px; background: #4a5a7a; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   #detail { flex: 1; overflow: auto; padding: 14px 18px; }
+  /* Resizable + collapsible detail sidebar (Requests view). */
+  #split-handle { flex: 0 0 6px; cursor: col-resize; background: #23262f; position: relative; }
+  #split-handle:hover { background: #3a4e6a; }
+  #detail-toggle { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: 20px; height: 34px; background: #2a2e3a; color: #9aa4b2; border: 1px solid #3a3e4a; border-radius: 4px; cursor: pointer; font-size: 13px; line-height: 1; z-index: 6; padding: 0; }
+  #detail-toggle:hover { background: #3a4e6a; color: #e6e6e6; }
+  #main.detail-collapsed #detail { display: none; }
+  #main.detail-collapsed #list { flex: 1 1 auto; width: auto !important; }
+  #main.stats #split-handle, #main.audit #split-handle, #main.convs #split-handle, #main.system #split-handle, #main.setup #split-handle, #main.chat #split-handle, #main.tasks #split-handle, #main.bench #split-handle { display: none; }
   .summary { background: #1a1d26; border: 1px solid #2a2e3a; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
   .summary .row { margin: 3px 0; }
   .summary .label { color: #888; display: inline-block; width: 80px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -208,6 +216,9 @@
     /* Stack list on top, detail below — only one shown at a time. */
     #main { flex-direction: column; }
     #list { width: 100%; min-width: 0; max-width: 100%; border-right: none; border-bottom: 1px solid #2a2e3a; }
+    /* No drag-resize on mobile (stacked layout). */
+    #split-handle { display: none; }
+    #main.detail-collapsed #detail { display: block; }
 
     /* When a row is selected AND we're on the requests view, hide list, show full-width
        detail with a sticky back bar. The :not() chain skips other tabs where #list is
@@ -492,6 +503,7 @@
     </table>
     <div class="empty" id="empty">No requests captured yet.</div>
   </div>
+  <div id="split-handle" title="Drag to resize · double-click to collapse"><button id="detail-toggle" title="Collapse / expand detail panel" onclick="toggleDetailPanel(event)">»</button></div>
   <div id="mobile-back-btn" onclick="mobileBack()">← back to list</div>
   <div id="detail"><div class="empty">Select a request to inspect</div></div>
   <div id="stats"></div>
@@ -674,6 +686,49 @@ function fmt(ts) {
   return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
 }
 
+// Detail sidebar: drag the split handle to resize, click the chevron (or double-click the
+// handle) to collapse/expand. Width + collapsed state persist in localStorage.
+const _LS_LIST_W = 'ai-proxy-list-width', _LS_DETAIL_COLLAPSED = 'ai-proxy-detail-collapsed';
+function toggleDetailPanel(e) {
+  if (e) e.stopPropagation();
+  const collapsed = $('main').classList.toggle('detail-collapsed');
+  const b = $('detail-toggle');
+  if (b) { b.textContent = collapsed ? '«' : '»'; b.title = (collapsed ? 'Expand' : 'Collapse') + ' detail panel'; }
+  try { localStorage.setItem(_LS_DETAIL_COLLAPSED, collapsed ? '1' : '0'); } catch {}
+}
+function initSplit() {
+  const main = $('main'), list = $('list'), handle = $('split-handle');
+  if (!main || !list || !handle) return;
+  try {
+    const w = localStorage.getItem(_LS_LIST_W);
+    if (w) list.style.width = w;
+    if (localStorage.getItem(_LS_DETAIL_COLLAPSED) === '1') {
+      main.classList.add('detail-collapsed');
+      const b = $('detail-toggle'); if (b) { b.textContent = '«'; b.title = 'Expand detail panel'; }
+    }
+  } catch {}
+  let dragging = false;
+  handle.addEventListener('mousedown', e => {
+    if (e.target.id === 'detail-toggle') return;                 // the button toggles, not resizes
+    if (main.classList.contains('detail-collapsed')) return;     // nothing to resize when collapsed
+    dragging = true; document.body.style.userSelect = 'none'; document.body.style.cursor = 'col-resize'; e.preventDefault();
+  });
+  window.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const r = main.getBoundingClientRect();
+    const w = Math.max(320, Math.min(e.clientX - r.left, r.width - 360));
+    list.style.width = w + 'px';
+  });
+  window.addEventListener('mouseup', () => {
+    if (!dragging) return;
+    dragging = false; document.body.style.userSelect = ''; document.body.style.cursor = '';
+    try { localStorage.setItem(_LS_LIST_W, list.style.width); } catch {}
+  });
+  handle.addEventListener('dblclick', e => { if (e.target.id !== 'detail-toggle') toggleDetailPanel(e); });
+}
+if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', initSplit);
+else initSplit();
+
 function renderList() {
   $('empty').style.display = items.length ? 'none' : 'block';
   $('rows').innerHTML = items.map(it => {
@@ -682,6 +737,7 @@ function renderList() {
     else if (!it.status) status = '<span class="dot live"></span>pending';
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
+    const imgBadge = it.has_images ? '<span class="badge" title="contains an image / non-text content" style="background:#3a2a4a;color:#d0b0f0;border-color:#5a3a6a">🖼 img</span>' : '';
     const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
@@ -709,7 +765,7 @@ function renderList() {
       pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
     }
     else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
@@ -1575,16 +1631,37 @@ async function loadDetail(id) {
   const reqHeaders = tryPretty(d.request_headers);
   const reqBody = tryPretty(d.request_body);
   const respHeaders = tryPretty(d.response_headers);
+  // Collapsible section wrapper (native <details>), so the detail panel can be folded down.
+  const section = (title, inner, open) =>
+    `<div class="section"><details ${open === false ? '' : 'open'}>`
+    + `<summary style="cursor:pointer;color:#9aa4b2;font-size:13px;font-weight:600;padding:2px 0">${title}</summary>`
+    + `<div style="margin-top:6px">${inner}</div></details></div>`;
+  // Images: reconstructed from the request body (base64 is stripped from the body view above to
+  // avoid a huge blob). Each is fetched on demand from the request/image endpoint.
+  let imagesHtml = '';
+  if (d.images && d.images.length) {
+    const rows = d.images.map(im => {
+      const kb = Math.round((im.size_bytes || 0) / 1024);
+      if (im.kind === 'url') {
+        return `<div style="margin:6px 0"><a href="${esc(im.url)}" target="_blank" rel="noopener" style="color:#88c0d0">external image ${im.index} ↗</a> <span style="color:#666;font-size:11px">${esc(im.media_type || '')}</span></div>`;
+      }
+      const src = `/__proxy/api/requests/${esc(d.id)}/image/${im.index}`;
+      return `<div style="margin:8px 0">
+        <a href="${src}" target="_blank" rel="noopener" style="color:#88c0d0">image ${im.index} — ${esc(im.media_type)} · ${num(kb)} KB ↗</a>
+        <div><img src="${src}" loading="lazy" style="max-width:360px;max-height:280px;border:1px solid #333;border-radius:4px;margin-top:4px;display:block" title="click the link above to open full size" onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'(could not render — data may be truncated)',style:'color:#e08080;font-size:11px'}))"></div>
+      </div>`;
+    }).join('');
+    imagesHtml = section(`Images (${d.images.length})`, rows);
+  }
   let respSection = '';
 
   if (d.is_stream || d.stream_chunks) {
     const reconstructed = reconstructStream(d.stream_chunks || '');
-    respSection = `
-      ${reconstructed ? `<div class="section"><h3>Reconstructed Assistant Output</h3><pre class="reconstructed stream-text" data-k="reconstructed">${esc(reconstructed)}</pre></div>` : ''}
-      <div class="section"><h3>Stream Chunks (SSE)</h3><pre data-k="stream">${esc(renderSSE(d.stream_chunks || ''))}</pre></div>
-    `;
+    respSection =
+      (reconstructed ? section('Reconstructed Assistant Output', `<pre class="reconstructed stream-text" data-k="reconstructed">${esc(reconstructed)}</pre>`) : '')
+      + section('Stream Chunks (SSE)', `<pre data-k="stream">${esc(renderSSE(d.stream_chunks || ''))}</pre>`, false);
   } else {
-    respSection = `<div class="section"><h3>Response Body</h3><pre data-k="resp">${esc(tryPretty(d.response_body))}</pre></div>`;
+    respSection = section('Response Body', `<pre data-k="resp">${esc(tryPretty(d.response_body))}</pre>`);
   }
 
   const errBlock = d.error ? `<div class="section"><h3>Error</h3><pre class="status-5" data-k="err">${esc(d.error)}</pre></div>` : '';
@@ -1680,6 +1757,7 @@ async function loadDetail(id) {
     ${shadowsHtml}
     ${analysisHtml}
     <div class="section"><h3>Request Headers</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="reqh">${esc(reqHeaders)}</pre></details></div>
+    ${imagesHtml}
     <div class="section"><h3>Request Body (raw)</h3><details open><summary style="cursor:pointer;color:#888;font-size:11px">hide</summary><pre data-k="reqb">${esc(reqBody)}</pre></details></div>
     <div class="section"><h3>Response Headers</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="resph">${esc(respHeaders)}</pre></details></div>
     ${respSection}
@@ -3449,6 +3527,25 @@ function setSetupSubTab(t) {
 function apiSnippets(base, baseRoot, model) {
   const j = JSON.stringify;
   return [
+    {
+      title: 'Hermes Agent (Nous Research)',
+      desc: 'Add a custom provider to ~/.hermes/config.yaml',
+      lang: 'yaml',
+      code: `# ~/.hermes/config.yaml
+custom_providers:
+  - name: ai-proxy
+    base_url: ${base}
+    api_key: ollama            # any non-empty string (proxy passes it upstream)
+    type: openai
+    default_model: ${model}
+    models:
+      - name: ${model}
+        context_length: 262144   # lower this to make Hermes compact sooner / decode faster
+
+model:
+  default: ai-proxy/${model}
+  provider: custom`,
+    },
     {
       title: 'OpenAI Python SDK',
       desc: 'Standard openai package',

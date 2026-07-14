@@ -116,6 +116,49 @@ def test_cache_verdict_timing_detects_reuse_across_upstreams():
     assert P._cache_verdict(50, 50, ttft_ms=1, prompt_tokens=50, upstream="lmstudio") == (None, None)
 
 
+def test_iter_and_strip_request_images():
+    body = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJDRA=="}},
+        {"type": "image_url", "image_url": {"url": "https://example.com/x.jpg"}}]}]}
+    imgs = list(P._iter_request_images(body))
+    assert len(imgs) == 2
+    assert imgs[0] == (0, "image/png", "data", "QUJDRA==")
+    assert imgs[1][2] == "url" and imgs[1][3] == "https://example.com/x.jpg"
+    # Stripping replaces the inline base64 but leaves the external URL and structure intact.
+    assert P._strip_image_data(body) == 1
+    url0 = body["messages"][0]["content"][1]["image_url"]["url"]
+    assert "base64,QUJDRA==" not in url0 and "see Images" in url0
+    assert body["messages"][0]["content"][2]["image_url"]["url"] == "https://example.com/x.jpg"
+
+
+def test_body_has_images():
+    assert P._body_has_images({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "describe this"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}) is True
+    assert P._body_has_images({"messages": [{"role": "user", "content": [
+        {"type": "image", "source": {}}]}]}) is True   # Anthropic shape
+    assert P._body_has_images({"messages": [{"role": "user", "content": "just text"}]}) is False
+    assert P._body_has_images({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "no images here"}]}]}) is False
+
+
+def test_router_images_bypass_coder_rule(monkeypatch):
+    # Vision requests keep the multimodal model (rule 1, no rewrite); text routes to the coder.
+    cfg = {"model_router": {"enabled": True, "aliases": {}, "rules": [
+        {"if": {"from_model_prefix": "qwen", "has_images": True}, "then": "qwen3.6:27b"},
+        {"if": {"from_model_prefix": "qwen"}, "then": "qwen/qwen3-coder-next", "upstream": "lmstudio"},
+    ]}}
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    img = {"model": "qwen3.6:27b", "messages": [{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]}
+    assert P.evaluate_router(img, {}) is None            # rule 1 matches, target==original → no rewrite → stays on Ollama
+    assert img["model"] == "qwen3.6:27b"
+    txt = {"model": "qwen3.6:27b", "messages": [{"role": "user", "content": "write code"}]}
+    out = P.evaluate_router(txt, {})
+    assert out and out["to"] == "qwen/qwen3-coder-next" and out["upstream"] == "lmstudio"
+
+
 def test_evaluate_router_upstream_override(monkeypatch):
     cfg = {"model_router": {"enabled": True, "aliases": {},
            "rules": [{"if": {"from_model_prefix": "qwen"}, "then": "qwen/qwen3-coder-next",
