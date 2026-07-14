@@ -68,6 +68,68 @@ def test_cap_num_ctx_leaves_small_values_and_absent():
     assert P._cap_num_ctx({"num_ctx": 262144}, 0) is None         # cap disabled (0)
 
 
+def test_model_parallelism_ollama_serializes_qwen3():
+    # Ollama refuses to batch the Qwen3 family — flagged serial by arch/family or name.
+    assert P._model_parallelism("ollama", "qwen3moe")["parallel"] is False
+    assert P._model_parallelism("ollama", "qwen3next")["parallel"] is False
+    assert P._model_parallelism("ollama", None, "qwen3.6:27b")["parallel"] is False
+    # Non-qwen3 architectures batch fine under Ollama.
+    assert P._model_parallelism("ollama", "llama")["parallel"] is True
+    assert P._model_parallelism("ollama", "gemma3")["parallel"] is True
+    assert P._model_parallelism("ollama", "qwen2")["parallel"] is True   # only qwen3* is serial
+    # Unknown arch/name → can't tell.
+    assert P._model_parallelism("ollama", None, None)["parallel"] is None
+
+
+def test_model_parallelism_lmstudio_always_parallel():
+    # llama.cpp continuous batching parallelizes every architecture, including qwen3next.
+    assert P._model_parallelism("lmstudio", "qwen3next")["parallel"] is True
+    assert P._model_parallelism("lmstudio", "gpt-oss")["parallel"] is True
+
+
+def test_cache_verdict_token_based_ollama():
+    # Ollama reports evaluated-only prompt tokens: evaluated << estimated ⇒ hit.
+    assert P._cache_verdict(2000, 100000, upstream="ollama")[1] == "hit"
+    assert P._cache_verdict(95000, 100000, upstream="ollama")[1] == "miss"
+    assert P._cache_verdict(80000, 100000, upstream="ollama")[1] == "partial"
+    assert P._cache_verdict(None, 100000, upstream="ollama") == (None, None)  # in flight
+    assert P._cache_verdict(2000, 0, upstream="ollama") == (None, None)       # no estimate
+    pct, verdict = P._cache_verdict(1000, 100000, upstream="ollama")
+    assert verdict == "hit" and pct == 99.0
+
+
+def test_cache_verdict_lmstudio_token_method_is_blind():
+    # LM Studio reports the FULL prompt_tokens regardless of reuse, so the token method must NOT
+    # fire (would falsely say 'miss'/'hit'). Without a timing signal → unknown.
+    assert P._cache_verdict(2000, 100000, upstream="lmstudio") == (None, None)
+    assert P._cache_verdict(100000, 100000, upstream="lmstudio") == (None, None)
+
+
+def test_cache_verdict_timing_detects_reuse_across_upstreams():
+    # Implausibly fast prefill (2500 tokens in 30ms ≈ 83k tok/s) ⇒ prefill skipped ⇒ hit,
+    # for both LM Studio (only signal available) and Ollama.
+    assert P._cache_verdict(2500, 2500, ttft_ms=30, prompt_tokens=2500, upstream="lmstudio")[1] == "hit"
+    assert P._cache_verdict(2500, 2500, ttft_ms=30, prompt_tokens=2500, upstream="ollama")[1] == "hit"
+    # Normal prefill speed (2500 tokens in 2500ms = 1000 tok/s) is NOT flagged by timing.
+    assert P._cache_verdict(2500, 2500, ttft_ms=2500, prompt_tokens=2500, upstream="lmstudio") == (None, None)
+    # Tiny prompt: timing too noisy to judge even if fast.
+    assert P._cache_verdict(50, 50, ttft_ms=1, prompt_tokens=50, upstream="lmstudio") == (None, None)
+
+
+def test_evaluate_router_upstream_override(monkeypatch):
+    cfg = {"model_router": {"enabled": True, "aliases": {},
+           "rules": [{"if": {"from_model_prefix": "qwen"}, "then": "qwen/qwen3-coder-next",
+                      "upstream": "lmstudio"}]}}
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    body = {"model": "qwen3.6:27b"}
+    out = P.evaluate_router(body, {})
+    assert out["to"] == "qwen/qwen3-coder-next"
+    assert out["upstream"] == "lmstudio"
+    assert body["model"] == "qwen/qwen3-coder-next"  # body mutated in place
+    # A non-matching model is left alone.
+    assert P.evaluate_router({"model": "gemma3:27b"}, {}) is None
+
+
 def test_system_history_downsampled(client):
     conn = P.db()
     now = time.time()

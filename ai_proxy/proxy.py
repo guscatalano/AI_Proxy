@@ -419,6 +419,10 @@ MIGRATIONS = [
     "ALTER TABLE system_metrics ADD COLUMN comfyui_json TEXT",
     "ALTER TABLE requests ADD COLUMN ttft_ms REAL",
     "ALTER TABLE requests ADD COLUMN upstream TEXT",
+    # Chars-based estimate of the prompt token count, stored at request time. Compared against
+    # the evaluated prompt_tokens (what the upstream actually prefilled) to derive a cache
+    # hit/miss verdict cheaply in the requests list — no body re-parsing needed.
+    "ALTER TABLE requests ADD COLUMN est_prompt_tokens INTEGER",
 ]
 
 
@@ -1242,6 +1246,34 @@ def _semver_tuple(v: str) -> tuple:
     return tuple(out)
 
 
+# Architectures Ollama refuses to batch — it returns "model architecture does not currently
+# support parallel requests" and serves them one at a time. The whole Qwen3 family
+# (qwen3, qwen3moe, qwen3next, qwen35, etc.) is serial under Ollama.
+# This is runtime-specific: LM Studio / llama.cpp continuous batching parallelizes the same
+# models fine, which is why we route heavy qwen traffic there.
+_OLLAMA_SERIAL_ARCH_PREFIXES = ("qwen3",)
+
+
+def _model_parallelism(runtime: str, arch: str | None = None, name: str | None = None) -> dict:
+    """Best-effort answer to 'can this model serve concurrent requests on this runtime?'.
+    Returns {"parallel": True|False|None, "reason": str}. None = couldn't determine."""
+    a = (arch or "").lower()
+    n = (name or "").lower()
+    if runtime == "lmstudio":
+        return {"parallel": True,
+                "reason": "LM Studio (llama.cpp continuous batching) batches all architectures"}
+    if runtime == "ollama":
+        hay = a or n
+        if hay and any(hay.startswith(p) or (p in hay) for p in _OLLAMA_SERIAL_ARCH_PREFIXES):
+            return {"parallel": False,
+                    "reason": "Ollama serializes this architecture — 'does not support parallel requests'"}
+        if not hay:
+            return {"parallel": None, "reason": "architecture unknown"}
+        return {"parallel": True,
+                "reason": "Ollama batches this architecture up to OLLAMA_NUM_PARALLEL"}
+    return {"parallel": None, "reason": "unknown runtime"}
+
+
 async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
     out: dict = {"reachable": False, "ps": [], "tags": [], "env": {}, "env_source": None,
                  "pid": None, "version": None, "recommended_version": OLLAMA_RECOMMENDED_VERSION,
@@ -1273,6 +1305,8 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
             out["reachable"] = True
             data = r.json()
             for m in (data.get("models") or []):
+                _fam = (m.get("details") or {}).get("family")
+                _par = _model_parallelism("ollama", _fam, m.get("name"))
                 out["ps"].append({
                     "name": m.get("name"),
                     "model": m.get("model"),
@@ -1280,6 +1314,9 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
                     "size_vram_mb": (m.get("size_vram") or 0) // (1024 * 1024) if m.get("size_vram") else None,
                     "expires_at": m.get("expires_at"),
                     "parameter_size": (m.get("details") or {}).get("parameter_size"),
+                    "family": _fam,
+                    "parallel": _par["parallel"],
+                    "parallel_reason": _par["reason"],
                 })
     except (httpx.RequestError, ValueError):
         return out
@@ -1288,11 +1325,16 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
         if r.status_code == 200:
             data = r.json()
             for m in (data.get("models") or []):
+                _fam = (m.get("details") or {}).get("family")
+                _par = _model_parallelism("ollama", _fam, m.get("name"))
                 out["tags"].append({
                     "name": m.get("name"),
                     "size_mb": (m.get("size") or 0) // (1024 * 1024) if m.get("size") else None,
                     "modified_at": m.get("modified_at"),
                     "parameter_size": (m.get("details") or {}).get("parameter_size"),
+                    "family": _fam,
+                    "parallel": _par["parallel"],
+                    "parallel_reason": _par["reason"],
                 })
     except (httpx.RequestError, ValueError):
         pass
@@ -1309,6 +1351,7 @@ async def _lmstudio_snapshot(client: httpx.AsyncClient) -> dict:
             data = r.json()
             entries = data.get("data") if isinstance(data, dict) else data
             for m in (entries or []):
+                _par = _model_parallelism("lmstudio", m.get("arch"), m.get("id"))
                 rec = {
                     "id": m.get("id"),
                     "type": m.get("type"),
@@ -1319,6 +1362,8 @@ async def _lmstudio_snapshot(client: httpx.AsyncClient) -> dict:
                     "publisher": m.get("publisher"),
                     "quant": m.get("quantization"),
                     "compat_type": m.get("compatibility_type"),
+                    "parallel": _par["parallel"],
+                    "parallel_reason": _par["reason"],
                 }
                 out["available"].append(rec)
                 if (m.get("state") or "").lower() in ("loaded", "ready"):
@@ -1624,15 +1669,20 @@ DEFAULT_RULES_CONFIG = {
         # Static aliases applied first: { "from_model": "to_model" }
         "aliases": {},
         # Conditional rules; first match wins (after aliases). Each rule:
-        #   { "if": { ...conditions... }, "then": "target_model_name" }
+        #   { "if": { ...conditions... }, "then": "target_model_name", "upstream": "lmstudio" }
         # Conditions (any combination, all must match):
         #   from_model: string | [strings]      match the model name (post-alias)
+        #   from_model_prefix: string | [str]   match a model-name prefix (e.g. "qwen")
         #   from_client: string | [strings]     exact client IP
         #   from_client_prefix: string          IP prefix
         #   prompt_chars_lt: int                total chars across all message content
         #   prompt_chars_gt: int                total chars across all message content
         #   has_tools: bool                     request includes a non-empty tools[] array
         #   path_prefix: string                 match URL path prefix
+        # Optional "upstream": "ollama" | "lmstudio" sends the (rewritten) model to that backend
+        # instead of the path-based default — both speak the /v1 shape so no translation needed.
+        # Lets you route e.g. qwen to LM Studio (parallel-capable) while everything else stays on
+        # Ollama, all still logged through the proxy.
         "rules": [],
         # When True, rewrites the `model` field in upstream responses (and streamed chunks)
         # back to the original requested model name. Hides the rewrite from clients that
@@ -2515,6 +2565,10 @@ def _match_router_cond(cond: dict, body: dict, ctx: dict) -> bool:
     if "from_model" in cond:
         if (body.get("model") or "") not in as_list(cond["from_model"]):
             return False
+    if "from_model_prefix" in cond:
+        m = body.get("model") or ""
+        if not any(m.startswith(str(p)) for p in as_list(cond["from_model_prefix"])):
+            return False
     if "from_client" in cond:
         if (ctx.get("client_ip") or "") not in as_list(cond["from_client"]):
             return False
@@ -2553,6 +2607,7 @@ def evaluate_router(body: dict, ctx: dict) -> dict | None:
     target = None
     via = None
     matched_cond = None
+    upstream = None  # optional per-rule upstream override ("ollama" | "lmstudio")
 
     aliases = cfg.get("aliases") or {}
     if isinstance(aliases, dict) and original in aliases:
@@ -2570,12 +2625,18 @@ def evaluate_router(body: dict, ctx: dict) -> dict | None:
             target = r.get("then")
             via = "rule"
             matched_cond = cond
+            upstream = r.get("upstream")  # e.g. "lmstudio" to send this model elsewhere
             break
 
-    if not target or target == original:
+    # A rule may switch upstream without renaming the model, so a bare upstream override
+    # (target == original) still counts as a rewrite.
+    if not target:
+        return None
+    if target == original and not upstream:
         return None
     body["model"] = target
-    return {"from": original, "to": target, "via": via, "condition": matched_cond}
+    return {"from": original, "to": target, "via": via, "condition": matched_cond,
+            "upstream": upstream}
 
 
 _NATIVE_TOP_LEVEL_KEYS = {"keep_alive", "format"}
@@ -3581,6 +3642,44 @@ def system_history(minutes: int = 60):
     return {"minutes": minutes, "samples": out, "total_samples": total}
 
 
+# Real prompt prefill is bounded by the accelerator's prompt-processing throughput. An implied
+# prefill rate (prompt tokens / TTFT) far above what the hardware can actually prefill means the
+# prompt was served from the KV cache (prefix reused) rather than re-evaluated. Large local
+# models typically cold-prefill at a few hundred tok/s, while a cache hit implies several
+# thousand — so this threshold sits several× above real cold prefill. Note TTFT includes some
+# scheduling/first-token overhead, which deflates the rate, so we keep the bar reachable. Tune
+# it (or _CACHE_MIN_PROMPT_TOKENS) to your hardware if the hit/miss labels look off.
+_PREFILL_SKIP_TOK_PER_S = 2500.0
+_CACHE_MIN_PROMPT_TOKENS = 400   # below this, timing is too noisy to judge reuse
+
+
+def _cache_verdict(evaluated, est, ttft_ms=None, prompt_tokens=None, upstream=None):
+    """Cache-reuse verdict. Returns (cache_pct, verdict) where verdict is 'hit'|'partial'|'miss',
+    or (None, None) when we can't tell (in flight, tiny prompt, or an upstream we can't measure).
+
+    Two signals, in priority order:
+      1. Timing (upstream-agnostic): if the effective prefill rate (prompt tokens / TTFT) is
+         implausibly high, the prefill was skipped → hit. This is the ONLY reliable signal for
+         OpenAI-semantics upstreams like LM Studio, which report the full prompt_tokens and no
+         cached_tokens regardless of reuse.
+      2. Token counts (Ollama only): Ollama's prompt_tokens is the *evaluated-only* count, so
+         evaluated < estimated ⇒ a prefix was reused. Invalid for LM Studio (full count), so it's
+         applied only to Ollama rows to avoid crying 'miss' on real hits."""
+    pt = prompt_tokens or evaluated or est or 0
+    # 1) Timing-based, works across upstreams (needs streamed TTFT + a non-trivial prompt).
+    if ttft_ms and ttft_ms > 0 and pt >= _CACHE_MIN_PROMPT_TOKENS:
+        if pt / (ttft_ms / 1000.0) >= _PREFILL_SKIP_TOK_PER_S:
+            return None, "hit"
+    # 2) Token-based, valid only where prompt_tokens == evaluated-only count (Ollama).
+    if upstream in (None, "ollama"):
+        e = evaluated or 0
+        s = est or 0
+        if s > 0 and e > 0:
+            pct = round(100.0 * (1 - e / s), 1) if e < s else 0.0
+            return pct, ("hit" if pct >= 50 else ("partial" if pct >= 10 else "miss"))
+    return None, None
+
+
 @app.get("/__proxy/api/requests")
 def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False, client: str = ""):  # sync → threadpool
     viewer = _client_ip(request)
@@ -3595,8 +3694,8 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
-                  prompt_tokens, completion_tokens, total_tokens, client_ip, client_app,
-                  gate_verdict, gate_rule, gate_reason, shadow_of
+                  prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
+                  upstream, client_ip, client_app, gate_verdict, gate_rule, gate_reason, shadow_of
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -3621,9 +3720,66 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
                 d["total_tokens"] = live["total_tokens"]
                 d["tokens_live"] = True
                 d["tokens_estimated"] = live["estimated"]
+        # Cache verdict: cheap (timing + token arithmetic), no body parse.
+        _cpct, _cverdict = _cache_verdict(d.get("prompt_tokens"), d.get("est_prompt_tokens"),
+                                          d.get("ttft_ms"), d.get("prompt_tokens"), d.get("upstream"))
+        d["cache_pct"] = _cpct
+        d["cache_verdict"] = _cverdict
         items.append(_redact_row(d, viewer))
     return {"total": total, "items": items,
             "clients": [dict(r) for r in client_rows], "redacted": REDACT_PII_ENABLED}
+
+
+@app.get("/__proxy/api/cache")
+def cache_stats(request: Request, limit: int = 50):  # sync → threadpool
+    """Prompt-cache diagnostic. Ollama reports how many prompt tokens it actually had to
+    *evaluate* (prefill) — stored here as prompt_tokens. Comparing that against the estimated
+    total prompt size shows whether the KV cache was reused: if a request sends ~85k tokens
+    but only ~2k were evaluated, the shared prefix was cached (hit); if it evaluated ~all of
+    them, no reuse (miss). Lets you SEE if caching is doing anything instead of guessing."""
+    limit = max(1, min(int(limit or 50), 200))
+    conn = db()
+    rows = conn.execute(
+        """SELECT id, ts, client_app, model, request_body, prompt_tokens, duration_ms,
+                  ttft_ms, upstream
+           FROM requests
+           WHERE prompt_tokens IS NOT NULL AND request_body IS NOT NULL AND shadow_of IS NULL
+                 AND (path LIKE '%chat%' OR path LIKE '%generate%' OR path LIKE '%messages%')
+           ORDER BY ts DESC LIMIT ?""",
+        (limit,),
+    ).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        try:
+            body = json.loads(r["request_body"])
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+        est = _estimate_prompt_tokens(body, 3.5) if isinstance(body, dict) else 0
+        evaluated = r["prompt_tokens"] or 0
+        # Shared verdict: timing-based for OpenAI-semantics upstreams (LM Studio), token-based
+        # for Ollama. See _cache_verdict. Falls back to a plain token pct when it returns None.
+        pct, verdict = _cache_verdict(evaluated, est, r["ttft_ms"], evaluated, r["upstream"])
+        if verdict is None:
+            pct = round(100.0 * (1 - evaluated / est), 1) if est > 0 and evaluated < est else 0.0
+            verdict = "hit" if pct >= 50 else ("partial" if pct >= 10 else "miss")
+        items.append({
+            "id": r["id"], "ts": r["ts"], "client_app": r["client_app"], "model": r["model"],
+            "evaluated_tokens": evaluated, "est_prompt_tokens": est, "upstream": r["upstream"],
+            "cache_pct": pct, "verdict": verdict, "duration_ms": r["duration_ms"],
+        })
+    n = len(items)
+    return {
+        "items": items,
+        "summary": {
+            "count": n,
+            "hits": sum(1 for i in items if i["verdict"] == "hit"),
+            "misses": sum(1 for i in items if i["verdict"] == "miss"),
+            "avg_cache_pct": round(sum(i["cache_pct"] for i in items) / n, 1) if n else 0.0,
+        },
+        "note": "evaluated_tokens = tokens Ollama actually prefilled (from usage). Much lower "
+                "than est_prompt_tokens => KV cache reused the shared prefix.",
+    }
 
 
 @app.get("/__proxy/api/audit")
@@ -4319,6 +4475,12 @@ async def get_request(req_id: str, request: Request):
     else:
         shadows = [_redact_row(dict(s), viewer, originator_ips=[d.get("client_ip")]) for s in shadow_rows]
     d["shadows"] = shadows
+    # Cache verdict for the detail panel (same logic as the list): timing-based for
+    # OpenAI-semantics upstreams, token-based for Ollama.
+    _cpct, _cverdict = _cache_verdict(d.get("prompt_tokens"), d.get("est_prompt_tokens"),
+                                      d.get("ttft_ms"), d.get("prompt_tokens"), d.get("upstream"))
+    d["cache_pct"] = _cpct
+    d["cache_verdict"] = _cverdict
     return _redact_row(d, viewer)
 
 
@@ -6879,10 +7041,13 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     turn = _turn_index(body_json)
     headers_dict = dict(request.headers)
     client_app = _detect_client_app(headers_dict, body_json if isinstance(body_json, dict) else None)
+    # Chars-based prompt-token estimate, persisted so the requests list can derive a cache
+    # verdict (evaluated vs estimated) without re-parsing the body on every load.
+    est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -6898,13 +7063,13 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             turn,
             client_app,
             upstream,
+            est or None,
         ),
     )
     conn.commit()
     conn.close()
-    # Seed live state with a chars-based prompt-token estimate so the UI shows something
-    # immediately, even before the upstream confirms the real input_tokens.
-    est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
+    # Seed live state with the estimate so the UI shows something immediately, even before
+    # the upstream confirms the real input_tokens.
     _LIVE_STREAMS[req_id] = {"prompt": None, "completion": None, "est_prompt": est or None}
 
 
@@ -8523,6 +8688,13 @@ async def proxy(full_path: str, request: Request):
     start = time.perf_counter()
     body = await request.body()
 
+    # Path normalization: some clients construct the URL as {ollama_base}/api + /v1/models,
+    # yielding /api/v1/models — which Ollama doesn't serve (404). Ollama's OpenAI-compat
+    # surface lives at /v1/*, so collapse a stray `api/v1/...` prefix to `v1/...` so these
+    # resolve instead of 404ing.
+    if full_path.startswith("api/v1/"):
+        full_path = full_path[len("api/"):]
+
     upstream_base, upstream_label = _pick_upstream(full_path)
     upstream_url = f"{upstream_base}/{full_path}"
     if request.url.query:
@@ -8604,6 +8776,38 @@ async def proxy(full_path: str, request: Request):
     # Anthropic requests skip ollama_options entirely (num_ctx etc. don't apply).
     router_ctx = {"client_ip": _client_ip(request), "path": "/" + full_path, "req_id": req_id, "upstream": upstream_label}
     rewrite = evaluate_router(body_json, router_ctx) if isinstance(body_json, dict) else None
+
+    # Per-rule upstream override: a model_router rule may carry {"upstream": "lmstudio"} to
+    # send that (rewritten) model to a different backend than the path-based default. This is
+    # how e.g. qwen traffic reaches LM Studio's OpenAI endpoint *through* the proxy so it's
+    # inspected/logged like everything else. Only OpenAI-compat backends are valid targets —
+    # both Ollama and LM Studio speak the same /v1 shape, so no body translation is needed.
+    # "anthropic" is deliberately NOT a target: forwarding an OpenAI-shape body there without
+    # the protocol bridge (which only goes anthropic→ollama) would produce 400s.
+    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL}
+    if (rewrite and rewrite.get("upstream")
+            and upstream_label != "anthropic"):
+        _new_label = str(rewrite["upstream"]).lower()
+        _new_base = _UPSTREAM_BASES.get(_new_label)
+        if _new_base and _new_label != upstream_label:
+            upstream_label = _new_label
+            upstream_base = _new_base
+            upstream_url = f"{upstream_base}/{full_path}"
+            if request.url.query:
+                upstream_url += f"?{request.url.query}"
+            router_ctx["upstream"] = upstream_label
+            # Keep the saved row in sync so audit/stats attribute the bytes to the real
+            # destination (mirrors the protocol-bridge fix-up below).
+            try:
+                _conn = db()
+                _conn.execute(
+                    "UPDATE requests SET upstream=?, upstream_url=? WHERE id=?",
+                    (upstream_label, upstream_url, req_id),
+                )
+                _conn.commit()
+                _conn.close()
+            except Exception:
+                pass
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
     # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response

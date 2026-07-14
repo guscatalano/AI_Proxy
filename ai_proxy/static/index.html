@@ -569,6 +569,17 @@ let lastDetailSig = null;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
 const num = (n) => (n == null ? '' : Number(n).toLocaleString());
+// Duration formatting. The requests list shows ms with thousands separators (the column header
+// supplies the "ms" unit). The detail view appends the next-biggest unit in parens for quick
+// reading, e.g. "4,080 ms (4s)" or "125,300 ms (2.1m)".
+const fmtMsLong = (v) => {
+  if (v == null) return '—';
+  const ms = Math.round(v);
+  let extra = '';
+  if (ms >= 60000) extra = ` (${(ms / 60000).toFixed(1)}m)`;
+  else if (ms >= 1000) extra = ` (${Math.round(ms / 1000)}s)`;
+  return num(ms) + ' ms' + extra;
+};
 
 const VIEW_KEY = 'ai-proxy-active-view';
 const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'bench']);
@@ -671,7 +682,7 @@ function renderList() {
     else if (!it.status) status = '<span class="dot live"></span>pending';
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
-    const ms = it.duration_ms ? Math.round(it.duration_ms) : '';
+    const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
       const tip = it.tokens_estimated ? 'estimated prompt tokens (chars/3.5); upstream usage not yet received' : 'live token count from upstream stream — still in flight';
@@ -1465,7 +1476,7 @@ function renderShadows(shadows, primary) {
     const status = s.status || (s.error ? 'ERR' : 'pending');
     const cls = !s.status && !s.error ? 'shadow-status-pending'
               : s.error || (s.status >= 400) ? 'shadow-status-err' : 'shadow-status-ok';
-    const ms = s.duration_ms ? Math.round(s.duration_ms) + ' ms' : '—';
+    const ms = fmtMsLong(s.duration_ms);
     const tokens = s.total_tokens ? `${num(s.total_tokens)} tok (p:${num(s.prompt_tokens)||0} / c:${num(s.completion_tokens)||0})` : '—';
     const respText = _shadowResponseText(s);
     const errBlock = s.error ? `<pre style="margin-top:6px;color:#bf616a;max-height:120px">${esc(s.error)}</pre>` : '';
@@ -1526,6 +1537,7 @@ async function loadDetail(id) {
     (d.stream_chunks || '').length,
     d.duration_ms || 0,
     d.total_tokens || 0,
+    d.cache_verdict || '',
     shadowSig,
   ].join('|');
   if (sig === lastDetailSig) return;
@@ -1537,6 +1549,28 @@ async function loadDetail(id) {
   detailEl.querySelectorAll('pre').forEach(p => {
     if (p.dataset.k) preScrolls[p.dataset.k] = { top: p.scrollTop, left: p.scrollLeft };
   });
+
+  // Upstream badge: which backend actually served this request (path-based default or a
+  // model_router upstream override). Saves reading the URL.
+  let upstreamBadge = '';
+  if (d.upstream) {
+    const uColors = { ollama: '#88c0d0', lmstudio: '#b48ead', anthropic: '#d08770' };
+    const uc = uColors[d.upstream] || '#888';
+    const ulabel = d.upstream === 'lmstudio' ? 'LM Studio' : (d.upstream[0].toUpperCase() + d.upstream.slice(1));
+    upstreamBadge = ` <span title="Served by ${esc(d.upstream)}" style="color:${uc};border:1px solid ${uc}55;border-radius:3px;padding:1px 6px;font-size:11px;white-space:nowrap">${esc(ulabel)}</span>`;
+  }
+  // Prompt-cache verdict. hit = KV-cache prefix reuse (inferred from prefill speed on LM Studio,
+  // or evaluated<estimated tokens on Ollama); miss = full re-prefill. Computed server-side.
+  let cacheBadge = '';
+  if (d.cache_verdict) {
+    const cv = d.cache_verdict;
+    const col = cv === 'hit' ? '#7ee787' : (cv === 'partial' ? '#ebcb8b' : '#ff7b72');
+    const pctTxt = d.cache_pct != null ? ' ' + Math.round(d.cache_pct) + '%' : '';
+    const tip = d.cache_pct != null
+      ? `prompt cache ${cv} — ~${Math.round(d.cache_pct)}% of the prompt was reused (upstream evaluated fewer tokens than were sent)`
+      : `prompt cache ${cv} — inferred from prefill speed (prompt tokens ÷ TTFT well above the hardware's real prefill rate ⇒ KV cache prefix reused, prefill skipped)`;
+    cacheBadge = ` <span title="${tip}" style="color:${col};border:1px solid ${col}55;border-radius:3px;padding:1px 6px;font-size:11px;white-space:nowrap">⚡ cache ${cv}${pctTxt}</span>`;
+  }
 
   const reqHeaders = tryPretty(d.request_headers);
   const reqBody = tryPretty(d.request_body);
@@ -1635,8 +1669,8 @@ async function loadDetail(id) {
       <div class="row"><span class="label">Request ID</span> <code style="user-select:all">${esc(d.id || '?')}</code></div>
       <div class="row"><span class="label">Request</span> <strong class="method">${esc(d.method)}</strong> <code>${esc(d.path)}</code></div>
       <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
-      <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code></div>
-      <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${d.duration_ms ? Math.round(d.duration_ms) + ' ms' : '—'}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
+      <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code>${upstreamBadge}${cacheBadge}</div>
+      <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${fmtMsLong(d.duration_ms)}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
       <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code></div>
       ${tokensLine}
       ${downsizeLine}
@@ -1849,45 +1883,46 @@ async function loadStats() {
   // Throughput percentile distributions: combined (legacy), generation (decode rate),
   // and processing (prefill rate). Split rates require ttft_ms which is only populated
   // on rows captured after the migration; older rows show only in the combined table.
-  const _fmtTps = v => (v == null) ? '—' : (v >= 100 ? Math.round(v) : v.toFixed(1));
-  function _renderTpsRow(d) {
+  const _fmtTps = v => (v == null) ? '—' : (v >= 100 ? num(Math.round(v)) : v.toFixed(1));
+  // One metric = one row: a label/description cell then the percentile spread. p50 highlighted.
+  function _renderTpsMetricRow(label, sub, accent, d) {
+    if (!d || !d.samples) {
+      return `<tr><td><div style="font-weight:600;color:${accent}">${label}</div>
+        <div style="color:#777;font-size:11px">${sub}</div></td>
+        <td colspan="7" class="empty" style="color:#666">no samples yet (needs TTFT-tagged rows)</td></tr>`;
+    }
+    const cell = (v, hi) => `<td class="num"${hi ? ' style="color:#88c0d0;font-weight:600"' : ''}>${_fmtTps(v)}</td>`;
     return `<tr>
-      <td class="num">${_fmtTps(d.min)}</td>
-      <td class="num">${_fmtTps(d.p10)}</td>
-      <td class="num">${_fmtTps(d.p25)}</td>
-      <td class="num" style="color:#88c0d0;font-weight:600">${_fmtTps(d.p50)}</td>
-      <td class="num">${_fmtTps(d.p75)}</td>
-      <td class="num">${_fmtTps(d.p90)}</td>
-      <td class="num">${_fmtTps(d.max)}</td>
+      <td><div style="font-weight:600;color:${accent}">${label}</div>
+          <div style="color:#777;font-size:11px">${sub}</div></td>
+      ${cell(d.min)}${cell(d.p25)}${cell(d.p50, true)}${cell(d.p75)}${cell(d.p90)}${cell(d.max)}
+      <td class="num" style="color:#777">${num(d.samples)}</td>
     </tr>`;
   }
-  function _renderTpsTable(title, hint, d) {
-    if (!d.samples) return '';
-    return `
-      <div class="stats-section">
-        <h2>${title} <span style="color:#666;font-weight:normal;font-size:11px">${hint} · n=${num(d.samples)}</span></h2>
-        <table style="width:100%">
-          <thead><tr><th class="num">min</th><th class="num">p10</th><th class="num">p25</th><th class="num">p50</th><th class="num">p75</th><th class="num">p90</th><th class="num">max</th></tr></thead>
-          <tbody>${_renderTpsRow(d)}</tbody>
-        </table>
-      </div>`;
-  }
-  const tpSection =
-    _renderTpsTable(
-      'Generation Rate',
-      'completion tokens / decoding time (tok/s)',
-      o.throughput_generation || {}
-    ) +
-    _renderTpsTable(
-      'Processing Rate',
-      'prompt tokens / prefill time (tok/s)',
-      o.throughput_processing || {}
-    ) +
-    _renderTpsTable(
-      'Combined Throughput',
-      'completion / total upstream time — includes prefill (tok/s)',
-      o.throughput || {}
-    );
+  const _gen = o.throughput_generation || {}, _proc = o.throughput_processing || {}, _comb = o.throughput || {};
+  const _anyTps = _gen.samples || _proc.samples || _comb.samples;
+  const tpSection = `
+    <div class="stats-section">
+      <h2>Throughput <span style="color:#666;font-weight:normal;font-size:11px">tokens/sec across requests · percentile spread</span></h2>
+      <table style="width:100%">
+        <thead><tr>
+          <th style="text-align:left">Metric</th>
+          <th class="num">min</th><th class="num">p25</th><th class="num">p50</th>
+          <th class="num">p75</th><th class="num">p90</th><th class="num">max</th><th class="num">n</th>
+        </tr></thead>
+        <tbody>
+          ${_renderTpsMetricRow('Processing rate', 'prompt tokens ÷ prefill time (TTFT) — how fast it reads the prompt', '#a3be8c', _proc)}
+          ${_renderTpsMetricRow('Generation rate', 'completion tokens ÷ decode time — how fast it writes the reply', '#88c0d0', _gen)}
+          ${_renderTpsMetricRow('Combined throughput', 'completion tokens ÷ TOTAL time (prefill + decode)', '#b48ead', _comb)}
+        </tbody>
+      </table>
+      ${_anyTps ? `<div style="margin-top:10px;padding:10px 12px;background:#20242e;border-left:3px solid #b48ead;border-radius:4px;font-size:12px;color:#bbb;line-height:1.5">
+        <strong style="color:#d8c3e0">Why is “Combined” so much lower than the other two?</strong><br>
+        They measure different things. <span style="color:#a3be8c">Processing</span> times only the <em>prefill</em> phase (reading the prompt); <span style="color:#88c0d0">Generation</span> times only the <em>decode</em> phase (writing the reply). Both can be fast.
+        <span style="color:#b48ead">Combined</span> divides <strong>only the completion tokens</strong> by the <strong>entire</strong> request time — prefill <em>and</em> decode.
+        So when the prompt is far larger than the reply (e.g. an 85k-token prompt that produces a 200-token answer), the model spends most of its time prefilling — counted under Processing — while emitting few completion tokens, which drags the completion-per-second figure down. It's not a slowdown; it's a big-prompt / small-reply ratio. A prompt-cache <em>hit</em> skips prefill and pulls Combined back up toward Generation.
+      </div>` : ''}
+    </div>`;
 
   const upstreams = d.by_upstream || [];
   const upstreamRows = upstreams.length ? upstreams.map(u => {
@@ -3215,25 +3250,36 @@ function renderSystem() {
   const ollama = now.ollama || {};
   const lmstudio = now.lmstudio || {};
 
+  // Parallel-capability badge: whether a model can serve concurrent requests on its runtime.
+  // Ollama serializes the Qwen3 family; LM Studio (llama.cpp batching) parallelizes everything.
+  const parBadge = m => {
+    const p = m.parallel, r = esc(m.parallel_reason || '');
+    if (p === true)  return `<span title="${r}" style="color:#7ee787;background:#132a17;border:1px solid #1f5427;border-radius:4px;padding:1px 6px;font-size:11px;white-space:nowrap">∥ parallel</span>`;
+    if (p === false) return `<span title="${r}" style="color:#ff7b72;background:#2d1213;border:1px solid #5c2427;border-radius:4px;padding:1px 6px;font-size:11px;white-space:nowrap">→ serial</span>`;
+    return `<span title="${r}" style="color:#888;font-size:11px">?</span>`;
+  };
+
   const ollamaPs = (ollama.ps || []).map(m => `
     <tr><td><code>${esc(m.name || m.model || '')}</code></td>
         <td>${esc(m.parameter_size || '')}</td>
         <td class="num">${num(m.size_mb || 0)} MB</td>
         <td class="num">${num(m.size_vram_mb || 0)} MB</td>
+        <td>${parBadge(m)}</td>
         <td>${m.expires_at ? esc(new Date(m.expires_at).toLocaleTimeString()) : ''}</td></tr>
-  `).join('') || '<tr><td colspan="5" class="empty" style="padding:8px">No models loaded</td></tr>';
+  `).join('') || '<tr><td colspan="6" class="empty" style="padding:8px">No models loaded</td></tr>';
 
   const ollamaTags = (ollama.tags || []).slice(0, 25).map(m => `
-    <tr><td><code>${esc(m.name || '')}</code></td><td>${esc(m.parameter_size || '')}</td><td class="num">${num(m.size_mb || 0)} MB</td></tr>
-  `).join('') || '<tr><td colspan="3" class="empty" style="padding:8px">No models</td></tr>';
+    <tr><td><code>${esc(m.name || '')}</code></td><td>${esc(m.parameter_size || '')}</td><td class="num">${num(m.size_mb || 0)} MB</td><td>${parBadge(m)}</td></tr>
+  `).join('') || '<tr><td colspan="4" class="empty" style="padding:8px">No models</td></tr>';
 
   const lmsLoaded = (lmstudio.loaded || []).map(m => `
     <tr><td><code>${esc(m.id || '')}</code></td>
         <td>${esc(m.type || '')}</td>
         <td>${esc(m.arch || '')}</td>
         <td>${esc(m.quant || '')}</td>
-        <td class="num">${m.loaded_context_length ? num(m.loaded_context_length) : ''}${m.max_context_length ? ' / ' + num(m.max_context_length) : ''}</td></tr>
-  `).join('') || '<tr><td colspan="5" class="empty" style="padding:8px">No models loaded</td></tr>';
+        <td class="num">${m.loaded_context_length ? num(m.loaded_context_length) : ''}${m.max_context_length ? ' / ' + num(m.max_context_length) : ''}</td>
+        <td>${parBadge(m)}</td></tr>
+  `).join('') || '<tr><td colspan="6" class="empty" style="padding:8px">No models loaded</td></tr>';
 
   const lmsAvailable = (lmstudio.available || []).slice(0, 25).map(m => `
     <tr><td><code>${esc(m.id || '')}</code></td><td>${esc(m.type || '')}</td><td>${esc(m.state || '')}</td></tr>
@@ -3250,7 +3296,7 @@ function renderSystem() {
     <div class="stats-section">
       <h2><span class="reach-dot ${ollama.reachable ? 'ok' : 'bad'}"></span>Ollama Loaded Models <span style="color:#888;font-weight:normal;font-size:11px">${esc(now.ts ? new Date(now.ts*1000).toLocaleTimeString() : '')}</span></h2>
       <table style="width:100%">
-        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th class="num">VRAM</th><th>Expires</th></tr></thead>
+        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th class="num">VRAM</th><th>Parallel</th><th>Expires</th></tr></thead>
         <tbody>${ollamaPs}</tbody>
       </table>
     </div>
@@ -3260,7 +3306,7 @@ function renderSystem() {
     <div class="stats-section">
       <h2><span class="reach-dot ${lmstudio.reachable ? 'ok' : 'bad'}"></span>LM Studio Loaded Models</h2>
       <table style="width:100%">
-        <thead><tr><th>ID</th><th>Type</th><th>Arch</th><th>Quant</th><th class="num">Context</th></tr></thead>
+        <thead><tr><th>ID</th><th>Type</th><th>Arch</th><th>Quant</th><th class="num">Context</th><th>Parallel</th></tr></thead>
         <tbody>${lmsLoaded}</tbody>
       </table>
     </div>
@@ -3268,7 +3314,7 @@ function renderSystem() {
     <div class="stats-section">
       <h2>Ollama Available (top 25)</h2>
       <table style="width:100%">
-        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th></tr></thead>
+        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th>Parallel</th></tr></thead>
         <tbody>${ollamaTags}</tbody>
       </table>
     </div>
