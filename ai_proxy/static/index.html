@@ -3547,6 +3547,44 @@ model:
   provider: custom`,
     },
     {
+      title: 'OpenClaw',
+      desc: 'Custom provider in ~/.openclaw/config.json5',
+      lang: 'json5',
+      code: `// ~/.openclaw/config.json5
+{
+  models: {
+    mode: "merge",
+    providers: {
+      "ai-proxy": {
+        baseUrl: "${base}",
+        apiKey: "sk-local",              // any non-empty string; proxy forwards it upstream
+        api: "openai-completions",
+        timeoutSeconds: 300,
+        models: [
+          {
+            id: "${model}",
+            name: "${model} (proxy)",
+            reasoning: false,
+            input: ["text", "image"],     // images auto-route to the vision model via the proxy
+            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            contextWindow: 262144,         // real 256k window — prevents early compaction
+            maxTokens: 32768,              // output reserve; leaves ~230k for input
+          },
+        ],
+      },
+    },
+  },
+  agents: {
+    defaults: {
+      model: { primary: "ai-proxy/${model}" },
+      models: {
+        "ai-proxy/${model}": { alias: "AI Proxy" },   // allowlist (required, or OpenClaw rejects it)
+      },
+    },
+  },
+}`,
+    },
+    {
       title: 'OpenAI Python SDK',
       desc: 'Standard openai package',
       lang: 'python',

@@ -101,7 +101,7 @@ MCP_API_KEY = os.environ.get("MCP_API_KEY", "").strip() or None
 #   - REQUEST_RETENTION_DAYS prunes old rows periodically. 0 = keep forever.
 #   - ANALYTICS_CACHE_TTL_S memoizes the expensive stats/suggestions endpoints briefly so
 #     rapid UI polling doesn't recompute them every time.
-MAX_STORED_BODY = int(os.environ.get("PROXY_MAX_STORED_BODY", str(256 * 1024)) or 0)
+MAX_STORED_BODY = int(os.environ.get("PROXY_MAX_STORED_BODY", str(4 * 1024 * 1024)) or 0)
 REQUEST_RETENTION_DAYS = float(os.environ.get("PROXY_REQUEST_RETENTION_DAYS", "30") or 0)
 ANALYTICS_CACHE_TTL_S = float(os.environ.get("PROXY_ANALYTICS_CACHE_TTL", "5") or 0)
 # Cap uvicorn's graceful shutdown so a lingering connection (e.g. the UI's live SSE feed
@@ -3660,6 +3660,58 @@ async def system_now():
         "lmstudio": json.loads(d["lmstudio_json"]) if d["lmstudio_json"] else {},
         "comfyui": json.loads(d["comfyui_json"]) if d["comfyui_json"] else {},
     }
+
+
+def _norm_model_id(mid: str) -> str:
+    """Normalize a model id for cross-runtime matching: drop any publisher/ prefix and :tag suffix."""
+    s = (mid or "").split("/")[-1]
+    return s.split(":")[0].lower()
+
+
+@app.get("/v1/models")
+async def list_models_enriched():
+    """OpenAI /v1/models, enriched with each model's real context window.
+
+    Ollama's /v1/models omits any context field, so a client that auto-discovers the window
+    (instead of hardcoding it) can't tell how large it is and falls back to a conservative
+    default — often 128k — then compacts/stops early even though the model is loaded much larger.
+    We fill `context_length` (plus `max_context_length` and `max_model_len` aliases, since
+    different clients read different keys) from the cached LM Studio snapshot — the runtime qwen
+    actually routes to — matched by normalized model name. Best-effort: if the snapshot is missing
+    or a model isn't matched, the entry is returned unchanged.
+    """
+    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+    try:
+        r = await client.get(OLLAMA_URL + "/v1/models")
+        data = r.json() if r.status_code == 200 else {"object": "list", "data": []}
+    except Exception:
+        data = {"object": "list", "data": []}
+    finally:
+        await client.aclose()
+    ctxmap: dict[str, int] = {}
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT lmstudio_json FROM system_metrics ORDER BY ts DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        lm = json.loads(row["lmstudio_json"]) if row and row["lmstudio_json"] else {}
+        for m in (lm.get("available") or []):
+            ctx = m.get("loaded_context_length") or m.get("max_context_length")
+            if isinstance(ctx, int) and ctx > 0:
+                ctxmap[_norm_model_id(m.get("id"))] = ctx
+    except Exception:
+        pass
+    if isinstance(data, dict) and ctxmap:
+        for m in (data.get("data") or []):
+            if not isinstance(m, dict) or "context_length" in m:
+                continue
+            ctx = ctxmap.get(_norm_model_id(m.get("id")))
+            if ctx:
+                m["context_length"] = ctx
+                m["max_context_length"] = ctx
+                m["max_model_len"] = ctx
+    return JSONResponse(data)
 
 
 @app.get("/__proxy/api/ollama/update-check")
@@ -9110,12 +9162,30 @@ async def proxy(full_path: str, request: Request):
             and isinstance(_ctx_cap, int) and _ctx_cap > 0):
         ctx_capped = _cap_num_ctx(body_json, _ctx_cap)
 
+    # Streaming OpenAI-compat responses only carry a usage block when the request opts in via
+    # stream_options.include_usage. Ollama's native /api stream always includes eval_count, but
+    # once qwen started routing to LM Studio's /v1 endpoint, streamed requests stopped reporting
+    # usage — so the dashboard's per-request token count went blank. Inject the opt-in for
+    # streaming /v1 chat/completions|completions (the stream parser already reads the usage chunk).
+    # Respect a client-set include_usage (true or false) rather than override it.
+    usage_injected = False
+    if (isinstance(body_json, dict) and body_json.get("stream")
+            and upstream_label != "anthropic"
+            and full_path in ("v1/chat/completions", "v1/completions")):
+        _so = body_json.get("stream_options")
+        if not isinstance(_so, dict):
+            _so = {}
+            body_json["stream_options"] = _so
+        if "include_usage" not in _so:
+            _so["include_usage"] = True
+            usage_injected = True
+
     body_mutated = bool(
         rewrite or options_inject or bridge_active or tool_injection_active
         or compaction_reminder_injected
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
-        or ctx_capped
+        or ctx_capped or usage_injected
     )
     if body_mutated:
         # Re-serialize the body so all mutations are forwarded upstream.
