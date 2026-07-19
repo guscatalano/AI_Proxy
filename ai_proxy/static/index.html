@@ -638,6 +638,24 @@
   body.lv-full #shell-rail, body.lv-full header { display: none !important; }
   body.lv-full { padding-left: 0 !important; }
   body.lv-full #live.show { position: fixed; inset: 0; z-index: 200; height: auto; }
+  /* diagnostics overlay */
+  .shell-meta .diag-open { cursor: pointer; color: #57d1e0; font-family: inherit; font-size: 11px; }
+  .shell-meta .diag-open:hover { text-decoration: underline; }
+  #diag-panel { display: none; position: fixed; right: 14px; bottom: 14px; width: 460px; max-width: calc(100vw - 28px); max-height: 66vh; overflow: auto; background: #0c0f15; border: 1px solid #313a48; border-radius: 10px; z-index: 400; box-shadow: 0 20px 60px -20px rgba(0,0,0,.85); font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: #c9d3e1; }
+  #diag-panel .diag-h { display: flex; align-items: center; gap: 8px; padding: 9px 12px; border-bottom: 1px solid #262d38; position: sticky; top: 0; background: #0c0f15; z-index: 2; }
+  #diag-panel .diag-h b { color: #57d1e0; font-size: 12px; }
+  #diag-panel .diag-x { cursor: pointer; color: #93a0b4; padding: 1px 8px; border: 1px solid #313a48; border-radius: 5px; }
+  #diag-panel .diag-x:hover { color: #e9edf4; border-color: #3a4e6a; }
+  #diag-panel .diag-line { padding: 9px 12px; border-bottom: 1px solid #262d38; }
+  #diag-panel .diag-line b { color: #e9edf4; }
+  #diag-panel .diag-bad { color: #f07178; margin-left: 6px; }
+  #diag-panel table.diag-t { width: 100%; border-collapse: collapse; }
+  #diag-panel .diag-t th { text-align: right; color: #5f6b7e; font-weight: 500; padding: 6px 8px; border-bottom: 1px solid #262d38; }
+  #diag-panel .diag-t th:first-child { text-align: left; }
+  #diag-panel .diag-t td { text-align: right; padding: 5px 8px; border-bottom: 1px solid #171c26; font-variant-numeric: tabular-nums; }
+  #diag-panel .diag-t td:first-child { text-align: left; color: #c9d3e1; word-break: break-all; }
+  #diag-panel .diag-t tr.bad td { color: #f0c674; }
+  #diag-panel .diag-foot { padding: 8px 12px; color: #5f6b7e; border-top: 1px solid #262d38; }
 </style>
 </head>
 <body class="shell-console">
@@ -668,6 +686,7 @@
     <div class="shell-meta" id="shell-meta">
       <div class="k"><b>uptime</b><span id="sm-uptime">—</span></div>
       <div class="k"><b>version</b><span id="sm-version">—</span></div>
+      <div class="k"><b>diagnostics</b><span class="diag-open" onclick="toggleDiag()" title="Ctrl+Shift+D">open ⚡</span></div>
     </div>
     <button class="sf-collapse" onclick="toggleRailCollapse()" title="Collapse sidebar">« Collapse</button>
   </div>
@@ -843,19 +862,18 @@ function setRailCollapsed(collapsed, animate) {
   if (!animate) requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('shell-noanim')));
 }
 function toggleRailCollapse() { setRailCollapsed(!document.body.classList.contains('shell-collapsed'), true); }
-let _shellTick = 0, _shellErr = null, _shellVer = null;
+let _shellTick = 0, _shellErr = null, _shellVer = null, _bootMs = null;
 function fmtUptime(s) { s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); if (d > 0) return d + 'd ' + String(h).padStart(2, '0') + 'h'; if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm'; return m + 'm'; }
 function fmtCompact(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n); }
 async function shellVitals() {
   if (document.hidden) return;              // no background-tab polling
   _shellTick++;
-  let gpuN = null, memU = null, memT = null, tps = 0, active = 0, uptimeS = null;
+  let gpuN = null, memU = null, memT = null, tps = 0, active = 0;
   try {
     const s = await (await fetch('/__proxy/api/system/now')).json();
     const g = (s.gpus || [])[0];
     if (g && g.util_pct != null) gpuN = Math.round(g.util_pct);
     if (s.mem) { memU = (s.mem.used_mb || 0) / 1024; memT = (s.mem.total_mb || 0) / 1024; }
-    if (s.uptime_s != null) uptimeS = s.uptime_s;
   } catch {}
   // Active / tok-s: reuse the Live view's own poll when it's open, else fetch /live once.
   if (view === 'live' && Array.isArray(_lvTiles)) {
@@ -871,6 +889,8 @@ async function shellVitals() {
   }
   // version once; error-rate (last 1h) refreshed every ~20s (perf is server-cached)
   if (_shellVer == null) { try { const inf = await (await fetch('/__proxy/api/info')).json(); _shellVer = inf.version || '—'; } catch { _shellVer = '—'; } }
+  // Boot time once (uptime lives at /health under process.uptime_s); tick it client-side after.
+  if (_bootMs == null) { try { const hz = await (await fetch('/__proxy/api/health')).json(); const us = hz && hz.process && hz.process.uptime_s; if (us != null) _bootMs = Date.now() - us * 1000; } catch {} }
   if (_shellErr == null || _shellTick % 5 === 0) {
     try {
       const p = await (await fetch('/__proxy/api/perf?window_h=1')).json();
@@ -892,7 +912,7 @@ async function shellVitals() {
     + cell('Throughput', `<span class="sv-v">${tps}<small> tok/s</small></span>`)
     + cell('Errors 1h', `<span class="sv-v" style="color:${errCol}">${errTxt}</span>`);
   // rail footer meta
-  const su = $('sm-uptime'); if (su && uptimeS != null) su.textContent = fmtUptime(uptimeS);
+  const su = $('sm-uptime'); if (su && _bootMs != null) su.textContent = fmtUptime((Date.now() - _bootMs) / 1000);
   const smv = $('sm-version'); if (smv && _shellVer) smv.textContent = _shellVer;
   // rail nav counts
   const rc = $('rail-req-count'); if (rc) { const cnt = $('count'), nRaw = cnt ? parseInt((cnt.textContent || '').replace(/[^0-9]/g, ''), 10) : NaN; rc.textContent = isNaN(nRaw) ? '' : fmtCompact(nRaw); }
@@ -902,6 +922,65 @@ async function shellVitals() {
   // keep the rail's upstream line in sync with the header
   try { const r = document.querySelector('#shell-rail .up2'); if (up && r) r.textContent = '→ ' + (up.textContent || '').replace(/^→\s*/, ''); } catch {}
 }
+
+// ---------- Diagnostics (always-on & cheap; overlay on demand) ----------
+// Answers "where is the slowness?": per-endpoint latency (server vs payload) via the
+// Resource Timing API, and main-thread long tasks (client jank) via the Long Tasks API.
+// Toggle the overlay with Ctrl+Shift+D or the rail's "diagnostics" link.
+const _diag = { ep: {}, long: [], longN: 0, longMax: 0 };
+try {
+  new PerformanceObserver(list => {
+    for (const e of list.getEntries()) {
+      if (e.initiatorType !== 'fetch' && e.initiatorType !== 'xmlhttprequest') continue;
+      let path = e.name; try { path = new URL(e.name).pathname; } catch {}
+      const r = _diag.ep[path] || (_diag.ep[path] = { n: 0, sum: 0, max: 0, last: 0, slow: 0, ttfb: 0 });
+      const dur = e.duration, ttfb = Math.max(0, e.responseStart - e.requestStart);
+      r.n++; r.sum += dur; r.last = dur; r.ttfb += ttfb; if (dur > r.max) r.max = dur; if (dur > 400) r.slow++;
+    }
+  }).observe({ type: 'resource', buffered: true });
+} catch {}
+try {
+  new PerformanceObserver(list => {
+    for (const e of list.getEntries()) { _diag.longN++; if (e.duration > _diag.longMax) _diag.longMax = e.duration; _diag.long.push({ t: Date.now(), dur: e.duration }); if (_diag.long.length > 80) _diag.long.shift(); }
+  }).observe({ type: 'longtask', buffered: true });
+} catch {}
+let _diagOpen = false, _diagTimer = null, _diagCopied = 0;
+function _diagEl() { let el = $('diag-panel'); if (!el) { el = document.createElement('div'); el.id = 'diag-panel'; document.body.appendChild(el); } return el; }
+function toggleDiag() {
+  _diagOpen = !_diagOpen;
+  const el = _diagEl(); el.style.display = _diagOpen ? 'block' : 'none';
+  if (_diagOpen) { renderDiag(); _diagTimer = setInterval(renderDiag, 1000); }
+  else { clearInterval(_diagTimer); _diagTimer = null; }
+}
+function resetDiag() { _diag.ep = {}; _diag.long = []; _diag.longN = 0; _diag.longMax = 0; renderDiag(); }
+function renderDiag() {
+  const rows = Object.entries(_diag.ep).map(([p, e]) => ({ p, ...e, avg: e.sum / e.n, attfb: e.ttfb / e.n })).sort((a, b) => b.avg - a.avg);
+  const recent = _diag.long.filter(x => Date.now() - x.t < 10000).length;
+  let h = `<div class="diag-h"><b>⚡ diagnostics</b><span style="flex:1"></span><span class="diag-x diag-copy" onclick="copyDiag()">${Date.now() - _diagCopied < 1500 ? 'copied ✓' : 'copy'}</span><span class="diag-x" onclick="resetDiag()">reset</span><span class="diag-x" onclick="toggleDiag()">✕</span></div>`;
+  h += `<div class="diag-line">long tasks (main-thread blocks): <b>${_diag.longN}</b> total · max <b>${Math.round(_diag.longMax)}ms</b> · <b>${recent}</b> in last 10s ${_diag.longMax > 200 ? '<span class="diag-bad">← client-side jank</span>' : ''}</div>`;
+  h += `<table class="diag-t"><thead><tr><th>endpoint</th><th>n</th><th>avg</th><th>ttfb</th><th>max</th><th>last</th><th>&gt;400</th></tr></thead><tbody>`;
+  if (!rows.length) h += `<tr><td colspan="7" style="color:#5f6b7e;text-align:left">no API calls captured yet — click around…</td></tr>`;
+  for (const r of rows) h += `<tr class="${r.avg > 400 ? 'bad' : ''}"><td>${r.p}</td><td>${r.n}</td><td>${Math.round(r.avg)}</td><td>${Math.round(r.attfb)}</td><td>${Math.round(r.max)}</td><td>${Math.round(r.last)}</td><td>${r.slow || ''}</td></tr>`;
+  h += `</tbody></table><div class="diag-foot">ms · high <b>ttfb</b> = server slow · high <b>max</b> with low ttfb = big payload/render · long tasks = JS blocking the UI</div>`;
+  _diagEl().innerHTML = h;
+}
+function _diagText() {
+  const rows = Object.entries(_diag.ep).map(([p, e]) => ({ p, ...e, avg: e.sum / e.n, attfb: e.ttfb / e.n })).sort((a, b) => b.avg - a.avg);
+  const recent = _diag.long.filter(x => Date.now() - x.t < 10000).length;
+  const pad = (s, n) => String(s).padEnd(n), padL = (s, n) => String(s).padStart(n);
+  let t = `AI Proxy diagnostics  (view=${view}, version=${_shellVer || '?'})\n`;
+  t += `long tasks: ${_diag.longN} total, max ${Math.round(_diag.longMax)}ms, ${recent} in last 10s\n\n`;
+  t += pad('endpoint', 36) + padL('n', 4) + padL('avg', 6) + padL('ttfb', 6) + padL('max', 6) + padL('last', 6) + padL('>400', 6) + '\n';
+  for (const r of rows) t += pad(r.p, 36) + padL(r.n, 4) + padL(Math.round(r.avg), 6) + padL(Math.round(r.attfb), 6) + padL(Math.round(r.max), 6) + padL(Math.round(r.last), 6) + padL(r.slow || 0, 6) + '\n';
+  return t;
+}
+function _diagFallbackCopy(t, ok) { try { const ta = document.createElement('textarea'); ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0'; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); document.body.removeChild(ta); ok(); } catch {} }
+function copyDiag() {
+  const t = _diagText(), ok = () => { _diagCopied = Date.now(); renderDiag(); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(ok, () => _diagFallbackCopy(t, ok));
+  else _diagFallbackCopy(t, ok);
+}
+document.addEventListener('keydown', e => { if (e.ctrlKey && e.shiftKey && (e.key === 'D' || e.key === 'd')) { e.preventDefault(); toggleDiag(); } });
 
 // ---------- Live View ----------
 let _lvPoll=null,_lvTick=null,_lvEls={},_lvTiles=[],_lvSysN=0,_lvSlots={},_lvCols=0;
@@ -4446,15 +4525,22 @@ function fmtSpan(s) {
   return `${(s/86400).toFixed(1)}d`;
 }
 
+// Auto-refresh loop. These DB endpoints are expensive (full scans over a blob-heavy table),
+// so poll conservatively: 3s base, heavy views throttled further, nothing when the tab is
+// hidden, and only the view that's actually showing. The audit badge used to fire here every
+// 1.5s (hammering /audit ~300ms) — it's now on its own slow 30s beat below.
+let _pollTick = 0;
 setInterval(() => {
-  if (!$('autoref').checked) return;
-  if (view === 'stats') loadStats();
-  else if (view === 'audit') loadAudit();
-  else if (view === 'convs') { /* don't auto-reload conversation detail; respect current view */ }
-  else if (view === 'system') loadSystem();
-  else refresh();
-  refreshAuditBadge();
-}, 1500);
+  if (document.hidden || !$('autoref').checked) return;
+  _pollTick++;
+  if (view === 'requests') refresh();                                     // ~3s
+  else if (view === 'stats') { if (_pollTick % 3 === 0) loadStats(); }     // ~9s (heavy)
+  else if (view === 'system') { if (_pollTick % 3 === 0) loadSystem(); }   // ~9s (heavy)
+  else if (view === 'audit') { if (_pollTick % 2 === 0) loadAudit(); }     // ~6s
+  // live / convs / chat / tasks / bench manage their own refresh (or are static)
+}, 3000);
+// Audit badge triggers a heavy count query — poll it slowly and only when visible.
+setInterval(() => { if (!document.hidden && $('autoref').checked) refreshAuditBadge(); }, 30000);
 // ─── Simple chat tab ───
 const CHAT_KEY = 'ai-proxy-chat-state';
 const PERSONALITIES_KEY = 'ai-proxy-chat-personalities';
