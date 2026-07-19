@@ -2097,8 +2097,8 @@ function renderPerf(P){
   function lineCard(title,keys,unit,colors,opts){opts=opts||{};
     const vals=keys.map(k=>S.map(b=>b[k])),[mn,mx]=range(...vals);
     let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(mn,mx,unit)}`;
-    if(opts.area)svg+=`<path d="${line(vals[0],mn,mx)} L${xAt(N-1)},${H-PADB} L${PADL},${H-PADB} Z" fill="${colors[0]}" opacity=".10"/>`;
-    vals.forEach((v,idx)=>{svg+=`<path d="${line(v,mn,mx)}" fill="none" stroke="${colors[idx]}" stroke-width="${idx?1.5:1.8}"/>`;});
+    if(opts.area){const ld=line(vals[0],mn,mx);if(ld)svg+=`<path d="${ld} L${xAt(N-1)},${H-PADB} L${PADL},${H-PADB} Z" fill="${colors[0]}" opacity=".10"/>`;}
+    vals.forEach((v,idx)=>{const ld=line(v,mn,mx);if(ld)svg+=`<path d="${ld}" fill="none" stroke="${colors[idx]}" stroke-width="${idx?1.5:1.8}"/>`;});
     const nowv=lastNN(keys[0]); if(nowv!=null)svg+=`<circle cx="${xAt(N-1)}" cy="${yAt(nowv,mn,mx)}" r="3" fill="${colors[0]}"/>`;
     svg+='</svg>';
     const cur=lastNN(keys[0]),prev=agoNN(keys[0]);let arrow='';
