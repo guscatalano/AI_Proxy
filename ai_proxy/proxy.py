@@ -43,6 +43,8 @@ try:
 except ValueError:
     REDACT_SUBNET_BITS_V4 = 24
 REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as originator]"
+# Admin IPs bypass PII redaction entirely (see everything, regardless of subnet). Comma-separated.
+ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "192.168.6.113").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
@@ -881,8 +883,10 @@ def _live_update_from_chunk(req_id: str, chunk_text: str) -> None:
             data = line.strip()
         if not data or data == "[DONE]":
             continue
-        # Cheap pre-filter — skip JSON parse if it can't possibly contain usage.
-        if "tokens" not in data and "usage" not in data and "eval_count" not in data:
+        # Cheap pre-filter — skip JSON parse unless the line could carry usage OR text content.
+        if ("tokens" not in data and "usage" not in data and "eval_count" not in data
+                and '"content"' not in data and '"text"' not in data and '"reasoning' not in data
+                and '"tool_calls"' not in data and '"function"' not in data):
             continue
         try:
             j = json.loads(data)
@@ -890,6 +894,32 @@ def _live_update_from_chunk(req_id: str, chunk_text: str) -> None:
             continue
         if not isinstance(j, dict):
             continue
+        # Live streaming text: keep a rolling ~1.4KB tail so the Live View can show the reply
+        # forming in real time without unbounded memory growth on a long response.
+        _piece = ""
+        _ch0 = j.get("choices")
+        if isinstance(_ch0, list) and _ch0 and isinstance(_ch0[0], dict):
+            _d = _ch0[0].get("delta") or {}
+            if isinstance(_d.get("content"), str):
+                _piece = _d["content"]
+            elif isinstance(_d.get("reasoning_content"), str):   # thinking-model reasoning stream
+                _piece = _d["reasoning_content"]
+            elif isinstance(_d.get("reasoning"), str):
+                _piece = _d["reasoning"]
+            for _tc in (_d.get("tool_calls") or []):      # tool-call name + streaming arguments
+                if not isinstance(_tc, dict):
+                    continue
+                _fn = _tc.get("function") or {}
+                if _fn.get("name"):
+                    _piece += ("\n🔧 " if (state.get("text") or _piece) else "🔧 ") + _fn["name"] + " "
+                if isinstance(_fn.get("arguments"), str):
+                    _piece += _fn["arguments"]
+        if not _piece and j.get("type") == "content_block_delta":
+            _dd = j.get("delta") or {}
+            if _dd.get("type") == "text_delta" and isinstance(_dd.get("text"), str):
+                _piece = _dd["text"]
+        if _piece:
+            state["text"] = ((state.get("text") or "") + _piece)[-6000:]
         def _anth_total(u):
             parts = [u.get(k) for k in ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens") if isinstance(u.get(k), int)]
             return sum(parts) if parts else None
@@ -2580,6 +2610,23 @@ def _body_has_images(body: dict) -> bool:
     return False
 
 
+# Base64 image blobs sometimes arrive embedded in a tool's TEXT output rather than as a standard
+# vision part — e.g. a screen-capture tool returning {"screenshot_png_b64": "iVBORw0KGgo…"}. A text
+# model can't decode these (and they must NOT trigger vision routing — that's why this is kept out
+# of _body_has_images), but the dashboard can still surface them. We spot them by the PNG
+# (iVBORw0KGgo…) and JPEG (/9j/…) base64 magic prefixes and pull the contiguous run.
+_EMBEDDED_B64_IMG_RE = re.compile(r"iVBORw0KGgo[A-Za-z0-9+/]{200,}={0,2}|/9j/[A-Za-z0-9+/]{200,}={0,2}")
+
+
+def _embedded_b64_images(s):
+    """Yield (media_type, base64) for each PNG/JPEG blob embedded in a string message body."""
+    if not isinstance(s, str) or ("iVBORw0KGgo" not in s and "/9j/" not in s):
+        return
+    for mm in _EMBEDDED_B64_IMG_RE.finditer(s):
+        blob = mm.group(0)
+        yield ("image/png" if blob[0] == "i" else "image/jpeg", blob)
+
+
 def _iter_request_images(body: dict):
     """Yield (index, media_type, kind, payload) for each image in a chat request, in order.
     kind='data' → payload is base64 (from a data: URL or Anthropic source); kind='url' →
@@ -2589,6 +2636,10 @@ def _iter_request_images(body: dict):
     idx = 0
     for m in (body.get("messages") or []):
         c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            for (mt, blob) in _embedded_b64_images(c):
+                yield (idx, mt, "data", blob); idx += 1
+            continue
         if not isinstance(c, list):
             continue
         for part in c:
@@ -2623,6 +2674,14 @@ def _strip_image_data(body: dict) -> int:
         return 0
     for m in (body.get("messages") or []):
         c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            if "iVBORw0KGgo" in c or "/9j/" in c:
+                new, cnt = _EMBEDDED_B64_IMG_RE.subn(
+                    lambda mm: f"…[{len(mm.group(0)) * 3 // 4} bytes image — see Images section]", c)
+                if cnt:
+                    m["content"] = new
+                    n += cnt
+            continue
         if not isinstance(c, list):
             continue
         for part in c:
@@ -3662,6 +3721,167 @@ async def system_now():
     }
 
 
+def _last_user_snippet(body_json, limit=6000):
+    """Pull the newest user message text from a request body, for the Live View tile."""
+    if not isinstance(body_json, dict):
+        return ""
+    for m in reversed(body_json.get("messages") or []):
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        if isinstance(c, str):
+            return c[:limit]
+        if isinstance(c, list):
+            for part in c:
+                if isinstance(part, dict) and part.get("type") in ("text", "input_text") and part.get("text"):
+                    return part["text"][:limit]
+    return ""
+
+
+def _response_snippet(response_body, stream_chunks, limit=6000):
+    """Reconstruct the assistant's reply text (OpenAI or Anthropic shape) from a finished
+    request's stored response, for the Live View tile. Cheap: stops once past the limit."""
+    txt = ""
+    if stream_chunks:
+        parts = []
+        for line in stream_chunks.split("\n"):
+            if not line.startswith("data: "):
+                continue
+            data = line[6:].strip()
+            if not data or data == "[DONE]":
+                continue
+            try:
+                j = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(j, dict):
+                continue
+            ch = j.get("choices")
+            if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+                d = ch[0].get("delta") or ch[0].get("message") or {}
+                if isinstance(d.get("content"), str):
+                    parts.append(d["content"])
+                for tc in (d.get("tool_calls") or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        parts.append(("\n🔧 " if parts else "🔧 ") + fn["name"] + " ")
+                    if isinstance(fn.get("arguments"), str):
+                        parts.append(fn["arguments"])
+            if j.get("type") == "content_block_delta":
+                dd = j.get("delta") or {}
+                if dd.get("type") == "text_delta" and isinstance(dd.get("text"), str):
+                    parts.append(dd["text"])
+            if sum(len(p) for p in parts) > limit * 2:
+                break
+        txt = "".join(parts)
+    if not txt and response_body:
+        try:
+            j = json.loads(response_body)
+            ch = j.get("choices")
+            if isinstance(ch, list) and ch and isinstance(ch[0], dict):
+                m = ch[0].get("message") or {}
+                if isinstance(m.get("content"), str):
+                    txt = m["content"]
+                if not txt:
+                    for tc in (m.get("tool_calls") or []):
+                        fn = (tc or {}).get("function") or {}
+                        if fn.get("name"):
+                            txt += ("\n🔧 " if txt else "🔧 ") + fn["name"] + " " + (fn.get("arguments") or "")
+            if not txt and isinstance(j.get("content"), list):   # Anthropic
+                txt = "".join(b.get("text", "") for b in j["content"]
+                              if isinstance(b, dict) and b.get("type") == "text")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return txt[:limit].strip()
+
+
+@app.get("/__proxy/api/live")
+def live_view(request: Request):  # sync → threadpool
+    """Snapshot for the Live View tab: one tile per active/recent conversation. Merges the
+    in-flight registry (live elapsed + tokens) with each request's saved DB row (model, client,
+    prompt, image) and the recently-finished rows so tiles linger a moment after completing."""
+    now = time.time()
+    # Only treat genuinely-live requests as active: skip entries the zombie-killer flagged
+    # cancelled, and cap the age (a streamer wedged on a dead client socket would otherwise show
+    # as a fake multi-minute "active" tile). 900s is well past any real prefill.
+    inflight = {k: v.get("ts", now) for k, v in dict(_INFLIGHT_REQUESTS).items()
+                if not v.get("cancelled") and (now - v.get("ts", now)) < 900}
+    conn = db()
+    placeholders = ",".join("?" for _ in inflight) or "''"
+    rows = conn.execute(
+        f"""SELECT id, ts, conversation_id, turn_index, client_app, client_ip, model, upstream, path,
+                   status, est_prompt_tokens, prompt_tokens, completion_tokens, duration_ms,
+                   has_images, request_body, response_body, stream_chunks, ttft_ms
+            FROM requests
+            WHERE id IN ({placeholders}) OR ts > ?
+            ORDER BY ts ASC""",
+        (*inflight.keys(), now - 32),   # finished tiles linger ~30s so the response is readable
+    ).fetchall()
+    conn.close()
+    viewer = _client_ip(request)
+    byconv = {}
+    for r in rows:
+        byconv[r["conversation_id"] or r["id"]] = r   # ASC order → last write is newest per conv
+    tiles = []
+    for cid, r in byconv.items():
+        rid = r["id"]
+        active = rid in inflight
+        started = inflight.get(rid, r["ts"])
+        live = _live_snapshot(rid) if active else None
+        ptok = (live or {}).get("prompt_tokens") or r["prompt_tokens"] or r["est_prompt_tokens"] or 0
+        otok = (live or {}).get("completion_tokens") or r["completion_tokens"] or 0
+        try:
+            bj = json.loads(r["request_body"]) if r["request_body"] else None
+        except (json.JSONDecodeError, TypeError):
+            bj = None
+        has_img = bool(r["has_images"])
+        live_text = ((_LIVE_STREAMS.get(rid) or {}).get("text") or "") if active else ""
+        if not active:
+            state = "DONE"
+        elif has_img:
+            state = "VISION"
+        elif otok or live_text:      # usage only lands in the final chunk, so key off live text too
+            state = "STREAMING"
+        else:
+            state = "THINKING"
+        # active → live elapsed; done → the request's actual duration (so a quick request that
+        # finished before we polled still shows how long it really took, not its age since).
+        elapsed_ms = int(r["duration_ms"]) if (not active and r["duration_ms"]) else int((now - started) * 1000)
+        tps = round(otok / (elapsed_ms / 1000), 1) if (otok and elapsed_ms > 500) else None
+        # Server-side PII gate: only expose the prompt text / image to a viewer allowed to see
+        # this originator's data (same IP, same subnet, or an admin IP). Metadata (model, timing,
+        # tokens, state) stays visible — mirrors the Requests view's redaction contract.
+        viewable = _can_view_pii(viewer, r["client_ip"])
+        cache = None
+        if not active:
+            try:
+                _cp, cache = _cache_verdict(r["prompt_tokens"], r["est_prompt_tokens"],
+                                            r["ttft_ms"], r["prompt_tokens"], r["upstream"])
+            except Exception:
+                cache = None
+        # "fresh" = finished within the last 10s → keep it highlighted (not dimmed) so a quick
+        # request that completed before we could catch it mid-flight still stands out.
+        fresh = (not active) and ((now - (r["ts"] + (r["duration_ms"] or 0) / 1000.0)) < 10)
+        tiles.append({
+            "cache": cache, "key": cid or rid, "fresh": fresh,
+            "req_id": rid, "conv": (cid or "")[:6], "client": r["client_app"] or "?",
+            "model": r["model"] or "?", "upstream": r["upstream"], "path": r["path"],
+            "state": state, "done": not active, "elapsed_ms": elapsed_ms,
+            "ptok": ptok, "otok": otok, "tps": tps, "turn": r["turn_index"],
+            "itps": (round(ptok / (elapsed_ms / 1000)) if (active and state == "THINKING" and ptok and elapsed_ms > 400) else None),
+            "prompt": _last_user_snippet(bj) if viewable else "",
+            "response": ((live_text if active else _response_snippet(r["response_body"], r["stream_chunks"]))
+                         if viewable else ""),
+            "has_image": has_img and viewable,
+            "image_url": f"/__proxy/api/requests/{rid}/image/0" if (has_img and viewable) else None,
+            "redacted": not viewable,
+        })
+    tiles.sort(key=lambda t: (t["done"], -t["elapsed_ms"]))
+    return {"ts": now, "tiles": tiles[:16]}
+
+
 def _norm_model_id(mid: str) -> str:
     """Normalize a model id for cross-runtime matching: drop any publisher/ prefix and :tag suffix."""
     s = (mid or "").split("/")[-1]
@@ -4379,6 +4599,95 @@ async def reset_rules():
 
 _STATS_CACHE: dict = {"ts": 0.0, "data": None}
 _STATS_CACHE_TTL_S = 10.0
+
+
+_PERF_CACHE: dict = {}
+
+
+@app.get("/__proxy/api/perf")
+def perf(window_h: float = 6.0, bucket_min: float = 5.0):  # sync → threadpool
+    """Time-bucketed performance trends for the Stats tab: prefill (TTFT) p50/p95, decode rate,
+    cache-hit %, prompt size, concurrency, and errors per bucket, plus a latency-vs-size scatter.
+    SQLite has no percentile aggregate, so we pull the window's rows and bucket in Python."""
+    now = time.time()
+    window_h = max(0.25, min(168.0, window_h))
+    bucket_min = max(1.0, min(120.0, bucket_min))
+    _ck = (round(window_h, 2), round(bucket_min, 2))
+    _cc = _PERF_CACHE.get(_ck)
+    if _cc and (now - _cc[0]) < 8.0:
+        return _cc[1]
+    since = now - window_h * 3600.0
+    bsec = bucket_min * 60.0
+    nb = max(1, int(round(window_h * 60.0 / bucket_min)))
+    conn = db()
+    rows = conn.execute(
+        """SELECT ts, ttft_ms, duration_ms, prompt_tokens, est_prompt_tokens, completion_tokens,
+                  status, error, upstream
+           FROM requests WHERE ts >= ? ORDER BY ts""",
+        (since,),
+    ).fetchall()
+    conn.close()
+
+    buckets = [{"ttft": [], "decode": [], "hit": 0, "ctot": 0, "ps": [], "conc": 0, "err": 0, "n": 0}
+               for _ in range(nb)]
+    scatter = []
+    for r in rows:
+        bi = int((r["ts"] - since) / bsec)
+        if bi < 0 or bi >= nb:
+            continue
+        b = buckets[bi]
+        b["n"] += 1
+        pt = r["prompt_tokens"] or r["est_prompt_tokens"]
+        if pt:
+            b["ps"].append(pt)
+        if r["ttft_ms"] and r["ttft_ms"] > 0:
+            b["ttft"].append(r["ttft_ms"] / 1000.0)
+        if (r["completion_tokens"] and r["ttft_ms"] and r["duration_ms"]
+                and r["duration_ms"] > r["ttft_ms"]):
+            dt = (r["duration_ms"] - r["ttft_ms"]) / 1000.0
+            if dt > 0:
+                b["decode"].append(r["completion_tokens"] / dt)
+        try:
+            _cp, cv = _cache_verdict(r["prompt_tokens"], r["est_prompt_tokens"],
+                                     r["ttft_ms"], r["prompt_tokens"], r["upstream"])
+        except Exception:
+            cv = None
+        if cv:
+            b["ctot"] += 1
+            if cv == "hit":
+                b["hit"] += 1
+        if (r["status"] is not None and (r["status"] >= 400 or r["status"] == 0)) or r["error"]:
+            b["err"] += 1
+        if r["duration_ms"]:
+            be = min(nb - 1, int((r["ts"] + r["duration_ms"] / 1000.0 - since) / bsec))
+            for j in range(bi, be + 1):
+                buckets[j]["conc"] += 1
+        if pt and r["ttft_ms"] and r["ttft_ms"] > 0:
+            scatter.append([round(pt / 1000.0, 1), round(r["ttft_ms"] / 1000.0, 2),
+                            1 if cv == "hit" else 0])
+
+    def pctl(vals, p):
+        if not vals:
+            return None
+        s = sorted(vals)
+        return round(s[min(len(s) - 1, int(p * len(s)))], 2)
+
+    series = []
+    for i, b in enumerate(buckets):
+        series.append({
+            "t": round(since + i * bsec),
+            "ttft_p50": pctl(b["ttft"], 0.50),
+            "ttft_p95": pctl(b["ttft"], 0.95),
+            "decode": pctl(b["decode"], 0.50),
+            "cache_pct": round(100.0 * b["hit"] / b["ctot"]) if b["ctot"] else None,
+            "psize_k": round(pctl(b["ps"], 0.50) / 1000.0, 1) if b["ps"] else None,
+            "conc": b["conc"],
+            "err": b["err"],
+            "n": b["n"],
+        })
+    _res = {"since": since, "now": now, "bucket_s": bsec, "series": series, "scatter": scatter[-220:]}
+    _PERF_CACHE[_ck] = (now, _res)
+    return _res
 
 
 @app.get("/__proxy/api/stats")
@@ -6839,6 +7148,10 @@ async def _inflight_zombie_killer(app: FastAPI):
                               f"(elapsed {int(now - info.get('ts', now))}s)")
                     except Exception:
                         pass
+                    # Remove it even if the streamer is wedged on a dead client socket (closing the
+                    # upstream doesn't unblock a client-write wedge, so it would never pop itself →
+                    # the entry would leak in the registry until the next restart).
+                    _INFLIGHT_REQUESTS.pop(req_id, None)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -7243,6 +7556,8 @@ def _can_view_pii(viewer_ip: str | None, originator_ip: str | None) -> bool:
     When redaction is off, everything is visible."""
     if not REDACT_PII_ENABLED:
         return True
+    if viewer_ip and viewer_ip in ADMIN_IPS:
+        return True
     if viewer_ip and originator_ip and viewer_ip == originator_ip:
         return True
     return _ips_share_subnet(viewer_ip, originator_ip)
@@ -7289,7 +7604,12 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     # Chars-based prompt-token estimate, persisted so the requests list can derive a cache
     # verdict (evaluated vs estimated) without re-parsing the body on every load.
     est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
-    has_imgs = 1 if _body_has_images(body_json) else None
+    # has_images flags standard vision parts (image_url / Anthropic image) AND base64 blobs
+    # embedded in tool-output text (e.g. screenshot_png_b64). The router keys off _body_has_images()
+    # directly (standard parts only), so flagging an embedded blob here surfaces it in the dashboard
+    # viewer WITHOUT routing a text request to the vision model (which couldn't consume it anyway).
+    _embedded_imgs = isinstance(body_text, str) and ("iVBORw0KGgo" in body_text or "/9j/" in body_text)
+    has_imgs = 1 if (_body_has_images(body_json) or _embedded_imgs) else None
     # Pull inline base64 images into their own column at full size, then store the text body
     # with them stripped — so the 256KB body cap can't truncate (and corrupt the JSON of) a
     # ~700KB screenshot. The image bytes stay reconstructable from images_data.
@@ -9584,23 +9904,70 @@ async def proxy(full_path: str, request: Request):
             first_chunk_ms: float | None = None
             if _ka_is_sse:
                 yield _ka_payload  # immediate "byte on wire" so the client doesn't TTFB-timeout
-            try:
-                async for chunk in upstream_resp.aiter_raw():
-                    if first_chunk_ms is None and chunk:
-                        first_chunk_ms = (time.perf_counter() - start) * 1000
-                    chunks.append(chunk)
+            if not bridge_active:
+                # Non-bridged SSE (e.g. Hermes → LM Studio): run the upstream read in a task and
+                # interleave keepalives during long silences (a big-prompt prefill emits no tokens
+                # for 30-60s) by racing the QUEUE get — never the socket read — with the keepalive
+                # timer. Racing/cancelling the raw read is what wedged bridged requests before, so
+                # those stay on the simple async-for in the else branch.
+                _q: "asyncio.Queue" = asyncio.Queue()
+
+                async def _reader():
                     try:
-                        _live_update_from_chunk(req_id, chunk.decode("utf-8", errors="replace"))
+                        async for _c in upstream_resp.aiter_raw():
+                            await _q.put(("c", _c))
+                    except Exception as _e:
+                        await _q.put(("e", f"stream error: {_e!r}"))
+                    await _q.put(("d", None))
+
+                _rt = asyncio.create_task(_reader())
+                try:
+                    while True:
+                        try:
+                            _kind, _val = await asyncio.wait_for(_q.get(), _ka_interval_s)
+                        except asyncio.TimeoutError:
+                            if _ka_is_sse:
+                                yield _ka_payload      # heartbeat during the prefill wait
+                            continue
+                        if _kind == "c":
+                            if first_chunk_ms is None and _val:
+                                first_chunk_ms = (time.perf_counter() - start) * 1000
+                            chunks.append(_val)
+                            try:
+                                _live_update_from_chunk(req_id, _val.decode("utf-8", errors="replace"))
+                            except Exception:
+                                pass
+                            if not do_buffer:
+                                yield _val
+                        elif _kind == "e":
+                            err = _val
+                            break
+                        else:
+                            break
+                finally:
+                    _rt.cancel()
+                    try:
+                        await _rt
                     except Exception:
                         pass
-                    if _do_incr_bridge and _incr_bridge is not None:
-                        translated_chunk = _incr_bridge.feed(chunk)
-                        if translated_chunk:
-                            yield translated_chunk
-                    elif not do_buffer:
-                        yield chunk
-            except Exception as e:
-                err = f"stream error: {e!r}"
+            else:
+                try:
+                    async for chunk in upstream_resp.aiter_raw():
+                        if first_chunk_ms is None and chunk:
+                            first_chunk_ms = (time.perf_counter() - start) * 1000
+                        chunks.append(chunk)
+                        try:
+                            _live_update_from_chunk(req_id, chunk.decode("utf-8", errors="replace"))
+                        except Exception:
+                            pass
+                        if _do_incr_bridge and _incr_bridge is not None:
+                            translated_chunk = _incr_bridge.feed(chunk)
+                            if translated_chunk:
+                                yield translated_chunk
+                        elif not do_buffer:
+                            yield chunk
+                except Exception as e:
+                    err = f"stream error: {e!r}"
             try:
                 await upstream_resp.aclose()
             except Exception:

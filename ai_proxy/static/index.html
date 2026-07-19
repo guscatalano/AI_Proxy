@@ -156,6 +156,82 @@
   #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup, #main.chat #tasks, #main.chat #bench { display: none; }
   #main.tasks #list, #main.tasks #detail, #main.tasks #stats, #main.tasks #audit, #main.tasks #convs, #main.tasks #system, #main.tasks #setup, #main.tasks #chat, #main.tasks #bench { display: none; }
   #main.bench #list, #main.bench #detail, #main.bench #stats, #main.bench #audit, #main.bench #convs, #main.bench #system, #main.bench #setup, #main.bench #chat, #main.bench #tasks { display: none; }
+
+  /* ---------- Live View ---------- */
+  #live{--lv-bg:#0a0d13;--lv-panel:#151b26;--lv-panel2:#1b2230;--lv-hair:#28303f;--lv-ink:#e9edf4;--lv-mute:#7d879b;
+    --lv-active:#3ddc84;--lv-think:#f5b942;--lv-stream:#41b6e6;--lv-vision:#c084fc;--lv-idle:#59647a;--lv-err:#f0616d;
+    --lv-ease:cubic-bezier(.22,.8,.24,1);--lv-bgimg:radial-gradient(1200px 600px at 80% -10%,#12202e,transparent 60%);
+    flex:1;overflow:hidden;display:none}
+  #live.show{display:flex;flex-direction:column;height:100%;background:var(--lv-bgimg),var(--lv-bg);color:var(--lv-ink)}
+  #main.live #list,#main.live #detail,#main.live #stats,#main.live #audit,#main.live #convs,#main.live #system,#main.live #setup,#main.live #chat,#main.live #tasks,#main.live #bench,#main.live #split-handle{display:none}
+  #live[data-theme="cyberpunk"]{--lv-bg:#0b0416;--lv-panel:#170a2a;--lv-panel2:#210f3a;--lv-hair:#3d1f60;--lv-ink:#f6e8ff;--lv-mute:#ad92cf;--lv-active:#00f0ff;--lv-think:#ffd400;--lv-stream:#ff2bd6;--lv-vision:#b026ff;--lv-idle:#6a4a8a;--lv-err:#ff3860;--lv-bgimg:radial-gradient(900px 500px at 12% 0,rgba(255,43,214,.15),transparent 60%),radial-gradient(920px 520px at 92% 108%,rgba(0,240,255,.14),transparent 60%),repeating-linear-gradient(0deg,transparent 0 37px,rgba(176,38,255,.05) 37px 38px),repeating-linear-gradient(90deg,transparent 0 37px,rgba(176,38,255,.05) 37px 38px)}
+  #live[data-theme="military"]{--lv-bg:#0a0d08;--lv-panel:#141a10;--lv-panel2:#1b2116;--lv-hair:#2f3b23;--lv-ink:#e9efda;--lv-mute:#909b79;--lv-active:#8bbf3a;--lv-think:#ffb000;--lv-stream:#c8d44a;--lv-vision:#e08a3a;--lv-idle:#5a6547;--lv-err:#e0492a;--lv-bgimg:radial-gradient(820px 520px at 100% 0,rgba(139,191,58,.10),transparent 60%),repeating-linear-gradient(45deg,transparent 0 21px,rgba(139,191,58,.035) 21px 22px),repeating-linear-gradient(-45deg,transparent 0 21px,rgba(139,191,58,.02) 21px 22px)}
+  #live[data-theme="scifi"]{--lv-bg:#040910;--lv-panel:#0a1724;--lv-panel2:#0e1f32;--lv-hair:#1e3c55;--lv-ink:#e3f5ff;--lv-mute:#7ba6c3;--lv-active:#22d3ee;--lv-think:#5eead4;--lv-stream:#38bdf8;--lv-vision:#a78bfa;--lv-idle:#4a6578;--lv-err:#fb7185;--lv-bgimg:radial-gradient(1100px 640px at 50% -10%,rgba(34,211,238,.13),transparent 60%),repeating-linear-gradient(0deg,transparent 0 39px,rgba(34,211,238,.045) 39px 40px),repeating-linear-gradient(90deg,transparent 0 39px,rgba(34,211,238,.045) 39px 40px)}
+  #live[data-theme="pipboy"]{--lv-bg:#06120a;--lv-panel:#0a1a10;--lv-panel2:#0e2214;--lv-hair:#1c3d26;--lv-ink:#41ff9f;--lv-mute:#20a466;--lv-active:#41ff9f;--lv-think:#b6ff4a;--lv-stream:#37ffb0;--lv-vision:#a8ffcf;--lv-idle:#1f7d4e;--lv-err:#ffb000;--lv-bgimg:radial-gradient(1000px 700px at 50% 40%,rgba(65,255,159,.07),transparent 70%)}
+  #live[data-theme="pipboy"] #lv-grid::after{content:"";position:absolute;inset:0;pointer-events:none;z-index:5;background:repeating-linear-gradient(0deg,transparent 0 2px,rgba(0,26,12,.5) 2px 3px)}
+  #live[data-theme="pipboy"] .lv-tile{text-shadow:0 0 5px color-mix(in srgb,var(--lc) 32%,transparent)}
+  #lv-bar{display:flex;align-items:center;gap:16px;padding:8px 14px;border-bottom:1px solid var(--lv-hair);flex:none}
+  .lv-themes{display:flex;gap:5px;flex-wrap:wrap}
+  .lv-themes button{font-family:ui-monospace,monospace;font-size:10px;text-transform:uppercase;letter-spacing:.05em;color:var(--lv-mute);background:transparent;border:1px solid var(--lv-hair);border-radius:6px;padding:3px 8px;cursor:pointer}
+  .lv-themes button.on{color:var(--lv-active);border-color:var(--lv-active);background:color-mix(in srgb,var(--lv-active) 12%,transparent)}
+  .lv-stats{margin-left:auto;display:flex;gap:18px;font-family:ui-monospace,monospace;font-size:11px}
+  .lv-stats>div{display:flex;flex-direction:column;line-height:1.1}
+  .lv-stats b{font-size:15px;font-variant-numeric:tabular-nums}.lv-stats span{color:var(--lv-mute);font-size:9px;text-transform:uppercase;letter-spacing:.08em}
+  #lv-grid{position:relative;flex:1;overflow:hidden;padding:12px}
+  .lv-tile{position:absolute;top:0;left:0;background:linear-gradient(160deg,var(--lv-panel),var(--lv-panel2));border:1px solid var(--lv-hair);border-radius:13px;padding:14px 15px;overflow:hidden;display:flex;flex-direction:column;min-height:0;opacity:0;transition:transform .55s var(--lv-ease),width .55s var(--lv-ease),height .55s var(--lv-ease),opacity .45s;will-change:transform,width,height}
+  .lv-tile::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--lc)}
+  .lv-tile.act{border-color:color-mix(in srgb,var(--lc) 45%,var(--lv-hair));box-shadow:0 0 30px -12px var(--lc)}
+  .lv-tile.idle{opacity:.6}
+  .lv-top{display:flex;align-items:center;gap:7px}
+  .lv-dot{width:8px;height:8px;border-radius:50%;background:var(--lc);flex:none}
+  .lv-client{font-family:ui-monospace,monospace;font-size:12px;font-weight:600}
+  .lv-model{margin-left:auto;font-family:ui-monospace,monospace;font-size:10px;color:var(--lv-mute);background:rgba(0,0,0,.25);border:1px solid var(--lv-hair);border-radius:5px;padding:1px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52%}
+  .lv-st{display:flex;align-items:baseline;gap:8px;margin-top:9px}
+  .lv-lbl{font-family:ui-monospace,monospace;font-weight:700;font-size:12px;letter-spacing:.1em;color:var(--lc)}
+  .lv-timer{margin-left:auto;font-family:ui-monospace,monospace;font-size:19px;font-weight:600;font-variant-numeric:tabular-nums}
+  .lv-timer.slow{color:var(--lv-err)}
+  .lv-spin{width:10px;height:10px;border-radius:50%;border:2px solid color-mix(in srgb,var(--lc) 30%,transparent);border-top-color:var(--lc);animation:lvsp .7s linear infinite;flex:none}
+  @keyframes lvsp{to{transform:rotate(360deg)}}
+  .lv-call{font-family:ui-monospace,monospace;font-size:11px;color:var(--lv-mute);margin-top:6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .lv-body{flex:1;min-height:0;margin-top:9px;display:flex;flex-direction:column;gap:7px;justify-content:flex-start;overflow:hidden}
+  .lv-prompt{font-size:12.5px;line-height:1.42;color:color-mix(in srgb,var(--lv-ink) 88%,transparent);flex:1 1 auto;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+  .lv-resp{font-family:ui-monospace,monospace;font-size:11.5px;line-height:1.45;color:color-mix(in srgb,var(--lv-ink) 78%,transparent);background:rgba(0,0,0,.22);border:1px solid var(--lv-hair);border-radius:7px;padding:8px 9px;flex:1 1 auto;overflow:hidden;white-space:pre-wrap;word-break:break-word}
+  .lv-cap{font-size:12px;line-height:1.35;color:color-mix(in srgb,var(--lv-ink) 82%,transparent);flex:none;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+  .lv-redact{color:var(--lv-mute);font-style:italic;font-size:12px}
+  .lv-scroll{will-change:transform}
+  .lv-img-sm{flex:0 0 auto !important;max-height:50% !important}
+  .lv-saw{flex:1 1 auto;overflow:hidden;font-size:12px;line-height:1.42;color:color-mix(in srgb,var(--lv-ink) 88%,transparent)}
+  .lv-sawlbl{font-family:ui-monospace,monospace;font-size:9px;text-transform:uppercase;letter-spacing:.1em;color:var(--lv-vision);border:1px solid color-mix(in srgb,var(--lv-vision) 42%,transparent);border-radius:4px;padding:0 5px;margin-right:6px;white-space:nowrap}
+  .lv-img{border-radius:8px;border:1px solid var(--lv-hair);flex:1 1 auto;min-height:0;object-fit:contain;object-position:center;width:100%;max-height:100%;background:rgba(0,0,0,.3)}
+  .lv-meter{margin-top:auto}
+  .lv-ml{display:flex;justify-content:space-between;font-family:ui-monospace,monospace;font-size:10px;color:var(--lv-mute);margin-bottom:3px}
+  .lv-ml b{color:var(--lv-ink);font-variant-numeric:tabular-nums}.lv-ml b.hot{color:var(--lv-think)}
+  .lv-bar2{height:5px;border-radius:4px;background:rgba(0,0,0,.3);overflow:hidden;border:1px solid var(--lv-hair)}
+  .lv-bar2 i{display:block;height:100%;border-radius:4px;background:var(--lc);transition:width .5s}
+  .lv-foot{display:flex;justify-content:space-between;font-family:ui-monospace,monospace;font-size:10px;color:var(--lv-mute);margin-top:8px;border-top:1px dashed var(--lv-hair);padding-top:6px}
+  .lv-empty{display:flex;align-items:center;justify-content:center;height:100%;color:var(--lv-mute);font-family:ui-monospace,monospace;font-size:13px}
+
+  /* ---------- Perf & Trends (top of Stats) ---------- */
+  .pf{--pf-grid:#1b2331;--pf-mute:#7d879b;--pf-acc:#3fc3b7;--pf-blue:#7aaffe;--pf-err:#f0616d;--pf-good:#3ddc84;--pf-warn:#f5b942;--mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;margin-bottom:20px}
+  .pf-bar{display:flex;align-items:center;margin:0 0 10px}
+  .pf-title{font-size:15px;font-weight:700}
+  .pf-win{margin-left:auto;display:flex;gap:5px}
+  .pf-win button{font-family:var(--mono);font-size:10.5px;color:var(--pf-mute);background:transparent;border:1px solid #26303f;border-radius:6px;padding:3px 9px;cursor:pointer}
+  .pf-win button.on{color:var(--pf-acc);border-color:color-mix(in srgb,var(--pf-acc) 55%,transparent);background:color-mix(in srgb,var(--pf-acc) 12%,transparent)}
+  .pf-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+  .pf-card{background:linear-gradient(160deg,#141a24,#0f141d);border:1px solid #26303f;border-radius:12px;padding:12px 14px 6px}
+  .pf-card.pf-wide{grid-column:1/-1}
+  .pf-h{display:flex;align-items:baseline;gap:9px;margin-bottom:6px}
+  .pf-t{font-size:13px;font-weight:600;color:#e9edf4}
+  .pf-now{margin-left:auto;font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;color:#e9edf4}
+  .pf-sub{font-family:var(--mono);font-size:10px;color:var(--pf-mute)}
+  .pf-up{color:var(--pf-err);font-family:var(--mono);font-size:11px}
+  .pf-down{color:var(--pf-good);font-family:var(--mono);font-size:11px}
+  .pf-flat{color:var(--pf-mute);font-family:var(--mono);font-size:11px}
+  .pf-leg{display:flex;gap:12px;font-family:var(--mono);font-size:10px;color:var(--pf-mute);margin:0 0 2px 2px}
+  .pf-leg i{display:inline-block;width:9px;height:3px;border-radius:2px;vertical-align:middle;margin-right:4px}
+  .pf svg{display:block;width:100%;overflow:visible}
+  @media(max-width:720px){.pf-grid{grid-template-columns:1fr}}
   /* Chat tab: 2-pane layout with composer pinned at bottom */
   #chat.show { padding: 0; flex-direction: column; height: 100%; }
   #chat .chat-header { padding: 10px 14px; border-bottom: 1px solid #2a2e3a; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; background: #14171f; }
@@ -479,6 +555,7 @@
   <span class="meta">→ <code id="upstream">…</code></span>
   <div class="tabs">
     <button class="tab active" id="tab-req" onclick="setView('requests')">Requests</button>
+    <button class="tab" id="tab-live" onclick="setView('live')">Live</button>
     <button class="tab" id="tab-convs" onclick="setView('convs')">Conversations</button>
     <button class="tab" id="tab-chat" onclick="setView('chat')">Chat</button>
     <button class="tab" id="tab-tasks" onclick="setView('tasks')">Tasks <span id="tasks-badge" style="display:none;background:#7aaffe;color:#0e1014;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
@@ -509,6 +586,7 @@
   <div id="stats"></div>
   <div id="audit"></div>
   <div id="convs"></div>
+  <div id="live"></div>
   <div id="system"></div>
   <div id="setup"></div>
   <div id="tasks"></div>
@@ -594,15 +672,16 @@ const fmtMsLong = (v) => {
 };
 
 const VIEW_KEY = 'ai-proxy-active-view';
-const VALID_VIEWS = new Set(['requests', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'bench']);
+const VALID_VIEWS = new Set(['requests', 'live', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'bench']);
 
 function setView(v) {
   view = v;
-  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','bench']) {
+  try { if (v !== 'live' && window.stopLive) stopLive(); } catch {}
+  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','bench','live']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
-  for (const c of ['stats','audit','convs','system','setup','chat','tasks','bench']) {
+  for (const c of ['stats','audit','convs','system','setup','chat','tasks','bench','live']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
@@ -619,8 +698,128 @@ function setView(v) {
   else if (v === 'chat') loadChat();
   else if (v === 'tasks') loadTasks();
   else if (v === 'bench') loadBench();
+  else if (v === 'live') loadLive();
   else refresh();
 }
+
+// ---------- Live View ----------
+let _lvPoll=null,_lvTick=null,_lvEls={},_lvTiles=[],_lvSysN=0,_lvSlots={},_lvCols=0;
+const _LVC={THINKING:'--lv-think',STREAMING:'--lv-stream',VISION:'--lv-vision',DONE:'--lv-idle'};
+function lvEsc(s){return (s==null?'':String(s)).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+function loadLive(){
+  const box=$('live');
+  if(!box.dataset.init){
+    box.innerHTML='<div id="lv-bar"><div class="lv-themes">'
+      +[['console',''],['cyber','cyberpunk'],['tactical','military'],['sci-fi','scifi'],['pip-boy','pipboy']]
+        .map(([n,t],i)=>`<button data-t="${t}"${i===0?' class="on"':''}>${n}</button>`).join('')
+      +'</div><div class="lv-stats"><div><b id="lv-active">0</b><span>active</span></div>'
+      +'<div><b id="lv-tps">0 / 0</b><span>tok/s in·out</span></div><div><b id="lv-gpu">—</b><span>gpu</span></div>'
+      +'<div><b id="lv-mem">—</b><span>ram gb</span></div></div></div>'
+      +'<div id="lv-grid"><div class="lv-empty">waiting for traffic…</div></div>';
+    box.dataset.init='1';
+    box.querySelectorAll('.lv-themes button').forEach(b=>b.onclick=()=>{
+      box.dataset.theme=b.dataset.t;
+      box.querySelectorAll('.lv-themes button').forEach(x=>x.classList.toggle('on',x===b));
+      try{localStorage.setItem('ai-proxy-live-theme',b.dataset.t);}catch{}
+      lvLayout();
+    });
+  }
+  let _lvth=''; try{_lvth=localStorage.getItem('ai-proxy-live-theme')||'';}catch{}
+  box.dataset.theme=_lvth;
+  box.querySelectorAll('.lv-themes button').forEach(x=>x.classList.toggle('on',(x.dataset.t||'')===_lvth));
+  _lvEls={};_lvTiles=[];_lvSlots={};_lvCols=0;$('lv-grid').innerHTML='<div class="lv-empty">waiting for traffic…</div>';
+  pollLive();
+  _lvPoll=setInterval(pollLive,1200);
+  _lvTick=setInterval(tickLive,120);
+}
+function stopLive(){clearInterval(_lvPoll);clearInterval(_lvTick);_lvPoll=_lvTick=null;}
+async function pollLive(){
+  try{
+    const d=await(await fetch('/__proxy/api/live')).json();
+    const at=Date.now();
+    _lvTiles=(d.tiles||[]).map(t=>({...t,key:t.key||t.req_id,_base:t.elapsed_ms,_at:at}));
+    lvReconcile();
+    const a=$('lv-active'); if(a)a.textContent=_lvTiles.filter(t=>!t.done).length;
+    const tp=$('lv-tps'); if(tp){const inR=Math.round(_lvTiles.reduce((s,t)=>s+(t.itps||0),0)),outR=Math.round(_lvTiles.reduce((s,t)=>s+(t.tps||0),0));tp.textContent=`${inR>9999?(inR/1000).toFixed(1)+'k':inR} / ${outR}`;}
+  }catch{}
+  if(_lvSysN++%3===0){ try{
+    const s=await(await fetch('/__proxy/api/system/now')).json();
+    const m=$('lv-mem'); if(m&&s.mem)m.textContent=Math.round((s.mem.used_mb||0)/1024)+' / '+Math.round((s.mem.total_mb||0)/1024);
+    const g=(s.gpus||[])[0], ge=$('lv-gpu');
+    if(ge&&g&&g.util_pct!=null){ge.textContent=Math.round(g.util_pct)+'%';ge.style.color=g.util_pct>90?'var(--lv-err)':g.util_pct>70?'var(--lv-think)':'var(--lv-active)';}
+  }catch{} }
+}
+let _lvTk=0;
+function tickLive(){
+  _lvTk++;
+  for(const t of _lvTiles){
+    const el=_lvEls[t.key]; if(!el)continue;
+    if(!t.done){ const ms=t._base+(Date.now()-t._at), tm=el.querySelector('.lv-timer');
+      if(tm){tm.firstChild.textContent=(ms/1000).toFixed(1);tm.classList.toggle('slow',t.state==='THINKING'&&ms>25000);} }
+    // auto-pan overflowing text so long prompts/responses can be read in full
+    const sc=el.querySelector('.lv-scroll'); if(!sc)continue;
+    if(_lvTk%8===0 || el.__ov==null){ const vp=sc.parentElement; el.__ov=Math.max(0,sc.scrollHeight-vp.clientHeight-2); }
+    if(el.__ov>6){
+      if(el.__sy==null){el.__sy=0;el.__sd=1;el.__sp=16;}
+      if(el.__sp>0)el.__sp--; else{ el.__sy+=el.__sd; if(el.__sy>=el.__ov){el.__sy=el.__ov;el.__sd=-1;el.__sp=22;} else if(el.__sy<=0){el.__sy=0;el.__sd=1;el.__sp=22;} }
+      sc.style.transform=`translateY(${-el.__sy}px)`;
+    } else if(el.__sy){el.__sy=0;el.__sd=1;sc.style.transform='';}
+  }
+}
+function lvCols(n){return n<=1?1:n<=2?2:n<=4?2:n<=6?3:n<=9?3:4;}
+function lvSig(t){return [t.state,t.done,t.fresh,t.client,t.model,t.prompt,t.response,t.redacted,t.has_image,t.turn,Math.round((t.ptok||0)/1000),t.upstream].join('|');}
+function lvInner(t){
+  const slow=t.state==='THINKING'&&t.elapsed_ms>25000;
+  const call=t.done?`✓ done · ${(t.elapsed_ms/1000).toFixed(1)}s${t.cache==='hit'?' · ⚡ cache hit':t.cache==='partial'?' · ⚡ partial cache':''}`
+    :t.state==='VISION'?`👁 ${lvEsc(t.model)}`
+    :t.state==='STREAMING'?`← streaming${t.tps?` · ${t.tps} tok/s`:''}`
+    :`→ ${lvEsc(t.upstream||'?')} · ${lvEsc((t.path||'').replace(/^\//,''))}`;
+  const pct=Math.min(100,(t.ptok||0)/262144*100),hot=pct>80;
+  let body;
+  if(t.redacted) body=`<div class="lv-prompt lv-redact">🔒 content hidden — PII (different subnet)</div>`;
+  else if(t.has_image){ const cap=t.response||t.prompt||''; body=`<img class="lv-img" src="${t.image_url}" onerror="this.style.display='none'" alt="">`+(cap?`<div class="lv-cap">${lvEsc(cap)}</div>`:''); }
+  else if(t.response) body=`<div class="lv-resp"><div class="lv-scroll">${lvEsc(t.response)}</div></div>`;
+  else body=`<div class="lv-prompt"><div class="lv-scroll">${lvEsc(t.prompt||'')}</div></div>`;
+  const out=t.state==='STREAMING'?`<div class="lv-ml" style="margin-top:6px"><span>output</span><span><b class="lv-otok">${(t.otok||0).toLocaleString()}</b> tok${t.tps?` · ${t.tps}/s`:''}</span></div>`:'';
+  return `<div class="lv-top"><span class="lv-dot"></span><span class="lv-client">${lvEsc(t.client)}</span><span class="lv-model">${lvEsc(t.model)}</span></div>
+    <div class="lv-st">${t.done?'':'<span class="lv-spin"></span>'}<span class="lv-lbl">${t.state}</span><span class="lv-timer${slow?' slow':''}">${(t.elapsed_ms/1000).toFixed(1)}<span style="font-size:11px;color:var(--lv-mute)">s</span></span></div>
+    <div class="lv-call">${call}</div>
+    <div class="lv-body">${body}</div>
+    <div class="lv-meter"><div class="lv-ml"><span>context</span><span><b class="${hot?'hot':''}">${Math.round((t.ptok||0)/1000)}k</b> / 256k · ${Math.round(pct)}%</span></div><div class="lv-bar2"><i style="width:${pct}%"></i></div>${out}</div>
+    <div class="lv-foot"><span>conv ${lvEsc(t.conv)}</span><span>turn ${t.turn==null?'—':t.turn}</span></div>`;
+}
+function lvLayout(){
+  const grid=$('lv-grid'); if(!grid)return; const N=_lvTiles.length;
+  const emp=grid.querySelector('.lv-empty'); if(emp&&N)emp.remove();
+  if(!N){ _lvSlots={};_lvCols=0; if(!grid.querySelector('.lv-empty'))grid.innerHTML='<div class="lv-empty">no active conversations</div>'; return; }
+  // stable slots: tiles keep their spot; new ones fill the lowest free slot (holes first)
+  const ids=new Set(_lvTiles.map(t=>t.key));
+  for(const id in _lvSlots){ if(!ids.has(id)) delete _lvSlots[id]; }
+  const used=new Set(Object.values(_lvSlots));
+  _lvTiles.forEach(t=>{ if(_lvSlots[t.key]==null){ let s=0; while(used.has(s))s++; _lvSlots[t.key]=s; used.add(s); } });
+  let cols=lvCols(N);
+  // only repack (move everyone) when the column count changes — ran out of / gained space
+  if(cols!==_lvCols){ _lvTiles.slice().sort((a,b)=>_lvSlots[a.req_id]-_lvSlots[b.req_id]).forEach((t,i)=>_lvSlots[t.key]=i); _lvCols=cols; }
+  let maxSlot=0; _lvTiles.forEach(t=>{ if(_lvSlots[t.key]>maxSlot)maxSlot=_lvSlots[t.key]; });
+  const rows=Math.max(1,Math.ceil((maxSlot+1)/cols)),pad=12,gap=12,W=grid.clientWidth,H=grid.clientHeight;
+  const tw=(W-pad*2-gap*(cols-1))/cols, th=(H-pad*2-gap*(rows-1))/rows;
+  _lvTiles.forEach(t=>{ const el=_lvEls[t.key]; if(!el)return;
+    const s=_lvSlots[t.key], x=pad+(s%cols)*(tw+gap), y=pad+Math.floor(s/cols)*(th+gap), geo=`translate(${x.toFixed(1)}px,${y.toFixed(1)}px)`;
+    if(el.__new){el.style.transition='none';el.style.transform=geo;el.style.width=tw+'px';el.style.height=th+'px';el.getBoundingClientRect();el.style.transition='';el.__new=false;requestAnimationFrame(()=>el.style.opacity=(t.done&&!t.fresh)?'0.6':'1');}
+    else{el.style.transform=geo;el.style.width=tw+'px';el.style.height=th+'px';}
+  });
+}
+function lvReconcile(){
+  const grid=$('lv-grid'); if(!grid)return;
+  const ids=new Set(_lvTiles.map(t=>t.key));
+  for(const id in _lvEls){ if(!ids.has(id)){ const el=_lvEls[id]; delete _lvEls[id]; el.style.opacity='0'; el.style.transform+=' scale(.94)'; setTimeout(()=>el.remove(),560);} }
+  _lvTiles.forEach(t=>{ let el=_lvEls[t.key];
+    if(!el){el=document.createElement('div');el.className='lv-tile '+((t.done&&!t.fresh)?'idle':'act');el.style.setProperty('--lc',`var(${_LVC[t.state]||'--lv-idle'})`);el.innerHTML=lvInner(t);el.dataset.sig=lvSig(t);el.__new=true;_lvEls[t.key]=el;grid.appendChild(el);}
+    else if(el.dataset.sig!==lvSig(t)){el.className='lv-tile '+((t.done&&!t.fresh)?'idle':'act');el.style.setProperty('--lc',`var(${_LVC[t.state]||'--lv-idle'})`);el.innerHTML=lvInner(t);el.dataset.sig=lvSig(t);el.style.opacity=(t.done&&!t.fresh)?'0.6':'1';el.__sy=null;el.__ov=null;}
+  });
+  lvLayout();
+}
+addEventListener('resize',()=>{ if(typeof view!=='undefined'&&view==='live') lvLayout(); });
 
 async function loadInfo() {
   try {
@@ -1880,12 +2079,63 @@ function _agoShort(s) {
   return (s / 86400).toFixed(1) + 'd';
 }
 
+let _perfWinH = 6;
+function setPerfWin(h){ _perfWinH = h; loadStats(); }
+function renderPerf(P){
+  const S=P.series||[]; if(S.length<2) return '';
+  const HRS=Math.max(1,Math.round((P.now-P.since)/3600)), N=S.length, W=520,H=132,PADL=36,PADR=8,PADT=8,PADB=18;
+  const xAt=i=>PADL+(i/(N-1))*(W-PADL-PADR);
+  const yAt=(v,mn,mx)=>PADT+(1-(v-mn)/((mx-mn)||1))*(H-PADT-PADB);
+  const fmt=v=>v==null?'—':(Math.abs(v)>=100?Math.round(v):(Math.abs(v)>=10?v.toFixed(0):v.toFixed(1)));
+  function grid(mn,mx,unit){let g='';for(let k=0;k<=3;k++){const v=mn+(mx-mn)*k/3,y=yAt(v,mn,mx);
+    g+=`<line x1="${PADL}" y1="${y.toFixed(1)}" x2="${W-PADR}" y2="${y.toFixed(1)}" stroke="var(--pf-grid)" stroke-width="1"/><text x="${PADL-6}" y="${(y+3).toFixed(1)}" text-anchor="end" font-size="9" fill="var(--pf-mute)" font-family="var(--mono)">${fmt(v)}${unit||''}</text>`;}
+    for(let h=0;h<=HRS;h++){const x=xAt((N-1)*h/HRS);g+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="9" fill="var(--pf-mute)" font-family="var(--mono)">${h===HRS?'now':'-'+(HRS-h)+'h'}</text>`;}return g;}
+  function line(vals,mn,mx){let d='',pen=false;vals.forEach((v,i)=>{if(v==null){pen=false;return;}d+=`${pen?'L':'M'}${xAt(i).toFixed(1)},${yAt(v,mn,mx).toFixed(1)}`;pen=true;});return d;}
+  function range(...arrs){const all=[].concat(...arrs).filter(v=>v!=null);if(!all.length)return[0,1];let mn=Math.min(...all),mx=Math.max(...all);const p=(mx-mn)*0.12||1;return[Math.max(0,mn-p),mx+p];}
+  const lastNN=k=>{for(let i=S.length-1;i>=0;i--)if(S[i][k]!=null)return S[i][k];return null;};
+  const agoNN=k=>{for(let i=Math.floor(S.length/2);i>=0;i--)if(S[i][k]!=null)return S[i][k];return null;};
+  function lineCard(title,keys,unit,colors,opts){opts=opts||{};
+    const vals=keys.map(k=>S.map(b=>b[k])),[mn,mx]=range(...vals);
+    let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(mn,mx,unit)}`;
+    if(opts.area)svg+=`<path d="${line(vals[0],mn,mx)} L${xAt(N-1)},${H-PADB} L${PADL},${H-PADB} Z" fill="${colors[0]}" opacity=".10"/>`;
+    vals.forEach((v,idx)=>{svg+=`<path d="${line(v,mn,mx)}" fill="none" stroke="${colors[idx]}" stroke-width="${idx?1.5:1.8}"/>`;});
+    const nowv=lastNN(keys[0]); if(nowv!=null)svg+=`<circle cx="${xAt(N-1)}" cy="${yAt(nowv,mn,mx)}" r="3" fill="${colors[0]}"/>`;
+    svg+='</svg>';
+    const cur=lastNN(keys[0]),prev=agoNN(keys[0]);let arrow='';
+    if(cur!=null&&prev){const dp=Math.round((cur-prev)/Math.abs(prev)*100);arrow=Math.abs(dp)>=6?`<span class="${(opts.bad?dp>0:dp<0)?'pf-up':'pf-down'}">${dp>0?'▲':'▼'} ${Math.abs(dp)}%</span>`:'<span class="pf-flat">≈</span>';}
+    const leg=keys.length>1?`<div class="pf-leg">${keys.map((k,i)=>`<span><i style="background:${colors[i]}"></i>${opts.labels[i]}</span>`).join('')}</div>`:'';
+    return `<div class="pf-card"><div class="pf-h"><span class="pf-t">${title}</span><span class="pf-now">${opts.nowFmt?opts.nowFmt(cur):fmt(cur)}${opts.nowUnit||unit||''}</span>${arrow}</div>${leg}${svg}</div>`;}
+  function barCard(title,key,color){const vals=S.map(b=>b[key]||0),mx=Math.max(2,...vals),bw=(W-PADL-PADR)/N*0.66;
+    let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(0,mx,'')}`;
+    vals.forEach((v,i)=>{const h=(v/mx)*(H-PADT-PADB);svg+=`<rect x="${(xAt(i)-bw/2).toFixed(1)}" y="${(H-PADB-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0,h).toFixed(1)}" rx="1.5" fill="${v>0?color:'var(--pf-grid)'}"/>`;});
+    svg+='</svg>';const tot=vals.reduce((a,b)=>a+b,0);
+    return `<div class="pf-card"><div class="pf-h"><span class="pf-t">${title}</span><span class="pf-now">${tot}</span><span class="pf-sub">peak ${mx}</span></div>${svg}</div>`;}
+  function scatterCard(){const pts=P.scatter||[];if(!pts.length)return '';
+    const xw=W-PADL-PADR,xmax=Math.max(10,...pts.map(p=>p[0])),ymax=Math.max(1,...pts.map(p=>p[1]))*1.1;
+    let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(0,ymax,'s')}`;
+    pts.forEach(p=>{const x=PADL+(p[0]/xmax)*xw,y=yAt(p[1],0,ymax);svg+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.3" fill="${p[2]?'var(--pf-acc)':'var(--pf-err)'}" opacity=".7"/>`;});
+    for(let k=0;k<=4;k++){const v=Math.round(xmax*k/4),x=PADL+(v/xmax)*xw;svg+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="9" fill="var(--pf-mute)" font-family="var(--mono)">${v}k</text>`;}
+    svg+='</svg>';
+    return `<div class="pf-card pf-wide"><div class="pf-h"><span class="pf-t">Latency vs prompt size</span><span class="pf-sub"><span style="color:var(--pf-acc)">●</span> hit · <span style="color:var(--pf-err)">●</span> miss</span></div>${svg}</div>`;}
+  const charts=
+    lineCard('Time-to-first-token (prefill)',['ttft_p50','ttft_p95'],'s',['var(--pf-blue)','var(--pf-err)'],{labels:['p50','p95'],bad:true,nowFmt:v=>v==null?'—':v.toFixed(1),nowUnit:'s'})
+   +lineCard('Decode throughput',['decode'],'',['var(--pf-good)'],{nowFmt:v=>v==null?'—':v.toFixed(1),nowUnit:' tok/s'})
+   +lineCard('Prompt cache-hit rate',['cache_pct'],'%',['var(--pf-acc)'],{area:true,nowFmt:v=>v==null?'—':Math.round(v)})
+   +lineCard('Median prompt size',['psize_k'],'k',['var(--pf-warn)'],{bad:true,nowFmt:v=>v==null?'—':Math.round(v)})
+   +barCard('Concurrent requests','conc','var(--pf-blue)')
+   +barCard('Errors &amp; interruptions','err','var(--pf-err)')
+   +scatterCard();
+  const winBtns=[1,6,24,72].map(h=>`<button onclick="setPerfWin(${h})" class="${_perfWinH===h?'on':''}">${h<24?h+'h':(h/24)+'d'}</button>`).join('');
+  return `<div class="pf"><div class="pf-bar"><span class="pf-title">Perf &amp; Trends</span><span class="pf-win">${winBtns}</span></div><div class="pf-grid">${charts}</div></div>`;
+}
 async function loadStats() {
-  const [d, rules, audit] = await Promise.all([
+  const [d, rules, audit, perfData] = await Promise.all([
     fetch('/__proxy/api/stats').then(r => r.json()),
     fetch('/__proxy/api/rules').then(r => r.json()).catch(() => null),
     fetch('/__proxy/api/audit?include_allow=true').then(r => r.json()).catch(() => null),
+    fetch(`/__proxy/api/perf?window_h=${_perfWinH}`).then(r => r.json()).catch(() => null),
   ]);
+  const perfHtml = perfData ? renderPerf(perfData) : '';
   const flowHtml = _renderTrafficFlow(d, rules, audit);
   const o = d.overall || {};
   const span = (o.first_ts && o.last_ts) ? Math.max(1, o.last_ts - o.first_ts) : 0;
@@ -2041,6 +2291,7 @@ async function loadStats() {
     </div>`;
 
   $('stats').innerHTML = `
+    ${perfHtml}
     ${flowHtml}
     ${cards}
     ${tpSection}
@@ -3537,6 +3788,9 @@ custom_providers:
     base_url: ${base}
     api_key: ollama            # any non-empty string (proxy passes it upstream)
     type: openai
+    stale_timeout_seconds: 300 # NOTE: Hermes bug #25249 currently IGNORES this for custom
+                               # providers (hardcoded ~30s). The proxy sends 5s SSE keepalives so
+                               # long prefills don't drop; kept here for when that bug is fixed.
     default_model: ${model}
     models:
       - name: ${model}
