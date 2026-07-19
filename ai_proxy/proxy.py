@@ -306,6 +306,16 @@ CREATE TABLE IF NOT EXISTS requests (
     total_tokens INTEGER,
     client_ip TEXT
 );
+-- Large request/response payloads live here, not inline in `requests`, so that list/count/
+-- aggregate scans over `requests` stay fast (they never touch these multi-MB blobs). The
+-- blob-split migration in init_db() moves existing data here and DROPs the old columns.
+CREATE TABLE IF NOT EXISTS request_blobs (
+    id TEXT PRIMARY KEY,
+    request_body TEXT,
+    response_body TEXT,
+    stream_chunks TEXT,
+    images_data TEXT
+);
 CREATE TABLE IF NOT EXISTS proxy_memory (
     conversation_id TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -767,8 +777,72 @@ def init_db():
             "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v7', '1', ?)",
             (time.time(),),
         )
+    # One-time blob split: move the multi-MB payload columns out of `requests` into
+    # `request_blobs` and DROP them from `requests`, so list/count/aggregate scans over the
+    # hot table never read blob pages. Robust to a partial prior run (checks table_info so it
+    # never SELECTs an already-dropped column). VACUUM (after close) reclaims the freed space.
+    _did_blob_split = False
+    if not conn.execute("SELECT value FROM settings WHERE key='blob_split_v1'").fetchone():
+        _req_cols = {r[1] for r in conn.execute("PRAGMA table_info(requests)").fetchall()}
+        _blob_cols = [c for c in ("request_body", "response_body", "stream_chunks", "images_data") if c in _req_cols]
+        if _blob_cols:
+            _sel = ", ".join(_blob_cols)
+            conn.execute(
+                f"""INSERT OR IGNORE INTO request_blobs (id, {_sel})
+                    SELECT id, {_sel} FROM requests
+                    WHERE {" OR ".join(f"{c} IS NOT NULL" for c in _blob_cols)}"""
+            )
+            conn.commit()  # persist the moved data before we start dropping columns
+            for _col in _blob_cols:
+                try:
+                    conn.execute(f"ALTER TABLE requests DROP COLUMN {_col}")
+                except sqlite3.OperationalError:
+                    pass  # DROP COLUMN needs SQLite >= 3.35; confirmed before deploy
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_ts) VALUES ('blob_split_v1', '1', ?)",
+            (time.time(),),
+        )
+        _did_blob_split = True
+    # Compatibility view: presents `requests` joined with its blobs as one row shape, so the
+    # (few) blob-reading queries use `requests_v` unchanged while fast scans stay on the lean
+    # `requests`. Recreated every startup (cheap); r.* is clean because the blob columns were
+    # dropped above. Needs SQLite >= 3.35 (DROP COLUMN) — confirmed before deploy.
+    try:
+        conn.execute("DROP VIEW IF EXISTS requests_v")
+        conn.execute(
+            "CREATE VIEW requests_v AS SELECT r.*, b.request_body, b.response_body, "
+            "b.stream_chunks, b.images_data FROM requests r LEFT JOIN request_blobs b ON b.id = r.id"
+        )
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
+    if _did_blob_split:
+        try:  # VACUUM can't run inside a transaction — use a fresh autocommit connection
+            _vc = sqlite3.connect(DB_PATH, timeout=120.0, isolation_level=None)
+            _vc.execute("VACUUM")
+            _vc.close()
+        except sqlite3.OperationalError:
+            pass
+
+
+_BLOB_COLS = ("request_body", "response_body", "stream_chunks", "images_data")
+
+def _blobs_upsert(conn, req_id, **cols):
+    """Write large payload columns to the request_blobs side table (id PK). Only the columns
+    passed are set; the rest are left intact via ON CONFLICT upsert. Callers use this instead
+    of writing request_body/response_body/stream_chunks/images_data into `requests` directly."""
+    cols = {k: v for k, v in cols.items() if k in _BLOB_COLS}
+    if not cols:
+        return
+    names = list(cols)
+    ph = ", ".join("?" for _ in names)
+    upd = ", ".join(f"{n}=excluded.{n}" for n in names)
+    conn.execute(
+        f"INSERT INTO request_blobs (id, {', '.join(names)}) VALUES (?, {ph}) "
+        f"ON CONFLICT(id) DO UPDATE SET {upd}",
+        (req_id, *[cols[n] for n in names]),
+    )
 
 
 def _maybe_gunzip(data):
@@ -3279,13 +3353,13 @@ def _conversation_tool_history(conv_id: str, exclude_req_id: str | None) -> tupl
     try:
         if exclude_req_id:
             rows = conn.execute(
-                "SELECT id, request_body, response_body, stream_chunks FROM requests "
+                "SELECT id, request_body, response_body, stream_chunks FROM requests_v "
                 "WHERE conversation_id = ? AND id != ? ORDER BY ts ASC",
                 (conv_id, exclude_req_id),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT id, request_body, response_body, stream_chunks FROM requests "
+                "SELECT id, request_body, response_body, stream_chunks FROM requests_v "
                 "WHERE conversation_id = ? ORDER BY ts ASC",
                 (conv_id,),
             ).fetchall()
@@ -3814,7 +3888,7 @@ def live_view(request: Request):  # sync → threadpool
         f"""SELECT id, ts, conversation_id, turn_index, client_app, client_ip, model, upstream, path,
                    status, est_prompt_tokens, prompt_tokens, completion_tokens, duration_ms,
                    has_images, request_body, response_body, stream_chunks, ttft_ms
-            FROM requests
+            FROM requests_v
             WHERE id IN ({placeholders}) OR ts > ?
             ORDER BY ts ASC""",
         (*inflight.keys(), now - 32),   # finished tiles linger ~30s so the response is readable
@@ -4118,7 +4192,7 @@ def cache_stats(request: Request, limit: int = 50):  # sync → threadpool
     rows = conn.execute(
         """SELECT id, ts, client_app, model, request_body, prompt_tokens, duration_ms,
                   ttft_ms, upstream
-           FROM requests
+           FROM requests_v
            WHERE prompt_tokens IS NOT NULL AND request_body IS NOT NULL AND shadow_of IS NULL
                  AND (path LIKE '%chat%' OR path LIKE '%generate%' OR path LIKE '%messages%')
            ORDER BY ts DESC LIMIT ?""",
@@ -4211,7 +4285,7 @@ def list_conversations(request: Request, limit: int = 100):  # sync → threadpo
     for r in rows:
         d = dict(r)
         preview = conn.execute(
-            """SELECT request_body FROM requests
+            """SELECT request_body FROM requests_v
                WHERE conversation_id = ? ORDER BY ts ASC LIMIT 1""",
             (d["conversation_id"],),
         ).fetchone()
@@ -4241,7 +4315,7 @@ def get_conversation(conv_id: str, request: Request):  # sync → threadpool
                   prompt_tokens, completion_tokens, total_tokens, duration_ms,
                   status, error, gate_verdict, gate_rule, gate_reason, gate_details,
                   client_ip, is_stream
-           FROM requests
+           FROM requests_v
            WHERE conversation_id = ?
            ORDER BY ts ASC""",
         (conv_id,),
@@ -4262,7 +4336,7 @@ def suggestions():  # sync → threadpool
     rows = conn.execute(
         """SELECT ts, model, request_body, response_body, stream_chunks, prompt_tokens, completion_tokens,
                   total_tokens, duration_ms, client_ip, gate_verdict, gate_rule
-           FROM requests
+           FROM requests_v
            WHERE ts > ?
            ORDER BY ts DESC
            LIMIT 5000""",
@@ -4423,7 +4497,7 @@ def suggestions():  # sync → threadpool
     conn = db()
     err_rows = conn.execute(
         """SELECT r.request_body
-           FROM requests r
+           FROM requests_v r
            INNER JOIN (
                SELECT conversation_id, MAX(ts) AS max_ts
                FROM requests
@@ -4794,7 +4868,7 @@ def stats():  # sync → threadpool
     # dominated the stats endpoint latency. The most recent 500 is representative.
     _tool_cutoff = time.time() - 7 * 86400
     tool_rows = conn.execute(
-        """SELECT model, response_body, stream_chunks FROM requests
+        """SELECT model, response_body, stream_chunks FROM requests_v
            WHERE ts > ? AND (response_body IS NOT NULL OR stream_chunks IS NOT NULL)
            ORDER BY ts DESC LIMIT 500""",
         (_tool_cutoff,),
@@ -4897,7 +4971,7 @@ def stats():  # sync → threadpool
 async def get_request(req_id: str, request: Request):
     viewer = _client_ip(request)
     conn = db()
-    row = conn.execute("SELECT * FROM requests WHERE id = ?", (req_id,)).fetchone()
+    row = conn.execute("SELECT * FROM requests_v WHERE id = ?", (req_id,)).fetchone()
     if not row:
         conn.close()
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -4930,7 +5004,7 @@ async def get_request(req_id: str, request: Request):
         """SELECT id, ts, model, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens,
                   upstream_url, request_body, response_body, stream_chunks
-           FROM requests WHERE shadow_of = ? ORDER BY ts ASC""",
+           FROM requests_v WHERE shadow_of = ? ORDER BY ts ASC""",
         (req_id,),
     ).fetchall()
     conn.close()
@@ -4994,7 +5068,7 @@ def _request_image_refs(row):
 def get_request_image(req_id: str, idx: int, request: Request):  # sync → threadpool
     """Reconstruct and serve the idx-th image, from the full-fidelity images_data column."""
     conn = db()
-    row = conn.execute("SELECT request_body, images_data, client_ip FROM requests WHERE id = ?", (req_id,)).fetchone()
+    row = conn.execute("SELECT request_body, images_data, client_ip FROM requests_v WHERE id = ?", (req_id,)).fetchone()
     conn.close()
     if not row:
         return JSONResponse({"error": "not found"}, status_code=404)
@@ -5524,7 +5598,7 @@ async def control_feed(target: str | None = None, since: float | None = None,
     sess_sql = (
         "SELECT conversation_id, MAX(ts) AS last_ts, MIN(ts) AS first_ts, "
         "       COUNT(*) AS turn_count, "
-        "       (SELECT request_body FROM requests "
+        "       (SELECT request_body FROM requests_v "
         "        WHERE conversation_id = r.conversation_id AND request_body IS NOT NULL "
         "        ORDER BY ts ASC LIMIT 1) AS first_body "
         "FROM requests r WHERE " + " AND ".join(sess_where)
@@ -5582,7 +5656,7 @@ async def control_feed(target: str | None = None, since: float | None = None,
         "SELECT id, ts, model, status, prompt_tokens, completion_tokens, total_tokens, "
         "duration_ms, request_body, response_body, stream_chunks, error, client_app, "
         "client_ip, conversation_id "
-        "FROM requests WHERE " + " AND ".join(where) + " ORDER BY ts ASC LIMIT ?"
+        "FROM requests_v WHERE " + " AND ".join(where) + " ORDER BY ts ASC LIMIT ?"
     )
     params.append(max(1, min(int(limit), 100)))
     rows = conn.execute(sql, params).fetchall()
@@ -5662,7 +5736,7 @@ async def control_await(send_id: str):
     rows = conn.execute(
         """SELECT id, ts, status, model, prompt_tokens, completion_tokens, total_tokens,
                   response_body, stream_chunks, error, duration_ms
-           FROM requests
+           FROM requests_v
            WHERE ts > ? AND client_ip = ?
              AND client_app IN ('vscode-copilot','claude-code','github-copilot','continue.dev','cursor')
              AND shadow_of IS NULL
@@ -7050,7 +7124,7 @@ async def _task_run_agent(task_id: int, prompt: str, target: str | None,
             conn = db()
             rows = conn.execute(
                 """SELECT id, status, response_body, stream_chunks, error
-                   FROM requests
+                   FROM requests_v
                    WHERE ts > ? AND client_ip = ?
                      AND client_app IN ('vscode-copilot','claude-code','github-copilot','continue.dev','cursor')
                      AND shadow_of IS NULL
@@ -7625,8 +7699,8 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             store_body_text = json.dumps(body_copy)
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, request_body, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images, images_data)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -7634,7 +7708,6 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             "/" + full_path,
             upstream_url,
             json.dumps(headers_dict),
-            _truncate_for_store(store_body_text),
             model,
             int(is_stream),
             _client_ip(request),
@@ -7644,9 +7717,11 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             upstream,
             est or None,
             has_imgs,
-            images_data,
         ),
     )
+    _blobs_upsert(conn, req_id,
+                  request_body=_truncate_for_store(store_body_text),
+                  images_data=images_data)
     conn.commit()
     conn.close()
     # Seed live state with the estimate so the UI shows something immediately, even before
@@ -8502,16 +8577,17 @@ async def _run_shadow(primary_id: str, primary_body: dict, primary_path: str,
         conn = db()
         conn.execute(
             """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers,
-                                       request_body, model, is_stream, client_ip,
+                                       model, is_stream, client_ip,
                                        conversation_id, turn_index, client_app, shadow_of)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 shadow_id, time.time(), "POST", "/" + shadow_path, upstream_url,
                 json.dumps({"x-proxy-shadow-of": primary_id, "x-proxy-translated": translated}),
-                body_text, target["target_model"], 0, viewer_ip,
+                target["target_model"], 0, viewer_ip,
                 conv_id, turn, "shadow", primary_id,
             ),
         )
+        _blobs_upsert(conn, shadow_id, request_body=body_text)
         conn.commit()
         conn.close()
         _LIVE_STREAMS[shadow_id] = {
@@ -9213,20 +9289,21 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
     conn = db()
     conn.execute(
         """UPDATE requests
-           SET status=?, response_headers=?, response_body=?, stream_chunks=?, duration_ms=?, error=?,
+           SET status=?, response_headers=?, duration_ms=?, error=?,
                prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?
            WHERE id=?""",
         (
             status,
             json.dumps(resp_headers) if resp_headers else None,
-            _truncate_for_store(body_text),
-            _truncate_for_store(stream_text),
             elapsed_ms,
             error,
             pt, ct, tt, ttft_ms,
             req_id,
         ),
     )
+    _blobs_upsert(conn, req_id,
+                  response_body=_truncate_for_store(body_text),
+                  stream_chunks=_truncate_for_store(stream_text))
     conn.commit()
     conn.close()
     _LIVE_STREAMS.pop(req_id, None)
@@ -9519,10 +9596,7 @@ async def proxy(full_path: str, request: Request):
         save_json = json.loads(json.dumps(body_json))
         _strip_image_data(save_json)
         conn = db()
-        conn.execute(
-            "UPDATE requests SET request_body=? WHERE id=?",
-            (_truncate_for_store(json.dumps(save_json)), req_id),
-        )
+        _blobs_upsert(conn, req_id, request_body=_truncate_for_store(json.dumps(save_json)))
         if rewrite:
             model = body_json.get("model")
             conn.execute("UPDATE requests SET model=? WHERE id=?", (model, req_id))
@@ -10336,7 +10410,7 @@ async def _gather_digest_data(samples: int = 10, since_minutes: int = 1440):
                   prompt_tokens, completion_tokens, total_tokens,
                   gate_verdict, gate_rule, gate_reason,
                   request_body, response_body, stream_chunks
-           FROM requests
+           FROM requests_v
            WHERE ts > ? AND request_body IS NOT NULL
            ORDER BY ts DESC LIMIT ?""",
         (cutoff, max(0, samples)),
