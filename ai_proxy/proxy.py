@@ -4308,20 +4308,30 @@ def list_conversations(request: Request, limit: int = 100):  # sync → threadpo
 
 @app.get("/__proxy/api/conversations/{conv_id}")
 def get_conversation(conv_id: str, request: Request):  # sync → threadpool
+    # Metadata only — NO bodies. The old version sent every turn's full request/response
+    # blobs (multi-MB responses, ~2s to transfer). The dedicated conversation page lazy-loads
+    # each turn's full content via /requests/{id} (fast, blob-split) on expand. This query
+    # hits the lean `requests` table (no blob read at all).
     viewer = _client_ip(request)
     conn = db()
     rows = conn.execute(
-        """SELECT id, ts, model, turn_index, request_body, response_body, stream_chunks,
-                  prompt_tokens, completion_tokens, total_tokens, duration_ms,
-                  status, error, gate_verdict, gate_rule, gate_reason, gate_details,
-                  client_ip, is_stream
-           FROM requests_v
+        """SELECT id, ts, model, turn_index, prompt_tokens, completion_tokens, total_tokens,
+                  est_prompt_tokens, duration_ms, ttft_ms, status, error, gate_verdict, gate_rule,
+                  gate_reason, client_ip, client_app, is_stream, has_images, path, upstream
+           FROM requests
            WHERE conversation_id = ?
            ORDER BY ts ASC""",
         (conv_id,),
     ).fetchall()
     conn.close()
-    turns = [_redact_row(dict(r), viewer) for r in rows]
+    turns = []
+    for r in rows:
+        d = dict(r)
+        _cpct, _cverdict = _cache_verdict(d.get("prompt_tokens"), d.get("est_prompt_tokens"),
+                                          d.get("ttft_ms"), d.get("prompt_tokens"), d.get("upstream"))
+        d["cache_pct"] = _cpct
+        d["cache_verdict"] = _cverdict
+        turns.append(_redact_row(d, viewer))
     return {"conversation_id": conv_id, "turns": turns, "redacted": REDACT_PII_ENABLED}
 
 

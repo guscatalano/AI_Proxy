@@ -656,6 +656,39 @@
   #diag-panel .diag-t td:first-child { text-align: left; color: #c9d3e1; word-break: break-all; }
   #diag-panel .diag-t tr.bad td { color: #f0c674; }
   #diag-panel .diag-foot { padding: 8px 12px; color: #5f6b7e; border-top: 1px solid #262d38; }
+  /* ---- dedicated conversation detail page ---- */
+  .conv-detail-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid #262d38; position: sticky; top: 0; background: #0c0f15; z-index: 3; }
+  .conv-back { background: #141922; color: #c9d3e1; border: 1px solid #262d38; border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .conv-back:hover { border-color: #3a4e6a; color: #e9edf4; }
+  .conv-head-main { min-width: 0; flex: 1; }
+  .conv-head-title code { font-size: 13px; color: #e9edf4; }
+  .conv-head-sub { font-size: 11px; color: #93a0b4; margin-top: 2px; }
+  .conv-expand-all { background: rgba(87,209,224,.12); color: #57d1e0; border: 1px solid #2c6b74; border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; white-space: nowrap; }
+  .conv-expand-all:hover { background: rgba(87,209,224,.2); }
+  .conv-turns-list { padding: 12px 16px; display: flex; flex-direction: column; gap: 8px; }
+  .conv-turn { border: 1px solid #262d38; border-radius: 8px; background: #141922; overflow: hidden; }
+  .conv-turn[open] { border-color: #313a48; }
+  .conv-turn-h { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 9px 12px; cursor: pointer; list-style: none; font-size: 12px; color: #93a0b4; }
+  .conv-turn-h::-webkit-details-marker { display: none; }
+  .conv-turn-h:hover { background: rgba(255,255,255,.02); }
+  .conv-turn-h .ct-n { font-weight: 600; color: #e9edf4; font-size: 12.5px; }
+  .conv-turn-h code { color: #c9d3e1; }
+  .conv-turn-h .ct-open { margin-left: auto; color: #57d1e0; font-size: 11px; }
+  .cv-badge { font-size: 9.5px; font-weight: 700; padding: 1px 6px; border-radius: 4px; }
+  .cv-badge.hit { background: rgba(104,211,145,.16); color: #68d391; }
+  .cv-badge.partial { background: rgba(240,198,116,.16); color: #f0c674; }
+  .cv-ok { color: #68d391; font-weight: 600; } .cv-err { color: #f07178; font-weight: 600; } .cv-live { color: #e0b34e; font-weight: 600; }
+  .conv-turn-body { padding: 6px 12px 12px; border-top: 1px solid #1f2530; }
+  .conv-turn-body .ct-loading, .conv-turn-body .ct-empty, .conv-turn-body .ct-redacted, .conv-turn-body .ct-err { color: #5f6b7e; font-size: 11px; padding: 8px 2px; }
+  .conv-turn-body .ct-err { color: #e08080; }
+  .conv-turn-body .ct-lbl { font-size: 10px; color: #57d1e0; text-transform: uppercase; letter-spacing: .5px; margin: 6px 0 2px; }
+  .conv-turn-body .msg { padding: 6px 10px; border-radius: 4px; margin: 5px 0; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .conv-turn-body .msg.user { background: #1a2030; color: #c9d3e1; }
+  .conv-turn-body .msg.assistant { background: #1a261a; color: #c9d3e1; }
+  .conv-turn-body details.msg.tool { background: #2a2418; color: #c9d3e1; white-space: normal; padding: 4px 8px; }
+  .conv-turn-body details.msg.tool > summary { cursor: pointer; font-size: 11px; }
+  .conv-turn-body .msg .role { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
+  .conv-turn-body pre { font-size: 11px; max-height: 240px; overflow: auto; background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 6px 8px; margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
 </style>
 </head>
 <body class="shell-console">
@@ -3036,369 +3069,102 @@ function _conversationTurnSummary(t, body, userText, assistantText, toolCalls, t
   return { snippet, outcome };
 }
 
+// ---------- Dedicated conversation detail page (lazy per-turn load) ----------
+// The list click opens this full-page view (replacing the conversations list). The endpoint
+// returns turn METADATA only; each turn's full body is fetched from /requests/{id} on expand,
+// so a long conversation loads instantly instead of transferring every turn's blobs at once.
+let _convReturnPage = 1;
 async function loadConversationDetail(cid) {
-  const d = await (await fetch('/__proxy/api/conversations/' + encodeURIComponent(cid))).json();
+  _convReturnPage = _convsPage;
+  const box = $('convs');
+  box.innerHTML = '<div style="padding:26px;color:#888">Loading conversation…</div>';
+  let d;
+  try { d = await (await fetch('/__proxy/api/conversations/' + encodeURIComponent(cid))).json(); }
+  catch { box.innerHTML = '<div style="padding:26px;color:#e08080">Failed to load conversation. <a href="#" onclick="event.preventDefault();convBack()">← back</a></div>'; return; }
   const turns = d.turns || [];
-  // Auto-expand last 3 turns on long conversations; expand all on short ones.
-  const longConv = turns.length > 8;
-  const expandedSet = new Set();
-  if (!longConv) {
-    turns.forEach((_, i) => expandedSet.add(i));
-  } else {
-    for (let i = Math.max(0, turns.length - 3); i < turns.length; i++) expandedSet.add(i);
-  }
-
-  // First pass: compute per-turn metadata so both TOC and turn list render from one source.
-  const meta = turns.map((t) => {
-    let body = null;
-    try { body = JSON.parse(t.request_body || ''); } catch {}
-    const userMsgs = (body && body.messages || []).filter(m => m && m.role === 'user');
-    const lastUser = userMsgs[userMsgs.length - 1];
-    const userText = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content)) : '';
-
-    let assistantText = '';
-    let toolCalls = [];
-    if (t.stream_chunks) {
-      assistantText = reconstructStream(t.stream_chunks);
-      const a = analyzeResponse(null, t.stream_chunks);
-      toolCalls = a.tool_calls;
-    } else if (t.response_body) {
-      const a = analyzeResponse(t.response_body, null);
-      assistantText = a.content;
-      toolCalls = a.tool_calls;
-    }
-
-    const allMsgs = (body && body.messages) || [];
-    const tcMap = {};
-    for (const m of allMsgs) {
-      if (m && m.role === 'assistant' && Array.isArray(m.tool_calls)) {
-        for (const tc of m.tool_calls) {
-          if (tc && tc.id && tc.function) {
-            tcMap[tc.id] = { name: tc.function.name, args: tc.function.arguments };
-          }
-        }
-      }
-    }
-    const toolResults = allMsgs.filter(m => m && m.role === 'tool').map(m => ({
-      ...m,
-      _call: m.tool_call_id ? tcMap[m.tool_call_id] : null,
-    }));
-    const hasError = toolResults.some(tr => {
-      const c = typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || '');
-      return looksLikeToolError(c).isError;
-    });
-    return { t, body, userText, assistantText, toolCalls, toolResults, hasError, hasTool: toolCalls.length > 0 };
-  });
-
-  const turnHtml = meta.map((m, i) => {
-    const { t, body, userText, assistantText, toolCalls, toolResults, hasError, hasTool } = m;
-
-    let verdictBadge = '';
-    if (t.gate_verdict && t.gate_verdict !== 'allow') {
-      verdictBadge = ` <span class="verdict ${esc(t.gate_verdict)}">${esc(t.gate_verdict)}${t.gate_rule ? ' · ' + esc(t.gate_rule) : ''}</span>`;
-    }
-
-    const tcHtml = toolCalls.length ? toolCalls.map(tc => {
-      let pretty = tc.arguments;
-      try { pretty = JSON.stringify(JSON.parse(tc.arguments), null, 2); } catch {}
-      return `<details style="margin:4px 0"><summary style="font-size:11px;cursor:pointer">🔧 <code>${esc(tc.name)}</code></summary><pre style="font-size:11px;max-height:160px">${esc(pretty)}</pre></details>`;
-    }).join('') : '';
-
-    const trHtml = toolResults.length ? toolResults.map(tr => {
-      const contentStr = typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || '');
-      const er = looksLikeToolError(contentStr);
-      const cls = er.isError ? 'msg tool tool-error-msg' : 'msg tool';
-      const summaryCls = er.isError ? 'tool-error-summary' : '';
-      const excerpt = er.isError ? `<span class="tool-error-excerpt">${esc(er.excerpt || '')}</span>` : '';
-      const callName = (tr._call && tr._call.name) || tr.name || tr.tool_call_id || '?';
-      let argsHtml = '';
-      if (tr._call && tr._call.args) {
-        let argsPretty = tr._call.args;
-        try { argsPretty = JSON.stringify(JSON.parse(tr._call.args), null, 2); } catch {}
-        argsHtml = `<div style="margin:6px 0 2px 0;font-size:10px;color:#57d1e0;text-transform:uppercase;letter-spacing:0.5px">→ called with</div><pre style="font-size:11px;max-height:160px;margin:0 0 4px 0">${esc(argsPretty)}</pre><div style="margin:0 0 2px 0;font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:0.5px">→ returned</div>`;
-      }
-      return `<details class="${cls}" style="margin:4px 0"><summary class="${summaryCls}" style="font-size:11px;cursor:pointer">🔧 <code>${esc(callName)}</code>${argsHtml ? '' : ' (result)'}${excerpt}</summary>
-        ${argsHtml}<pre style="font-size:11px;max-height:160px;margin-top:0">${esc(contentStr.slice(0, 4000))}</pre>
-      </details>`;
-    }).join('') : '';
-
-    const sum = _conversationTurnSummary(t, body, userText, assistantText, toolCalls, toolResults);
-    const isOpen = expandedSet.has(i);
-    const summaryLine = `<span style="color:#888;font-size:11px">${esc(sum.snippet || '(no user msg)')}</span>${sum.outcome ? `<span style="color:#aaa;font-size:11px">${esc(sum.outcome)}</span>` : ''}`;
-    return `<details id="turn-${i}" class="turn" data-turn-idx="${i}" data-has-error="${hasError ? 1 : 0}" data-has-tool="${hasTool ? 1 : 0}" ${isOpen ? 'open' : ''}>
-      <summary class="turn-header" style="cursor:pointer;list-style:none;display:flex;flex-wrap:wrap;align-items:baseline;gap:6px">
-        <span style="color:#888;font-size:10px;width:10px">▸</span>
-        <strong>Turn ${i + 1}</strong>${t.turn_index && t.turn_index !== (i + 1) ? `<span style="color:#666;font-size:10px"> (msg #${num(t.turn_index)})</span>` : ''}
-        <span>· ${fmt(t.ts)}</span>
-        <span>· <code>${esc(t.model || '')}</code></span>
-        <span>· ${num(t.total_tokens || 0)} tok</span>
-        <span>· ${Math.round(t.duration_ms || 0)}ms</span>
-        ${verdictBadge}
-        <span style="flex:1;min-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${summaryLine}</span>
-        <a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(t.id)}')" style="color:#57d1e0;font-size:11px;margin-left:auto">open ${esc(t.id.slice(0,8))}</a>
+  const totalTok = turns.reduce((s, t) => s + (t.total_tokens || 0), 0);
+  const models = [...new Set(turns.map(t => t.model).filter(Boolean))];
+  const clients = [...new Set(turns.map(t => t.client_app || t.client_ip).filter(Boolean))];
+  const span = turns.length > 1 ? fmtSpan(turns[turns.length - 1].ts - turns[0].ts) : '—';
+  const nErr = turns.filter(t => (t.status && t.status >= 400) || t.error).length;
+  const rows = turns.map((t, i) => {
+    const cache = t.cache_verdict === 'hit' ? '<span class="cv-badge hit">⚡ cache</span>'
+      : t.cache_verdict === 'partial' ? '<span class="cv-badge partial">⚡ partial</span>' : '';
+    const verd = (t.gate_verdict && t.gate_verdict !== 'allow')
+      ? `<span class="verdict ${esc(t.gate_verdict)}">${esc(t.gate_verdict)}${t.gate_rule ? ' · ' + esc(t.gate_rule) : ''}</span>` : '';
+    const st = t.status == null ? '<span class="cv-live">live</span>'
+      : ((t.status >= 400 || t.error) ? `<span class="cv-err">${esc(String(t.status || 'err'))}</span>`
+        : `<span class="cv-ok">${esc(String(t.status))}</span>`);
+    return `<details class="conv-turn" data-rid="${esc(t.id)}" data-idx="${i}" ontoggle="convTurnToggle(this)">
+      <summary class="conv-turn-h">
+        <span class="ct-n">Turn ${i + 1}</span>
+        <span class="ct-meta">${fmt(t.ts)} · <code>${esc(t.model || '')}</code> · ${num(t.total_tokens || 0)} tok · ${Math.round(t.duration_ms || 0)}ms</span>
+        ${st} ${cache} ${verd} ${t.has_images ? '<span title="vision request">🖼</span>' : ''}
+        <a href="#" class="ct-open" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(t.id)}')">open ${esc(t.id.slice(0, 8))}</a>
       </summary>
-      <div style="margin-top:8px">
-        ${trHtml}
-        ${userText ? `<div class="msg user"><div class="role">user</div>${esc(userText.slice(0, 4000))}${userText.length > 4000 ? '\n…' : ''}</div>` : ''}
-        ${assistantText ? `<div class="msg assistant"><div class="role">assistant</div>${esc(assistantText.slice(0, 4000))}${assistantText.length > 4000 ? '\n…' : ''}</div>` : ''}
-        ${tcHtml}
-      </div>
+      <div class="conv-turn-body"><div class="ct-loading">Loading turn…</div></div>
     </details>`;
   }).join('');
-
-  const tocHtml = meta.map((m, i) => {
-    const { t, userText, assistantText, toolCalls, toolResults, hasError, hasTool } = m;
-    const sum = _conversationTurnSummary(t, m.body, userText, assistantText, toolCalls, toolResults);
-    const snippet = sum.snippet || sum.outcome.replace(/^[^A-Za-z0-9]+/, '') || '(no msg)';
-    const verdict = t.gate_verdict && t.gate_verdict !== 'allow' ? t.gate_verdict : '';
-    const icons = [
-      hasTool ? `🔧${toolCalls.length}` : '',
-      hasError ? `<span class="err">⚠</span>` : '',
-      verdict ? `<span class="verdict ${esc(verdict)}" style="font-size:9px;padding:0 4px">${esc(verdict[0].toUpperCase())}</span>` : '',
-    ].filter(Boolean).join(' ');
-    return `<li><a href="#" class="conv-toc-item" data-turn-idx="${i}" data-has-error="${hasError ? 1 : 0}" data-has-tool="${hasTool ? 1 : 0}" title="${esc(snippet)}">
-      <span class="toc-num">T${i + 1}</span>
-      <span class="toc-snippet">${esc(snippet)}</span>
-      <span class="toc-icons">${icons}</span>
-    </a></li>`;
-  }).join('');
-
-  const layout = turns.length > 1 ? `
-    <div class="conv-layout">
-      <aside class="conv-toc">
-        <div class="conv-toc-controls">
-          <input type="text" placeholder="Search turns…" oninput="convSearch(this.value)">
-          <div class="conv-filter-row">
-            <button data-filter="all" class="active" onclick="convFilter('all', this)">All</button>
-            <button data-filter="error" onclick="convFilter('error', this)">⚠ Errors</button>
-            <button data-filter="tool" onclick="convFilter('tool', this)">🔧 Tools</button>
-          </div>
-          <div class="conv-jump-row">
-            <button onclick="convJumpTop()" title="Scroll to top">↑ Top</button>
-            <button onclick="convJumpError()" title="Jump to next error">⚠ Next err</button>
-            <button onclick="convToggleAll('${esc(cid)}', true)" title="Expand all turns">＋ All</button>
-            <button onclick="convToggleAll('${esc(cid)}', false)" title="Collapse all turns">－ All</button>
-          </div>
-          <div class="conv-toc-pager"></div>
-        </div>
-        <ol class="conv-toc-list">${tocHtml}</ol>
-      </aside>
-      <div class="conv-turns">
-        <div class="conv-pager"></div>
-        ${turnHtml}
+  box.innerHTML = `
+    <div class="conv-detail-head">
+      <button class="conv-back" onclick="convBack()">← Conversations</button>
+      <div class="conv-head-main">
+        <div class="conv-head-title"><code>${esc(cid)}</code></div>
+        <div class="conv-head-sub">${turns.length} turn${turns.length === 1 ? '' : 's'} · ${num(totalTok)} tok · ${esc(models.slice(0, 3).join(', ')) || '—'} · ${esc(clients.slice(0, 2).join(', '))} · span ${span}${nErr ? ` · <span class="cv-err">${nErr} error${nErr === 1 ? '' : 's'}</span>` : ''}</div>
       </div>
+      <button class="conv-expand-all" onclick="convExpandAll()">Expand all</button>
     </div>
-  ` : turnHtml;
-
-  $('conv-detail').innerHTML = `
-    <div class="stats-section">
-      <h2>Conversation <code style="font-size:13px">${esc(cid)}</code> · ${turns.length} turn${turns.length === 1 ? '' : 's'}</h2>
-      ${layout}
-    </div>
-  `;
-  for (const a of $('conv-detail').querySelectorAll('.conv-toc-item')) {
-    a.addEventListener('click', (e) => {
-      e.preventDefault();
-      convJumpTo(+a.dataset.turnIdx);
-    });
-  }
-  // Initialize pagination state. Default to last page so most-recent turns are visible.
-  _convState = { cid, perPage: 25, page: 0, filter: 'all', search: '', total: turns.length };
-  if (turns.length > _convState.perPage) {
-    _convState.page = Math.ceil(turns.length / _convState.perPage) - 1;
-  }
-  _applyConvVisibility();
-  _convSetupScrollSpy();
-  $('conv-detail').scrollIntoView({ behavior: 'smooth', block: 'start' });
+    <div class="conv-turns-list">${rows || '<div style="padding:22px;color:#888">No turns in this conversation.</div>'}</div>`;
+  const dets = [...box.querySelectorAll('details.conv-turn')];
+  dets.slice(-2).forEach(el => { el.open = true; convTurnToggle(el); });
+  box.scrollTop = 0;
 }
-
-let _convState = null;
-
-function _convMatches(el, filter, q) {
-  if (filter === 'error' && el.dataset.hasError !== '1') return false;
-  if (filter === 'tool' && el.dataset.hasTool !== '1') return false;
-  if (q && !((el.textContent || '').toLowerCase().includes(q))) return false;
-  return true;
+function convBack() { _convsPage = _convReturnPage; loadConversations(); }
+function convExpandAll() {
+  for (const el of $('convs').querySelectorAll('details.conv-turn')) { if (!el.open) { el.open = true; convTurnToggle(el); } }
 }
-
-function _applyConvVisibility() {
-  if (!_convState) return;
-  const root = $('conv-detail');
-  if (!root) return;
-  const { perPage, page, filter, search } = _convState;
-  const q = (search || '').trim().toLowerCase();
-  const turnEls = [...root.querySelectorAll('details.turn')];
-  const tocItems = [...root.querySelectorAll('.conv-toc-item')];
-
-  const matchIdxs = [];
-  turnEls.forEach((el, i) => { if (_convMatches(el, filter, q)) matchIdxs.push(i); });
-
-  const totalPages = Math.max(1, Math.ceil(matchIdxs.length / perPage));
-  if (_convState.page >= totalPages) _convState.page = totalPages - 1;
-  if (_convState.page < 0) _convState.page = 0;
-  const curPage = _convState.page;
-  const start = curPage * perPage;
-  const visibleIdxs = new Set(matchIdxs.slice(start, start + perPage));
-
-  turnEls.forEach((el, i) => { el.style.display = visibleIdxs.has(i) ? '' : 'none'; });
-  tocItems.forEach(a => {
-    const i = +a.dataset.turnIdx;
-    const matched = matchIdxs.includes(i);
-    a.parentElement.style.display = matched ? '' : 'none';
-    a.classList.toggle('off-page', matched && !visibleIdxs.has(i));
-  });
-
-  const pager = root.querySelector('.conv-pager');
-  if (pager) {
-    if (matchIdxs.length <= perPage) {
-      pager.style.display = 'none';
-      pager.innerHTML = '';
-    } else {
-      pager.style.display = '';
-      pager.innerHTML = _convPagerHtml(curPage, totalPages, matchIdxs.length, perPage);
-      for (const b of pager.querySelectorAll('button[data-page]')) {
-        b.addEventListener('click', () => { _convGoToPage(+b.dataset.page); });
-      }
-      const sel = pager.querySelector('select.per-page');
-      if (sel) sel.addEventListener('change', () => {
-        _convState.perPage = +sel.value;
-        _convState.page = 0;
-        _applyConvVisibility();
-      });
-    }
-  }
-  const tocPager = root.querySelector('.conv-toc-pager');
-  if (tocPager) {
-    tocPager.textContent = totalPages > 1 ? `Page ${curPage + 1} / ${totalPages} · ${matchIdxs.length} turn${matchIdxs.length === 1 ? '' : 's'}` : '';
+async function convTurnToggle(el) {
+  if (!el.open || el.dataset.loaded) return;
+  el.dataset.loaded = '1';
+  const bodyEl = el.querySelector('.conv-turn-body');
+  try {
+    const t = await (await fetch('/__proxy/api/requests/' + encodeURIComponent(el.dataset.rid))).json();
+    bodyEl.innerHTML = _renderTurnContent(t);
+  } catch {
+    bodyEl.innerHTML = '<div class="ct-err">Failed to load this turn.</div>';
+    el.dataset.loaded = '';
   }
 }
-
-function _convGoToPage(p) {
-  if (!_convState) return;
-  _convState.page = p;
-  _applyConvVisibility();
-  const first = $('conv-detail').querySelector('details.turn:not([style*="display: none"])');
-  if (first) first.scrollIntoView({ behavior: 'smooth', block: 'start' });
-}
-
-function _convPagerHtml(page, totalPages, totalMatches, perPage) {
-  const pages = [];
-  for (let i = 0; i < totalPages; i++) {
-    if (i < 2 || i >= totalPages - 2 || Math.abs(i - page) <= 1) {
-      pages.push(i);
-    } else if (pages[pages.length - 1] !== '…') {
-      pages.push('…');
-    }
+// Render one turn's transcript from a /requests/{id} detail. Reuses the shared response helpers.
+function _renderTurnContent(t) {
+  if (t && t._pii_redacted && !t.request_body && !t.response_body && !t.stream_chunks) {
+    return '<div class="ct-redacted">🔒 Redacted — body not viewable from this network.</div>';
   }
-  const btns = pages.map(p => p === '…'
-    ? `<span class="pager-gap">…</span>`
-    : `<button data-page="${p}" class="${p === page ? 'active' : ''}">${p + 1}</button>`).join('');
-  const perPageSel = `<select class="per-page" title="Turns per page">
-    ${[10, 25, 50, 100].map(n => `<option value="${n}" ${n === perPage ? 'selected' : ''}>${n}/page</option>`).join('')}
-  </select>`;
-  return `
-    <button data-page="${Math.max(0, page - 1)}" ${page === 0 ? 'disabled' : ''}>« Prev</button>
-    ${btns}
-    <button data-page="${Math.min(totalPages - 1, page + 1)}" ${page >= totalPages - 1 ? 'disabled' : ''}>Next »</button>
-    ${perPageSel}
-    <span class="pager-info">${totalMatches} match${totalMatches === 1 ? '' : 'es'}</span>
-  `;
-}
-
-function convToggleAll(cid, open) {
-  for (const el of $('conv-detail').querySelectorAll('details.turn')) {
-    if (open) el.setAttribute('open', '');
-    else el.removeAttribute('open');
-  }
-}
-
-function convJumpTo(i) {
-  // If the target is filtered out or on a different page, switch first.
-  if (_convState) {
-    const root = $('conv-detail');
-    const turnEls = [...root.querySelectorAll('details.turn')];
-    const q = (_convState.search || '').trim().toLowerCase();
-    const matchIdxs = [];
-    turnEls.forEach((el, j) => { if (_convMatches(el, _convState.filter, q)) matchIdxs.push(j); });
-    let pos = matchIdxs.indexOf(i);
-    if (pos < 0) {
-      // Target doesn't match current filter — clear filter and search to reveal it.
-      _convState.filter = 'all';
-      _convState.search = '';
-      const si = root.querySelector('.conv-toc-controls input');
-      if (si) si.value = '';
-      for (const b of root.querySelectorAll('.conv-filter-row button')) b.classList.toggle('active', b.dataset.filter === 'all');
-      pos = i;
-    }
-    const targetPage = Math.floor(pos / _convState.perPage);
-    if (targetPage !== _convState.page) {
-      _convState.page = targetPage;
-    }
-    _applyConvVisibility();
-  }
-  const el = document.getElementById(`turn-${i}`);
-  if (!el) return;
-  el.setAttribute('open', '');
-  el.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  el.classList.remove('turn-flash');
-  void el.offsetWidth;
-  el.classList.add('turn-flash');
-  setTimeout(() => el.classList.remove('turn-flash'), 1000);
-}
-
-function convJumpTop() {
-  const scroller = $('convs');
-  if (scroller) scroller.scrollTo({ top: 0, behavior: 'smooth' });
-}
-
-function convJumpError() {
-  const errs = [...document.querySelectorAll('#conv-detail details.turn[data-has-error="1"]')];
-  if (!errs.length) return;
-  const scroller = $('convs');
-  const sTop = scroller ? scroller.getBoundingClientRect().top : 0;
-  const next = errs.find(el => el.getBoundingClientRect().top > sTop + 60) || errs[0];
-  convJumpTo(+next.dataset.turnIdx);
-}
-
-function convFilter(kind, btn) {
-  if (!_convState) return;
-  _convState.filter = kind;
-  _convState.page = 0;
-  if (btn) {
-    for (const b of $('conv-detail').querySelectorAll('.conv-filter-row button')) b.classList.toggle('active', b === btn);
-  }
-  _applyConvVisibility();
-}
-
-function convSearch(q) {
-  if (!_convState) return;
-  _convState.search = q || '';
-  _convState.page = 0;
-  _applyConvVisibility();
-}
-
-function _convSetupScrollSpy() {
-  const root = $('conv-detail');
-  const scroller = $('convs');
-  if (!root || !scroller) return;
-  const turns = [...root.querySelectorAll('details.turn')];
-  const tocItems = [...root.querySelectorAll('.conv-toc-item')];
-  if (!turns.length || !tocItems.length) return;
-  const update = () => {
-    const threshold = scroller.getBoundingClientRect().top + 80;
-    let activeIdx = turns[0].dataset.turnIdx;
-    for (const el of turns) {
-      if (el.style.display === 'none') continue;
-      if (el.getBoundingClientRect().top <= threshold) activeIdx = el.dataset.turnIdx;
-      else break;
-    }
-    for (const a of tocItems) a.classList.toggle('current', a.dataset.turnIdx === activeIdx);
-  };
-  // Replace any prior listener so re-renders don't pile up.
-  if (scroller._convSpy) scroller.removeEventListener('scroll', scroller._convSpy);
-  scroller._convSpy = update;
-  scroller.addEventListener('scroll', update, { passive: true });
-  update();
+  let body = null; try { body = JSON.parse(t.request_body || ''); } catch {}
+  const msgs = (body && body.messages) || [];
+  const userMsgs = msgs.filter(m => m && m.role === 'user');
+  const lastUser = userMsgs[userMsgs.length - 1];
+  const userText = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content, null, 2)) : '';
+  let assistantText = '', toolCalls = [];
+  if (t.stream_chunks) { assistantText = reconstructStream(t.stream_chunks); toolCalls = analyzeResponse(null, t.stream_chunks).tool_calls; }
+  else if (t.response_body) { const a = analyzeResponse(t.response_body, null); assistantText = a.content; toolCalls = a.tool_calls; }
+  const tcMap = {};
+  for (const m of msgs) { if (m && m.role === 'assistant' && Array.isArray(m.tool_calls)) { for (const tc of m.tool_calls) { if (tc && tc.id && tc.function) tcMap[tc.id] = { name: tc.function.name, args: tc.function.arguments }; } } }
+  const toolResults = msgs.filter(m => m && m.role === 'tool').map(m => ({ ...m, _call: m.tool_call_id ? tcMap[m.tool_call_id] : null }));
+  const trHtml = toolResults.map(tr => {
+    const c = typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || '');
+    const er = looksLikeToolError(c);
+    const name = (tr._call && tr._call.name) || tr.name || tr.tool_call_id || '?';
+    let argsHtml = '';
+    if (tr._call && tr._call.args) { let ap = tr._call.args; try { ap = JSON.stringify(JSON.parse(tr._call.args), null, 2); } catch {} argsHtml = `<div class="ct-lbl">→ called with</div><pre>${esc(ap)}</pre><div class="ct-lbl">→ returned</div>`; }
+    return `<details class="msg tool${er.isError ? ' tool-error-msg' : ''}"><summary>🔧 <code>${esc(name)}</code>${er.isError ? ' <span class="ct-err">error</span>' : ''}</summary>${argsHtml}<pre>${esc(c.slice(0, 6000))}</pre></details>`;
+  }).join('');
+  const tcHtml = toolCalls.map(tc => { let p = tc.arguments; try { p = JSON.stringify(JSON.parse(tc.arguments), null, 2); } catch {} return `<details class="msg tool"><summary>🔧 <code>${esc(tc.name || '?')}</code></summary><pre>${esc(p || '')}</pre></details>`; }).join('');
+  const out = `${trHtml}
+    ${userText ? `<div class="msg user"><div class="role">user</div>${esc(userText.slice(0, 8000))}${userText.length > 8000 ? '\n…(truncated — use “open” for full)' : ''}</div>` : ''}
+    ${assistantText ? `<div class="msg assistant"><div class="role">assistant</div>${esc(assistantText.slice(0, 8000))}${assistantText.length > 8000 ? '\n…(truncated — use “open” for full)' : ''}</div>` : ''}
+    ${tcHtml}`;
+  return out.trim() || '<div class="ct-empty">No renderable content for this turn.</div>';
 }
 
 let rulesEditorBaseline = '';
