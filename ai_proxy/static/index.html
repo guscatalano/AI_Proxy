@@ -9,138 +9,138 @@
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { font: 13px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; margin: 0; background: #0f1116; color: #e6e6e6; height: 100vh; display: flex; flex-direction: column; }
-  header { padding: 8px 14px; background: #1a1d26; border-bottom: 1px solid #2a2e3a; display: flex; gap: 12px; align-items: center; flex: 0 0 auto; }
+  body { font: 13px/1.45 -apple-system, system-ui, "Segoe UI", sans-serif; margin: 0; background: #0c0f15; color: #e9edf4; height: 100vh; display: flex; flex-direction: column; }
+  header { padding: 8px 14px; background: #141922; border-bottom: 1px solid #262d38; display: flex; gap: 12px; align-items: center; flex: 0 0 auto; }
   header h1 { font-size: 13px; margin: 0; font-weight: 600; letter-spacing: 0.5px; }
   .tabs { display: flex; gap: 2px; }
-  .tab { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  .tab.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
+  .tab { background: #262d38; color: #aaa; border: 1px solid #313a48; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .tab.active { background: #3a4a6a; color: #e9edf4; border-color: #4a5a7a; }
   header .meta { color: #888; font-size: 12px; }
-  header .meta code { background: #2a2e3a; padding: 1px 6px; border-radius: 3px; color: #d8dee9; }
-  header button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  header button:hover { background: #3a3e4a; }
+  header .meta code { background: #262d38; padding: 1px 6px; border-radius: 3px; color: #c9d3e1; }
+  header button { background: #262d38; color: #e9edf4; border: 1px solid #313a48; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  header button:hover { background: #313a48; }
   header label { color: #888; font-size: 12px; user-select: none; cursor: pointer; }
   #main { display: flex; flex: 1; min-height: 0; }
-  #list { width: 48%; min-width: 320px; overflow: auto; border-right: 1px solid #2a2e3a; }
-  #requests-pager { position: sticky; top: 0; background: #0f1116; padding: 6px 12px; border-bottom: 1px solid #2a2e3a; z-index: 5; }
+  #list { width: 48%; min-width: 320px; overflow: auto; border-right: 1px solid #262d38; }
+  #requests-pager { position: sticky; top: 0; background: #0c0f15; padding: 6px 12px; border-bottom: 1px solid #262d38; z-index: 5; }
   table { width: 100%; border-collapse: collapse; }
-  thead th { position: sticky; top: 0; background: #1a1d26; color: #aaa; font-weight: normal; font-size: 11px; text-align: left; padding: 6px 8px; border-bottom: 1px solid #2a2e3a; text-transform: uppercase; letter-spacing: 0.5px; z-index: 1; }
+  thead th { position: sticky; top: 0; background: #141922; color: #aaa; font-weight: normal; font-size: 11px; text-align: left; padding: 6px 8px; border-bottom: 1px solid #262d38; text-transform: uppercase; letter-spacing: 0.5px; z-index: 1; }
   tbody td { padding: 5px 8px; border-bottom: 1px solid #1f232c; font-size: 12px; vertical-align: top; }
   tbody tr { cursor: pointer; }
   tbody tr:hover td { background: #161922; }
   tbody tr.selected td { background: #243049 !important; color: #ffffff; }
-  tbody tr.selected td:first-child { box-shadow: inset 4px 0 0 #88c0d0; padding-left: 12px; }
+  tbody tr.selected td:first-child { box-shadow: inset 4px 0 0 #57d1e0; padding-left: 12px; }
   td.path { font-family: ui-monospace, "SF Mono", Consolas, monospace; max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .app-badge { display: inline-block; padding: 1px 6px; margin-top: 2px; border-radius: 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; }
-  .app-badge.app-claude-code { background: #4a3a2a; color: #ebcb8b; border-color: #6a5a3a; }
-  .app-badge.app-vscode-copilot, .app-badge.app-github-copilot, .app-badge.app-vscode { background: #1a3050; color: #88c0d0; border-color: #2a4060; }
+  .app-badge { display: inline-block; padding: 1px 6px; margin-top: 2px; border-radius: 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; background: #262d38; color: #aaa; border: 1px solid #313a48; }
+  .app-badge.app-claude-code { background: #4a3a2a; color: #f0c674; border-color: #6a5a3a; }
+  .app-badge.app-vscode-copilot, .app-badge.app-github-copilot, .app-badge.app-vscode { background: #1a3050; color: #57d1e0; border-color: #2a4060; }
   .app-badge.app-cursor { background: #3a2a4a; color: #c8a8d8; border-color: #5a3a6a; }
   .app-badge.app-anthropic-sdk, .app-badge.app-anthropic-python, .app-badge.app-anthropic-node { background: #4a2e3a; color: #d8a8b8; border-color: #6a3e4a; }
-  .app-badge.app-openai-sdk, .app-badge.app-openai-python, .app-badge.app-openai-node { background: #2a4a3a; color: #a3be8c; border-color: #3a6a4a; }
+  .app-badge.app-openai-sdk, .app-badge.app-openai-python, .app-badge.app-openai-node { background: #2a4a3a; color: #68d391; border-color: #3a6a4a; }
   .app-badge.app-langchain, .app-badge.app-llamaindex { background: #2a3a4a; color: #b8c8d8; border-color: #3a4a5a; }
-  .app-badge.app-unknown { background: #2a2e3a; color: #666; }
-  .app-badge.app-shadow { background: #2a3a2a; color: #a3be8c; border-color: #3a4a3a; }
+  .app-badge.app-unknown { background: #262d38; color: #666; }
+  .app-badge.app-shadow { background: #2a3a2a; color: #68d391; border-color: #3a4a3a; }
   .app-badge.app-browser-firefox, .app-badge.app-browser-chrome, .app-badge.app-browser-edge, .app-badge.app-browser-safari, .app-badge.app-browser-other { background: #2a2630; color: #b8a8d0; border-color: #3a3640; }
-  .shadow-section { background: #1a1d26; border: 1px solid #2a4a3a; border-left: 3px solid #5e8c66; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
-  .shadow-section h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; color: #88c0d0; letter-spacing: 0.5px; }
-  .shadow-row { padding: 8px 0; border-top: 1px solid #2a2e3a; }
+  .shadow-section { background: #141922; border: 1px solid #2a4a3a; border-left: 3px solid #5e8c66; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
+  .shadow-section h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; color: #57d1e0; letter-spacing: 0.5px; }
+  .shadow-row { padding: 8px 0; border-top: 1px solid #262d38; }
   .shadow-row:first-of-type { border-top: none; }
   .shadow-meta { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; font-size: 12px; }
-  .shadow-meta strong { color: #ebcb8b; }
-  .shadow-status-pending { color: #ebcb8b; }
-  .shadow-status-ok { color: #a3be8c; }
-  .shadow-status-err { color: #bf616a; }
+  .shadow-meta strong { color: #f0c674; }
+  .shadow-status-pending { color: #f0c674; }
+  .shadow-status-ok { color: #68d391; }
+  .shadow-status-err { color: #f07178; }
   .shadow-back-banner { background: #1a2a1f; border: 1px solid #2e4a3a; border-radius: 6px; padding: 8px 12px; margin-bottom: 14px; font-size: 12px; }
-  .shadow-back-banner a { color: #88c0d0; text-decoration: none; }
+  .shadow-back-banner a { color: #57d1e0; text-decoration: none; }
   .shadow-back-banner a:hover { text-decoration: underline; }
   .pii-banner { background: #2a2030; border: 1px solid #503a60; border-left: 3px solid #b48ead; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; font-size: 12px; color: #d8c8e8; }
   .pii-banner code { background: #1a1426; padding: 1px 6px; border-radius: 3px; }
-  .shadow-cmp { margin-top: 8px; padding: 8px 10px; background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; font-size: 11px; }
-  .cmp-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0 3px 8px; border-left: 2px solid #3a3e4a; align-items: baseline; }
+  .shadow-cmp { margin-top: 8px; padding: 8px 10px; background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; font-size: 11px; }
+  .cmp-row { display: flex; flex-wrap: wrap; gap: 8px; padding: 3px 0 3px 8px; border-left: 2px solid #313a48; align-items: baseline; }
   .cmp-row + .cmp-row { margin-top: 2px; }
   .cmp-row .cmp-label { color: #888; min-width: 110px; }
-  .cmp-row strong { color: #d8dee9; font-weight: 600; }
+  .cmp-row strong { color: #c9d3e1; font-weight: 600; }
   .cmp-row.cmp-good { border-left-color: #5e8c66; }
-  .cmp-row.cmp-warn { border-left-color: #ebcb8b; }
-  .cmp-row.cmp-bad  { border-left-color: #bf616a; }
+  .cmp-row.cmp-warn { border-left-color: #f0c674; }
+  .cmp-row.cmp-bad  { border-left-color: #f07178; }
   .compare-view { padding: 14px 18px; }
   .compare-view .compare-header { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; flex-wrap: wrap; }
-  .compare-view .compare-header button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  .compare-view .compare-header h2 { margin: 0; font-size: 14px; color: #e6e6e6; }
+  .compare-view .compare-header button { background: #262d38; color: #e9edf4; border: 1px solid #313a48; padding: 4px 12px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .compare-view .compare-header h2 { margin: 0; font-size: 14px; color: #e9edf4; }
   .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 1100px) { .compare-grid { grid-template-columns: 1fr; } }
-  .compare-col { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; min-width: 0; }
-  .compare-col.compare-primary { border-left: 3px solid #88c0d0; }
+  .compare-col { background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 12px 14px; min-width: 0; }
+  .compare-col.compare-primary { border-left: 3px solid #57d1e0; }
   .compare-col.compare-shadow { border-left: 3px solid #5e8c66; }
   .compare-col h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #aaa; }
   .compare-col .col-title { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
-  .compare-col .col-title strong { font-size: 14px; color: #e6e6e6; }
+  .compare-col .col-title strong { font-size: 14px; color: #e9edf4; }
   .compare-col .col-meta { color: #888; font-size: 11px; margin-bottom: 8px; }
   .compare-col .col-meta span { margin-right: 10px; }
-  .compare-col .text-pane { background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; padding: 10px 12px; font: 12px/1.5 ui-monospace, monospace; max-height: 480px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
+  .compare-col .text-pane { background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 10px 12px; font: 12px/1.5 ui-monospace, monospace; max-height: 480px; overflow: auto; white-space: pre-wrap; word-break: break-word; }
   .compare-col .text-pane.empty { color: #666; font-style: italic; }
-  .compare-col .tool-card { background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px 10px; margin: 6px 0; }
-  .compare-col .tool-card .tool-name { color: #88c0d0; font-weight: 600; font-size: 12px; }
-  .compare-col .tool-card pre { background: #1a1d26; border: 1px solid #2a2e3a; padding: 6px 8px; border-radius: 3px; margin-top: 4px; max-height: 180px; font-size: 11px; }
-  .compare-tools { margin-top: 14px; background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; }
+  .compare-col .tool-card { background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 8px 10px; margin: 6px 0; }
+  .compare-col .tool-card .tool-name { color: #57d1e0; font-weight: 600; font-size: 12px; }
+  .compare-col .tool-card pre { background: #141922; border: 1px solid #262d38; padding: 6px 8px; border-radius: 3px; margin-top: 4px; max-height: 180px; font-size: 11px; }
+  .compare-tools { margin-top: 14px; background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 12px 14px; }
   .compare-tools h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.5px; color: #aaa; }
-  .compare-tool-pair { padding: 8px 0; border-top: 1px solid #2a2e3a; }
+  .compare-tool-pair { padding: 8px 0; border-top: 1px solid #262d38; }
   .compare-tool-pair:first-of-type { border-top: none; }
-  .compare-tool-pair .pair-name { color: #88c0d0; font-weight: 600; margin-bottom: 4px; font-size: 12px; }
-  .compare-tool-pair .pair-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: #2a2e3a; color: #aaa; margin-left: 6px; vertical-align: middle; }
-  .compare-tool-pair .pair-tag.tag-match { background: #2e4a2e; color: #a3be8c; }
-  .compare-tool-pair .pair-tag.tag-diff { background: #4a4020; color: #ebcb8b; }
+  .compare-tool-pair .pair-name { color: #57d1e0; font-weight: 600; margin-bottom: 4px; font-size: 12px; }
+  .compare-tool-pair .pair-tag { font-size: 10px; padding: 1px 6px; border-radius: 3px; background: #262d38; color: #aaa; margin-left: 6px; vertical-align: middle; }
+  .compare-tool-pair .pair-tag.tag-match { background: #2e4a2e; color: #68d391; }
+  .compare-tool-pair .pair-tag.tag-diff { background: #4a4020; color: #f0c674; }
   .compare-tool-pair .pair-tag.tag-only { background: #4a2e2e; color: #e08080; }
   .compare-tool-pair .pair-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-top: 4px; }
-  .compare-tool-pair .pair-grid pre { background: #0f1116; border: 1px solid #2a2e3a; padding: 6px 8px; border-radius: 3px; font-size: 11px; max-height: 200px; }
+  .compare-tool-pair .pair-grid pre { background: #0c0f15; border: 1px solid #262d38; padding: 6px 8px; border-radius: 3px; font-size: 11px; max-height: 200px; }
   .compare-tool-pair .pair-grid .empty { color: #666; font-style: italic; padding: 6px 8px; }
-  td.method { font-weight: 600; color: #88c0d0; }
+  td.method { font-weight: 600; color: #57d1e0; }
   td.ms, td.num { text-align: right; color: #888; font-variant-numeric: tabular-nums; }
   th.num, th.ms { text-align: right; }
   #stats { flex: 1; overflow: auto; padding: 18px; display: none; }
   #stats.show { display: block; }
   #main.stats #list, #main.stats #detail { display: none; }
   .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin-bottom: 22px; }
-  .card { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; }
+  .card { background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 12px 14px; }
   .card .l { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.6px; }
   .card .v { font-size: 22px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .card .s { font-size: 11px; color: #888; margin-top: 2px; }
   .stats-section { margin-bottom: 22px; }
   .stats-section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; margin: 0 0 8px 0; font-weight: 600; }
-  .stats-section table { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; overflow: hidden; }
+  .stats-section table { background: #141922; border: 1px solid #262d38; border-radius: 6px; overflow: hidden; }
   .stats-section th { text-transform: uppercase; letter-spacing: 0.5px; }
   .bar { display: inline-block; height: 6px; background: #4a5a7a; border-radius: 2px; vertical-align: middle; margin-right: 6px; }
   #detail { flex: 1; overflow: auto; padding: 14px 18px; }
   /* Resizable + collapsible detail sidebar (Requests view). */
   #split-handle { flex: 0 0 6px; cursor: col-resize; background: #23262f; position: relative; }
   #split-handle:hover { background: #3a4e6a; }
-  #detail-toggle { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: 20px; height: 34px; background: #2a2e3a; color: #9aa4b2; border: 1px solid #3a3e4a; border-radius: 4px; cursor: pointer; font-size: 13px; line-height: 1; z-index: 6; padding: 0; }
-  #detail-toggle:hover { background: #3a4e6a; color: #e6e6e6; }
+  #detail-toggle { position: absolute; top: 10px; left: 50%; transform: translateX(-50%); width: 20px; height: 34px; background: #262d38; color: #9aa4b2; border: 1px solid #313a48; border-radius: 4px; cursor: pointer; font-size: 13px; line-height: 1; z-index: 6; padding: 0; }
+  #detail-toggle:hover { background: #3a4e6a; color: #e9edf4; }
   #main.detail-collapsed #detail { display: none; }
   #main.detail-collapsed #list { flex: 1 1 auto; width: auto !important; }
   #main.stats #split-handle, #main.audit #split-handle, #main.convs #split-handle, #main.system #split-handle, #main.setup #split-handle, #main.chat #split-handle, #main.tasks #split-handle, #main.bench #split-handle { display: none; }
-  .summary { background: #1a1d26; border: 1px solid #2a2e3a; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
+  .summary { background: #141922; border: 1px solid #262d38; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
   .summary .row { margin: 3px 0; }
   .summary .label { color: #888; display: inline-block; width: 80px; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
   .section { margin-bottom: 16px; }
   .section h3 { margin: 0 0 6px 0; font-size: 11px; text-transform: uppercase; color: #aaa; letter-spacing: 1px; font-weight: 600; }
-  pre { background: #1a1d26; border: 1px solid #2a2e3a; padding: 10px 12px; border-radius: 4px; overflow: auto; max-height: 480px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, "SF Mono", Consolas, monospace; margin: 0; }
-  .status-2 { color: #a3be8c; }
-  .status-3 { color: #ebcb8b; }
-  .status-4, .status-5, .status-0 { color: #bf616a; }
-  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; background: #3a4a6a; font-size: 10px; margin-left: 6px; color: #d8dee9; }
+  pre { background: #141922; border: 1px solid #262d38; padding: 10px 12px; border-radius: 4px; overflow: auto; max-height: 480px; white-space: pre-wrap; word-break: break-word; font: 12px/1.45 ui-monospace, "SF Mono", Consolas, monospace; margin: 0; }
+  .status-2 { color: #68d391; }
+  .status-3 { color: #f0c674; }
+  .status-4, .status-5, .status-0 { color: #f07178; }
+  .badge { display: inline-block; padding: 1px 6px; border-radius: 3px; background: #3a4a6a; font-size: 10px; margin-left: 6px; color: #c9d3e1; }
   .empty { color: #666; padding: 40px; text-align: center; }
-  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #ebcb8b; margin-right: 4px; vertical-align: middle; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #f0c674; margin-right: 4px; vertical-align: middle; }
   .dot.live { animation: pulse 1.2s infinite; }
   @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
   code { font-family: ui-monospace, "SF Mono", Consolas, monospace; }
   .reconstructed { background: #1a2a1a; border-color: #2e4a2e; }
   .stream-text { white-space: pre-wrap; }
   .verdict { display: inline-block; padding: 1px 6px; border-radius: 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.5px; text-transform: uppercase; }
-  .verdict.allow { background: #2e4a2e; color: #a3be8c; }
+  .verdict.allow { background: #2e4a2e; color: #68d391; }
   .verdict.block { background: #4a2e2e; color: #e08080; }
-  .verdict.warn { background: #4a4020; color: #ebcb8b; }
-  .verdict.rewrite { background: #2e3e5a; color: #88c0d0; }
+  .verdict.warn { background: #4a4020; color: #f0c674; }
+  .verdict.rewrite { background: #2e3e5a; color: #57d1e0; }
   .verdict.intercept { background: #4a3a5a; color: #c8a8d8; }
   tr.row-block td { background: #2a1818 !important; }
   tr.row-warn td { background: #2a2418 !important; }
@@ -234,31 +234,31 @@
   @media(max-width:720px){.pf-grid{grid-template-columns:1fr}}
   /* Chat tab: 2-pane layout with composer pinned at bottom */
   #chat.show { padding: 0; flex-direction: column; height: 100%; }
-  #chat .chat-header { padding: 10px 14px; border-bottom: 1px solid #2a2e3a; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; background: #14171f; }
-  #chat .chat-header select { background: #1a1d26; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 4px; padding: 4px 8px; font: 12px ui-monospace, monospace; }
-  #chat .chat-header button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  #chat .chat-header button:hover { background: #3a3e4a; }
+  #chat .chat-header { padding: 10px 14px; border-bottom: 1px solid #262d38; display: flex; gap: 8px; align-items: center; flex: 0 0 auto; background: #14171f; }
+  #chat .chat-header select { background: #141922; color: #e9edf4; border: 1px solid #262d38; border-radius: 4px; padding: 4px 8px; font: 12px ui-monospace, monospace; }
+  #chat .chat-header button { background: #262d38; color: #e9edf4; border: 1px solid #313a48; padding: 4px 10px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  #chat .chat-header button:hover { background: #313a48; }
   #chat .chat-scroll { flex: 1; overflow-y: auto; padding: 14px 18px; }
   #chat .chat-empty { color: #666; text-align: center; padding: 60px 20px; font-size: 13px; }
   #chat .cmsg { margin: 0 0 12px; max-width: 80%; }
   #chat .cmsg.user { margin-left: auto; }
   #chat .cmsg .role { font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; color: #888; margin-bottom: 3px; padding: 0 4px; }
-  #chat .cmsg.user .role { text-align: right; color: #88c0d0; }
-  #chat .cmsg.model .role { color: #a3be8c; }
+  #chat .cmsg.user .role { text-align: right; color: #57d1e0; }
+  #chat .cmsg.model .role { color: #68d391; }
   #chat .cmsg.system .role { color: #b48ead; }
   #chat .cmsg .bubble { padding: 9px 13px; border-radius: 12px; font-size: 14px; line-height: 1.5; white-space: pre-wrap; word-wrap: break-word; }
   #chat .cmsg.user .bubble { background: #2a3e5a; color: #fff; border-bottom-right-radius: 4px; }
-  #chat .cmsg.model .bubble { background: #1a261f; color: #d8dee9; border: 1px solid #2a3a2a; border-bottom-left-radius: 4px; }
-  #chat .cmsg.system .bubble { background: #1a1d26; color: #aaa; border: 1px dashed #2a2e3a; font-size: 12px; }
+  #chat .cmsg.model .bubble { background: #1a261f; color: #c9d3e1; border: 1px solid #2a3a2a; border-bottom-left-radius: 4px; }
+  #chat .cmsg.system .bubble { background: #141922; color: #aaa; border: 1px dashed #262d38; font-size: 12px; }
   #chat .cmsg.streaming .bubble::after { content: '▌'; color: #5e8c66; animation: chat-blink 1s infinite; margin-left: 2px; }
   @keyframes chat-blink { 50% { opacity: 0 } }
-  #chat .cmsg pre { background: #0a0c12; border: 1px solid #2a2e3a; border-radius: 6px; padding: 10px; margin: 8px 0; overflow-x: auto; font: 12px ui-monospace, monospace; white-space: pre; }
-  #chat .cmsg code:not(pre code) { background: #0f1116; border: 1px solid #2a2e3a; padding: 1px 5px; border-radius: 3px; font: 12px ui-monospace, monospace; color: #88c0d0; }
+  #chat .cmsg pre { background: #0a0c12; border: 1px solid #262d38; border-radius: 6px; padding: 10px; margin: 8px 0; overflow-x: auto; font: 12px ui-monospace, monospace; white-space: pre; }
+  #chat .cmsg code:not(pre code) { background: #0c0f15; border: 1px solid #262d38; padding: 1px 5px; border-radius: 3px; font: 12px ui-monospace, monospace; color: #57d1e0; }
   #chat .cmsg .meta { font-size: 10px; color: #666; margin-top: 4px; padding: 0 4px; }
   #chat .cmsg.user .meta { text-align: right; }
-  #chat .composer { border-top: 1px solid #2a2e3a; padding: 10px 14px; background: #14171f; flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end; }
-  #chat .composer textarea { flex: 1; min-height: 40px; max-height: 220px; resize: none; background: #1a1d26; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 18px; padding: 10px 14px; font: 14px/1.4 inherit; outline: none; }
-  #chat .composer textarea:focus { border-color: #88c0d0; }
+  #chat .composer { border-top: 1px solid #262d38; padding: 10px 14px; background: #14171f; flex: 0 0 auto; display: flex; gap: 8px; align-items: flex-end; }
+  #chat .composer textarea { flex: 1; min-height: 40px; max-height: 220px; resize: none; background: #141922; color: #e9edf4; border: 1px solid #262d38; border-radius: 18px; padding: 10px 14px; font: 14px/1.4 inherit; outline: none; }
+  #chat .composer textarea:focus { border-color: #57d1e0; }
   #chat .composer button { border: none; border-radius: 8px; padding: 10px 16px; background: #3a5a7a; color: #fff; font-weight: 600; cursor: pointer; min-width: 64px; }
   #chat .composer button:hover { background: #4a6a8a; }
   #chat .composer button:disabled { opacity: 0.4; cursor: not-allowed; }
@@ -291,7 +291,7 @@
 
     /* Stack list on top, detail below — only one shown at a time. */
     #main { flex-direction: column; }
-    #list { width: 100%; min-width: 0; max-width: 100%; border-right: none; border-bottom: 1px solid #2a2e3a; }
+    #list { width: 100%; min-width: 0; max-width: 100%; border-right: none; border-bottom: 1px solid #262d38; }
     /* No drag-resize on mobile (stacked layout). */
     #split-handle { display: none; }
     #main.detail-collapsed #detail { display: block; }
@@ -309,8 +309,8 @@
       padding: 0 14px;
       background: rgba(26,29,38,0.96);
       backdrop-filter: blur(8px);
-      border-bottom: 1px solid #2a2e3a;
-      color: #88c0d0;
+      border-bottom: 1px solid #262d38;
+      color: #57d1e0;
       font-weight: 600;
       z-index: 1000;
       cursor: pointer;
@@ -396,46 +396,46 @@
     .cards { grid-template-columns: 1fr; }
     .compare-grid { grid-template-columns: 1fr !important; }
   }
-  .setup-vars { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; }
+  .setup-vars { background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 12px 14px; margin-bottom: 18px; }
   .setup-vars > div { margin: 4px 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
   .setup-vars .label { width: 110px; color: #888; font-size: 11px; text-transform: uppercase; letter-spacing: 0.5px; }
-  .setup-vars code { background: #0f1116; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
-  .setup-vars select { background: #0f1116; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 8px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 12px; min-width: 200px; }
-  .snippet { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; margin-bottom: 14px; overflow: hidden; }
-  .snippet-head { padding: 8px 14px; background: #14171f; border-bottom: 1px solid #2a2e3a; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
+  .setup-vars code { background: #0c0f15; padding: 3px 8px; border-radius: 3px; font-size: 12px; }
+  .setup-vars select { background: #0c0f15; color: #e9edf4; border: 1px solid #313a48; padding: 4px 8px; border-radius: 3px; font-family: ui-monospace, monospace; font-size: 12px; min-width: 200px; }
+  .snippet { background: #141922; border: 1px solid #262d38; border-radius: 6px; margin-bottom: 14px; overflow: hidden; }
+  .snippet-head { padding: 8px 14px; background: #14171f; border-bottom: 1px solid #262d38; display: flex; justify-content: space-between; align-items: center; gap: 12px; }
   .snippet-head h4 { margin: 0; font-size: 13px; }
   .snippet-head .desc { color: #888; font-size: 11px; flex: 1; }
-  .snippet-head button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 3px 10px; border-radius: 3px; cursor: pointer; font-size: 11px; }
-  .snippet-head button:hover { background: #3a3e4a; }
+  .snippet-head button { background: #262d38; color: #e9edf4; border: 1px solid #313a48; padding: 3px 10px; border-radius: 3px; cursor: pointer; font-size: 11px; }
+  .snippet-head button:hover { background: #313a48; }
   .snippet-head button.ok { background: #2e4a2e; border-color: #4a6a4a; }
   .snippet pre { margin: 0; padding: 12px 14px; max-height: 360px; }
-  .gauge { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; }
+  .gauge { background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 12px 14px; }
   .gauge .l { font-size: 11px; color: #888; text-transform: uppercase; letter-spacing: 0.6px; }
   .gauge .v { font-size: 22px; font-weight: 600; margin-top: 4px; font-variant-numeric: tabular-nums; }
   .gauge .s { font-size: 11px; color: #888; margin-top: 2px; }
-  .gauge .bar-bg { height: 6px; background: #0f1116; border-radius: 3px; margin-top: 8px; overflow: hidden; }
-  .gauge .bar-fg { height: 100%; background: linear-gradient(90deg, #5e81ac, #88c0d0); border-radius: 3px; transition: width 200ms; }
-  .gauge .bar-fg.warn { background: linear-gradient(90deg, #d08770, #ebcb8b); }
-  .gauge .bar-fg.crit { background: linear-gradient(90deg, #bf616a, #d08770); }
+  .gauge .bar-bg { height: 6px; background: #0c0f15; border-radius: 3px; margin-top: 8px; overflow: hidden; }
+  .gauge .bar-fg { height: 100%; background: linear-gradient(90deg, #5e81ac, #57d1e0); border-radius: 3px; transition: width 200ms; }
+  .gauge .bar-fg.warn { background: linear-gradient(90deg, #d08770, #f0c674); }
+  .gauge .bar-fg.crit { background: linear-gradient(90deg, #f07178, #d08770); }
   .spark { width: 100%; height: 60px; display: block; margin-top: 8px; }
-  .spark path.line { fill: none; stroke: #88c0d0; stroke-width: 1.5; }
+  .spark path.line { fill: none; stroke: #57d1e0; stroke-width: 1.5; }
   .spark path.fill { fill: rgba(136, 192, 208, 0.12); stroke: none; }
   .pid-list { font-size: 11px; color: #aaa; margin-top: 6px; }
   .pid-list .pid { display: inline-block; margin-right: 8px; }
   .reach-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
-  .reach-dot.ok { background: #a3be8c; }
-  .reach-dot.bad { background: #bf616a; }
-  .suggestion { background: #1a1d26; border: 1px solid #2a2e3a; border-left: 3px solid #5e81ac; padding: 10px 12px; border-radius: 4px; margin-bottom: 10px; }
-  .suggestion.tune { border-left-color: #ebcb8b; }
-  .suggestion.perf { border-left-color: #88c0d0; }
+  .reach-dot.ok { background: #68d391; }
+  .reach-dot.bad { background: #f07178; }
+  .suggestion { background: #141922; border: 1px solid #262d38; border-left: 3px solid #5e81ac; padding: 10px 12px; border-radius: 4px; margin-bottom: 10px; }
+  .suggestion.tune { border-left-color: #f0c674; }
+  .suggestion.perf { border-left-color: #57d1e0; }
   .suggestion.cleanup { border-left-color: #b48ead; }
   .suggestion.policy { border-left-color: #d08770; }
   .suggestion h4 { margin: 0 0 4px 0; font-size: 13px; }
   .suggestion .detail { color: #aaa; font-size: 12px; margin-bottom: 6px; }
   .suggestion pre { font-size: 11px; max-height: 150px; }
-  .turn { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
+  .turn { background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 12px 14px; margin-bottom: 10px; }
   .turn .turn-header { display: flex; gap: 8px; align-items: baseline; font-size: 12px; color: #888; }
-  .turn .turn-header strong { color: #e6e6e6; }
+  .turn .turn-header strong { color: #e9edf4; }
   details.turn > summary > span:first-child::before { content: "▸"; }
   details.turn[open] > summary > span:first-child::before { content: "▾"; }
   details.turn > summary > span:first-child { font-size: 0; }
@@ -443,69 +443,69 @@
   details.turn > summary::-webkit-details-marker { display: none; }
   details.turn > summary:hover { background: #1f2230; }
   .turn .msg { padding: 6px 10px; border-radius: 4px; margin: 4px 0; font-size: 12px; }
-  .turn .msg.user { background: #1a2030; color: #d8dee9; }
-  .turn .msg.assistant { background: #1a261a; color: #d8dee9; }
-  .turn .msg.tool { background: #2a2418; color: #d8dee9; }
+  .turn .msg.user { background: #1a2030; color: #c9d3e1; }
+  .turn .msg.assistant { background: #1a261a; color: #c9d3e1; }
+  .turn .msg.tool { background: #2a2418; color: #c9d3e1; }
   .turn .msg .role { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
   .tool-error-summary { color: #e08080 !important; }
-  .tool-error-summary::before { content: "⚠ "; color: #bf616a; }
+  .tool-error-summary::before { content: "⚠ "; color: #f07178; }
   details.tool-error-msg { background: #2a1818 !important; border: 1px solid #6a3030 !important; }
   details.tool-error-msg pre { background: #1a0e0e; border-color: #4a2020; }
   .tool-error-excerpt { color: #e08080; font-size: 11px; margin-left: 6px; max-width: 600px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-block; vertical-align: middle; }
-  #rules-editor textarea { width: 100%; min-height: 320px; background: #0f1116; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 4px; padding: 10px 12px; font: 12px/1.45 ui-monospace, "SF Mono", Consolas, monospace; resize: vertical; }
-  #rules-editor textarea.dirty { border-color: #ebcb8b; }
+  #rules-editor textarea { width: 100%; min-height: 320px; background: #0c0f15; color: #e9edf4; border: 1px solid #262d38; border-radius: 4px; padding: 10px 12px; font: 12px/1.45 ui-monospace, "SF Mono", Consolas, monospace; resize: vertical; }
+  #rules-editor textarea.dirty { border-color: #f0c674; }
   #rules-editor .toolbar { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
-  #rules-editor button { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  #rules-editor button { background: #262d38; color: #e9edf4; border: 1px solid #313a48; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
   #rules-editor button.primary { background: #3a4a6a; border-color: #4a5a7a; }
-  #rules-editor button:hover { background: #3a3e4a; }
+  #rules-editor button:hover { background: #313a48; }
   #rules-editor .status { font-size: 12px; }
-  #rules-editor .status.ok { color: #a3be8c; }
-  #rules-editor .status.err { color: #bf616a; }
-  .routing-panel { background: #1a1d26; border: 1px solid #2a2e3a; border-left: 3px solid #88c0d0; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; }
+  #rules-editor .status.ok { color: #68d391; }
+  #rules-editor .status.err { color: #f07178; }
+  .routing-panel { background: #141922; border: 1px solid #262d38; border-left: 3px solid #57d1e0; border-radius: 6px; padding: 12px 14px; margin-bottom: 14px; }
   .routing-panel h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; margin: 0 0 8px 0; font-weight: 600; }
   .routing-panel .desc { color: #888; font-size: 11px; margin-bottom: 8px; }
   .routing-row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
   .routing-row label { font-size: 11px; color: #888; display: flex; gap: 6px; align-items: center; }
-  .routing-row input { background: #0f1116; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 4px 8px; border-radius: 3px; font: 12px ui-monospace, monospace; min-width: 200px; }
-  .routing-mode-btn { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
-  .routing-mode-btn:hover { background: #3a3e4a; color: #e6e6e6; }
-  .routing-mode-btn.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
-  .routing-mode-btn.mode-shadow.active { background: #2e4a3a; border-color: #4a6a4a; color: #a3be8c; }
-  .routing-mode-btn.mode-redirect.active { background: #4a3a2e; border-color: #6a5a3a; color: #ebcb8b; }
+  .routing-row input { background: #0c0f15; color: #e9edf4; border: 1px solid #313a48; padding: 4px 8px; border-radius: 3px; font: 12px ui-monospace, monospace; min-width: 200px; }
+  .routing-mode-btn { background: #262d38; color: #aaa; border: 1px solid #313a48; padding: 6px 14px; border-radius: 4px; cursor: pointer; font-size: 12px; }
+  .routing-mode-btn:hover { background: #313a48; color: #e9edf4; }
+  .routing-mode-btn.active { background: #3a4a6a; color: #e9edf4; border-color: #4a5a7a; }
+  .routing-mode-btn.mode-shadow.active { background: #2e4a3a; border-color: #4a6a4a; color: #68d391; }
+  .routing-mode-btn.mode-redirect.active { background: #4a3a2e; border-color: #6a5a3a; color: #f0c674; }
   #routing-status { font-size: 11px; color: #888; margin-top: 6px; }
   .flow-section { margin-bottom: 22px; }
   .flow-section h2 { font-size: 12px; text-transform: uppercase; letter-spacing: 1px; color: #aaa; margin: 0 0 10px 0; font-weight: 600; }
   .flow-grid { display: grid; grid-template-columns: 1fr auto 1.1fr auto 1fr; gap: 10px; align-items: stretch; }
   @media (max-width: 1100px) { .flow-grid { grid-template-columns: 1fr; } .flow-arrow-col { display: none; } }
-  .flow-col { background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 6px; padding: 10px 12px; min-width: 0; display: flex; flex-direction: column; }
-  .flow-col-clients   { border-left: 3px solid #88c0d0; }
+  .flow-col { background: #141922; border: 1px solid #262d38; border-radius: 6px; padding: 10px 12px; min-width: 0; display: flex; flex-direction: column; }
+  .flow-col-clients   { border-left: 3px solid #57d1e0; }
   .flow-col-proxy     { border-left: 3px solid #b48ead; }
   .flow-col-upstreams { border-left: 3px solid #5e8c66; }
   .flow-col-title { font-size: 10px; text-transform: uppercase; letter-spacing: 0.6px; color: #888; margin-bottom: 8px; }
   .flow-arrow-col { display: flex; align-items: center; justify-content: center; padding: 0 4px; min-width: 60px; }
   .flow-arrow-col .flow-arrow { font-size: 22px; color: #4a5a7a; }
   .flow-arrow-col .flow-arrow-label { font-size: 10px; color: #666; text-align: center; margin-top: 2px; }
-  .flow-card { background: #0f1116; border: 1px solid #2a2e3a; border-radius: 4px; padding: 7px 9px; margin-bottom: 6px; font-size: 11px; }
+  .flow-card { background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 7px 9px; margin-bottom: 6px; font-size: 11px; }
   .flow-card:last-child { margin-bottom: 0; }
   .flow-card-name { display: flex; gap: 6px; align-items: center; margin-bottom: 3px; }
-  .flow-card-name strong { color: #e6e6e6; font-size: 12px; }
+  .flow-card-name strong { color: #e9edf4; font-size: 12px; }
   .flow-card-stat { color: #888; font-size: 11px; }
-  .flow-card-stat strong { color: #d8dee9; font-weight: 600; }
+  .flow-card-stat strong { color: #c9d3e1; font-weight: 600; }
   .flow-card.flow-card-live { border-color: #5e8c66; box-shadow: inset 0 0 0 1px #2e4a3a; animation: flow-pulse 2s infinite; }
   @keyframes flow-pulse { 0%,100% { box-shadow: inset 0 0 0 1px #2e4a3a } 50% { box-shadow: inset 0 0 0 1px #5e8c66 } }
   .flow-rule { display: flex; align-items: center; gap: 8px; padding: 4px 8px; border-radius: 3px; font-size: 11px; }
   .flow-rule + .flow-rule { border-top: 1px solid #1f232c; }
   .flow-rule .rule-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
-  .flow-rule .rule-dot.on  { background: #a3be8c; }
-  .flow-rule .rule-dot.off { background: #3a3e4a; }
-  .flow-rule .rule-name { flex: 1; color: #d8dee9; font-family: ui-monospace, monospace; font-size: 11px; }
+  .flow-rule .rule-dot.on  { background: #68d391; }
+  .flow-rule .rule-dot.off { background: #313a48; }
+  .flow-rule .rule-name { flex: 1; color: #c9d3e1; font-family: ui-monospace, monospace; font-size: 11px; }
   .flow-rule.is-off .rule-name { color: #666; }
-  .flow-rule .rule-count { color: #88c0d0; font-size: 10px; font-variant-numeric: tabular-nums; }
+  .flow-rule .rule-count { color: #57d1e0; font-size: 10px; font-variant-numeric: tabular-nums; }
   .flow-rule .rule-count.zero { color: #555; }
   .flow-rule.is-off .rule-count { color: #555; }
-  .flow-totals { display: flex; gap: 12px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #2a2e3a; font-size: 11px; color: #888; }
-  .flow-totals strong { color: #d8dee9; }
-  .quick-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; background: #1a1d26; border: 1px solid #2a2e3a; border-radius: 4px; margin-right: 6px; margin-bottom: 6px; font-size: 12px; }
+  .flow-totals { display: flex; gap: 12px; margin-top: 8px; padding-top: 8px; border-top: 1px solid #262d38; font-size: 11px; color: #888; }
+  .flow-totals strong { color: #c9d3e1; }
+  .quick-toggle { display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; background: #141922; border: 1px solid #262d38; border-radius: 4px; margin-right: 6px; margin-bottom: 6px; font-size: 12px; }
   details.suggestion summary span:first-child::before, #suggestions-section > summary > .caret::before { content: "▸"; }
   details[open].suggestion > summary span:first-child::before, #suggestions-section[open] > summary > .caret::before { content: "▾"; }
   details.suggestion summary span:first-child, #suggestions-section > summary > .caret { font-size: 0; }
@@ -517,35 +517,35 @@
   .gate-intercept { background: #251a30; border: 1px solid #503a60; padding: 10px 12px; border-radius: 6px; margin-bottom: 14px; }
   .gate-allow { background: #1a261a; border: 1px solid #2e4a2e; padding: 8px 12px; border-radius: 6px; margin-bottom: 14px; font-size: 12px; color: #aaa; }
   .conv-layout { display: flex; gap: 14px; align-items: flex-start; }
-  .conv-toc { width: 240px; flex: 0 0 240px; position: sticky; top: 0; max-height: calc(100vh - 110px); overflow: auto; background: #14171f; border: 1px solid #2a2e3a; border-radius: 6px; padding: 8px; }
-  .conv-toc-controls { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid #2a2e3a; margin-bottom: 8px; }
-  .conv-toc-controls input { background: #0f1116; color: #e6e6e6; border: 1px solid #2a2e3a; border-radius: 3px; padding: 4px 6px; font-size: 11px; width: 100%; }
+  .conv-toc { width: 240px; flex: 0 0 240px; position: sticky; top: 0; max-height: calc(100vh - 110px); overflow: auto; background: #14171f; border: 1px solid #262d38; border-radius: 6px; padding: 8px; }
+  .conv-toc-controls { display: flex; flex-direction: column; gap: 6px; padding-bottom: 8px; border-bottom: 1px solid #262d38; margin-bottom: 8px; }
+  .conv-toc-controls input { background: #0c0f15; color: #e9edf4; border: 1px solid #262d38; border-radius: 3px; padding: 4px 6px; font-size: 11px; width: 100%; }
   .conv-filter-row, .conv-jump-row { display: flex; gap: 4px; flex-wrap: wrap; }
-  .conv-filter-row button, .conv-jump-row button { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1; }
-  .conv-filter-row button.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
-  .conv-filter-row button:hover, .conv-jump-row button:hover { background: #3a3e4a; }
+  .conv-filter-row button, .conv-jump-row button { background: #262d38; color: #aaa; border: 1px solid #313a48; padding: 3px 8px; border-radius: 3px; cursor: pointer; font-size: 10px; flex: 1; }
+  .conv-filter-row button.active { background: #3a4a6a; color: #e9edf4; border-color: #4a5a7a; }
+  .conv-filter-row button:hover, .conv-jump-row button:hover { background: #313a48; }
   .conv-toc-list { list-style: none; margin: 0; padding: 0; }
   .conv-toc-item { display: flex; align-items: center; gap: 6px; padding: 4px 6px; border-radius: 3px; text-decoration: none; color: #aaa; font-size: 11px; cursor: pointer; border-left: 2px solid transparent; line-height: 1.3; }
-  .conv-toc-item:hover { background: #1f2230; color: #e6e6e6; }
-  .conv-toc-item.current { background: #243049; color: #e6e6e6; border-left-color: #88c0d0; }
-  .conv-toc-item .toc-num { font-weight: 600; color: #88c0d0; min-width: 26px; font-variant-numeric: tabular-nums; }
+  .conv-toc-item:hover { background: #1f2230; color: #e9edf4; }
+  .conv-toc-item.current { background: #243049; color: #e9edf4; border-left-color: #57d1e0; }
+  .conv-toc-item .toc-num { font-weight: 600; color: #57d1e0; min-width: 26px; font-variant-numeric: tabular-nums; }
   .conv-toc-item .toc-snippet { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .conv-toc-item .toc-icons { color: #888; font-size: 10px; white-space: nowrap; }
   .conv-toc-item .toc-icons .err { color: #e08080; }
   .conv-toc-item.off-page { opacity: 0.55; }
   .conv-toc-item.off-page .toc-num::after { content: " ↗"; color: #666; }
   .conv-turns { flex: 1; min-width: 0; }
-  .conv-pager { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; padding: 8px 10px; background: #14171f; border: 1px solid #2a2e3a; border-radius: 6px; margin-bottom: 10px; font-size: 11px; }
-  .conv-pager button { background: #2a2e3a; color: #aaa; border: 1px solid #3a3e4a; padding: 3px 9px; border-radius: 3px; cursor: pointer; font-size: 11px; min-width: 28px; }
-  .conv-pager button:hover:not(:disabled) { background: #3a3e4a; color: #e6e6e6; }
-  .conv-pager button.active { background: #3a4a6a; color: #e6e6e6; border-color: #4a5a7a; }
+  .conv-pager { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; padding: 8px 10px; background: #14171f; border: 1px solid #262d38; border-radius: 6px; margin-bottom: 10px; font-size: 11px; }
+  .conv-pager button { background: #262d38; color: #aaa; border: 1px solid #313a48; padding: 3px 9px; border-radius: 3px; cursor: pointer; font-size: 11px; min-width: 28px; }
+  .conv-pager button:hover:not(:disabled) { background: #313a48; color: #e9edf4; }
+  .conv-pager button.active { background: #3a4a6a; color: #e9edf4; border-color: #4a5a7a; }
   .conv-pager button:disabled { opacity: 0.4; cursor: not-allowed; }
   .conv-pager .pager-gap { color: #666; padding: 0 2px; }
   .conv-pager .pager-info { color: #888; margin-left: auto; }
-  .conv-pager select { background: #2a2e3a; color: #e6e6e6; border: 1px solid #3a3e4a; padding: 3px 6px; border-radius: 3px; font-size: 11px; }
+  .conv-pager select { background: #262d38; color: #e9edf4; border: 1px solid #313a48; padding: 3px 6px; border-radius: 3px; font-size: 11px; }
   .conv-toc-pager { color: #888; font-size: 10px; padding: 4px 0; text-align: center; }
   details.turn.turn-flash { animation: turn-flash-anim 1000ms ease-out; }
-  @keyframes turn-flash-anim { 0% { box-shadow: 0 0 0 2px #ebcb8b; } 100% { box-shadow: 0 0 0 0 transparent; } }
+  @keyframes turn-flash-anim { 0% { box-shadow: 0 0 0 2px #f0c674; } 100% { box-shadow: 0 0 0 0 transparent; } }
   @media (max-width: 900px) { .conv-layout { flex-direction: column; } .conv-toc { width: 100%; flex: none; position: static; max-height: 280px; } }
 
   /* ============ Console shell (alternate skin — grouped rail + status strip) ============ */
@@ -553,32 +553,43 @@
   :root { --shell-w: 210px; }
   body { transition: padding-left .32s cubic-bezier(.4,0,.2,1); }
   body.shell-console { padding-left: var(--shell-w); }
-  #shell-rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--shell-w); background: #0e1119; border-right: 1px solid #2a2e3a; display: flex; flex-direction: column; padding: 12px 10px; z-index: 50; overflow-x: hidden; overflow-y: auto; transform: translateX(-100%); transition: transform .32s cubic-bezier(.4,0,.2,1), width .32s cubic-bezier(.4,0,.2,1), padding .32s cubic-bezier(.4,0,.2,1); box-shadow: 6px 0 24px -14px rgba(0,0,0,.7); }
+  #shell-rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--shell-w); background: #0e131a; border-right: 1px solid #262d38; display: flex; flex-direction: column; padding: 12px 10px; z-index: 50; overflow-x: hidden; overflow-y: auto; transform: translateX(-100%); transition: transform .32s cubic-bezier(.4,0,.2,1), width .32s cubic-bezier(.4,0,.2,1), padding .32s cubic-bezier(.4,0,.2,1); box-shadow: 6px 0 24px -14px rgba(0,0,0,.7); }
   body.shell-console #shell-rail { transform: translateX(0); }
   .shell-brand { display: flex; align-items: center; gap: 9px; padding: 4px 6px 12px; cursor: pointer; }
-  .shell-brand .lg { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg,#88c0d0,#7aaffe); display: grid; place-items: center; flex: none; }
+  .shell-brand .lg { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg,#57d1e0,#7aa2f7); display: grid; place-items: center; flex: none; box-shadow: 0 0 14px -3px rgba(87,209,224,.55); }
   .shell-brand .lg svg { width: 15px; height: 15px; }
   .shell-brand b { font-size: 13px; letter-spacing: .3px; }
   .shell-brand .up2 { font-family: ui-monospace, Consolas, monospace; font-size: 10px; color: #888; display: block; margin-top: 1px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .shell-grp { margin-top: 12px; }
   .shell-grp .gl { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: #5f6675; padding: 0 8px 5px; }
   .snav { display: flex; align-items: center; gap: 9px; width: 100%; padding: 6px 8px; border: none; background: none; color: #9aa4b2; font-size: 12.5px; border-radius: 7px; cursor: pointer; position: relative; text-align: left; font-family: inherit; }
-  .snav:hover { background: rgba(255,255,255,.04); color: #e6e6e6; }
+  .snav:hover { background: rgba(255,255,255,.04); color: #e9edf4; }
   .snav svg { width: 15px; height: 15px; flex: none; opacity: .72; }
   .snav .lbl2 { flex: 1; }
-  .snav.on { background: linear-gradient(90deg, rgba(136,192,208,.16), rgba(136,192,208,.02)); color: #e6e6e6; }
-  .snav.on svg { opacity: 1; color: #88c0d0; }
-  .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #88c0d0; }
+  .snav.on { background: linear-gradient(90deg, rgba(87,209,224,.15), rgba(87,209,224,.02)); color: #e9edf4; }
+  .snav.on svg { opacity: 1; color: #57d1e0; }
+  .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #57d1e0; }
   .snav .cntx { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; color: #5f6675; }
   .snav-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-  .snav-pip.live { background: #a3be8c; box-shadow: 0 0 8px #a3be8c; animation: shell-pulse 1.6s infinite; }
-  .snav-pip.badge { background: #bf616a; box-shadow: 0 0 8px #bf616a; display: none; }
+  .snav-pip.live { background: #68d391; box-shadow: 0 0 8px #68d391; animation: shell-pulse 1.6s infinite; }
+  .snav-pip.badge { background: #f07178; box-shadow: 0 0 8px #f07178; display: none; }
   @keyframes shell-pulse { 50% { opacity: .35; } }
-  .shell-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid #23262f; display: flex; gap: 6px; align-items: stretch; }
-  .shell-foot button { background: #1a1d26; color: #9aa4b2; border: 1px solid #2a2e3a; border-radius: 6px; padding: 6px; font-size: 11.5px; cursor: pointer; font-family: inherit; }
-  .shell-foot button:hover { border-color: #3a4e6a; color: #e6e6e6; }
-  .sf-collapse { flex: none; width: 34px; font-size: 14px; line-height: 1; }
-  .sf-classic { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+  .shell-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid #23262f; display: flex; flex-direction: column; gap: 8px; }
+  .shell-foot button { background: #141922; color: #9aa4b2; border: 1px solid #262d38; border-radius: 6px; padding: 6px; font-size: 11.5px; cursor: pointer; font-family: inherit; }
+  .shell-foot button:hover { border-color: #3a4e6a; color: #e9edf4; }
+  .sf-collapse { width: 100%; font-size: 12px; line-height: 1; }
+  .shell-meta { font-size: 11px; }
+  .shell-meta .k { display: flex; justify-content: space-between; padding: 2px 6px; }
+  .shell-meta .k b { color: #93a0b4; font-weight: 500; }
+  .shell-meta .k span { font-family: ui-monospace, Consolas, monospace; font-size: 10px; color: #5f6b7e; }
+  body.shell-collapsed .shell-meta { display: none; }
+  /* auto-refresh pill toggle (native checkbox kept, visually hidden) */
+  .ar-toggle { display: inline-flex; align-items: center; gap: 7px; cursor: pointer; user-select: none; }
+  .ar-toggle input { position: absolute; opacity: 0; width: 0; height: 0; }
+  .ar-sw { width: 30px; height: 17px; border-radius: 9px; background: #20262f; position: relative; transition: background .2s; flex: none; }
+  .ar-sw::after { content: ""; position: absolute; top: 2px; left: 2px; width: 13px; height: 13px; border-radius: 50%; background: #5f6b7e; transition: all .2s; }
+  .ar-toggle input:checked + .ar-sw { background: #2c6b74; }
+  .ar-toggle input:checked + .ar-sw::after { left: 15px; background: #57d1e0; }
   /* ---- collapsed (icon-only) rail ---- */
   body.shell-collapsed { --shell-w: 56px; }
   body.shell-collapsed #shell-rail { padding: 12px 6px; }
@@ -593,15 +604,24 @@
   body.shell-collapsed .shell-foot { flex-direction: column; gap: 6px; }
   body.shell-collapsed .sf-collapse, body.shell-collapsed .sf-classic { width: 100%; }
   body.shell-collapsed .sfc-tx { display: none; }
-  /* status strip vitals live inside the existing header; shown only in console mode */
-  #shell-vitals { display: none; align-items: center; gap: 14px; font-size: 12px; }
-  body.shell-console #shell-vitals { display: flex; }
-  #shell-vitals .sv { color: #888; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
-  #shell-vitals .sv b { color: #d8dee9; font-variant-numeric: tabular-nums; }
-  #shell-vitals .dot { width: 8px; height: 8px; border-radius: 50%; background: #a3be8c; box-shadow: 0 0 8px #a3be8c; }
-  body.shell-console header .tabs { display: none; }
+  /* status strip — segmented stat cells with meters, folded into the header */
+  body.shell-console header { background: #141922; border-bottom-color: #262d38; min-height: 48px; padding: 0 12px 0 0; gap: 0; }
   body.shell-console header h1 { display: none; }
-  #shell-toggle-btn { display: inline-flex; align-items: center; gap: 5px; }
+  body.shell-console header .tabs { display: none; }
+  body.shell-console #upstream-chip { display: none; }
+  body.shell-console header > label,
+  body.shell-console header > button { margin: 0 0 0 8px; }
+  body.shell-console header #count { margin-right: 8px; }
+  #shell-vitals { display: none; align-self: stretch; align-items: stretch; }
+  body.shell-console #shell-vitals { display: flex; }
+  #shell-vitals .sv-cell { display: flex; flex-direction: column; justify-content: center; gap: 2px; padding: 0 16px; border-right: 1px solid #262d38; }
+  #shell-vitals .sv-l { font-size: 10px; letter-spacing: .12em; text-transform: uppercase; color: #5f6b7e; }
+  #shell-vitals .sv-v { font-size: 15px; font-weight: 600; color: #e9edf4; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  #shell-vitals .sv-v small { font-size: 11px; color: #93a0b4; font-weight: 400; }
+  #shell-vitals .sv-pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; font-weight: 600; color: #e9edf4; }
+  #shell-vitals .sv-dot { width: 8px; height: 8px; border-radius: 50%; background: #68d391; box-shadow: 0 0 8px #68d391; flex: none; }
+  #shell-vitals .sv-bar { height: 5px; border-radius: 3px; background: #20262f; width: 72px; overflow: hidden; margin-top: 4px; }
+  #shell-vitals .sv-bar i { display: block; height: 100%; border-radius: 3px; transition: width .5s, background .5s; }
   /* suppress the shell transition on first paint so a console-default load doesn't animate */
   body.shell-noanim, body.shell-noanim #shell-rail, body.shell-noanim .tabs { transition: none !important; }
   @media (prefers-reduced-motion: reduce) {
@@ -612,9 +632,15 @@
     body.shell-console { padding-left: 0; }
     #shell-rail { width: 200px; }
   }
+  /* Live full-screen: hide chrome, let the grid own the whole viewport */
+  .lv-full-btn { margin-left: auto; background: #141922; color: #9aa4b2; border: 1px solid #262d38; border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: inherit; }
+  .lv-full-btn:hover { border-color: #3a4e6a; color: #e9edf4; }
+  body.lv-full #shell-rail, body.lv-full header { display: none !important; }
+  body.lv-full { padding-left: 0 !important; }
+  body.lv-full #live.show { position: fixed; inset: 0; z-index: 200; height: auto; }
 </style>
 </head>
-<body>
+<body class="shell-console">
 <aside id="shell-rail">
   <div class="shell-brand" onclick="setView('requests')" title="Requests">
     <span class="lg"><svg viewBox="0 0 24 24" fill="none" stroke="#0e1119" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13m-4-4 4 4-4 4"/><path d="M20 16H7m4-4-4 4 4 4"/></svg></span>
@@ -622,7 +648,7 @@
   </div>
   <div class="shell-grp"><div class="gl">Monitor</div>
     <button class="snav" data-view="live" onclick="setView('live')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg><span class="lbl2">Live</span><i class="snav-pip live"></i></button>
-    <button class="snav" data-view="requests" onclick="setView('requests')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg><span class="lbl2">Requests</span></button>
+    <button class="snav" data-view="requests" onclick="setView('requests')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg><span class="lbl2">Requests</span><span class="cntx" id="rail-req-count"></span></button>
     <button class="snav" data-view="convs" onclick="setView('convs')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Conversations</span></button>
   </div>
   <div class="shell-grp"><div class="gl">Analyze</div>
@@ -631,7 +657,7 @@
   </div>
   <div class="shell-grp"><div class="gl">Work</div>
     <button class="snav" data-view="chat" onclick="setView('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 10h8M8 13.5h5M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Chat</span></button>
-    <button class="snav" data-view="tasks" onclick="setView('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg><span class="lbl2">Tasks</span><i class="snav-pip badge" id="shell-tasks-pip"></i></button>
+    <button class="snav" data-view="tasks" onclick="setView('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg><span class="lbl2">Tasks</span><span class="cntx" id="rail-tasks-count"></span></button>
   </div>
   <div class="shell-grp"><div class="gl">System</div>
     <button class="snav" data-view="system" onclick="setView('system')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.3 2.6a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L4 11a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/></svg><span class="lbl2">System</span></button>
@@ -639,32 +665,24 @@
     <button class="snav" data-view="audit" onclick="setView('audit')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 3 6v6c0 5 4 8 9 10 5-2 9-5 9-10V6z"/></svg><span class="lbl2">Audit</span><i class="snav-pip badge" id="shell-audit-pip"></i></button>
   </div>
   <div class="shell-foot">
-    <button class="sf-collapse" onclick="toggleRailCollapse()" title="Collapse sidebar">«</button>
-    <button class="sf-classic" onclick="toggleShell()" title="Switch to classic layout"><span class="sfc-ic">↩</span><span class="sfc-tx">Classic view</span></button>
+    <div class="shell-meta" id="shell-meta">
+      <div class="k"><b>uptime</b><span id="sm-uptime">—</span></div>
+      <div class="k"><b>version</b><span id="sm-version">—</span></div>
+    </div>
+    <button class="sf-collapse" onclick="toggleRailCollapse()" title="Collapse sidebar">« Collapse</button>
   </div>
 </aside>
 <header>
   <h1>AI Proxy</h1>
-  <span class="meta">→ <code id="upstream">…</code></span>
-  <div class="tabs">
-    <button class="tab active" id="tab-req" onclick="setView('requests')">Requests</button>
-    <button class="tab" id="tab-live" onclick="setView('live')">Live</button>
-    <button class="tab" id="tab-convs" onclick="setView('convs')">Conversations</button>
-    <button class="tab" id="tab-chat" onclick="setView('chat')">Chat</button>
-    <button class="tab" id="tab-tasks" onclick="setView('tasks')">Tasks <span id="tasks-badge" style="display:none;background:#7aaffe;color:#0e1014;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
-    <button class="tab" id="tab-bench" onclick="setView('bench')">Bench</button>
-    <button class="tab" id="tab-system" onclick="setView('system')">System</button>
-    <button class="tab" id="tab-setup" onclick="setView('setup')">Setup</button>
-    <button class="tab" id="tab-stats" onclick="setView('stats')">Stats</button>
-    <button class="tab" id="tab-audit" onclick="setView('audit')">Audit <span id="audit-badge" title="Click ✕ to mark as seen" style="display:none;background:#bf616a;color:#fff;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
-  </div>
+  <span class="meta" id="upstream-chip">→ <code id="upstream">…</code></span>
+  <!-- Badge state holders: updated by id elsewhere; mirrored onto the rail as pips. -->
+  <span id="classic-badges" style="display:none"><span id="tasks-badge"></span><span id="audit-badge" title="Mark as seen"></span></span>
   <span id="shell-vitals"></span>
   <span style="flex:1"></span>
   <span class="meta" id="count"></span>
-  <label><input type="checkbox" id="autoref" checked> auto-refresh</label>
+  <label class="ar-toggle"><input type="checkbox" id="autoref" checked><span class="ar-sw"></span>auto-refresh</label>
   <button onclick="refresh()">Refresh</button>
   <button onclick="clearAll()">Clear</button>
-  <button id="shell-toggle-btn" onclick="toggleShell()" title="Switch dashboard layout"><span class="sti">▧</span><span class="stl">Console</span></button>
 </header>
 <div id="main">
   <div id="list">
@@ -694,9 +712,9 @@
       <select id="chat-personality"></select>
       <button onclick="chatOpenPersonalityModal()" title="Manage personalities">✎</button>
       <span style="font-size:12px;color:#aaa;margin-left:8px">Tools:</span>
-      <label style="font-size:12px;color:#d8dee9"><input type="checkbox" id="chat-tool-memory"> memory</label>
-      <label style="font-size:12px;color:#d8dee9"><input type="checkbox" id="chat-tool-todos"> todos</label>
-      <label style="font-size:12px;color:#d8dee9"><input type="checkbox" id="chat-tool-web"> web</label>
+      <label style="font-size:12px;color:#c9d3e1"><input type="checkbox" id="chat-tool-memory"> memory</label>
+      <label style="font-size:12px;color:#c9d3e1"><input type="checkbox" id="chat-tool-todos"> todos</label>
+      <label style="font-size:12px;color:#c9d3e1"><input type="checkbox" id="chat-tool-web"> web</label>
       <button onclick="chatOpenMemoryModal()" id="chat-mem-btn" title="View / edit / erase the active personality's memory">🧠 Memory</button>
       <button onclick="chatNew()">+ New chat</button>
       <span style="flex:1"></span>
@@ -704,14 +722,14 @@
     </div>
     <!-- Memory viewer modal -->
     <div id="chat-mem-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:300;padding:20px">
-      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:10px;padding:18px;max-width:720px;margin:0 auto;max-height:88vh;overflow:auto">
+      <div style="background:#141922;border:1px solid #262d38;border-radius:10px;padding:18px;max-width:720px;margin:0 auto;max-height:88vh;overflow:auto">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
           <h2 style="margin:0;font-size:14px;flex:1">🧠 Memory <span id="chat-mem-title" style="color:#888;font-weight:normal;font-size:12px"></span></h2>
-          <button onclick="chatRefreshMemory()" style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+          <button onclick="chatRefreshMemory()" style="background:#262d38;color:#e9edf4;border:1px solid #313a48;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
           <button onclick="chatCloseMemoryModal()" style="background:none;border:none;color:#aaa;font-size:18px;cursor:pointer">✕</button>
         </div>
         <div id="chat-mem-list"></div>
-        <div id="chat-mem-footer" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #2a2e3a;display:flex;align-items:center;gap:8px">
+        <div id="chat-mem-footer" style="display:none;margin-top:12px;padding-top:10px;border-top:1px solid #262d38;display:flex;align-items:center;gap:8px">
           <span id="chat-mem-count" style="color:#888;font-size:11px;flex:1"></span>
           <button onclick="chatEraseAllMemory()" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer">🗑 Erase all</button>
         </div>
@@ -720,18 +738,18 @@
 
     <!-- Personalities management modal -->
     <div id="chat-pers-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.6);z-index:300;padding:20px">
-      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:10px;padding:18px;max-width:640px;margin:0 auto;max-height:88vh;overflow:auto">
+      <div style="background:#141922;border:1px solid #262d38;border-radius:10px;padding:18px;max-width:640px;margin:0 auto;max-height:88vh;overflow:auto">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:12px">
           <h2 style="margin:0;font-size:14px;flex:1">Chat personalities</h2>
           <button onclick="chatClosePersonalityModal()" style="background:none;border:none;color:#aaa;font-size:18px;cursor:pointer">✕</button>
         </div>
         <div style="font-size:12px;color:#888;margin-bottom:10px">A personality is a name plus a system prompt that gets prepended to every turn. Pick "(none)" in the chat to disable.</div>
         <div id="chat-pers-list" style="margin-bottom:14px"></div>
-        <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:10px">
+        <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px">
           <div style="font-size:12px;color:#aaa;margin-bottom:6px"><strong>+ New personality</strong></div>
-          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
-          <textarea id="chat-pers-prompt" rows="6" placeholder="System prompt — describe how the model should respond." style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
-          <button onclick="chatAddPersonality()" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#d8dee9;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Save</button>
+          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
+          <textarea id="chat-pers-prompt" rows="6" placeholder="System prompt — describe how the model should respond." style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
+          <button onclick="chatAddPersonality()" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Save</button>
           <span id="chat-pers-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
         </div>
       </div>
@@ -802,65 +820,87 @@ function setView(v) {
 // The rail + status strip are pure chrome over the existing views: nav buttons call the
 // same setView(), and the strip reuses the /system/now + /live endpoints. Persisted in
 // localStorage so the choice survives reloads; classic remains the default.
-const SHELL_KEY = 'ai-proxy-shell';
 let _shellPoll = null;
 function syncShellNav(v) {
   document.querySelectorAll('#shell-rail .snav').forEach(b => b.classList.toggle('on', b.dataset.view === v));
 }
-function setShell(mode, animate) {
-  const isConsole = mode === 'console';
-  if (!animate) document.body.classList.add('shell-noanim');
-  document.body.classList.toggle('shell-console', isConsole);
-  try { localStorage.setItem(SHELL_KEY, mode); } catch {}
-  const btn = $('shell-toggle-btn');
-  if (btn) { const l = btn.querySelector('.stl'); if (l) l.textContent = isConsole ? 'Classic' : 'Console'; }
+function startShell() {
   syncShellNav(view);
-  if (isConsole) { shellVitals(); if (!_shellPoll) _shellPoll = setInterval(shellVitals, 4000); }
-  else { clearInterval(_shellPoll); _shellPoll = null; }
-  if (!animate) requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('shell-noanim')));
+  shellVitals();
+  // 8s cadence (not 4s), and shellVitals() itself no-ops when the tab is hidden and
+  // reuses the Live view's poll when it's open — the strip must not add background load
+  // to the single process that also serves the models.
+  if (!_shellPoll) _shellPoll = setInterval(shellVitals, 8000);
 }
-function toggleShell() { setShell(document.body.classList.contains('shell-console') ? 'classic' : 'console', true); }
-// Collapse the rail to an icon-only strip. Persisted separately from the shell choice.
+// Collapse the rail to an icon-only strip. Persisted in localStorage.
 const SHELL_COLLAPSE_KEY = 'ai-proxy-shell-collapsed';
 function setRailCollapsed(collapsed, animate) {
   if (!animate) document.body.classList.add('shell-noanim');
   document.body.classList.toggle('shell-collapsed', collapsed);
   try { localStorage.setItem(SHELL_COLLAPSE_KEY, collapsed ? '1' : '0'); } catch {}
   const g = document.querySelector('.sf-collapse');
-  if (g) { g.textContent = collapsed ? '»' : '«'; g.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar'; }
+  if (g) { g.textContent = collapsed ? '»' : '« Collapse'; g.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar'; }
   if (!animate) requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('shell-noanim')));
 }
 function toggleRailCollapse() { setRailCollapsed(!document.body.classList.contains('shell-collapsed'), true); }
+let _shellTick = 0, _shellErr = null, _shellVer = null;
+function fmtUptime(s) { s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); if (d > 0) return d + 'd ' + String(h).padStart(2, '0') + 'h'; if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm'; return m + 'm'; }
+function fmtCompact(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n); }
 async function shellVitals() {
-  let gpu = '—', mem = '—', tps = 0, active = 0;
+  if (document.hidden) return;              // no background-tab polling
+  _shellTick++;
+  let gpuN = null, memU = null, memT = null, tps = 0, active = 0, uptimeS = null;
   try {
     const s = await (await fetch('/__proxy/api/system/now')).json();
     const g = (s.gpus || [])[0];
-    if (g && g.util_pct != null) gpu = Math.round(g.util_pct) + '%';
-    if (s.mem) mem = Math.round((s.mem.used_mb || 0) / 1024) + '/' + Math.round((s.mem.total_mb || 0) / 1024);
+    if (g && g.util_pct != null) gpuN = Math.round(g.util_pct);
+    if (s.mem) { memU = (s.mem.used_mb || 0) / 1024; memT = (s.mem.total_mb || 0) / 1024; }
+    if (s.uptime_s != null) uptimeS = s.uptime_s;
   } catch {}
-  try {
-    const d = await (await fetch('/__proxy/api/live')).json();
-    const tiles = d.tiles || [];
-    active = tiles.filter(t => !t.done).length;
-    tps = Math.round(tiles.reduce((a, t) => a + (t.tps || 0), 0));
-  } catch {}
+  // Active / tok-s: reuse the Live view's own poll when it's open, else fetch /live once.
+  if (view === 'live' && Array.isArray(_lvTiles)) {
+    active = _lvTiles.filter(t => !t.done).length;
+    tps = Math.round(_lvTiles.reduce((a, t) => a + (t.tps || 0), 0));
+  } else {
+    try {
+      const d = await (await fetch('/__proxy/api/live')).json();
+      const tiles = d.tiles || [];
+      active = tiles.filter(t => !t.done).length;
+      tps = Math.round(tiles.reduce((a, t) => a + (t.tps || 0), 0));
+    } catch {}
+  }
+  // version once; error-rate (last 1h) refreshed every ~20s (perf is server-cached)
+  if (_shellVer == null) { try { const inf = await (await fetch('/__proxy/api/info')).json(); _shellVer = inf.version || '—'; } catch { _shellVer = '—'; } }
+  if (_shellErr == null || _shellTick % 5 === 0) {
+    try {
+      const p = await (await fetch('/__proxy/api/perf?window_h=1')).json();
+      let e = 0, n = 0; for (const b of (p.series || [])) { e += b.err || 0; n += b.n || 0; }
+      _shellErr = n ? Math.round(e / n * 1000) / 10 : 0;
+    } catch {}
+  }
+  const up = $('upstream'), upName = ((up && up.textContent) || '').replace(/^→\s*/, '').split(/[·,|]/)[0].trim() || 'upstream';
+  const memPct = (memU != null && memT) ? Math.round(memU / memT * 100) : 0;
+  const gpuBar = gpuN == null ? 0 : gpuN, gpuCol = gpuN == null ? '#5f6b7e' : gpuN > 90 ? '#f07178' : gpuN > 70 ? '#f0c674' : '#57d1e0';
+  const errTxt = _shellErr == null ? '—' : _shellErr + '%', errCol = _shellErr == null ? '#e9edf4' : _shellErr >= 2 ? '#f07178' : _shellErr >= 0.5 ? '#f0c674' : '#68d391';
+  const cell = (label, valHtml, bar) => `<div class="sv-cell"><span class="sv-l">${label}</span>${valHtml}${bar || ''}</div>`;
   const v = $('shell-vitals');
-  if (v) v.innerHTML = `<span class="sv"><i class="dot"></i>online</span>`
-    + `<span class="sv">gpu <b>${gpu}</b></span>`
-    + `<span class="sv">mem <b>${mem}G</b></span>`
-    + `<span class="sv"><b>${tps}</b> tok/s</span>`
-    + `<span class="sv"><b>${active}</b> active</span>`;
-  // mirror the classic audit/tasks badges onto their rail items
-  try {
-    const map = [['audit-badge', 'shell-audit-pip'], ['tasks-badge', 'shell-tasks-pip']];
-    for (const [src, dst] of map) {
-      const ab = $(src), rp = $(dst);
-      if (rp) rp.style.display = (ab && ab.style.display !== 'none' && (ab.textContent || '').trim()) ? 'block' : 'none';
-    }
-  } catch {}
+  if (v) v.innerHTML =
+      cell('Upstream', `<span class="sv-pill"><span class="sv-dot"></span>${upName} · online</span>`)
+    + cell('Active', `<span class="sv-v">${active} <small>reqs</small></span>`)
+    + cell('GPU', `<span class="sv-v">${gpuN == null ? '—' : gpuN}<small>%</small></span>`, `<span class="sv-bar"><i style="width:${gpuBar}%;background:${gpuCol}"></i></span>`)
+    + cell('Mem', `<span class="sv-v">${memU == null ? '—' : Math.round(memU)}<small>/${memT == null ? '—' : Math.round(memT)} GB</small></span>`, `<span class="sv-bar"><i style="width:${memPct}%;background:#f0c674"></i></span>`)
+    + cell('Throughput', `<span class="sv-v">${tps}<small> tok/s</small></span>`)
+    + cell('Errors 1h', `<span class="sv-v" style="color:${errCol}">${errTxt}</span>`);
+  // rail footer meta
+  const su = $('sm-uptime'); if (su && uptimeS != null) su.textContent = fmtUptime(uptimeS);
+  const smv = $('sm-version'); if (smv && _shellVer) smv.textContent = _shellVer;
+  // rail nav counts
+  const rc = $('rail-req-count'); if (rc) { const cnt = $('count'), nRaw = cnt ? parseInt((cnt.textContent || '').replace(/[^0-9]/g, ''), 10) : NaN; rc.textContent = isNaN(nRaw) ? '' : fmtCompact(nRaw); }
+  const tc = $('rail-tasks-count'), tb = $('tasks-badge'); if (tc) tc.textContent = (tb && (tb.textContent || '').trim()) ? tb.textContent.trim() : '';
+  // mirror the audit badge onto its rail pip
+  try { const ab = $('audit-badge'), rp = $('shell-audit-pip'); if (rp) rp.style.display = (ab && ab.style.display !== 'none' && (ab.textContent || '').trim()) ? 'block' : 'none'; } catch {}
   // keep the rail's upstream line in sync with the header
-  try { const up = $('upstream'), r = document.querySelector('#shell-rail .up2'); if (up && r) r.textContent = '→ ' + (up.textContent || '').replace(/^→\s*/, ''); } catch {}
+  try { const r = document.querySelector('#shell-rail .up2'); if (up && r) r.textContent = '→ ' + (up.textContent || '').replace(/^→\s*/, ''); } catch {}
 }
 
 // ---------- Live View ----------
@@ -875,7 +915,8 @@ function loadLive(){
         .map(([n,t],i)=>`<button data-t="${t}"${i===0?' class="on"':''}>${n}</button>`).join('')
       +'</div><div class="lv-stats"><div><b id="lv-active">0</b><span>active</span></div>'
       +'<div><b id="lv-tps">0 / 0</b><span>tok/s in·out</span></div><div><b id="lv-gpu">—</b><span>gpu</span></div>'
-      +'<div><b id="lv-mem">—</b><span>ram gb</span></div></div></div>'
+      +'<div><b id="lv-mem">—</b><span>ram gb</span></div></div>'
+      +'<button id="lv-full-btn" class="lv-full-btn" onclick="toggleLiveFull()" title="Toggle full screen (Esc to exit)">⛶ Full screen</button></div>'
       +'<div id="lv-grid"><div class="lv-empty">waiting for traffic…</div></div>';
     box.dataset.init='1';
     box.querySelectorAll('.lv-themes button').forEach(b=>b.onclick=()=>{
@@ -893,7 +934,29 @@ function loadLive(){
   _lvPoll=setInterval(pollLive,1200);
   _lvTick=setInterval(tickLive,120);
 }
-function stopLive(){clearInterval(_lvPoll);clearInterval(_lvTick);_lvPoll=_lvTick=null;}
+function stopLive(){clearInterval(_lvPoll);clearInterval(_lvTick);_lvPoll=_lvTick=null; if(document.body.classList.contains('lv-full'))_setLiveFull(false);}
+// Full-screen Live: hide the rail + header so the grid fills the page, and also request
+// native browser fullscreen for a true kiosk view. Esc (or the button) exits.
+function _setLiveFull(on){
+  document.body.classList.toggle('lv-full', on);
+  const b=$('lv-full-btn'); if(b)b.textContent=on?'✕ Exit full screen':'⛶ Full screen';
+  try{ if(typeof lvLayout==='function') lvLayout(); }catch{}
+}
+function toggleLiveFull(){
+  const on=!document.body.classList.contains('lv-full');
+  _setLiveFull(on);
+  try{
+    if(on){ const el=document.documentElement; (el.requestFullscreen||el.webkitRequestFullscreen||(()=>{})).call(el); }
+    else if(document.fullscreenElement||document.webkitFullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen||(()=>{})).call(document); }
+  }catch{}
+}
+document.addEventListener('fullscreenchange',()=>{
+  // If the user leaves native fullscreen (Esc / F11), drop our CSS full mode too.
+  if(!document.fullscreenElement && document.body.classList.contains('lv-full')) _setLiveFull(false);
+});
+document.addEventListener('keydown',e=>{
+  if(e.key==='Escape' && document.body.classList.contains('lv-full') && !document.fullscreenElement) _setLiveFull(false);
+});
 async function pollLive(){
   try{
     const d=await(await fetch('/__proxy/api/live')).json();
@@ -1029,7 +1092,7 @@ function renderRequestsPager() {
   const clientOpts = ['<option value="">all clients</option>']
     .concat(_reqClients.map(c => `<option value="${esc(c.app)}" ${c.app===_reqClient?'selected':''}>${esc(c.app)} (${c.count})</option>`))
     .join('');
-  const clientSel = `<label>Client <select id="rq-client" style="background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 4px;border-radius:3px;font-size:11px">${clientOpts}</select></label>`;
+  const clientSel = `<label>Client <select id="rq-client" style="background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px">${clientOpts}</select></label>`;
   wrap.innerHTML = _pagerHtml('rq', { total: _reqTotal, totalPages, page: _reqPage, size, start }, clientSel);
   const csel = $('rq-client');
   if (csel) csel.onchange = () => { _reqClient = csel.value; _reqPage = 1; refresh(); };
@@ -1102,7 +1165,7 @@ function renderList() {
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
       const tip = it.tokens_estimated ? 'estimated prompt tokens (chars/3.5); upstream usage not yet received' : 'live token count from upstream stream — still in flight';
-      tokens = `<span style="color:#ebcb8b;font-style:italic" title="${tip}">${tokens}${it.tokens_estimated ? '~' : ''}<span style="color:#888"> live</span></span>`;
+      tokens = `<span style="color:#f0c674;font-style:italic" title="${tip}">${tokens}${it.tokens_estimated ? '~' : ''}<span style="color:#888"> live</span></span>`;
     }
     const sel = it.id === selected ? 'selected' : '';
     const appBadge = it.client_app
@@ -1445,7 +1508,7 @@ function renderAnalysis(d) {
           if (t.calledWith && t.calledWith.args) {
             let argsPretty = t.calledWith.args;
             try { argsPretty = JSON.stringify(JSON.parse(t.calledWith.args), null, 2); } catch {}
-            argsHtml = `<div style="margin:6px 0 4px 0;font-size:11px;color:#88c0d0">→ called with</div><pre style="max-height:160px;font-size:11px">${esc(argsPretty)}</pre><div style="margin:6px 0 4px 0;font-size:11px;color:#888">→ returned</div>`;
+            argsHtml = `<div style="margin:6px 0 4px 0;font-size:11px;color:#57d1e0">→ called with</div><pre style="max-height:160px;font-size:11px">${esc(argsPretty)}</pre><div style="margin:6px 0 4px 0;font-size:11px;color:#888">→ returned</div>`;
           }
           return `<details class="${cls}" style="margin-bottom:6px"><summary class="${summaryCls}"><code>${esc(t.name)}</code> · ${num(t.content.length)} chars${excerpt}</summary>${argsHtml}<pre data-k="tr-${esc(t.name)}" style="max-height:200px">${esc(t.content.slice(0, 4000))}</pre></details>`;
         }).join('')}
@@ -1493,9 +1556,9 @@ function renderAnalysis(d) {
         const iter = e.iteration ? ` · iter ${e.iteration}` : '';
         return `<details ${e.is_error ? 'open' : ''} style="margin-bottom:6px">
           <summary><code>${esc(e.name)}</code>${errBadge}${ms}${iter}</summary>
-          <div style="margin:6px 0 4px;font-size:11px;color:#88c0d0">→ called with</div>
+          <div style="margin:6px 0 4px;font-size:11px;color:#57d1e0">→ called with</div>
           <pre data-k="ptl-in-${i}" style="max-height:200px;font-size:11px">${esc(inputPretty)}</pre>
-          <div style="margin:6px 0 4px;font-size:11px;color:#a3be8c">→ returned</div>
+          <div style="margin:6px 0 4px;font-size:11px;color:#68d391">→ returned</div>
           <pre data-k="ptl-out-${i}" style="max-height:300px;font-size:11px">${esc(String(e.result || '').slice(0, 6000))}${(e.result || '').length > 6000 ? '\n…' : ''}</pre>
         </details>`;
       }).join('');
@@ -1679,9 +1742,9 @@ function _renderShadowComparison(cmp) {
     let note = '';
     let cls = '';
     if (r != null) {
-      if (r < 0.5) { note = ` · <span style="color:#a3be8c">${(1/r).toFixed(1)}× faster</span>`; cls = 'cmp-good'; }
+      if (r < 0.5) { note = ` · <span style="color:#68d391">${(1/r).toFixed(1)}× faster</span>`; cls = 'cmp-good'; }
       else if (r < 1.2) { note = ' · ≈ same speed'; cls = 'cmp-good'; }
-      else if (r < 3) { note = ` · <span style="color:#ebcb8b">${r.toFixed(1)}× slower</span>`; cls = 'cmp-warn'; }
+      else if (r < 3) { note = ` · <span style="color:#f0c674">${r.toFixed(1)}× slower</span>`; cls = 'cmp-warn'; }
       else { note = ` · <span style="color:#e08080">${r.toFixed(1)}× slower</span>`; cls = 'cmp-bad'; }
     }
     rows.push(`<div class="cmp-row ${cls}"><span class="cmp-label">⏱ Latency</span> primary <strong>${num(cmp.latency.primary)}ms</strong> · shadow <strong>${num(cmp.latency.shadow)}ms</strong>${note}</div>`);
@@ -1895,7 +1958,7 @@ function renderShadows(shadows, primary) {
     const ms = fmtMsLong(s.duration_ms);
     const tokens = s.total_tokens ? `${num(s.total_tokens)} tok (p:${num(s.prompt_tokens)||0} / c:${num(s.completion_tokens)||0})` : '—';
     const respText = _shadowResponseText(s);
-    const errBlock = s.error ? `<pre style="margin-top:6px;color:#bf616a;max-height:120px">${esc(s.error)}</pre>` : '';
+    const errBlock = s.error ? `<pre style="margin-top:6px;color:#f07178;max-height:120px">${esc(s.error)}</pre>` : '';
     const cmp = compareShadow(primary, s, primaryAnalysis);
     const cmpBlock = _renderShadowComparison(cmp);
     const respBlock = respText
@@ -1907,7 +1970,7 @@ function renderShadows(shadows, primary) {
            <pre data-k="shadow-${esc(s.id)}-raw" style="max-height:240px;font-size:11px">${esc(tryPretty(s.response_body))}</pre></details>`
       : '';
     const compareBtn = (s.response_body || s.stream_chunks)
-      ? ` &nbsp;<a href="#" style="color:#a3be8c;font-size:11px" onclick="event.preventDefault();openCompare('${esc(primary.id)}','${esc(s.id)}')">🔍 compare →</a>`
+      ? ` &nbsp;<a href="#" style="color:#68d391;font-size:11px" onclick="event.preventDefault();openCompare('${esc(primary.id)}','${esc(s.id)}')">🔍 compare →</a>`
       : '';
     return `<div class="shadow-row">
       <div class="shadow-meta">
@@ -1916,7 +1979,7 @@ function renderShadows(shadows, primary) {
         <span style="color:#888">${ms}</span>
         <span style="color:#888">${tokens}</span>
         <span style="color:#666;font-size:11px">${esc(s.upstream_url || '')}</span>
-        <span style="margin-left:auto"><a href="#" style="color:#88c0d0;font-size:11px" onclick="event.preventDefault();selectItem('${esc(s.id)}')">open ${esc(s.id.slice(0,8))} →</a>${compareBtn}</span>
+        <span style="margin-left:auto"><a href="#" style="color:#57d1e0;font-size:11px" onclick="event.preventDefault();selectItem('${esc(s.id)}')">open ${esc(s.id.slice(0,8))} →</a>${compareBtn}</span>
       </div>
       ${cmpBlock}
       ${errBlock}
@@ -1970,7 +2033,7 @@ async function loadDetail(id) {
   // model_router upstream override). Saves reading the URL.
   let upstreamBadge = '';
   if (d.upstream) {
-    const uColors = { ollama: '#88c0d0', lmstudio: '#b48ead', anthropic: '#d08770' };
+    const uColors = { ollama: '#57d1e0', lmstudio: '#b48ead', anthropic: '#d08770' };
     const uc = uColors[d.upstream] || '#888';
     const ulabel = d.upstream === 'lmstudio' ? 'LM Studio' : (d.upstream[0].toUpperCase() + d.upstream.slice(1));
     upstreamBadge = ` <span title="Served by ${esc(d.upstream)}" style="color:${uc};border:1px solid ${uc}55;border-radius:3px;padding:1px 6px;font-size:11px;white-space:nowrap">${esc(ulabel)}</span>`;
@@ -1980,7 +2043,7 @@ async function loadDetail(id) {
   let cacheBadge = '';
   if (d.cache_verdict) {
     const cv = d.cache_verdict;
-    const col = cv === 'hit' ? '#7ee787' : (cv === 'partial' ? '#ebcb8b' : '#ff7b72');
+    const col = cv === 'hit' ? '#7ee787' : (cv === 'partial' ? '#f0c674' : '#ff7b72');
     const pctTxt = d.cache_pct != null ? ' ' + Math.round(d.cache_pct) + '%' : '';
     const tip = d.cache_pct != null
       ? `prompt cache ${cv} — ~${Math.round(d.cache_pct)}% of the prompt was reused (upstream evaluated fewer tokens than were sent)`
@@ -2003,11 +2066,11 @@ async function loadDetail(id) {
     const rows = d.images.map(im => {
       const kb = Math.round((im.size_bytes || 0) / 1024);
       if (im.kind === 'url') {
-        return `<div style="margin:6px 0"><a href="${esc(im.url)}" target="_blank" rel="noopener" style="color:#88c0d0">external image ${im.index} ↗</a> <span style="color:#666;font-size:11px">${esc(im.media_type || '')}</span></div>`;
+        return `<div style="margin:6px 0"><a href="${esc(im.url)}" target="_blank" rel="noopener" style="color:#57d1e0">external image ${im.index} ↗</a> <span style="color:#666;font-size:11px">${esc(im.media_type || '')}</span></div>`;
       }
       const src = `/__proxy/api/requests/${esc(d.id)}/image/${im.index}`;
       return `<div style="margin:8px 0">
-        <a href="${src}" target="_blank" rel="noopener" style="color:#88c0d0">image ${im.index} — ${esc(im.media_type)} · ${num(kb)} KB ↗</a>
+        <a href="${src}" target="_blank" rel="noopener" style="color:#57d1e0">image ${im.index} — ${esc(im.media_type)} · ${num(kb)} KB ↗</a>
         <div><img src="${src}" loading="lazy" style="max-width:360px;max-height:280px;border:1px solid #333;border-radius:4px;margin-top:4px;display:block" title="click the link above to open full size" onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'(could not render — data may be truncated)',style:'color:#e08080;font-size:11px'}))"></div>
       </div>`;
     }).join('');
@@ -2039,7 +2102,7 @@ async function loadDetail(id) {
     const s = d.downsize_score;
     const filled = Math.round(s / 10);
     const bar = '●'.repeat(filled) + '○'.repeat(10 - filled);
-    const color = s >= 70 ? '#a3be8c' : s >= 40 ? '#ebcb8b' : '#888';
+    const color = s >= 70 ? '#68d391' : s >= 40 ? '#f0c674' : '#888';
     // downsize_reasons is an array, but PII-redacted rows replace it with a placeholder
     // string. Coerce defensively so `.join` doesn't blow up.
     const reasonsArr = Array.isArray(d.downsize_reasons) ? d.downsize_reasons : [];
@@ -2062,16 +2125,16 @@ async function loadDetail(id) {
     if (parsed) {
       if (parsed.rewrite) {
         const r = parsed.rewrite;
-        routedLine += `<div style="margin-top:6px;font-size:14px"><strong>model:</strong> <code>${esc(r.from)}</code> &nbsp;→&nbsp; <code style="color:#88c0d0">${esc(r.to)}</code> <span class="badge">via ${esc(r.via || '')}</span></div>`;
+        routedLine += `<div style="margin-top:6px;font-size:14px"><strong>model:</strong> <code>${esc(r.from)}</code> &nbsp;→&nbsp; <code style="color:#57d1e0">${esc(r.to)}</code> <span class="badge">via ${esc(r.via || '')}</span></div>`;
       }
       if (parsed.options && parsed.options.applied) {
         const apps = parsed.options.applied;
         const kvs = Object.entries(apps).map(([k, v]) => `<code>${esc(k)}=${esc(JSON.stringify(v))}</code>`).join(' &nbsp;');
-        routedLine += `<div style="margin-top:6px;font-size:13px"><strong style="color:#88c0d0">options injected:</strong> ${kvs}</div>`;
+        routedLine += `<div style="margin-top:6px;font-size:13px"><strong style="color:#57d1e0">options injected:</strong> ${kvs}</div>`;
       }
       if (parsed.fixes && Array.isArray(parsed.fixes) && parsed.fixes.length) {
         const fixSummary = parsed.fixes.map(f => `<code>${esc(f.tool_name)}</code> ← {${Object.entries(f.fixed_fields || {}).map(([k, v]) => `${esc(k)}: ${esc(JSON.stringify(v))}`).join(', ')}}`).join('; ');
-        routedLine += `<div style="margin-top:6px;font-size:13px"><strong style="color:#88c0d0">tool args autofixed:</strong> ${fixSummary}</div>`;
+        routedLine += `<div style="margin-top:6px;font-size:13px"><strong style="color:#57d1e0">tool args autofixed:</strong> ${fixSummary}</div>`;
       }
     }
     const cls = d.gate_verdict === 'block' ? 'gate-block'
@@ -2380,7 +2443,7 @@ async function loadStats() {
         <div style="color:#777;font-size:11px">${sub}</div></td>
         <td colspan="7" class="empty" style="color:#666">no samples yet (needs TTFT-tagged rows)</td></tr>`;
     }
-    const cell = (v, hi) => `<td class="num"${hi ? ' style="color:#88c0d0;font-weight:600"' : ''}>${_fmtTps(v)}</td>`;
+    const cell = (v, hi) => `<td class="num"${hi ? ' style="color:#57d1e0;font-weight:600"' : ''}>${_fmtTps(v)}</td>`;
     return `<tr>
       <td><div style="font-weight:600;color:${accent}">${label}</div>
           <div style="color:#777;font-size:11px">${sub}</div></td>
@@ -2400,14 +2463,14 @@ async function loadStats() {
           <th class="num">p75</th><th class="num">p90</th><th class="num">max</th><th class="num">n</th>
         </tr></thead>
         <tbody>
-          ${_renderTpsMetricRow('Processing rate', 'prompt tokens ÷ prefill time (TTFT) — how fast it reads the prompt', '#a3be8c', _proc)}
-          ${_renderTpsMetricRow('Generation rate', 'completion tokens ÷ decode time — how fast it writes the reply', '#88c0d0', _gen)}
+          ${_renderTpsMetricRow('Processing rate', 'prompt tokens ÷ prefill time (TTFT) — how fast it reads the prompt', '#68d391', _proc)}
+          ${_renderTpsMetricRow('Generation rate', 'completion tokens ÷ decode time — how fast it writes the reply', '#57d1e0', _gen)}
           ${_renderTpsMetricRow('Combined throughput', 'completion tokens ÷ TOTAL time (prefill + decode)', '#b48ead', _comb)}
         </tbody>
       </table>
       ${_anyTps ? `<div style="margin-top:10px;padding:10px 12px;background:#20242e;border-left:3px solid #b48ead;border-radius:4px;font-size:12px;color:#bbb;line-height:1.5">
         <strong style="color:#d8c3e0">Why is “Combined” so much lower than the other two?</strong><br>
-        They measure different things. <span style="color:#a3be8c">Processing</span> times only the <em>prefill</em> phase (reading the prompt); <span style="color:#88c0d0">Generation</span> times only the <em>decode</em> phase (writing the reply). Both can be fast.
+        They measure different things. <span style="color:#68d391">Processing</span> times only the <em>prefill</em> phase (reading the prompt); <span style="color:#57d1e0">Generation</span> times only the <em>decode</em> phase (writing the reply). Both can be fast.
         <span style="color:#b48ead">Combined</span> divides <strong>only the completion tokens</strong> by the <strong>entire</strong> request time — prefill <em>and</em> decode.
         So when the prompt is far larger than the reply (e.g. an 85k-token prompt that produces a 200-token answer), the model spends most of its time prefilling — counted under Processing — while emitting few completion tokens, which drags the completion-per-second figure down. It's not a slowdown; it's a big-prompt / small-reply ratio. A prompt-cache <em>hit</em> skips prefill and pulls Combined back up toward Generation.
       </div>` : ''}
@@ -2529,10 +2592,10 @@ function _pagerHtml(prefix, p, extra) {
     <span>${p.total ? `Showing ${p.start+1}–${Math.min(p.start+p.size, p.total)} of ${p.total}` : 'No items'}</span>
     <span style="flex:1"></span>
     ${extra || ''}
-    <label>Per page <select id="${prefix}-pagesize" style="background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 4px;border-radius:3px;font-size:11px">${opts}</select></label>
-    <button id="${prefix}-prev" ${p.page<=1?'disabled':''} style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page<=1?'opacity:0.4;cursor:not-allowed':''}">‹ prev</button>
-    <span>page <input id="${prefix}-jump" type="number" min="1" max="${p.totalPages}" value="${p.page}" title="Type a page number and press Enter" style="width:46px;background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 4px;border-radius:3px;font-size:11px;text-align:center"> / ${p.totalPages}</span>
-    <button id="${prefix}-next" ${p.page>=p.totalPages?'disabled':''} style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page>=p.totalPages?'opacity:0.4;cursor:not-allowed':''}">next ›</button>
+    <label>Per page <select id="${prefix}-pagesize" style="background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px">${opts}</select></label>
+    <button id="${prefix}-prev" ${p.page<=1?'disabled':''} style="background:#262d38;color:#e9edf4;border:1px solid #313a48;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page<=1?'opacity:0.4;cursor:not-allowed':''}">‹ prev</button>
+    <span>page <input id="${prefix}-jump" type="number" min="1" max="${p.totalPages}" value="${p.page}" title="Type a page number and press Enter" style="width:46px;background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px;text-align:center"> / ${p.totalPages}</span>
+    <button id="${prefix}-next" ${p.page>=p.totalPages?'disabled':''} style="background:#262d38;color:#e9edf4;border:1px solid #313a48;padding:2px 10px;border-radius:3px;cursor:pointer;${p.page>=p.totalPages?'opacity:0.4;cursor:not-allowed':''}">next ›</button>
   </div>`;
 }
 function _wirePager(prefix, onChange) {
@@ -2564,7 +2627,7 @@ async function fetchAuditEventsPage() {
     if (_auditPage > maxPage) { _auditPage = maxPage; _auditEventsLoading = false; return fetchAuditEventsPage(); }
     renderAuditEvents();
   } catch (e) {
-    if (wrap) wrap.innerHTML = `<div class="empty" style="padding:20px;color:#bf616a">${esc(e.message)}</div>`;
+    if (wrap) wrap.innerHTML = `<div class="empty" style="padding:20px;color:#f07178">${esc(e.message)}</div>`;
   } finally {
     _auditEventsLoading = false;
   }
@@ -2623,7 +2686,7 @@ async function loadSuggestionsLazy() {
       wrap.innerHTML = `<div class="empty" style="padding:20px">No suggestions — analyzed ${sample} requests.</div>`;
     }
   } catch (e) {
-    if (wrap) wrap.innerHTML = `<div class="empty" style="padding:20px;color:#bf616a">${esc(e.message)}</div>`;
+    if (wrap) wrap.innerHTML = `<div class="empty" style="padding:20px;color:#f07178">${esc(e.message)}</div>`;
     if (cnt) cnt.textContent = '(error)';
   } finally {
     _suggLoading = false;
@@ -2713,11 +2776,11 @@ async function loadAudit() {
 
   $('audit').innerHTML = `
     <div class="cards">
-      <div class="card"><div class="l">Allowed</div><div class="v" style="color:#a3be8c">${num(allows)}</div></div>
-      <div class="card"><div class="l">Rewrites</div><div class="v" style="color:#88c0d0">${num(rewrites)}</div></div>
+      <div class="card"><div class="l">Allowed</div><div class="v" style="color:#68d391">${num(allows)}</div></div>
+      <div class="card"><div class="l">Rewrites</div><div class="v" style="color:#57d1e0">${num(rewrites)}</div></div>
       <div class="card"><div class="l">Intercepts</div><div class="v" style="color:#c8a8d8">${num(intercepts)}</div></div>
-      <div class="card"><div class="l">Warnings</div><div class="v" style="color:#ebcb8b">${num(warns)}</div></div>
-      <div class="card"><div class="l">Blocks</div><div class="v" style="color:#bf616a">${num(blocks)}</div></div>
+      <div class="card"><div class="l">Warnings</div><div class="v" style="color:#f0c674">${num(warns)}</div></div>
+      <div class="card"><div class="l">Blocks</div><div class="v" style="color:#f07178">${num(blocks)}</div></div>
       <div class="card"><div class="l">Rules File</div><div class="v" style="font-size:12px"><code>${esc((r.rules_file || '').split('/').pop())}</code></div><div class="s">${r.rules_file_exists ? 'override active' : 'using defaults'}</div></div>
     </div>
     <div class="stats-section">
@@ -2768,8 +2831,8 @@ async function loadAudit() {
       <h2>Export for AI review</h2>
       <div style="color:#888;font-size:12px;margin-bottom:8px">Build a digest you can paste into Claude/GPT to get rule recommendations. Or wire up the MCP endpoint and let an AI pull this data on demand.</div>
       <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <label style="font-size:12px;color:#aaa">Samples <input type="number" id="export-samples" value="10" min="0" max="50" style="width:60px;background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 6px;border-radius:3px;font-size:12px"></label>
-        <label style="font-size:12px;color:#aaa">Window (min) <input type="number" id="export-minutes" value="1440" min="1" max="43200" style="width:80px;background:#0f1116;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 6px;border-radius:3px;font-size:12px"></label>
+        <label style="font-size:12px;color:#aaa">Samples <input type="number" id="export-samples" value="10" min="0" max="50" style="width:60px;background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:3px 6px;border-radius:3px;font-size:12px"></label>
+        <label style="font-size:12px;color:#aaa">Window (min) <input type="number" id="export-minutes" value="1440" min="1" max="43200" style="width:80px;background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:3px 6px;border-radius:3px;font-size:12px"></label>
         <label style="font-size:12px;color:#aaa"><input type="checkbox" id="export-redact" checked> redact PII</label>
         <label style="font-size:12px;color:#aaa"><input type="checkbox" id="export-bodies"> longer bodies</label>
         <button onclick="exportDigest('markdown', this)">Copy Markdown</button>
@@ -2973,7 +3036,7 @@ async function loadConversationDetail(cid) {
       if (tr._call && tr._call.args) {
         let argsPretty = tr._call.args;
         try { argsPretty = JSON.stringify(JSON.parse(tr._call.args), null, 2); } catch {}
-        argsHtml = `<div style="margin:6px 0 2px 0;font-size:10px;color:#88c0d0;text-transform:uppercase;letter-spacing:0.5px">→ called with</div><pre style="font-size:11px;max-height:160px;margin:0 0 4px 0">${esc(argsPretty)}</pre><div style="margin:0 0 2px 0;font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:0.5px">→ returned</div>`;
+        argsHtml = `<div style="margin:6px 0 2px 0;font-size:10px;color:#57d1e0;text-transform:uppercase;letter-spacing:0.5px">→ called with</div><pre style="font-size:11px;max-height:160px;margin:0 0 4px 0">${esc(argsPretty)}</pre><div style="margin:0 0 2px 0;font-size:10px;color:#aaa;text-transform:uppercase;letter-spacing:0.5px">→ returned</div>`;
       }
       return `<details class="${cls}" style="margin:4px 0"><summary class="${summaryCls}" style="font-size:11px;cursor:pointer">🔧 <code>${esc(callName)}</code>${argsHtml ? '' : ' (result)'}${excerpt}</summary>
         ${argsHtml}<pre style="font-size:11px;max-height:160px;margin-top:0">${esc(contentStr.slice(0, 4000))}</pre>
@@ -2993,7 +3056,7 @@ async function loadConversationDetail(cid) {
         <span>· ${Math.round(t.duration_ms || 0)}ms</span>
         ${verdictBadge}
         <span style="flex:1;min-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${summaryLine}</span>
-        <a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(t.id)}')" style="color:#88c0d0;font-size:11px;margin-left:auto">open ${esc(t.id.slice(0,8))}</a>
+        <a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(t.id)}')" style="color:#57d1e0;font-size:11px;margin-left:auto">open ${esc(t.id.slice(0,8))}</a>
       </summary>
       <div style="margin-top:8px">
         ${trHtml}
@@ -3436,8 +3499,8 @@ function ollamaConfigSection(ollama) {
     : `<tr><td colspan="2" class="empty" style="padding:8px">Couldn't read OLLAMA_* env vars. The proxy isn't the same user as the ollama process and the systemd unit lookup also failed. Set <code>OLLAMA_SYSTEMD_UNIT</code> on the proxy if your unit name isn't <code>ollama.service</code>.</td></tr>`;
   const versionLabel = ollama.version
     ? (ollama.outdated
-        ? `<span style="background:#4a4020;color:#ebcb8b;border:1px solid #6a5a3a;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)} · upgrade ≥ v${esc(ollama.recommended_version || '')} recommended</span>`
-        : `<span style="background:#1e3a26;color:#a3be8c;border:1px solid #2e5a36;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)}</span>`)
+        ? `<span style="background:#4a4020;color:#f0c674;border:1px solid #6a5a3a;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)} · upgrade ≥ v${esc(ollama.recommended_version || '')} recommended</span>`
+        : `<span style="background:#1e3a26;color:#68d391;border:1px solid #2e5a36;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)}</span>`)
     : '';
   const meta = [
     ollama.pid ? 'pid ' + ollama.pid : null,
@@ -3559,7 +3622,7 @@ function renderProxyHealth(hp) {
       <div style="margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
         <strong style="font-size:12px;color:#aaa">Process:</strong>
         <span style="font-size:11px;color:#888">PID ${proc.pid || '?'} · uptime ${upH}</span>
-        <button id="restart-btn" onclick="restartProxy(this)" style="background:#4a3a2e;color:#ebcb8b;border:1px solid #6a5a30;padding:4px 14px;border-radius:3px;cursor:pointer;font-size:12px">↻ Restart proxy</button>
+        <button id="restart-btn" onclick="restartProxy(this)" style="background:#4a3a2e;color:#f0c674;border:1px solid #6a5a30;padding:4px 14px;border-radius:3px;cursor:pointer;font-size:12px">↻ Restart proxy</button>
         <span id="restart-status" style="font-size:11px;color:#888"></span>
       </div>
     </div>
@@ -3587,7 +3650,7 @@ async function resetDb(btn) {
     const d = await r.json();
     btn.textContent = '✓ wiped';
     btn.style.background = '#2e4a2e';
-    btn.style.color = '#a3be8c';
+    btn.style.color = '#68d391';
     btn.style.borderColor = '#4a6a4a';
     setTimeout(() => loadSystem(), 500);
   } catch (e) {
@@ -3642,7 +3705,7 @@ async function restartProxy(btn) {
     if (backOnline) {
       btn.textContent = '✓ restarted';
       btn.style.background = '#2e4a2e';
-      btn.style.color = '#a3be8c';
+      btn.style.color = '#68d391';
       btn.style.borderColor = '#4a6a4a';
       status.textContent = 'proxy is back';
       loadSystem();
@@ -3812,8 +3875,8 @@ function renderSystem() {
     <div class="stats-section" id="ollama-update-section">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <h2 style="margin:0">Ollama Registry Updates</h2>
-        <button onclick="checkOllamaUpdates(false)" id="ollama-upd-btn" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Check (cached)</button>
-        <button onclick="checkOllamaUpdates(true)" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Force refresh</button>
+        <button onclick="checkOllamaUpdates(false)" id="ollama-upd-btn" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Check (cached)</button>
+        <button onclick="checkOllamaUpdates(true)" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Force refresh</button>
         <span id="ollama-upd-status" style="color:#888;font-size:11px;margin-left:auto"></span>
       </div>
       <div id="ollama-upd-results" style="color:#666;font-size:12px;padding:6px">Click "Check" to compare local model digests against the Ollama registry.</div>
@@ -3852,11 +3915,11 @@ async function checkOllamaUpdates(force) {
     }
     const badge = (s) => {
       const map = {
-        outdated: ['#ebcb8b','#4a4020','#6a5a3a','⚠ update available'],
-        up_to_date: ['#a3be8c','#1e3a26','#2e5a36','✓ up to date'],
-        not_in_registry: ['#888','#2a2e3a','#3a3e4a','— not in registry'],
-        unknown: ['#888','#2a2e3a','#3a3e4a','? unknown'],
-        error: ['#bf616a','#3a1818','#5a2828','✗ error'],
+        outdated: ['#f0c674','#4a4020','#6a5a3a','⚠ update available'],
+        up_to_date: ['#68d391','#1e3a26','#2e5a36','✓ up to date'],
+        not_in_registry: ['#888','#262d38','#313a48','— not in registry'],
+        unknown: ['#888','#262d38','#313a48','? unknown'],
+        error: ['#f07178','#3a1818','#5a2828','✗ error'],
       };
       const [fg, bg, br, label] = map[s] || map.error;
       return `<span style="background:${bg};color:${fg};border:1px solid ${br};padding:1px 6px;border-radius:3px;font-size:11px">${label}</span>`;
@@ -3867,7 +3930,7 @@ async function checkOllamaUpdates(force) {
         <td>${badge(it.status)}</td>
         <td><code style="font-size:10px;color:#888">${esc((it.local_digest || '').slice(0,12) || '—')}</code></td>
         <td><code style="font-size:10px;color:#888">${esc((it.remote_digest || '').slice(0,12) || '—')}</code></td>
-        <td>${it.status === 'outdated' ? `<code style="font-size:11px;color:#88c0d0;user-select:all">ollama pull ${esc(it.name)}</code>` : (it.error ? `<span style="color:#888;font-size:11px" title="${esc(it.error)}">${esc((it.error||'').slice(0,40))}${(it.error||'').length>40?'…':''}</span>` : '')}</td>
+        <td>${it.status === 'outdated' ? `<code style="font-size:11px;color:#57d1e0;user-select:all">ollama pull ${esc(it.name)}</code>` : (it.error ? `<span style="color:#888;font-size:11px" title="${esc(it.error)}">${esc((it.error||'').slice(0,40))}${(it.error||'').length>40?'…':''}</span>` : '')}</td>
       </tr>
     `).join('');
     results.innerHTML = `<table style="width:100%">
@@ -3878,7 +3941,7 @@ async function checkOllamaUpdates(force) {
     const checked = new Date((d.checked_ts || 0)*1000).toLocaleTimeString();
     if (status) status.textContent = `${outdated} outdated · checked ${checked}`;
   } catch (e) {
-    results.innerHTML = `<div style="color:#bf616a;padding:6px">${esc(e.message)}</div>`;
+    results.innerHTML = `<div style="color:#f07178;padding:6px">${esc(e.message)}</div>`;
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -3911,7 +3974,7 @@ function renderComfyUISection(comfyui) {
   const queuePending = comfyui.queue_pending ?? '—';
   return `
     <div class="stats-section">
-      <h2><span class="reach-dot ${reachable ? 'ok' : 'bad'}"></span>ComfyUI ${reachable ? '<span style="color:#a3be8c;font-weight:normal;font-size:11px">running</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
+      <h2><span class="reach-dot ${reachable ? 'ok' : 'bad'}"></span>ComfyUI ${reachable ? '<span style="color:#68d391;font-weight:normal;font-size:11px">running</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
       ${reachable ? `
         <div class="cards" style="margin-bottom:12px">
           <div class="card"><div class="l">Queue</div><div class="v">${esc(String(queueRunning))} <span style="color:#888;font-size:13px">running</span> · ${esc(String(queuePending))} <span style="color:#888;font-size:13px">pending</span></div></div>
@@ -4258,13 +4321,13 @@ async function loadSetup() {
 
   const mcpUrl = baseRoot + '/__proxy/mcp';
   const apiVarsHtml = `
-    <div><span class="label">Base URL</span> <code>${esc(base)}</code> <button onclick="copyText('${esc(base)}', this)" style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px">copy</button></div>
+    <div><span class="label">Base URL</span> <code>${esc(base)}</code> <button onclick="copyText('${esc(base)}', this)" style="background:#262d38;color:#e9edf4;border:1px solid #313a48;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px">copy</button></div>
     <div><span class="label">Ollama URL</span> <code>${esc(baseRoot)}</code> <span style="color:#666;font-size:11px">(for clients using Ollama-native API, not /v1)</span></div>
     <div><span class="label">API Key</span> <code>ollama</code> <span style="color:#666;font-size:11px">(any non-empty string — proxy passes it to upstream)</span></div>
     <div><span class="label">Model</span> <select id="setup-model" onchange="setupSelectedModel = this.value; loadSetup();">${modelOpts}</select> <span style="color:#666;font-size:11px">${num(models.length)} model${models.length === 1 ? '' : 's'} available</span></div>
   `;
   const mcpVarsHtml = `
-    <div><span class="label">MCP URL</span> <code>${esc(mcpUrl)}</code> <button onclick="copyText('${esc(mcpUrl)}', this)" style="background:#2a2e3a;color:#e6e6e6;border:1px solid #3a3e4a;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px">copy</button></div>
+    <div><span class="label">MCP URL</span> <code>${esc(mcpUrl)}</code> <button onclick="copyText('${esc(mcpUrl)}', this)" style="background:#262d38;color:#e9edf4;border:1px solid #313a48;padding:3px 10px;border-radius:3px;cursor:pointer;font-size:11px">copy</button></div>
     <div><span class="label">Transport</span> <code>streamable-http</code> <span style="color:#666;font-size:11px">(JSON-RPC 2.0 over HTTP POST)</span></div>
     <div><span class="label">Auth</span> <span style="color:#666;font-size:11px">none unless <code>MCP_API_KEY</code> is set on the proxy</span></div>
     <div><span class="label">Tools</span> <span style="color:#666;font-size:11px">list_recent_requests, get_request_detail, list_conversations, get_conversation, get_stats, get_audit, get_suggestions, get_rules, get_system_metrics, export_digest <span style="color:#666">(+ update_rules when MCP_ALLOW_WRITE=true)</span></span></div>
@@ -4501,13 +4564,13 @@ function chatRenderPersonalityList() {
     return;
   }
   wrap.innerHTML = chatPersonalities.map(p => `
-    <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:10px;margin-bottom:6px">
+    <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px;margin-bottom:6px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" style="flex:1;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
-        <button data-pers-save="${esc(p.id)}" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Save</button>
+        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" style="flex:1;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
+        <button data-pers-save="${esc(p.id)}" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Save</button>
         <button data-pers-del="${esc(p.id)}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
       </div>
-      <textarea data-pers-prompt="${esc(p.id)}" rows="4" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:6px;font-family:inherit;font-size:12px;resize:vertical;box-sizing:border-box">${esc(p.prompt)}</textarea>
+      <textarea data-pers-prompt="${esc(p.id)}" rows="4" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:6px;font-family:inherit;font-size:12px;resize:vertical;box-sizing:border-box">${esc(p.prompt)}</textarea>
     </div>
   `).join('');
   wrap.querySelectorAll('[data-pers-save]').forEach(btn => {
@@ -4586,13 +4649,13 @@ async function chatRefreshMemory() {
       return;
     }
     list.innerHTML = items.map(it => `
-      <div style="background:#12141b;border:1px solid #2a2e3a;border-radius:6px;padding:10px 12px;margin-bottom:6px">
+      <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px 12px;margin-bottom:6px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-          <code style="font-size:12px;color:#88c0d0;flex:1;word-break:break-all">${esc(it.key)}</code>
+          <code style="font-size:12px;color:#57d1e0;flex:1;word-break:break-all">${esc(it.key)}</code>
           <span style="font-size:10px;color:#666" title="${new Date(it.updated_ts*1000).toLocaleString()}">${_taskAgo(it.updated_ts)}</span>
           <button data-mem-del-key="${esc(it.key)}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:2px 8px;font-size:11px;cursor:pointer">🗑</button>
         </div>
-        <pre style="margin:0;background:#0e1014;padding:8px;border-radius:4px;font-size:12px;color:#d8dee9;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto">${esc(it.value)}</pre>
+        <pre style="margin:0;background:#0a0d12;padding:8px;border-radius:4px;font-size:12px;color:#c9d3e1;white-space:pre-wrap;word-break:break-word;max-height:240px;overflow:auto">${esc(it.value)}</pre>
       </div>
     `).join('');
     list.querySelectorAll('[data-mem-del-key]').forEach(btn => {
@@ -4613,7 +4676,7 @@ async function chatRefreshMemory() {
     $('chat-mem-footer').style.display = '';
     $('chat-mem-count').textContent = `${items.length} entr${items.length === 1 ? 'y' : 'ies'}`;
   } catch (e) {
-    list.innerHTML = `<div style="color:#bf616a;padding:12px">${esc(e.message)}</div>`;
+    list.innerHTML = `<div style="color:#f07178;padding:12px">${esc(e.message)}</div>`;
   }
 }
 
@@ -5064,29 +5127,29 @@ async function loadBench() {
     el.innerHTML = `
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
         <h2 style="margin:0;font-size:14px;flex:1">⏱ Benchmark Runner</h2>
-        <button id="bench-refresh" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+        <button id="bench-refresh" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
       </div>
-      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:8px;padding:14px;margin-bottom:18px">
+      <div style="background:#141922;border:1px solid #262d38;border-radius:8px;padding:14px;margin-bottom:18px">
         <div style="font-size:12px;color:#aaa;margin-bottom:10px">Queue a streaming workload against a model. Each request reports TTFT and decode rate; the run rolls up min / p50 / p90 / max.</div>
         <div style="display:grid;grid-template-columns:auto 1fr auto 1fr;gap:8px 12px;align-items:center;font-size:12px;margin-bottom:10px">
-          <label>Model</label><select id="bench-model" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px"></select>
-          <label>Runs</label><input id="bench-runs" type="number" value="5" min="1" max="50" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px;width:80px">
-          <label>Max tokens</label><input id="bench-maxtok" type="number" value="256" min="16" max="4096" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px;width:80px">
-          <label>Prompt size</label><select id="bench-prompt" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px"><option value="0">short (~80 tok)</option><option value="2000">2K</option><option value="4000">4K</option><option value="8000">8K</option><option value="16000">16K</option><option value="32000">32K</option></select>
-          <label>Concurrency</label><select id="bench-concur" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px"><option value="1">1 (serial)</option><option value="2">2 parallel</option><option value="4">4 parallel</option><option value="8">8 parallel</option></select>
-          <label>Drain (s)</label><input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:4px;width:80px">
+          <label>Model</label><select id="bench-model" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"></select>
+          <label>Runs</label><input id="bench-runs" type="number" value="5" min="1" max="50" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
+          <label>Max tokens</label><input id="bench-maxtok" type="number" value="256" min="16" max="4096" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
+          <label>Prompt size</label><select id="bench-prompt" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="0">short (~80 tok)</option><option value="2000">2K</option><option value="4000">4K</option><option value="8000">8K</option><option value="16000">16K</option><option value="32000">32K</option></select>
+          <label>Concurrency</label><select id="bench-concur" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="1">1 (serial)</option><option value="2">2 parallel</option><option value="4">4 parallel</option><option value="8">8 parallel</option></select>
+          <label>Drain (s)</label><input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
         </div>
         <div style="display:flex;gap:14px;align-items:center;font-size:12px;margin-bottom:10px;flex-wrap:wrap">
           <label><input type="checkbox" id="bench-randomize"> Randomize prompt each run <span style="color:#666">(defeats prompt cache)</span></label>
           <label><input type="checkbox" id="bench-exclusive"> Exclusive mode <span style="color:#666">(queue all other clients during the bench)</span></label>
-          <button id="bench-go" style="margin-left:auto;background:#2a3e5a;border:1px solid #3a4e6a;color:#d8dee9;border-radius:4px;padding:6px 18px;font-size:13px;cursor:pointer">▶ Run benchmark</button>
+          <button id="bench-go" style="margin-left:auto;background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 18px;font-size:13px;cursor:pointer">▶ Run benchmark</button>
         </div>
         <div id="bench-go-err" style="color:#e08080;font-size:11px"></div>
       </div>
       <div id="bench-compare-bar" style="display:none;background:#12141b;border:1px solid #2a3e5a;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;align-items:center;gap:8px">
         <span style="flex:1" id="bench-compare-label"></span>
-        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Compare ↔</button>
-        <button id="bench-compare-clear" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Clear</button>
+        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Compare ↔</button>
+        <button id="bench-compare-clear" style="background:#262d38;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Clear</button>
       </div>
       <div id="bench-compare-view"></div>
       <h3 style="font-size:11px;text-transform:uppercase;color:#888;margin:18px 0 8px;letter-spacing:0.5px">History</h3>
@@ -5203,7 +5266,7 @@ async function _benchRefreshHistory() {
       });
     });
   } catch (e) {
-    wrap.innerHTML = `<div style="color:#bf616a">${esc(e.message)}</div>`;
+    wrap.innerHTML = `<div style="color:#f07178">${esc(e.message)}</div>`;
   }
 }
 
@@ -5221,10 +5284,10 @@ function _benchRenderRow(it) {
     summaryLine = `<span style="color:#5a5">✓ done</span>`;
   }
   return `
-    <div data-bench-id="${esc(it.id)}" style="background:#1a1d26;border:1px solid ${isSelected ? '#88c0d0' : '#2a2e3a'};border-radius:6px;padding:10px 12px;margin-bottom:6px;cursor:pointer">
+    <div data-bench-id="${esc(it.id)}" style="background:#141922;border:1px solid ${isSelected ? '#57d1e0' : '#262d38'};border-radius:6px;padding:10px 12px;margin-bottom:6px;cursor:pointer">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">
         <input type="checkbox" data-bench-cmp ${isSelected ? 'checked' : ''} title="Select for comparison" onclick="event.stopPropagation()">
-        <code style="color:#88c0d0">${esc(it.model)}</code>
+        <code style="color:#57d1e0">${esc(it.model)}</code>
         <span style="color:#888">${cfg.runs || '?'} runs · prompt=${cfg.prompt_tokens || 'short'} · cc=${cfg.concurrency || 1}${cfg.randomize ? ' · rand' : ''}${cfg.exclusive ? ' · excl' : ''}</span>
         <span style="margin-left:auto;color:#888">${_benchAgo(it.ts)}</span>
         <span>${summaryLine}</span>
@@ -5251,7 +5314,7 @@ async function _benchRenderCompare() {
   const [a, b] = await Promise.all(ids.map(id => fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id)).then(r => r.json())));
   const view = $('bench-compare-view');
   view.innerHTML = `
-    <div class="stats-section" style="background:#12141b;border:1px solid #88c0d0;padding:12px;border-radius:8px;margin-bottom:18px">
+    <div class="stats-section" style="background:#12141b;border:1px solid #57d1e0;padding:12px;border-radius:8px;margin-bottom:18px">
       <h3 style="margin:0 0 10px 0;font-size:13px">↔ Comparison</h3>
       ${_benchCompareTable(a, b)}
     </div>`;
@@ -5268,7 +5331,7 @@ function _benchCompareTable(a, b) {
     if (av == null || bv == null) return `<tr><td>${label}</td><td>${fmt(av)}</td><td>${fmt(bv)}</td><td>—</td></tr>`;
     const delta = betterIsHigh ? (bv - av) / av * 100 : (av - bv) / av * 100;
     const sign = delta >= 0 ? '+' : '';
-    const color = delta > 0 ? '#a3be8c' : (delta < 0 ? '#e08080' : '#888');
+    const color = delta > 0 ? '#68d391' : (delta < 0 ? '#e08080' : '#888');
     return `<tr><td>${label}</td><td>${fmt(av)}</td><td>${fmt(bv)}</td><td style="color:${color}">${sign}${delta.toFixed(1)}%</td></tr>`;
   }
   const aLabel = `<code>${esc(a.model)}</code> · ${(a.config || {}).runs || '?'} runs · ${_benchAgo(a.ts)}`;
@@ -5324,7 +5387,7 @@ async function _benchLoadDetail(id) {
         <tr><td style="color:#888">Total ms</td><td>min ${_benchFmtMs(tot.min)} · p50 ${_benchFmtMs(tot.p50)} · max ${_benchFmtMs(tot.max)}</td></tr>
       </tbody></table>
       <details style="margin-top:8px"><summary style="cursor:pointer;color:#888;font-size:11px">per-request rows</summary>
-        <pre style="background:#0e1014;padding:8px;border-radius:4px;font-size:11px;max-height:300px;overflow:auto">${esc(JSON.stringify(rows, null, 2))}</pre>
+        <pre style="background:#0a0d12;padding:8px;border-radius:4px;font-size:11px;max-height:300px;overflow:auto">${esc(JSON.stringify(rows, null, 2))}</pre>
       </details>`;
     _benchDetailCache.set(id, html);
     // For a running/pending bench, refresh detail on the next tick so progress updates.
@@ -5332,7 +5395,7 @@ async function _benchLoadDetail(id) {
     wrap.innerHTML = html;
     _benchApplyInnerState(id);
   } catch (err) {
-    wrap.innerHTML = `<span style="color:#bf616a">${esc(err.message)}</span>`;
+    wrap.innerHTML = `<span style="color:#f07178">${esc(err.message)}</span>`;
   }
 }
 
@@ -5343,19 +5406,19 @@ async function loadTasks() {
     el.innerHTML = `
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
         <h2 style="margin:0;font-size:14px;flex:1">📋 Task queue</h2>
-        <button id="tasks-refresh-btn" style="background:#2a2e3a;border:1px solid #3a3e4a;color:#e6e6e6;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+        <button id="tasks-refresh-btn" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
       </div>
-      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:8px;padding:12px;margin-bottom:14px">
+      <div style="background:#141922;border:1px solid #262d38;border-radius:8px;padding:12px;margin-bottom:14px">
         <div style="font-size:12px;color:#aaa;margin-bottom:8px"><strong>+ Queue a task</strong> — agent tasks drive your VS Code session; chat tasks hit Ollama directly.</div>
-        <textarea id="t2-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
+        <textarea id="t2-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
         <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:6px;align-items:center">
-          <label>Mode <select id="t2-mode" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px"><option value="chat">chat</option><option value="agent">agent</option></select></label>
-          <label id="t2-model-wrap">Model <select id="t2-model" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px;min-width:220px"></select></label>
-          <label id="t2-target-wrap" style="display:none">Endpoint <select id="t2-target" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px;min-width:220px"></select></label>
-          <label id="t2-approval-wrap" style="display:none">Approval <select id="t2-approval" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px"><option value="notify-phone">notify phone</option><option value="rules-only">rules only</option><option value="yolo">yolo</option></select></label>
-          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" style="background:#0e1014;border:1px solid #2a2e3a;color:#d8dee9;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
+          <label>Mode <select id="t2-mode" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px"><option value="chat">chat</option><option value="agent">agent</option></select></label>
+          <label id="t2-model-wrap">Model <select id="t2-model" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px;min-width:220px"></select></label>
+          <label id="t2-target-wrap" style="display:none">Endpoint <select id="t2-target" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px;min-width:220px"></select></label>
+          <label id="t2-approval-wrap" style="display:none">Approval <select id="t2-approval" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px"><option value="notify-phone">notify phone</option><option value="rules-only">rules only</option><option value="yolo">yolo</option></select></label>
+          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
         </div>
-        <button id="t2-add" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#d8dee9;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Queue task</button>
+        <button id="t2-add" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Queue task</button>
         <span id="t2-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
       </div>
       <h3 style="font-size:11px;text-transform:uppercase;color:#888;margin:14px 0 6px;letter-spacing:0.5px">Recurring</h3>
@@ -5377,7 +5440,7 @@ async function loadTasks() {
     const recurring = items.filter(t => t.schedule);
     const recent = items.filter(t => !t.schedule).slice(0, 50);
     $('t2-recurring').innerHTML = recurring.length ? recurring.map(t => `
-      <div style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:6px;padding:10px 12px;margin-bottom:6px">
+      <div style="background:#141922;border:1px solid #262d38;border-radius:6px;padding:10px 12px;margin-bottom:6px">
         <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;flex-wrap:wrap">
           <span style="font-size:11px;color:#7af">${esc(t.mode)}</span>
           <span style="font-size:11px;color:#888;font-family:ui-monospace,monospace">${esc(t.schedule)}</span>
@@ -5385,16 +5448,16 @@ async function loadTasks() {
           ${t.tool_approval_mode ? `<span style="font-size:11px;color:#666">${esc(t.tool_approval_mode)}</span>` : ''}
           <span style="margin-left:auto;font-size:11px;color:#888">${_taskNextRun(t.next_run_ts)}</span>
         </div>
-        <div style="font-size:13px;color:#d8dee9;white-space:pre-wrap;word-break:break-word;margin-bottom:8px">${esc((t.prompt||'').slice(0,300))}${(t.prompt||'').length>300?'…':''}</div>
+        <div style="font-size:13px;color:#c9d3e1;white-space:pre-wrap;word-break:break-word;margin-bottom:8px">${esc((t.prompt||'').slice(0,300))}${(t.prompt||'').length>300?'…':''}</div>
         <div style="display:flex;gap:6px;flex-wrap:wrap">
-          <button data-t2-act="run-now" data-t2-id="${t.id}" style="background:#2a3e5a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">▶ Run now</button>
-          <button data-t2-act="${t.enabled ? 'pause' : 'resume'}" data-t2-id="${t.id}" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">${t.enabled ? '⏸ Pause' : '▶ Resume'}</button>
+          <button data-t2-act="run-now" data-t2-id="${t.id}" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">▶ Run now</button>
+          <button data-t2-act="${t.enabled ? 'pause' : 'resume'}" data-t2-id="${t.id}" style="background:#262d38;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">${t.enabled ? '⏸ Pause' : '▶ Resume'}</button>
           <button data-t2-act="delete" data-t2-id="${t.id}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
         </div>
       </div>
     `).join('') : '<div style="color:#666;font-size:12px;padding:6px">No recurring tasks.</div>';
     $('t2-recent').innerHTML = recent.length ? recent.map(t => `
-      <details style="background:#1a1d26;border:1px solid #2a2e3a;border-radius:6px;padding:8px 12px;margin-bottom:6px">
+      <details style="background:#141922;border:1px solid #262d38;border-radius:6px;padding:8px 12px;margin-bottom:6px">
         <summary style="cursor:pointer;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
           ${_taskBadge(t.status)}
           <span style="font-size:11px;color:#7af">${esc(t.mode)}</span>
@@ -5404,11 +5467,11 @@ async function loadTasks() {
         </summary>
         <div style="margin-top:8px;font-size:12px">
           <div style="color:#888;margin-bottom:4px"><strong>Prompt:</strong></div>
-          <div style="white-space:pre-wrap;word-break:break-word;background:#0e1014;padding:8px;border-radius:4px;margin-bottom:8px">${esc(t.prompt||'')}</div>
-          ${t.result ? `<div style="color:#888;margin-bottom:4px"><strong>Result:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#0e1014;padding:8px;border-radius:4px;margin-bottom:8px;max-height:400px;overflow:auto">${esc(t.result)}</div>` : ''}
+          <div style="white-space:pre-wrap;word-break:break-word;background:#0a0d12;padding:8px;border-radius:4px;margin-bottom:8px">${esc(t.prompt||'')}</div>
+          ${t.result ? `<div style="color:#888;margin-bottom:4px"><strong>Result:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#0a0d12;padding:8px;border-radius:4px;margin-bottom:8px;max-height:400px;overflow:auto">${esc(t.result)}</div>` : ''}
           ${t.error ? `<div style="color:#e08080;margin-bottom:4px"><strong>Error:</strong></div><div style="white-space:pre-wrap;word-break:break-word;background:#2a1414;padding:8px;border-radius:4px;color:#e08080">${esc(t.error)}</div>` : ''}
           <div style="display:flex;gap:6px;margin-top:8px">
-            ${(t.status === 'pending' || t.status === 'running') ? `<button data-t2-act="cancel" data-t2-id="${t.id}" style="background:#2a2e3a;border:none;color:#d8dee9;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Cancel</button>` : ''}
+            ${(t.status === 'pending' || t.status === 'running') ? `<button data-t2-act="cancel" data-t2-id="${t.id}" style="background:#262d38;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Cancel</button>` : ''}
             <button data-t2-act="delete" data-t2-id="${t.id}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
           </div>
         </div>
@@ -5546,14 +5609,12 @@ document.addEventListener('input', (e) => {
 });
 
 loadInfo();
-// Console is the default experience now; Classic stays available via the toggle and only
-// takes over if the user explicitly chose it. Done before the view restore so the rail's
-// active state lands on the right item.
+// The Console shell is the only UI now (body carries .shell-console from first paint).
 try {
   // Give each rail item a tooltip so the collapsed icon-only strip stays discoverable.
   document.querySelectorAll('#shell-rail .snav').forEach(b => { const l = b.querySelector('.lbl2'); if (l) b.title = l.textContent; });
   if (localStorage.getItem(SHELL_COLLAPSE_KEY) === '1') setRailCollapsed(true, false);
-  if (localStorage.getItem(SHELL_KEY) !== 'classic') setShell('console', false);
+  startShell();
 } catch {}
 // Restore last-viewed tab if any; default to Requests.
 let _restoredView = null;
