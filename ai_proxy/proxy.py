@@ -440,10 +440,10 @@ MIGRATIONS = [
     # 1 if the request carried image/non-text content, so the list can badge it without
     # re-parsing the (large) body per row.
     "ALTER TABLE requests ADD COLUMN has_images INTEGER",
-    # Full-fidelity image payloads pulled out of the request body at save time, as a JSON
-    # array of {media_type, data(base64)}. Kept separate so the 256KB text-body cap can't
-    # truncate (and thereby corrupt) large embedded images. Powers the image reconstruction.
-    "ALTER TABLE requests ADD COLUMN images_data TEXT",
+    # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
+    # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
+    # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
+    # view. Fresh installs get it via the request_blobs CREATE TABLE.
 ]
 
 
