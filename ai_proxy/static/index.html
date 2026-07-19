@@ -547,9 +547,102 @@
   details.turn.turn-flash { animation: turn-flash-anim 1000ms ease-out; }
   @keyframes turn-flash-anim { 0% { box-shadow: 0 0 0 2px #ebcb8b; } 100% { box-shadow: 0 0 0 0 transparent; } }
   @media (max-width: 900px) { .conv-layout { flex-direction: column; } .conv-toc { width: 100%; flex: none; position: static; max-height: 280px; } }
+
+  /* ============ Console shell (alternate skin — grouped rail + status strip) ============ */
+  /* Both shells drive the same setView() and the same view divs; the rail is only chrome. */
+  :root { --shell-w: 210px; }
+  body { transition: padding-left .32s cubic-bezier(.4,0,.2,1); }
+  body.shell-console { padding-left: var(--shell-w); }
+  #shell-rail { position: fixed; left: 0; top: 0; bottom: 0; width: var(--shell-w); background: #0e1119; border-right: 1px solid #2a2e3a; display: flex; flex-direction: column; padding: 12px 10px; z-index: 50; overflow-x: hidden; overflow-y: auto; transform: translateX(-100%); transition: transform .32s cubic-bezier(.4,0,.2,1), width .32s cubic-bezier(.4,0,.2,1), padding .32s cubic-bezier(.4,0,.2,1); box-shadow: 6px 0 24px -14px rgba(0,0,0,.7); }
+  body.shell-console #shell-rail { transform: translateX(0); }
+  .shell-brand { display: flex; align-items: center; gap: 9px; padding: 4px 6px 12px; cursor: pointer; }
+  .shell-brand .lg { width: 26px; height: 26px; border-radius: 7px; background: linear-gradient(135deg,#88c0d0,#7aaffe); display: grid; place-items: center; flex: none; }
+  .shell-brand .lg svg { width: 15px; height: 15px; }
+  .shell-brand b { font-size: 13px; letter-spacing: .3px; }
+  .shell-brand .up2 { font-family: ui-monospace, Consolas, monospace; font-size: 10px; color: #888; display: block; margin-top: 1px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .shell-grp { margin-top: 12px; }
+  .shell-grp .gl { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase; color: #5f6675; padding: 0 8px 5px; }
+  .snav { display: flex; align-items: center; gap: 9px; width: 100%; padding: 6px 8px; border: none; background: none; color: #9aa4b2; font-size: 12.5px; border-radius: 7px; cursor: pointer; position: relative; text-align: left; font-family: inherit; }
+  .snav:hover { background: rgba(255,255,255,.04); color: #e6e6e6; }
+  .snav svg { width: 15px; height: 15px; flex: none; opacity: .72; }
+  .snav .lbl2 { flex: 1; }
+  .snav.on { background: linear-gradient(90deg, rgba(136,192,208,.16), rgba(136,192,208,.02)); color: #e6e6e6; }
+  .snav.on svg { opacity: 1; color: #88c0d0; }
+  .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #88c0d0; }
+  .snav .cntx { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; color: #5f6675; }
+  .snav-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .snav-pip.live { background: #a3be8c; box-shadow: 0 0 8px #a3be8c; animation: shell-pulse 1.6s infinite; }
+  .snav-pip.badge { background: #bf616a; box-shadow: 0 0 8px #bf616a; display: none; }
+  @keyframes shell-pulse { 50% { opacity: .35; } }
+  .shell-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid #23262f; display: flex; gap: 6px; align-items: stretch; }
+  .shell-foot button { background: #1a1d26; color: #9aa4b2; border: 1px solid #2a2e3a; border-radius: 6px; padding: 6px; font-size: 11.5px; cursor: pointer; font-family: inherit; }
+  .shell-foot button:hover { border-color: #3a4e6a; color: #e6e6e6; }
+  .sf-collapse { flex: none; width: 34px; font-size: 14px; line-height: 1; }
+  .sf-classic { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 5px; }
+  /* ---- collapsed (icon-only) rail ---- */
+  body.shell-collapsed { --shell-w: 56px; }
+  body.shell-collapsed #shell-rail { padding: 12px 6px; }
+  body.shell-collapsed .shell-brand { justify-content: center; padding: 4px 0 12px; }
+  body.shell-collapsed .shell-brand > div { display: none; }
+  body.shell-collapsed .shell-grp { margin-top: 8px; }
+  body.shell-collapsed .shell-grp .gl { display: none; }
+  body.shell-collapsed .snav { justify-content: center; padding: 9px 0; }
+  body.shell-collapsed .snav .lbl2, body.shell-collapsed .snav .cntx { display: none; }
+  body.shell-collapsed .snav.on::before { left: -6px; }
+  body.shell-collapsed .snav-pip { position: absolute; top: 5px; right: 9px; width: 6px; height: 6px; }
+  body.shell-collapsed .shell-foot { flex-direction: column; gap: 6px; }
+  body.shell-collapsed .sf-collapse, body.shell-collapsed .sf-classic { width: 100%; }
+  body.shell-collapsed .sfc-tx { display: none; }
+  /* status strip vitals live inside the existing header; shown only in console mode */
+  #shell-vitals { display: none; align-items: center; gap: 14px; font-size: 12px; }
+  body.shell-console #shell-vitals { display: flex; }
+  #shell-vitals .sv { color: #888; display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+  #shell-vitals .sv b { color: #d8dee9; font-variant-numeric: tabular-nums; }
+  #shell-vitals .dot { width: 8px; height: 8px; border-radius: 50%; background: #a3be8c; box-shadow: 0 0 8px #a3be8c; }
+  body.shell-console header .tabs { display: none; }
+  body.shell-console header h1 { display: none; }
+  #shell-toggle-btn { display: inline-flex; align-items: center; gap: 5px; }
+  /* suppress the shell transition on first paint so a console-default load doesn't animate */
+  body.shell-noanim, body.shell-noanim #shell-rail, body.shell-noanim .tabs { transition: none !important; }
+  @media (prefers-reduced-motion: reduce) {
+    body, #shell-rail { transition: none !important; }
+    .snav-pip.live { animation: none; }
+  }
+  @media (max-width: 760px) {
+    body.shell-console { padding-left: 0; }
+    #shell-rail { width: 200px; }
+  }
 </style>
 </head>
 <body>
+<aside id="shell-rail">
+  <div class="shell-brand" onclick="setView('requests')" title="Requests">
+    <span class="lg"><svg viewBox="0 0 24 24" fill="none" stroke="#0e1119" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M4 8h13m-4-4 4 4-4 4"/><path d="M20 16H7m4-4-4 4 4 4"/></svg></span>
+    <div><b>AI Proxy</b><span class="up2">→ …</span></div>
+  </div>
+  <div class="shell-grp"><div class="gl">Monitor</div>
+    <button class="snav" data-view="live" onclick="setView('live')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg><span class="lbl2">Live</span><i class="snav-pip live"></i></button>
+    <button class="snav" data-view="requests" onclick="setView('requests')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg><span class="lbl2">Requests</span></button>
+    <button class="snav" data-view="convs" onclick="setView('convs')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Conversations</span></button>
+  </div>
+  <div class="shell-grp"><div class="gl">Analyze</div>
+    <button class="snav" data-view="stats" onclick="setView('stats')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M7 14l3-4 4 3 5-7"/></svg><span class="lbl2">Stats</span></button>
+    <button class="snav" data-view="bench" onclick="setView('bench')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m12 2 3 7 7 .5-5.5 4.5 2 7-6.5-4-6.5 4 2-7L2 9.5 9 9z"/></svg><span class="lbl2">Bench</span></button>
+  </div>
+  <div class="shell-grp"><div class="gl">Work</div>
+    <button class="snav" data-view="chat" onclick="setView('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 10h8M8 13.5h5M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Chat</span></button>
+    <button class="snav" data-view="tasks" onclick="setView('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg><span class="lbl2">Tasks</span><i class="snav-pip badge" id="shell-tasks-pip"></i></button>
+  </div>
+  <div class="shell-grp"><div class="gl">System</div>
+    <button class="snav" data-view="system" onclick="setView('system')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.3 2.6a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L4 11a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/></svg><span class="lbl2">System</span></button>
+    <button class="snav" data-view="setup" onclick="setView('setup')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h16v12H4z"/><path d="M8 20h8M12 16v4"/></svg><span class="lbl2">Setup</span></button>
+    <button class="snav" data-view="audit" onclick="setView('audit')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2 3 6v6c0 5 4 8 9 10 5-2 9-5 9-10V6z"/></svg><span class="lbl2">Audit</span><i class="snav-pip badge" id="shell-audit-pip"></i></button>
+  </div>
+  <div class="shell-foot">
+    <button class="sf-collapse" onclick="toggleRailCollapse()" title="Collapse sidebar">«</button>
+    <button class="sf-classic" onclick="toggleShell()" title="Switch to classic layout"><span class="sfc-ic">↩</span><span class="sfc-tx">Classic view</span></button>
+  </div>
+</aside>
 <header>
   <h1>AI Proxy</h1>
   <span class="meta">→ <code id="upstream">…</code></span>
@@ -565,11 +658,13 @@
     <button class="tab" id="tab-stats" onclick="setView('stats')">Stats</button>
     <button class="tab" id="tab-audit" onclick="setView('audit')">Audit <span id="audit-badge" title="Click ✕ to mark as seen" style="display:none;background:#bf616a;color:#fff;border-radius:8px;padding:0 5px;margin-left:4px;font-size:10px"></span></button>
   </div>
+  <span id="shell-vitals"></span>
   <span style="flex:1"></span>
   <span class="meta" id="count"></span>
   <label><input type="checkbox" id="autoref" checked> auto-refresh</label>
   <button onclick="refresh()">Refresh</button>
   <button onclick="clearAll()">Clear</button>
+  <button id="shell-toggle-btn" onclick="toggleShell()" title="Switch dashboard layout"><span class="sti">▧</span><span class="stl">Console</span></button>
 </header>
 <div id="main">
   <div id="list">
@@ -681,6 +776,7 @@ function setView(v) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
+  try { syncShellNav(v); } catch {}
   for (const c of ['stats','audit','convs','system','setup','chat','tasks','bench','live']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
@@ -700,6 +796,71 @@ function setView(v) {
   else if (v === 'bench') loadBench();
   else if (v === 'live') loadLive();
   else refresh();
+}
+
+// ---------- Console shell (alternate skin) ----------
+// The rail + status strip are pure chrome over the existing views: nav buttons call the
+// same setView(), and the strip reuses the /system/now + /live endpoints. Persisted in
+// localStorage so the choice survives reloads; classic remains the default.
+const SHELL_KEY = 'ai-proxy-shell';
+let _shellPoll = null;
+function syncShellNav(v) {
+  document.querySelectorAll('#shell-rail .snav').forEach(b => b.classList.toggle('on', b.dataset.view === v));
+}
+function setShell(mode, animate) {
+  const isConsole = mode === 'console';
+  if (!animate) document.body.classList.add('shell-noanim');
+  document.body.classList.toggle('shell-console', isConsole);
+  try { localStorage.setItem(SHELL_KEY, mode); } catch {}
+  const btn = $('shell-toggle-btn');
+  if (btn) { const l = btn.querySelector('.stl'); if (l) l.textContent = isConsole ? 'Classic' : 'Console'; }
+  syncShellNav(view);
+  if (isConsole) { shellVitals(); if (!_shellPoll) _shellPoll = setInterval(shellVitals, 4000); }
+  else { clearInterval(_shellPoll); _shellPoll = null; }
+  if (!animate) requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('shell-noanim')));
+}
+function toggleShell() { setShell(document.body.classList.contains('shell-console') ? 'classic' : 'console', true); }
+// Collapse the rail to an icon-only strip. Persisted separately from the shell choice.
+const SHELL_COLLAPSE_KEY = 'ai-proxy-shell-collapsed';
+function setRailCollapsed(collapsed, animate) {
+  if (!animate) document.body.classList.add('shell-noanim');
+  document.body.classList.toggle('shell-collapsed', collapsed);
+  try { localStorage.setItem(SHELL_COLLAPSE_KEY, collapsed ? '1' : '0'); } catch {}
+  const g = document.querySelector('.sf-collapse');
+  if (g) { g.textContent = collapsed ? '»' : '«'; g.title = collapsed ? 'Expand sidebar' : 'Collapse sidebar'; }
+  if (!animate) requestAnimationFrame(() => requestAnimationFrame(() => document.body.classList.remove('shell-noanim')));
+}
+function toggleRailCollapse() { setRailCollapsed(!document.body.classList.contains('shell-collapsed'), true); }
+async function shellVitals() {
+  let gpu = '—', mem = '—', tps = 0, active = 0;
+  try {
+    const s = await (await fetch('/__proxy/api/system/now')).json();
+    const g = (s.gpus || [])[0];
+    if (g && g.util_pct != null) gpu = Math.round(g.util_pct) + '%';
+    if (s.mem) mem = Math.round((s.mem.used_mb || 0) / 1024) + '/' + Math.round((s.mem.total_mb || 0) / 1024);
+  } catch {}
+  try {
+    const d = await (await fetch('/__proxy/api/live')).json();
+    const tiles = d.tiles || [];
+    active = tiles.filter(t => !t.done).length;
+    tps = Math.round(tiles.reduce((a, t) => a + (t.tps || 0), 0));
+  } catch {}
+  const v = $('shell-vitals');
+  if (v) v.innerHTML = `<span class="sv"><i class="dot"></i>online</span>`
+    + `<span class="sv">gpu <b>${gpu}</b></span>`
+    + `<span class="sv">mem <b>${mem}G</b></span>`
+    + `<span class="sv"><b>${tps}</b> tok/s</span>`
+    + `<span class="sv"><b>${active}</b> active</span>`;
+  // mirror the classic audit/tasks badges onto their rail items
+  try {
+    const map = [['audit-badge', 'shell-audit-pip'], ['tasks-badge', 'shell-tasks-pip']];
+    for (const [src, dst] of map) {
+      const ab = $(src), rp = $(dst);
+      if (rp) rp.style.display = (ab && ab.style.display !== 'none' && (ab.textContent || '').trim()) ? 'block' : 'none';
+    }
+  } catch {}
+  // keep the rail's upstream line in sync with the header
+  try { const up = $('upstream'), r = document.querySelector('#shell-rail .up2'); if (up && r) r.textContent = '→ ' + (up.textContent || '').replace(/^→\s*/, ''); } catch {}
 }
 
 // ---------- Live View ----------
@@ -5385,6 +5546,15 @@ document.addEventListener('input', (e) => {
 });
 
 loadInfo();
+// Console is the default experience now; Classic stays available via the toggle and only
+// takes over if the user explicitly chose it. Done before the view restore so the rail's
+// active state lands on the right item.
+try {
+  // Give each rail item a tooltip so the collapsed icon-only strip stays discoverable.
+  document.querySelectorAll('#shell-rail .snav').forEach(b => { const l = b.querySelector('.lbl2'); if (l) b.title = l.textContent; });
+  if (localStorage.getItem(SHELL_COLLAPSE_KEY) === '1') setRailCollapsed(true, false);
+  if (localStorage.getItem(SHELL_KEY) !== 'classic') setShell('console', false);
+} catch {}
 // Restore last-viewed tab if any; default to Requests.
 let _restoredView = null;
 // sessionStorage wins on reload of the same tab; localStorage is the cross-tab default
