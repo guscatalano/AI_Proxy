@@ -940,6 +940,39 @@ let selected = null;
 let items = [];
 let view = 'requests';
 let lastDetailSig = null;
+let _liveDetailTimer = null;   // polls live output for an in-flight streaming request
+let _liveDetailId = null;
+
+function stopLiveDetail() {
+  if (_liveDetailTimer) { clearInterval(_liveDetailTimer); _liveDetailTimer = null; }
+  _liveDetailId = null;
+}
+
+function startLiveDetail(id) {
+  if (_liveDetailId === id && _liveDetailTimer) return;   // already polling this one
+  stopLiveDetail();
+  _liveDetailId = id;
+  const tick = async () => {
+    if (selected !== id) { stopLiveDetail(); return; }
+    let j = null;
+    try { j = await (await fetch('/__proxy/api/requests/' + id + '/live')).json(); } catch { return; }
+    const out = $('live-detail-out'), meta = $('live-detail-meta');
+    if (!out) { stopLiveDetail(); return; }   // detail re-rendered without a live section
+    if (j.redacted) { out.textContent = '🔒 live output hidden (PII: not on this client\'s subnet)'; }
+    else if (j.text != null) {
+      const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
+      out.textContent = j.text || '…';
+      if (atBottom) out.scrollTop = out.scrollHeight;
+      if (meta) meta.textContent = [
+        j.prompt_tokens != null ? 'prompt ' + num(j.prompt_tokens) : '',
+        j.completion_tokens != null ? 'completion ' + num(j.completion_tokens) : '',
+      ].filter(Boolean).join(' · ');
+    }
+    if (!j.active) { stopLiveDetail(); lastDetailSig = null; loadDetail(id); }   // finished → render persisted view
+  };
+  tick();
+  _liveDetailTimer = setInterval(tick, 700);
+}
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
@@ -1714,6 +1747,79 @@ function analyzeResponse(respBody, streamChunks) {
   return out;
 }
 
+// Did the client ask the model to think, at what level, and did the response actually
+// produce reasoning (+ how many reasoning tokens)? Returns null when there's nothing to show.
+function analyzeThinking(d) {
+  let j = null;
+  try { j = JSON.parse(d.request_body || ''); } catch {}
+  const isGen = !!(j && ((Array.isArray(j.messages) && j.messages.length) || typeof j.prompt === 'string'));
+  const norm = v => String(v).toLowerCase();
+  let requested = 'default', signal = '';
+  if (j) {
+    let eff = j.reasoning_effort;
+    if (eff == null && j.reasoning && typeof j.reasoning === 'object') eff = j.reasoning.effort;
+    if (eff != null) {
+      const e = norm(eff);
+      if (e === 'none' || e === 'off') requested = 'off';
+      else if (['minimal','low','medium','high'].includes(e)) requested = (e === 'minimal') ? 'low' : e;
+      else requested = 'on';
+      signal = 'reasoning_effort=' + eff;
+    }
+    let et = j.enable_thinking;
+    if (et == null && j.chat_template_kwargs && typeof j.chat_template_kwargs === 'object') et = j.chat_template_kwargs.enable_thinking;
+    if (et === false) { requested = 'off'; signal = signal || 'enable_thinking=false'; }
+    else if (et === true && requested === 'default') { requested = 'on'; signal = signal || 'enable_thinking=true'; }
+    if (j.thinking && typeof j.thinking === 'object') {
+      if (j.thinking.type === 'disabled') { requested = 'off'; signal = 'thinking:disabled'; }
+      else if (j.thinking.type === 'enabled') {
+        const b = j.thinking.budget_tokens || 0;
+        requested = b >= 8000 ? 'high' : b >= 2000 ? 'medium' : b > 0 ? 'low' : 'on';
+        signal = 'thinking budget ' + (b || '?');
+      }
+    }
+    let lastUser = '';
+    const msgs = j.messages || [];
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i] && msgs[i].role === 'user') {
+        const c = msgs[i].content;
+        lastUser = typeof c === 'string' ? c : (Array.isArray(c) ? c.map(p => (p && p.text) || '').join(' ') : '');
+        break;
+      }
+    }
+    if (!lastUser && typeof j.prompt === 'string') lastUser = j.prompt;
+    if (/\/no_think\b/.test(lastUser)) { requested = 'off'; signal = '/no_think'; }
+    else if (/\/think\b/.test(lastUser) && requested === 'default') { requested = 'on'; signal = '/think'; }
+  }
+  let thought = false, reasoningTokens = null;
+  const scanObj = (o) => {
+    if (!o || typeof o !== 'object') return;
+    const u = o.usage;
+    if (u && typeof u === 'object') {
+      const rt = (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens != null)
+        ? u.completion_tokens_details.reasoning_tokens : u.reasoning_tokens;
+      if (rt != null) { reasoningTokens = Math.max(reasoningTokens || 0, rt); if (rt > 0) thought = true; }
+    }
+    for (const c of (o.choices || [])) {
+      const m = c.message || c.delta || {};
+      if (m.reasoning_content || m.reasoning) thought = true;
+    }
+    if (Array.isArray(o.content)) for (const blk of o.content) if (blk && (blk.type === 'thinking' || blk.type === 'redacted_thinking')) thought = true;
+  };
+  if (d.response_body) { try { scanObj(JSON.parse(d.response_body)); } catch {} }
+  const sc = d.stream_chunks || '';
+  if (sc) {
+    if (/"reasoning_content"|"reasoning"\s*:\s*"|"thinking_delta"|"type"\s*:\s*"thinking"/.test(sc)) thought = true;
+    for (const line of sc.split('\n')) {
+      const s = line.startsWith('data: ') ? line.slice(6) : (line.trim().startsWith('{') ? line.trim() : '');
+      if (!s || s === '[DONE]') continue;
+      try { scanObj(JSON.parse(s)); } catch {}
+    }
+  }
+  if (!thought && (/<think>/.test(d.response_body || '') || /<think>/.test(sc))) thought = true;
+  if (!isGen && !thought && requested === 'default') return null;
+  return { requested, thought, reasoningTokens, signal };
+}
+
 function renderAnalysis(d) {
   const req = analyzeRequest(d.request_body);
   const resp = analyzeResponse(d.response_body, d.stream_chunks);
@@ -2297,6 +2403,36 @@ async function loadDetail(id) {
     cacheBadge = ` <span title="${tip}" style="color:${col};border:1px solid ${col}55;border-radius:3px;padding:1px 6px;font-size:11px;white-space:nowrap">⚡ cache ${cv}${pctTxt}</span>`;
   }
 
+  // Thinking badge: what the client asked for (reasoning_effort / enable_thinking / thinking /
+  // /think·/no_think) and whether the model actually reasoned (+ reasoning-token count).
+  let thinkBadge = '';
+  const think = analyzeThinking(d);
+  if (think) {
+    const lvlTxt = ['low','medium','high'].includes(think.requested) ? ': ' + think.requested : '';
+    let col, txt, tip;
+    if (think.thought) {
+      col = '#c8a8f0';
+      const tok = think.reasoningTokens ? ' · ' + num(think.reasoningTokens) + ' tok' : '';
+      txt = '💭 thinking' + lvlTxt + tok;
+      tip = 'model produced reasoning'
+        + (think.signal ? ' (client sent ' + think.signal + ')' : '')
+        + (think.reasoningTokens ? ' — ' + think.reasoningTokens + ' reasoning tokens' : '');
+    } else if (think.requested === 'off') {
+      col = '#8b93a0';
+      txt = '🚫 no-think';
+      tip = 'thinking explicitly disabled by the client' + (think.signal ? ' (' + think.signal + ')' : '');
+    } else if (think.requested !== 'default') {
+      col = '#f0c674';
+      txt = '💭 think' + (lvlTxt || ': on') + ' (req)';
+      tip = 'client requested thinking (' + think.signal + ') but no reasoning was detected in the response';
+    } else {
+      col = '#8b93a0';
+      txt = 'no-think';
+      tip = 'no thinking requested and none produced';
+    }
+    thinkBadge = ` <span title="${esc(tip)}" style="color:${col};border:1px solid ${col}55;border-radius:3px;padding:1px 6px;font-size:11px;white-space:nowrap">${txt}</span>`;
+  }
+
   const reqHeaders = tryPretty(d.request_headers);
   const reqBody = tryPretty(d.request_body);
   const respHeaders = tryPretty(d.response_headers);
@@ -2322,6 +2458,14 @@ async function loadDetail(id) {
     }).join('');
     imagesHtml = section(`Images (${d.images.length})`, rows);
   }
+  // In-flight streaming: show a live-updating output pane (polled from the in-memory mirror).
+  const inflight = !d.status && !d.error;
+  const liveSection = inflight
+    ? `<div class="section"><h3><span style="color:#ff7b72">🔴 Live Output</span> <span style="color:#888;font-size:11px">streaming…</span></h3>`
+      + `<div id="live-detail-meta" style="color:#888;font-size:11px;margin-bottom:4px"></div>`
+      + `<pre id="live-detail-out" class="stream-text" style="max-height:340px">…</pre></div>`
+    : '';
+
   let respSection = '';
 
   if (d.is_stream || d.stream_chunks) {
@@ -2417,12 +2561,13 @@ async function loadDetail(id) {
       <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
       <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code>${upstreamBadge}${cacheBadge}</div>
       <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${fmtMsLong(d.duration_ms)}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
-      <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code></div>
+      <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code>${thinkBadge}</div>
       ${tokensLine}
       ${downsizeLine}
     </div>
     ${gateHtml}
     ${errBlock}
+    ${liveSection}
     ${shadowsHtml}
     ${analysisHtml}
     <div class="section"><h3>Request Headers</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="reqh">${esc(reqHeaders)}</pre></details></div>
@@ -2440,6 +2585,8 @@ async function loadDetail(id) {
   });
 
   lastDetailSig = sig;
+  // Drive (or stop) the live-output poll based on whether this request is still streaming.
+  if (inflight) startLiveDetail(d.id); else stopLiveDetail();
 }
 
 async function clearAll() {

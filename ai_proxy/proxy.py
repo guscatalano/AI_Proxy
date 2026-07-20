@@ -5328,6 +5328,29 @@ def get_request_image(req_id: str, idx: int, request: Request):  # sync → thre
     return JSONResponse({"error": "image index out of range"}, status_code=404)
 
 
+@app.get("/__proxy/api/requests/{req_id}/live")
+async def request_live(req_id: str, request: Request):
+    """Live output for an in-flight streaming request: the rolling reconstructed tail from the
+    in-memory mirror (raw SSE chunks aren't retained; only the assembled text is). The detail
+    view polls this while a request streams, then falls back to the persisted stream_chunks once
+    it completes. Same PII gate as the detail: only a viewer allowed to see this client's data."""
+    s = _LIVE_STREAMS.get(req_id)
+    conn = db()
+    row = conn.execute("SELECT client_ip, status FROM requests WHERE id = ?", (req_id,)).fetchone()
+    conn.close()
+    active = s is not None and (row is None or not row["status"])
+    if row is not None and not _can_view_pii(_client_ip(request), row["client_ip"]):
+        return {"active": active, "text": None, "redacted": True}
+    if not s:
+        return {"active": False, "text": None}
+    return {
+        "active": active,
+        "text": s.get("text") or "",
+        "prompt_tokens": s.get("prompt"),
+        "completion_tokens": s.get("completion"),
+    }
+
+
 @app.post("/__proxy/api/clear")
 async def clear_requests():
     conn = db()
