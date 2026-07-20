@@ -752,6 +752,27 @@
   .conv-timeline.f-no-toolresults .tl-tool-result { display: none; }
   .conv-timeline.f-no-system .tl-system { display: none; }
   .tl-system.tl-force-show { display: block !important; }
+  /* ── decluttered Stats: KPI strip + tabbed breakdown ── */
+  .s2-kpis { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; margin-bottom: 18px; }
+  .s2-kpi { background: #141922; border: 1px solid #262d38; border-radius: 9px; padding: 11px 13px; }
+  .s2-kpi .l { font-size: 10px; letter-spacing: .1em; text-transform: uppercase; color: #5f6b7e; }
+  .s2-kpi .v { font-size: 21px; font-weight: 650; margin-top: 4px; }
+  .s2-kpi .v small { font-size: 12px; color: #93a0b4; font-weight: 400; }
+  .s2-kpi .s { font-size: 10.5px; color: #5f6b7e; margin-top: 3px; }
+  .s2-kpi .s.s2-bad { color: #f07178; }
+  .s2-lbl { font-family: ui-monospace, Consolas, monospace; font-size: 10px; letter-spacing: .18em; text-transform: uppercase; color: #5f6b7e; margin: 0 0 8px; }
+  .s2-detail { background: #141922; border: 1px solid #262d38; border-radius: 10px; overflow: hidden; margin-top: 4px; }
+  .s2-tabs { display: flex; gap: 2px; padding: 8px 8px 0; border-bottom: 1px solid #262d38; overflow-x: auto; }
+  .s2-tabs button { background: none; border: none; border-bottom: 2px solid transparent; color: #93a0b4; font-size: 12.5px; padding: 8px 14px; cursor: pointer; white-space: nowrap; font-family: inherit; }
+  .s2-tabs button:hover { color: #e9edf4; }
+  .s2-tabs button.on { color: #57d1e0; border-bottom-color: #57d1e0; }
+  .s2-panes { padding: 6px; overflow-x: auto; }
+  .s2-pane table { width: 100%; border-collapse: collapse; }
+  .s2-explain { margin: 10px 6px 4px; }
+  .s2-explain > summary { cursor: pointer; color: #93a0b4; font-size: 12px; padding: 6px 8px; list-style: none; }
+  .s2-explain > summary::-webkit-details-marker { display: none; }
+  .s2-explain > div { margin-top: 6px; padding: 8px 12px; background: #12161d; border-left: 3px solid #b48ead; border-radius: 4px; font-size: 12px; color: #bbb; line-height: 1.5; }
+  @media (max-width: 760px) { .s2-kpis { grid-template-columns: repeat(3, 1fr); } }
 </style>
 </head>
 <body class="shell-console">
@@ -2518,6 +2539,17 @@ function renderPerf(P){
   const winBtns=[1,6,24,72].map(h=>`<button onclick="setPerfWin(${h})" class="${_perfWinH===h?'on':''}">${h<24?h+'h':(h/24)+'d'}</button>`).join('');
   return `<div class="pf"><div class="pf-bar"><span class="pf-title">Perf &amp; Trends</span><span class="pf-win">${winBtns}</span></div><div class="pf-grid">${charts}</div></div>`;
 }
+// Decluttered Stats: one tabbed breakdown instead of seven stacked tables. The active tab
+// persists across the ~9s auto-refresh so a rebuild doesn't snap you back to Models.
+let _statsTab = 'models';
+function setStatsTab(id) { _statsTab = id; _activateStatsTab(id); }
+function _activateStatsTab(id) {
+  const root = $('stats'); if (!root) return;
+  if (!root.querySelector(`.s2-pane[data-stab="${id}"]`)) id = 'models';
+  _statsTab = id;
+  root.querySelectorAll('.s2-tabs button').forEach(b => b.classList.toggle('on', b.dataset.stab === id));
+  root.querySelectorAll('.s2-pane').forEach(p => { p.style.display = p.dataset.stab === id ? '' : 'none'; });
+}
 async function loadStats() {
   const [d, rules, audit, perfData] = await Promise.all([
     fetch('/__proxy/api/stats').then(r => r.json()),
@@ -2680,55 +2712,57 @@ async function loadStats() {
       </table>
     </div>`;
 
+  // ── Decluttered layout: KPI strip → trends → one tabbed breakdown ──
+  const _errRate = (o.count > 0) ? ((o.errors || 0) / o.count * 100) : 0;
+  let _cacheHit = '—';
+  if (perfData && perfData.series) { const cp = perfData.series.map(b => b.cache_pct).filter(v => v != null); if (cp.length) _cacheHit = Math.round(cp.reduce((a, b) => a + b, 0) / cp.length) + '%'; }
+  const _kpi = (l, v, unit, sub, cls) => `<div class="s2-kpi"><div class="l">${l}</div><div class="v tnum">${v}${unit ? `<small> ${unit}</small>` : ''}</div><div class="s ${cls || ''}">${sub}</div></div>`;
+  const kpiStrip = `<div class="s2-kpis">
+    ${_kpi('Requests', num(o.count || 0), '', `${num(o.streams || 0)} streamed`)}
+    ${_kpi('Total tokens', num(o.total_tokens || 0), '', `p ${num(o.prompt_tokens || 0)} · c ${num(o.completion_tokens || 0)}`)}
+    ${_kpi('Throughput', overallTokSec, 'tok/s', 'completion / decode')}
+    ${_kpi('Avg latency', num(Math.round(o.avg_ms || 0)), 'ms', `${(((o.total_ms || 0) / 1000)).toFixed(0)}s upstream`)}
+    ${_kpi('Errors', num(o.errors || 0), '', `${_errRate.toFixed(1)}% of reqs`, _errRate > 1 ? 's2-bad' : '')}
+    ${_kpi('Cache hit', _cacheHit, '', 'prefill reuse')}
+  </div>`;
+
+  const tpPane = `<table style="width:100%">
+      <thead><tr><th style="text-align:left">Metric</th><th class="num">min</th><th class="num">p25</th><th class="num">p50</th><th class="num">p75</th><th class="num">p90</th><th class="num">max</th><th class="num">n</th></tr></thead>
+      <tbody>
+        ${_renderTpsMetricRow('Processing rate', 'prompt tokens ÷ prefill time (TTFT) — how fast it reads the prompt', '#68d391', _proc)}
+        ${_renderTpsMetricRow('Generation rate', 'completion tokens ÷ decode time — how fast it writes the reply', '#57d1e0', _gen)}
+        ${_renderTpsMetricRow('Combined throughput', 'completion tokens ÷ TOTAL time (prefill + decode)', '#b48ead', _comb)}
+      </tbody></table>
+    ${_anyTps ? `<details class="s2-explain"><summary>ⓘ Why is “Combined” lower than the other two?</summary>
+      <div>They measure different phases. <span style="color:#68d391">Processing</span> times only <em>prefill</em> (reading the prompt); <span style="color:#57d1e0">Generation</span> times only <em>decode</em> (writing the reply). <span style="color:#b48ead">Combined</span> divides only the completion tokens by the <em>entire</em> request time — so a large prompt with a short reply drags it down. A prompt-cache <em>hit</em> skips prefill and pulls Combined back up.</div>
+    </details>` : ''}`;
+
+  const upstreamPane = `<table style="width:100%">
+      <thead><tr><th>Upstream</th><th class="num">Requests</th><th class="num">Streamed</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total</th><th class="num">Avg ms</th><th class="num">tok/s</th><th class="num">w/ TTFT</th><th class="num">Avg TTFT</th></tr></thead>
+      <tbody>${upstreamRows}</tbody></table>`;
+
+  const tabs = [
+    ['models', 'Models', `<table style="width:100%"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total</th><th class="num">Avg ms</th><th class="num" title="completion tokens per second">tok/s</th><th class="num" title="ms per 1,000 completion tokens">ms/1k</th><th class="num">Errors</th></tr></thead><tbody>${modelRows}</tbody></table>`],
+    ['throughput', 'Throughput', tpPane],
+    ['apps', 'Apps', `<table style="width:100%"><thead><tr><th>App</th><th class="num">Requests</th><th class="num">Convs</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total</th><th class="num">Avg ms</th><th>Models</th><th>Last Seen</th></tr></thead><tbody>${appRows}</tbody></table>`],
+    ['clients', 'Clients', `<table style="width:100%"><thead><tr><th>Client IP</th><th class="num">Requests</th><th class="num">Total tok</th><th class="num">Avg ms</th><th>Last Seen</th></tr></thead><tbody>${clientRows}</tbody></table>`],
+    ['endpoints', 'Endpoints', `<table style="width:100%"><thead><tr><th>Path</th><th class="num">Requests</th><th class="num">Total tok</th><th class="num">Avg ms</th></tr></thead><tbody>${pathRows}</tbody></table>`],
+    ['upstreams', 'Upstreams', upstreamPane],
+    ['tools', 'Tools', `<table style="width:100%"><thead><tr><th>Tool</th><th class="num">Calls</th><th>By Model</th></tr></thead><tbody>${toolRows}</tbody></table>`],
+    ['status', 'Status', `<table style="width:auto;min-width:240px"><thead><tr><th>Status</th><th class="num">Count</th></tr></thead><tbody>${statusRows}</tbody></table>`],
+    ['flow', 'Flow', flowHtml || '<div class="empty" style="padding:22px">No routing/flow data yet.</div>'],
+  ];
+  const tabBar = tabs.map(([id, label]) => `<button data-stab="${id}" onclick="setStatsTab('${id}')">${label}</button>`).join('');
+  const tabPanes = tabs.map(([id, , html]) => `<div class="s2-pane" data-stab="${id}">${html}</div>`).join('');
+
   $('stats').innerHTML = `
+    ${kpiStrip}
+    <div class="s2-lbl">Trends</div>
     ${perfHtml}
-    ${flowHtml}
-    ${cards}
-    ${tpSection}
-    <div class="stats-section">
-      <h2>By Model</h2>
-      <table style="width:100%">
-        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th class="num" title="completion tokens per second">tok/s</th><th class="num" title="ms to generate 1,000 completion tokens">ms/1k</th><th class="num">Errors</th></tr></thead>
-        <tbody>${modelRows}</tbody>
-      </table>
-    </div>
-    <div class="stats-section">
-      <h2>By Endpoint</h2>
-      <table style="width:100%">
-        <thead><tr><th>Path</th><th class="num">Requests</th><th class="num">Total Tokens</th><th class="num">Avg ms</th></tr></thead>
-        <tbody>${pathRows}</tbody>
-      </table>
-    </div>
-    ${upstreamSection}
-    <div class="stats-section">
-      <h2>By Client App</h2>
-      <table style="width:100%">
-        <thead><tr><th>App</th><th class="num">Requests</th><th class="num">Conversations</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th>Models</th><th>Last Seen</th></tr></thead>
-        <tbody>${appRows}</tbody>
-      </table>
-    </div>
-    <div class="stats-section">
-      <h2>By Client IP</h2>
-      <table style="width:100%">
-        <thead><tr><th>Client IP</th><th class="num">Requests</th><th class="num">Total Tokens</th><th class="num">Avg ms</th><th>Last Seen</th></tr></thead>
-        <tbody>${clientRows}</tbody>
-      </table>
-    </div>
-    <div class="stats-section">
-      <h2>Tool Usage</h2>
-      <table style="width:100%">
-        <thead><tr><th>Tool</th><th class="num">Calls</th><th>By Model</th></tr></thead>
-        <tbody>${toolRows}</tbody>
-      </table>
-    </div>
-    <div class="stats-section">
-      <h2>By Status</h2>
-      <table style="width:auto;min-width:240px">
-        <thead><tr><th>Status</th><th class="num">Count</th></tr></thead>
-        <tbody>${statusRows}</tbody>
-      </table>
-    </div>
+    <div class="s2-lbl">Breakdown</div>
+    <div class="s2-detail"><div class="s2-tabs">${tabBar}</div><div class="s2-panes">${tabPanes}</div></div>
   `;
+  _activateStatsTab(_statsTab);
 }
 
 // ---------- Audit pagination helpers ----------
