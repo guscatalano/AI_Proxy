@@ -221,6 +221,9 @@
   .pf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
   .pf-card{background:linear-gradient(160deg,#141a24,#0f141d);border:1px solid #26303f;border-radius:10px;padding:9px 11px 4px}
   .pf-card.pf-wide{grid-column:auto}
+  .pf-big-btn{align-self:center;background:none;border:1px solid #26303f;color:#93a0b4;border-radius:5px;font-size:12px;line-height:1;cursor:pointer;padding:3px 6px;margin-left:6px}
+  .pf-big-btn:hover{border-color:#3a4e6a;color:#e9edf4}
+  .pf-card.pf-big{grid-column:1/-1}
   .pf-h{display:flex;align-items:baseline;gap:9px;margin-bottom:6px}
   .pf-t{font-size:13px;font-weight:600;color:#e9edf4}
   .pf-now{margin-left:auto;font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;color:#e9edf4}
@@ -2490,8 +2493,24 @@ function _agoShort(s) {
   return (s / 86400).toFixed(1) + 'd';
 }
 
-let _perfWinH = 6;
+let _perfWinH = 6, _pfBig = new Set();
 function setPerfWin(h){ _perfWinH = h; loadStats(); }
+// Per-chart enlarge: toggle a chart to full-width. Tracked in _pfBig so it survives the ~9s
+// stats auto-refresh (which rebuilds the chart HTML).
+function pfToggleBig(btn){
+  const card = btn.closest('.pf-card'); if(!card) return;
+  const k = card.dataset.pfk || '';
+  const big = card.classList.toggle('pf-big');
+  if(big) _pfBig.add(k); else _pfBig.delete(k);
+  btn.textContent = big ? '⤡' : '⤢'; btn.title = big ? 'Shrink' : 'Enlarge';
+}
+function _pfReapplyBig(){
+  document.querySelectorAll('#stats .pf-card[data-pfk]').forEach(c=>{
+    const big = _pfBig.has(c.dataset.pfk);
+    c.classList.toggle('pf-big', big);
+    const b = c.querySelector('.pf-big-btn'); if(b){ b.textContent = big ? '⤡' : '⤢'; b.title = big ? 'Shrink' : 'Enlarge'; }
+  });
+}
 function renderPerf(P){
   const S=P.series||[]; if(S.length<2) return '';
   const HRS=Math.max(1,Math.round((P.now-P.since)/3600)), N=S.length, W=520,H=104,PADL=36,PADR=8,PADT=8,PADB=18;
@@ -2515,19 +2534,19 @@ function renderPerf(P){
     const cur=lastNN(keys[0]),prev=agoNN(keys[0]);let arrow='';
     if(cur!=null&&prev){const dp=Math.round((cur-prev)/Math.abs(prev)*100);arrow=Math.abs(dp)>=6?`<span class="${(opts.bad?dp>0:dp<0)?'pf-up':'pf-down'}">${dp>0?'▲':'▼'} ${Math.abs(dp)}%</span>`:'<span class="pf-flat">≈</span>';}
     const leg=keys.length>1?`<div class="pf-leg">${keys.map((k,i)=>`<span><i style="background:${colors[i]}"></i>${opts.labels[i]}</span>`).join('')}</div>`:'';
-    return `<div class="pf-card"><div class="pf-h"><span class="pf-t">${title}</span><span class="pf-now">${opts.nowFmt?opts.nowFmt(cur):fmt(cur)}${opts.nowUnit||unit||''}</span>${arrow}</div>${leg}${svg}</div>`;}
+    return `<div class="pf-card" data-pfk="${title}"><div class="pf-h"><span class="pf-t">${title}</span><span class="pf-now">${opts.nowFmt?opts.nowFmt(cur):fmt(cur)}${opts.nowUnit||unit||''}</span>${arrow}<button class="pf-big-btn" onclick="pfToggleBig(this)" title="Enlarge">⤢</button></div>${leg}${svg}</div>`;}
   function barCard(title,key,color){const vals=S.map(b=>b[key]||0),mx=Math.max(2,...vals),bw=(W-PADL-PADR)/N*0.66;
     let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(0,mx,'')}`;
     vals.forEach((v,i)=>{const h=(v/mx)*(H-PADT-PADB);svg+=`<rect x="${(xAt(i)-bw/2).toFixed(1)}" y="${(H-PADB-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0,h).toFixed(1)}" rx="1.5" fill="${v>0?color:'var(--pf-grid)'}"/>`;});
     svg+='</svg>';const tot=vals.reduce((a,b)=>a+b,0);
-    return `<div class="pf-card"><div class="pf-h"><span class="pf-t">${title}</span><span class="pf-now">${tot}</span><span class="pf-sub">peak ${mx}</span></div>${svg}</div>`;}
+    return `<div class="pf-card" data-pfk="${title}"><div class="pf-h"><span class="pf-t">${title}</span><span class="pf-now">${tot}</span><span class="pf-sub">peak ${mx}</span><button class="pf-big-btn" onclick="pfToggleBig(this)" title="Enlarge">⤢</button></div>${svg}</div>`;}
   function scatterCard(){const pts=P.scatter||[];if(!pts.length)return '';
     const xw=W-PADL-PADR,xmax=Math.max(10,...pts.map(p=>p[0])),ymax=Math.max(1,...pts.map(p=>p[1]))*1.1;
     let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(0,ymax,'s')}`;
     pts.forEach(p=>{const x=PADL+(p[0]/xmax)*xw,y=yAt(p[1],0,ymax);svg+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.3" fill="${p[2]?'var(--pf-acc)':'var(--pf-err)'}" opacity=".7"/>`;});
     for(let k=0;k<=4;k++){const v=Math.round(xmax*k/4),x=PADL+(v/xmax)*xw;svg+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="13" fill="var(--pf-mute)" font-family="var(--mono)">${v}k</text>`;}
     svg+='</svg>';
-    return `<div class="pf-card pf-wide"><div class="pf-h"><span class="pf-t">Latency vs prompt size</span><span class="pf-sub"><span style="color:var(--pf-acc)">●</span> hit · <span style="color:var(--pf-err)">●</span> miss</span></div>${svg}</div>`;}
+    return `<div class="pf-card pf-wide" data-pfk="scatter"><div class="pf-h"><span class="pf-t">Latency vs prompt size</span><span class="pf-sub"><span style="color:var(--pf-acc)">●</span> hit · <span style="color:var(--pf-err)">●</span> miss</span><button class="pf-big-btn" onclick="pfToggleBig(this)" title="Enlarge">⤢</button></div>${svg}</div>`;}
   const charts=
     lineCard('Time-to-first-token (prefill)',['ttft_p50','ttft_p95'],'s',['var(--pf-blue)','var(--pf-err)'],{labels:['p50','p95'],bad:true,nowFmt:v=>v==null?'—':v.toFixed(1),nowUnit:'s'})
    +lineCard('Decode throughput',['decode'],'',['var(--pf-good)'],{nowFmt:v=>v==null?'—':v.toFixed(1),nowUnit:' tok/s'})
@@ -2761,6 +2780,7 @@ async function loadStats() {
     <div class="s2-detail"><div class="s2-tabs">${tabBar}</div><div class="s2-panes">${tabPanes}</div></div>
   `;
   _activateStatsTab(_statsTab);
+  _pfReapplyBig();
 }
 
 // ---------- Audit pagination helpers ----------
