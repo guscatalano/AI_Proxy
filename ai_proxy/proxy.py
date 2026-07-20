@@ -47,6 +47,12 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
+# "Buggy models" whose reasoning is broken/malformed — the proxy forces thinking OFF for these
+# (Ornith-1.0-35B never emits a closing </think>, so thinking output is verbose + un-parseable;
+# no-think is also the bench-preferred mode for coding). Comma-separated model-name substrings,
+# matched case-insensitively against the (post-routing) model name. Set to "" to disable.
+FORCE_NO_THINK_MODELS = {p.strip().lower() for p in
+                         os.environ.get("PROXY_FORCE_NO_THINK_MODELS", "ornith").split(",") if p.strip()}
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 
@@ -9050,23 +9056,22 @@ async def proxy(full_path: str, request: Request):
             except Exception:
                 pass
 
-    # Ornith (vLLM) thinking control. Ornith honors thinking ONLY via
-    # chat_template_kwargs.enable_thinking — it ignores the OpenAI `reasoning_effort` knob, and
-    # its chat template defaults to thinking-ON. Benchmarks show no-think is faster and more
-    # correct for coding, so default it OFF here and let a client opt back in with
-    # reasoning_effort high/medium. A caller that already set chat_template_kwargs.enable_thinking
-    # explicitly is left untouched.
+    # Buggy-model thinking control. Some models have broken reasoning that the OpenAI knobs can't
+    # fix: Ornith honors thinking only via chat_template_kwargs.enable_thinking (ignores
+    # reasoning_effort), defaults to thinking-ON, and never emits a closing </think> — so its
+    # thinking is verbose and un-parseable. For any model in FORCE_NO_THINK_MODELS we force
+    # enable_thinking=false unconditionally (overriding reasoning_effort and any client-set value),
+    # which is also the bench-preferred mode for coding. Matches the post-routing model name.
     ornith_think = None
-    if (isinstance(body_json, dict) and upstream_label == "vllm"
-            and str(body_json.get("model") or "").lower().startswith("ornith")):
+    _model_l = str(body_json.get("model") or "").lower() if isinstance(body_json, dict) else ""
+    if _model_l and any(pat in _model_l for pat in FORCE_NO_THINK_MODELS):
         ctk = body_json.get("chat_template_kwargs")
         if not isinstance(ctk, dict):
             ctk = {}
-        if "enable_thinking" not in ctk:
-            eff = str(body_json.get("reasoning_effort") or "").lower()
-            ctk["enable_thinking"] = eff in ("high", "medium")
+        if ctk.get("enable_thinking") is not False:
+            ctk["enable_thinking"] = False
             body_json["chat_template_kwargs"] = ctk
-            ornith_think = ctk["enable_thinking"]
+            ornith_think = False
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
     # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response
