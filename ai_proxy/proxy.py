@@ -2157,58 +2157,76 @@ def _normalize_args(args) -> str:
 
 @rule("loop_detector")
 def _rule_loop_detector(body: dict, cfg: dict):
-    """Block when the same tool call (name + normalized args) appears too often or consecutively in recent assistant turns."""
+    """Block when the same tool call (name + normalized args) repeats too often SINCE THE LAST
+    USER MESSAGE. A fresh user turn resets the loop window — so if the user tells the model to
+    "start again", the request is no longer blocked. When a loop happened *before* the last user
+    turn (i.e. the user just interrupted a loop), we allow the request but attach a soft-unblock
+    note so the model knows it was stopped for looping and shouldn't repeat the same call."""
     messages = body.get("messages") or []
     if not isinstance(messages, list) or not messages:
         return None
 
-    assistant_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "assistant"]
+    # Index of the most recent human turn. Tool calls before it belong to a loop the user has
+    # since interrupted; tool calls after it are the current attempt.
+    last_user_idx = -1
+    for i, m in enumerate(messages):
+        if isinstance(m, dict) and m.get("role") == "user":
+            last_user_idx = i
+
     window = max(1, int(cfg.get("window", 10)))
-    recent = assistant_msgs[-window:]
-
-    sigs: list[tuple[str, str]] = []
-    for m in recent:
-        for tc in (m.get("tool_calls") or []):
-            fn = tc.get("function") or {}
-            name = fn.get("name") or "?"
-            args = _normalize_args(fn.get("arguments"))
-            sigs.append((name, args))
-
-    if not sigs:
-        return None
-
-    # Total count in window
-    counts: dict = {}
-    for s in sigs:
-        counts[s] = counts.get(s, 0) + 1
-    top_sig, top_count = max(counts.items(), key=lambda kv: kv[1])
-
     max_repeats = max(2, int(cfg.get("max_repeats", 4)))
     tail_n = max(2, int(cfg.get("tail_consecutive", 3)))
 
-    if top_count >= max_repeats:
+    def _collect(msgs) -> list[tuple[str, str]]:
+        out: list[tuple[str, str]] = []
+        for m in msgs:
+            if not (isinstance(m, dict) and m.get("role") == "assistant"):
+                continue
+            for tc in (m.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                out.append((fn.get("name") or "?", _normalize_args(fn.get("arguments"))))
+        return out
+
+    def _detect(sigs):
+        """Return (tool_name, count, trigger, args_preview) or None."""
+        if not sigs:
+            return None
+        counts: dict = {}
+        for s in sigs:
+            counts[s] = counts.get(s, 0) + 1
+        top_sig, top_count = max(counts.items(), key=lambda kv: kv[1])
+        if top_count >= max_repeats:
+            return (top_sig[0], top_count, "count_in_window", top_sig[1])
+        if len(sigs) >= tail_n and all(s == sigs[-1] for s in sigs[-tail_n:]):
+            return (sigs[-1][0], tail_n, "tail_consecutive", sigs[-1][1])
+        return None
+
+    # Active loop: assistant tool calls made SINCE the last user message.
+    active_msgs = messages[last_user_idx + 1:] if last_user_idx >= 0 else messages
+    active = _detect(_collect(active_msgs)[-window:])
+    if active:
+        name, count, trigger, args_preview = active
         return {
-            "reason": f"Tool call {top_sig[0]!r} repeated {top_count}× in last {len(recent)} assistant turn(s)",
-            "details": {
-                "trigger": "count_in_window",
-                "tool_name": top_sig[0],
-                "count": top_count,
-                "window_size": len(recent),
-                "args_preview": top_sig[1][:300],
-            },
+            "reason": f"Tool call {name!r} repeated {count}× since the last user message",
+            "details": {"trigger": trigger, "tool_name": name, "count": count,
+                        "args_preview": args_preview[:300]},
         }
 
-    # Consecutive tail
-    if len(sigs) >= tail_n and all(s == sigs[-1] for s in sigs[-tail_n:]):
-        return {
-            "reason": f"Tool call {sigs[-1][0]!r} called {tail_n}× consecutively at end of conversation",
-            "details": {
-                "trigger": "tail_consecutive",
-                "tool_name": sigs[-1][0],
-                "count": tail_n,
-                "args_preview": sigs[-1][1][:300],
-            },
-        }
+    # No active loop, but a loop before the last user turn means the user just interrupted one.
+    # Allow through, but carry a note so the model learns why it was stopped.
+    if last_user_idx >= 0:
+        prior = _detect(_collect(messages[:last_user_idx + 1])[-window:])
+        if prior:
+            name, count, trigger, args_preview = prior
+            note = (f"[AI Proxy loop-detector] Your earlier turn called the tool `{name}` with the "
+                    f"same parameters {count}× in a row and was stopped to prevent an infinite loop. "
+                    f"The user has asked you to continue — do NOT repeat that identical call; change "
+                    f"the parameters or try a different approach.")
+            return {
+                "reason": f"loop on {name!r} ({count}×) cleared by user intervention — note injected",
+                "details": {"trigger": trigger, "tool_name": name, "count": count,
+                            "args_preview": args_preview[:300], "soft_unblock": True, "note": note},
+            }
 
     return None
 
@@ -3818,8 +3836,11 @@ def evaluate_rules(body_json) -> dict:
                 "details": None,
             }
         if result:
+            # A soft-unblock result (loop_detector after user intervention) is allowed through as
+            # a 'warn' regardless of the rule's configured action, so it never blocks the request.
+            soft = bool((result.get("details") or {}).get("soft_unblock"))
             return {
-                "verdict": rcfg.get("action", "block"),
+                "verdict": "warn" if soft else rcfg.get("action", "block"),
                 "rule": name,
                 "reason": result["reason"],
                 "details": result.get("details"),
@@ -9235,6 +9256,15 @@ async def proxy(full_path: str, request: Request):
 
     # Phase 2: block/warn rules.
     gate = evaluate_rules(body_json)
+    # Loop-detector soft-unblock: the model previously looped but the user has intervened, so we
+    # let the request through AND inject a note (into the system prompt) explaining the earlier
+    # block, so the model doesn't immediately repeat the same call. Re-encode the outgoing body
+    # (already serialized above) after the injection.
+    if (gate.get("rule") == "loop_detector" and (gate.get("details") or {}).get("soft_unblock")
+            and isinstance(body_json, dict)):
+        _note = (gate.get("details") or {}).get("note")
+        if _note and _inject_system_reminder(body_json, _note):
+            body = json.dumps(body_json).encode("utf-8")
     # context_overflow_guard with action=block short-circuits before evaluate_rules verdicts.
     if overflow_blocks:
         gate = {
