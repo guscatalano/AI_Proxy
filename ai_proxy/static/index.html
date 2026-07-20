@@ -1091,7 +1091,7 @@ function loadLive(){
       +'</div><div class="lv-stats"><div><b id="lv-active">0</b><span>active</span></div>'
       +'<div><b id="lv-tps">0 / 0</b><span>tok/s in·out</span></div><div><b id="lv-gpu">—</b><span>gpu</span></div>'
       +'<div><b id="lv-mem">—</b><span>ram gb</span></div></div>'
-      +'<button id="lv-full-btn" class="lv-full-btn" onclick="toggleLiveFull()" title="Toggle full screen (Esc to exit)">⛶ Full screen</button></div>'
+      +'<button id="lv-full-btn" class="lv-full-btn" onclick="toggleLiveFull()" title="Fill the browser window (Esc to exit)">⛶ Full window</button></div>'
       +'<div id="lv-grid"><div class="lv-empty">waiting for traffic…</div></div>';
     box.dataset.init='1';
     box.querySelectorAll('.lv-themes button').forEach(b=>b.onclick=()=>{
@@ -1110,27 +1110,18 @@ function loadLive(){
   _lvTick=setInterval(tickLive,120);
 }
 function stopLive(){clearInterval(_lvPoll);clearInterval(_lvTick);_lvPoll=_lvTick=null; if(document.body.classList.contains('lv-full'))_setLiveFull(false);}
-// Full-screen Live: hide the rail + header so the grid fills the page, and also request
-// native browser fullscreen for a true kiosk view. Esc (or the button) exits.
+// Full-window Live: hide the rail + header so the grid fills the whole browser window
+// (NOT native browser fullscreen). Esc (or the button) exits.
 function _setLiveFull(on){
   document.body.classList.toggle('lv-full', on);
-  const b=$('lv-full-btn'); if(b)b.textContent=on?'✕ Exit full screen':'⛶ Full screen';
+  const b=$('lv-full-btn'); if(b)b.textContent=on?'✕ Exit full window':'⛶ Full window';
   try{ if(typeof lvLayout==='function') lvLayout(); }catch{}
 }
 function toggleLiveFull(){
-  const on=!document.body.classList.contains('lv-full');
-  _setLiveFull(on);
-  try{
-    if(on){ const el=document.documentElement; (el.requestFullscreen||el.webkitRequestFullscreen||(()=>{})).call(el); }
-    else if(document.fullscreenElement||document.webkitFullscreenElement){ (document.exitFullscreen||document.webkitExitFullscreen||(()=>{})).call(document); }
-  }catch{}
+  _setLiveFull(!document.body.classList.contains('lv-full'));
 }
-document.addEventListener('fullscreenchange',()=>{
-  // If the user leaves native fullscreen (Esc / F11), drop our CSS full mode too.
-  if(!document.fullscreenElement && document.body.classList.contains('lv-full')) _setLiveFull(false);
-});
 document.addEventListener('keydown',e=>{
-  if(e.key==='Escape' && document.body.classList.contains('lv-full') && !document.fullscreenElement) _setLiveFull(false);
+  if(e.key==='Escape' && document.body.classList.contains('lv-full')) _setLiveFull(false);
 });
 async function pollLive(){
   try{
