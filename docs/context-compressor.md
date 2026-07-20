@@ -1,6 +1,6 @@
 # Future feature: Native context compressor + content-capture transparency
 
-Status: **idea / not started.** Captured 2026-07-19. Owner: TBD.
+Status: **v1 shipped** (2026-07-19) — the `context_compressor` rule below is live: deterministic tool-output + JSON squeeze, shadow/live modes, savings at `/__proxy/api/compress-stats` and on the Stats page. v2/v3 (code-AST, before/after diff view, history compaction, prose summarization) remain future work.
 
 ## Motivation
 - Local coding agents routinely blow past the context window (qwen3-coder-next, 256k) and waste tokens on verbose tool outputs, JSON blobs, file dumps, and accreting history.
