@@ -142,18 +142,6 @@ _PROCESS_START_TS = time.time()
 # it again). Backed by the settings table so it survives restarts.
 _PANIC_MODE: bool = False
 
-# Tracks recent phone-PWA chat sends so /api/control/await can correlate the resulting
-# upstream request and stream its response back to the phone. Layout:
-#   {send_id: {ts, target_name, target_ip, prompt_hint}}
-# Auto-pruned by age in control_await; bounded by the phone polling client.
-_CONTROL_SENDS: dict = {}
-
-# In-memory pending tool-call queue. Each entry waits for a phone decision.
-# Layout:
-#   {pending_id: {ts, source(extension name), tool_name, arguments, summary, decision, decided_ts}}
-# decision: None | 'allow' | 'deny' | 'always_allow' | 'always_deny'
-_PENDING_TOOLS: dict = {}
-
 # In-flight upstream responses, keyed by req_id. Populated when client.send() returns and
 # cleared in a finally block when the response is fully consumed. The cancel endpoint
 # looks up the entry and calls .aclose() on it to drop the upstream connection mid-stream
@@ -335,27 +323,10 @@ CREATE TABLE IF NOT EXISTS proxy_todos (
     PRIMARY KEY (conversation_id, idx)
 );
 
-CREATE TABLE IF NOT EXISTS control_endpoints (
-    name TEXT PRIMARY KEY,
-    url TEXT NOT NULL,
-    token TEXT,
-    kind TEXT,
-    registered_ts REAL,
-    last_seen_ts REAL,
-    source TEXT
-);
-
 CREATE TABLE IF NOT EXISTS conversation_labels (
     conversation_id TEXT PRIMARY KEY,
     label TEXT NOT NULL,
     updated_ts REAL
-);
-
-CREATE TABLE IF NOT EXISTS tool_permissions (
-    -- Persistent allow/deny rules. `pattern` is the literal tool_name or "tool_name:argpfx".
-    pattern TEXT PRIMARY KEY,
-    decision TEXT NOT NULL,  -- 'allow' | 'deny'
-    created_ts REAL
 );
 
 CREATE TABLE IF NOT EXISTS bench_runs (
@@ -5147,279 +5118,6 @@ async def restart_proxy(request: Request):
     )
 
 
-# -------- Remote control: self-registered endpoints + phone PWA bridge + panic mode --------
-
-@app.post("/__proxy/api/control/register")
-async def control_register(request: Request):
-    """Self-registration endpoint for control targets (e.g. the VS Code companion extension).
-    Idempotent upsert keyed by `name`. Re-call as a heartbeat (last_seen_ts gets updated)."""
-    try:
-        payload = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
-    name = (payload.get("name") or "").strip()
-    url = (payload.get("url") or "").strip()
-    if not name or not url:
-        return JSONResponse({"error": "'name' and 'url' are required"}, status_code=400)
-    token = payload.get("token") or None
-    kind = (payload.get("kind") or "vscode-chat").strip()
-    now = time.time()
-    conn = db()
-    conn.execute(
-        """INSERT INTO control_endpoints (name, url, token, kind, registered_ts, last_seen_ts, source)
-           VALUES (?, ?, ?, ?, ?, ?, 'auto')
-           ON CONFLICT(name) DO UPDATE SET
-             url = excluded.url,
-             token = COALESCE(excluded.token, control_endpoints.token),
-             kind = excluded.kind,
-             last_seen_ts = excluded.last_seen_ts""",
-        (name, url, token, kind, now, now),
-    )
-    conn.commit()
-    conn.close()
-    return {"ok": True, "name": name, "registered_ts": now}
-
-
-@app.get("/__proxy/api/control/endpoints")
-async def control_list_endpoints():
-    """Lists all registered control endpoints (auto + manual)."""
-    conn = db()
-    rows = conn.execute(
-        """SELECT name, url, kind, registered_ts, last_seen_ts, source,
-                  CASE WHEN token IS NOT NULL THEN 1 ELSE 0 END AS has_token
-           FROM control_endpoints ORDER BY last_seen_ts DESC"""
-    ).fetchall()
-    conn.close()
-    return {"items": [dict(r) for r in rows], "panic_mode": _PANIC_MODE}
-
-
-@app.delete("/__proxy/api/control/endpoints/{name}")
-async def control_delete_endpoint(name: str):
-    conn = db()
-    cur = conn.execute("DELETE FROM control_endpoints WHERE name = ?", (name,))
-    conn.commit()
-    conn.close()
-    return {"ok": True, "removed": cur.rowcount}
-
-
-@app.post("/__proxy/api/control/chat")
-async def control_chat(request: Request):
-    """Forward a chat prompt to a registered VS Code endpoint. The phone PWA hits this; the
-    proxy looks up the endpoint and POSTs to its /chat with the stored token."""
-    try:
-        payload = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
-    prompt = payload.get("prompt") or payload.get("query")
-    if not isinstance(prompt, str) or not prompt.strip():
-        return JSONResponse({"error": "'prompt' is required"}, status_code=400)
-    target = payload.get("target")
-    conn = db()
-    if target:
-        row = conn.execute(
-            "SELECT name, url, token FROM control_endpoints WHERE name = ?", (target,),
-        ).fetchone()
-    else:
-        row = conn.execute(
-            "SELECT name, url, token FROM control_endpoints ORDER BY last_seen_ts DESC LIMIT 1"
-        ).fetchone()
-    conn.close()
-    if not row:
-        return JSONResponse({"error": "no control endpoints registered"}, status_code=404)
-    fwd_url = row["url"].rstrip("/") + "/chat"
-    fwd_headers = {"content-type": "application/json"}
-    if row["token"]:
-        fwd_headers["authorization"] = f"Bearer {row['token']}"
-    fwd_body = {"prompt": prompt}
-    for k in ("command", "location", "isPartialQuery", "attachScreenshot",
-              "newChat", "submit", "newChatCommand", "submitCommand"):
-        if payload.get(k) is not None:
-            fwd_body[k] = payload[k]
-    client_http: httpx.AsyncClient = request.app.state.client
-    send_id = uuid.uuid4().hex[:16]
-    send_ts = time.time()
-    try:
-        r = await client_http.post(
-            fwd_url, headers=fwd_headers,
-            content=json.dumps(fwd_body).encode("utf-8"),
-            timeout=httpx.Timeout(10.0),
-        )
-        try:
-            ext_payload = json.loads(r.text)
-        except (json.JSONDecodeError, TypeError):
-            ext_payload = {"raw": r.text}
-        # Record the send so /api/control/await can correlate the resulting LLM call.
-        if r.is_success:
-            _CONTROL_SENDS[send_id] = {
-                "ts": send_ts,
-                "target_name": row["name"],
-                "target_ip": _control_target_ip(row["url"]),
-                "prompt_hint": prompt[:120],
-            }
-        return JSONResponse(
-            {"ok": r.is_success, "target": row["name"], "status": r.status_code,
-             "endpoint_url": row["url"], "extension": ext_payload, "send_id": send_id},
-            status_code=r.status_code,
-        )
-    except Exception as e:
-        return JSONResponse(
-            {"ok": False, "target": row["name"], "error": str(e),
-             "endpoint_url": row["url"], "send_id": send_id},
-            status_code=502,
-        )
-
-
-def _extract_response_text(body_text, stream_text) -> str:
-    """Best-effort assistant text extraction from either OpenAI or Anthropic shape.
-    Used by /api/control/await to stream live responses back to the phone PWA."""
-    parts: list[str] = []
-    if body_text:
-        try:
-            j = json.loads(body_text)
-            if isinstance(j, dict):
-                # OpenAI chat.completion
-                for c in (j.get("choices") or []):
-                    msg = c.get("message") or {}
-                    if isinstance(msg.get("content"), str):
-                        parts.append(msg["content"])
-                # Anthropic /v1/messages
-                if j.get("type") == "message":
-                    for blk in (j.get("content") or []):
-                        if isinstance(blk, dict) and blk.get("type") == "text" and isinstance(blk.get("text"), str):
-                            parts.append(blk["text"])
-                # Ollama native
-                m = j.get("message")
-                if isinstance(m, dict) and isinstance(m.get("content"), str):
-                    parts.append(m["content"])
-        except (json.JSONDecodeError, TypeError):
-            pass
-    if stream_text:
-        text = _maybe_gunzip(stream_text)
-        for line in text.split("\n") if isinstance(text, str) else []:
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                continue
-            try:
-                j = json.loads(data)
-            except (json.JSONDecodeError, TypeError):
-                continue
-            # OpenAI streaming delta
-            for c in (j.get("choices") or []):
-                d = c.get("delta") or c.get("message") or {}
-                if isinstance(d.get("content"), str):
-                    parts.append(d["content"])
-            # Anthropic streaming
-            if j.get("type") == "content_block_delta":
-                d = j.get("delta") or {}
-                if d.get("type") == "text_delta" and isinstance(d.get("text"), str):
-                    parts.append(d["text"])
-            elif j.get("type") == "content_block_start":
-                blk = j.get("content_block") or {}
-                if blk.get("type") == "text" and isinstance(blk.get("text"), str):
-                    parts.append(blk["text"])
-            # Ollama streaming
-            elif isinstance(j.get("message"), dict) and isinstance(j["message"].get("content"), str):
-                parts.append(j["message"]["content"])
-    return "".join(parts)
-
-
-def _extract_response_tool_calls_full(body_text, stream_text) -> list[dict]:
-    """Extract tool calls (name + args) from a response in either shape, in arrival order.
-    Used by the phone PWA to render 'Read welcome.md' / 'Created welcome.md' style events."""
-    out: list[dict] = []
-    if body_text:
-        try:
-            j = json.loads(body_text)
-            if isinstance(j, dict):
-                for c in (j.get("choices") or []):
-                    msg = c.get("message") or {}
-                    for tc in (msg.get("tool_calls") or []):
-                        fn = (tc.get("function") or {})
-                        out.append({
-                            "id": tc.get("id"),
-                            "name": fn.get("name") or "?",
-                            "arguments": fn.get("arguments") if isinstance(fn.get("arguments"), str) else json.dumps(fn.get("arguments") or {}),
-                        })
-                m = j.get("message")
-                if isinstance(m, dict):
-                    for tc in (m.get("tool_calls") or []):
-                        fn = (tc.get("function") or {})
-                        out.append({
-                            "name": fn.get("name") or "?",
-                            "arguments": json.dumps(fn.get("arguments") or {}),
-                        })
-                if j.get("type") == "message" and isinstance(j.get("content"), list):
-                    for blk in j["content"]:
-                        if isinstance(blk, dict) and blk.get("type") == "tool_use":
-                            out.append({
-                                "id": blk.get("id"),
-                                "name": blk.get("name") or "?",
-                                "arguments": json.dumps(blk.get("input") or {}),
-                            })
-        except (json.JSONDecodeError, TypeError):
-            pass
-    if stream_text:
-        text = _maybe_gunzip(stream_text)
-        if isinstance(text, str):
-            tcs: dict = {}
-            order: list = []
-            for line in text.split("\n"):
-                if not line.startswith("data: "):
-                    continue
-                data = line[6:]
-                if data == "[DONE]":
-                    continue
-                try:
-                    j = json.loads(data)
-                except (json.JSONDecodeError, TypeError):
-                    continue
-                # OpenAI streaming
-                for c in (j.get("choices") or []):
-                    delta = c.get("delta") or c.get("message") or {}
-                    for tc in (delta.get("tool_calls") or []):
-                        idx = ("oai", tc.get("index", len(order)))
-                        if idx not in tcs:
-                            tcs[idx] = {"name": "", "arguments": "", "id": tc.get("id")}
-                            order.append(idx)
-                        slot = tcs[idx]
-                        if tc.get("id"):
-                            slot["id"] = tc["id"]
-                        fn = tc.get("function") or {}
-                        if fn.get("name"):
-                            slot["name"] = fn["name"]
-                        if fn.get("arguments"):
-                            slot["arguments"] += fn["arguments"]
-                # Anthropic streaming tool_use
-                if j.get("type") == "content_block_start":
-                    blk = j.get("content_block") or {}
-                    if blk.get("type") == "tool_use":
-                        idx = ("anth", j.get("index", len(order)))
-                        tcs[idx] = {"name": blk.get("name") or "?", "arguments": "", "id": blk.get("id")}
-                        order.append(idx)
-                elif j.get("type") == "content_block_delta":
-                    idx = ("anth", j.get("index"))
-                    if idx in tcs:
-                        d = j.get("delta") or {}
-                        if d.get("type") == "input_json_delta":
-                            tcs[idx]["arguments"] += d.get("partial_json") or ""
-            for k in order:
-                out.append(tcs[k])
-    return out
-
-
-def _control_target_ip(url_str: str | None) -> str | None:
-    """Extract host portion of an endpoint URL for client_ip correlation."""
-    if not url_str:
-        return None
-    try:
-        from urllib.parse import urlparse
-        return urlparse(url_str).hostname
-    except (ValueError, TypeError):
-        return None
-
-
 # Context wrappers that VS Code Copilot Chat / Claude Code / Continue inject into the user
 # message envelope. Stripped by _clean_user_prompt so the mirror shows what the user actually
 # typed instead of the whole context bundle. Order matters — more-specific names checked first.
@@ -5557,378 +5255,6 @@ def _clean_user_prompt(text: str | None) -> tuple[str, list[str], str | None]:
     return text.strip()[:4000], [], raw
 
 
-def _classify_turn_origin(req_ts: float, target_ip: str | None) -> str:
-    """Was this chat turn triggered from the phone (recent control send) or typed locally?
-    Wide window because Copilot Chat can take 30+ seconds between the user pressing send
-    and the actual upstream API call firing (especially on cold-start). Underclassifying as
-    'local' would break the phone PWA's placeholder-reconcile logic (visible as echo)."""
-    if not target_ip:
-        return "local"
-    for info in _CONTROL_SENDS.values():
-        if info.get("target_ip") == target_ip:
-            sent_ts = info.get("ts", 0)
-            # Match if the feed turn arrived within 60s after the send (or within 5s before,
-            # to absorb minor clock skew).
-            if -5 <= (req_ts - sent_ts) <= 60:
-                return "phone"
-    return "local"
-
-
-_FEED_APPS = ("vscode-copilot", "claude-code", "github-copilot", "continue.dev", "cursor", "vscode")
-
-
-@app.get("/__proxy/api/control/feed")
-async def control_feed(target: str | None = None, since: float | None = None,
-                        limit: int = 30, conversation_id: str | None = None):
-    """Live-mirror feed of recent chat turns from registered editor endpoints.
-
-    Each item is one round-trip (request → response) shaped as a chat turn. Filterable by
-    `conversation_id` so the PWA can pin to a single session. The `sessions` field in the
-    response lists every conversation_id seen in the broader window so the UI can offer a
-    session picker."""
-    conn = db()
-    target_ip: str | None = None
-    target_url: str | None = None
-    if target:
-        row = conn.execute("SELECT url FROM control_endpoints WHERE name = ?", (target,)).fetchone()
-        if row:
-            target_url = row["url"]
-            target_ip = _control_target_ip(row["url"])
-    where = ["shadow_of IS NULL", f"client_app IN ({','.join('?' * len(_FEED_APPS))})"]
-    params: list = list(_FEED_APPS)
-    if target_ip:
-        where.append("client_ip = ?")
-        params.append(target_ip)
-
-    # Session picker window: last 24 hours so sessions you've worked on across the day all
-    # appear. Capped at 30 entries to keep the dropdown manageable.
-    sess_window = time.time() - 24 * 3600
-    sess_where = list(where) + ["ts > ?", "conversation_id IS NOT NULL"]
-    sess_params = list(params) + [sess_window]
-    sess_sql = (
-        "SELECT conversation_id, MAX(ts) AS last_ts, MIN(ts) AS first_ts, "
-        "       COUNT(*) AS turn_count, "
-        "       (SELECT request_body FROM requests_v "
-        "        WHERE conversation_id = r.conversation_id AND request_body IS NOT NULL "
-        "        ORDER BY ts ASC LIMIT 1) AS first_body "
-        "FROM requests r WHERE " + " AND ".join(sess_where)
-        + " GROUP BY conversation_id ORDER BY last_ts DESC LIMIT 30"
-    )
-    sess_rows = conn.execute(sess_sql, sess_params).fetchall()
-    sessions = []
-    for sr in sess_rows:
-        first_user = ""
-        try:
-            body = json.loads(sr["first_body"]) if sr["first_body"] else None
-        except (json.JSONDecodeError, TypeError):
-            body = None
-        if isinstance(body, dict):
-            # Prefer the first user-typed prompt (skips Copilot's <environment_info>-only
-            # first message); fall back to cleaned first user content for non-Copilot shapes.
-            typed = _first_typed_user_prompt(body)
-            if typed:
-                first_user = typed[:120]
-            else:
-                for m in (body.get("messages") or []):
-                    if isinstance(m, dict) and m.get("role") == "user":
-                        cleaned, _, _ = _clean_user_prompt(_msg_text(m))
-                        if cleaned:
-                            first_user = cleaned[:120]
-                        break
-        # Honor custom labels set via /api/control/session-label.
-        label_row = conn.execute(
-            "SELECT label FROM conversation_labels WHERE conversation_id = ?",
-            (sr["conversation_id"],),
-        ).fetchone()
-        custom_label = label_row["label"] if label_row else None
-        sessions.append({
-            "conversation_id": sr["conversation_id"],
-            "first_ts": sr["first_ts"],
-            "last_ts": sr["last_ts"],
-            "turn_count": sr["turn_count"],
-            "first_user": first_user or "(no user prompt)",
-            "label": custom_label,
-        })
-
-    # Now the actual feed query.
-    if conversation_id:
-        where.append("conversation_id = ?")
-        params.append(conversation_id)
-    if since is not None:
-        where.append("ts > ?")
-        params.append(float(since))
-    # Only chat round-trips, not utility endpoints (model discovery, embeddings, etc.).
-    where.append(
-        "(path LIKE '%/v1/chat/completions%' OR path LIKE '%/v1/messages%' "
-        "OR path LIKE '%/v1/complete%' OR path LIKE '/api/chat%')"
-    )
-    sql = (
-        "SELECT id, ts, model, status, prompt_tokens, completion_tokens, total_tokens, "
-        "duration_ms, request_body, response_body, stream_chunks, error, client_app, "
-        "client_ip, conversation_id "
-        "FROM requests_v WHERE " + " AND ".join(where) + " ORDER BY ts ASC LIMIT ?"
-    )
-    params.append(max(1, min(int(limit), 100)))
-    rows = conn.execute(sql, params).fetchall()
-    conn.close()
-
-    items = []
-    newest_ts = since or 0.0
-    for r in rows:
-        last_user = ""
-        try:
-            body = json.loads(r["request_body"]) if r["request_body"] else None
-        except (json.JSONDecodeError, TypeError):
-            body = None
-        if isinstance(body, dict):
-            msgs = body.get("messages") or []
-            for m in reversed(msgs):
-                if isinstance(m, dict) and m.get("role") == "user":
-                    last_user = _msg_text(m)
-                    break
-        cleaned, stripped, raw = _clean_user_prompt(last_user)
-        text = _extract_response_text(r["response_body"], r["stream_chunks"])
-        tool_calls = _extract_response_tool_calls_full(r["response_body"], r["stream_chunks"])
-        if r["status"] is None and not r["error"]:
-            state = "streaming"
-        elif r["error"]:
-            state = "error"
-        else:
-            state = "complete"
-        items.append({
-            "id": r["id"],
-            "ts": r["ts"],
-            "model": r["model"],
-            "client_app": r["client_app"],
-            "conversation_id": r["conversation_id"],
-            "status": state,
-            "via": _classify_turn_origin(r["ts"] or 0.0, target_ip),
-            "prompt": cleaned,
-            "prompt_raw": raw if raw and raw != cleaned else None,
-            "context_blocks": stripped,
-            "text": text,
-            "tool_calls": tool_calls,
-            "prompt_tokens": r["prompt_tokens"],
-            "completion_tokens": r["completion_tokens"],
-            "total_tokens": r["total_tokens"],
-            "duration_ms": r["duration_ms"],
-            "error": r["error"],
-        })
-        if (r["ts"] or 0.0) > newest_ts:
-            newest_ts = r["ts"]
-    return {
-        "items": items,
-        "newest_ts": newest_ts,
-        "target_url": target_url,
-        "sessions": sessions,
-        "active_session": conversation_id,
-        "panic_mode": _PANIC_MODE,
-    }
-
-
-@app.get("/__proxy/api/control/await/{send_id}")
-async def control_await(send_id: str):
-    """Polled by the phone PWA after a /api/control/chat send. Looks for the LLM API call
-    that VS Code's chat triggered as a result, and returns its response (live or final).
-    Returns one of: {state: 'pending'|'streaming'|'complete'|'error'|'unknown'}."""
-    # Prune sends older than 10 minutes so the in-memory map can't grow unbounded.
-    cutoff = time.time() - 600
-    stale = [k for k, v in _CONTROL_SENDS.items() if v.get("ts", 0) < cutoff]
-    for k in stale:
-        _CONTROL_SENDS.pop(k, None)
-
-    info = _CONTROL_SENDS.get(send_id)
-    if not info:
-        return JSONResponse({"state": "unknown", "error": "send_id not found or expired"}, status_code=404)
-    target_ip = info.get("target_ip")
-    elapsed = time.time() - info["ts"]
-    conn = db()
-    rows = conn.execute(
-        """SELECT id, ts, status, model, prompt_tokens, completion_tokens, total_tokens,
-                  response_body, stream_chunks, error, duration_ms
-           FROM requests_v
-           WHERE ts > ? AND client_ip = ?
-             AND client_app IN ('vscode-copilot','claude-code','github-copilot','continue.dev','cursor')
-             AND shadow_of IS NULL
-           ORDER BY ts ASC LIMIT 1""",
-        (info["ts"] - 1, target_ip or ""),
-    ).fetchall()
-    conn.close()
-    if not rows:
-        return {"state": "pending", "elapsed_s": round(elapsed, 1), "target_ip": target_ip}
-    r = rows[0]
-    text = _extract_response_text(r["response_body"], r["stream_chunks"])
-    tool_calls = _extract_response_tool_calls_full(r["response_body"], r["stream_chunks"])
-    if r["status"] is None and not r["error"]:
-        return {
-            "state": "streaming", "request_id": r["id"], "model": r["model"],
-            "elapsed_s": round(elapsed, 1), "text": text, "tool_calls": tool_calls,
-        }
-    return {
-        "state": "error" if r["error"] else "complete",
-        "request_id": r["id"], "model": r["model"],
-        "duration_ms": r["duration_ms"],
-        "prompt_tokens": r["prompt_tokens"],
-        "completion_tokens": r["completion_tokens"],
-        "total_tokens": r["total_tokens"],
-        "text": text,
-        "tool_calls": tool_calls,
-        "error": r["error"],
-        "elapsed_s": round(elapsed, 1),
-    }
-
-
-# -------- Tool permission queue (used by the @proxy chat participant) --------
-
-def _tool_permission_lookup(tool_name: str, args_str: str) -> str | None:
-    """Check persistent allow/deny rules. Returns 'allow', 'deny', or None.
-    Patterns: exact tool name match, or 'tool_name:<argprefix>' for command-prefix rules."""
-    if not tool_name:
-        return None
-    conn = db()
-    rows = conn.execute(
-        "SELECT pattern, decision FROM tool_permissions WHERE pattern = ? OR pattern LIKE ? || '%'",
-        (tool_name, tool_name + ":"),
-    ).fetchall()
-    conn.close()
-    for r in rows:
-        pat = r["pattern"]
-        if pat == tool_name:
-            return r["decision"]
-        # Prefix rules: pattern is "bash:npm test", argument starts with "npm test"
-        if pat.startswith(tool_name + ":"):
-            prefix = pat[len(tool_name) + 1:]
-            if isinstance(args_str, str) and args_str.startswith(prefix):
-                return r["decision"]
-    return None
-
-
-@app.post("/__proxy/api/control/pending-tool")
-async def control_pending_tool_register(request: Request):
-    """Extension calls this when its LLM emits a tool call requiring approval. Returns a
-    pending_id; the extension then polls /pending-tool/{id} until decided. Hits a persistent
-    allow/deny rule first (auto-decided immediately if matched)."""
-    try:
-        payload = await request.json()
-    except Exception as e:
-        return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
-    name = (payload.get("tool_name") or "").strip()
-    args = payload.get("arguments")
-    if isinstance(args, dict):
-        args_str = json.dumps(args)
-    elif args is None:
-        args_str = ""
-    else:
-        args_str = str(args)
-    summary = (payload.get("summary") or "").strip() or f"{name}({args_str[:120]})"
-    if not name:
-        return JSONResponse({"error": "'tool_name' required"}, status_code=400)
-    source = (payload.get("source") or "extension").strip()
-    pending_id = uuid.uuid4().hex[:16]
-
-    # Auto-decide via persistent rules.
-    rule = _tool_permission_lookup(name, args_str)
-    decision = rule if rule in ("allow", "deny") else None
-    auto_rule_label = rule if rule else None
-    # If this tool call originates while a queued agent task is running, fall back to
-    # that task's tool_approval_mode when no persistent rule applied.
-    if decision is None and _CURRENT_AGENT_TASK:
-        mode = _CURRENT_AGENT_TASK.get("mode")
-        if mode == "yolo":
-            decision = "allow"
-            auto_rule_label = "task:yolo"
-        elif mode == "rules-only":
-            decision = "deny"
-            auto_rule_label = "task:rules-only"
-        # 'notify-phone' (and unset) → fall through to existing wait-for-approval flow.
-
-    _PENDING_TOOLS[pending_id] = {
-        "id": pending_id,
-        "ts": time.time(),
-        "source": source,
-        "tool_name": name,
-        "arguments": args_str,
-        "summary": summary[:300],
-        "decision": decision,
-        "decided_ts": time.time() if decision else None,
-        "auto_rule": auto_rule_label,
-    }
-    return {"id": pending_id, "decision": decision, "auto_rule": auto_rule_label}
-
-
-@app.get("/__proxy/api/control/pending-tool/{pending_id}")
-async def control_pending_tool_status(pending_id: str):
-    info = _PENDING_TOOLS.get(pending_id)
-    if not info:
-        return JSONResponse({"error": "not found"}, status_code=404)
-    return info
-
-
-@app.get("/__proxy/api/control/pending-tools")
-async def control_pending_tools_list():
-    """List undecided pending tool calls (for the phone PWA to show approve/deny prompts).
-    Also auto-prunes entries older than 10 minutes."""
-    cutoff = time.time() - 600
-    for k in list(_PENDING_TOOLS.keys()):
-        info = _PENDING_TOOLS[k]
-        if info.get("ts", 0) < cutoff and info.get("decision") is not None:
-            _PENDING_TOOLS.pop(k, None)
-    pending = [v for v in _PENDING_TOOLS.values() if v.get("decision") is None]
-    pending.sort(key=lambda v: v.get("ts", 0))
-    return {"items": pending}
-
-
-@app.post("/__proxy/api/control/tool-decision/{pending_id}")
-async def control_tool_decision(pending_id: str, request: Request):
-    """Phone PWA POSTs the user's decision. Body: {"decision": "allow"|"deny"|"always_allow"|"always_deny"}.
-    'always_*' also writes a persistent rule to tool_permissions."""
-    try:
-        payload = await request.json()
-    except Exception:
-        payload = {}
-    decision = (payload.get("decision") or "").strip()
-    if decision not in ("allow", "deny", "always_allow", "always_deny"):
-        return JSONResponse({"error": "decision must be allow/deny/always_allow/always_deny"}, status_code=400)
-    info = _PENDING_TOOLS.get(pending_id)
-    if not info:
-        return JSONResponse({"error": "pending_id not found"}, status_code=404)
-    short = "allow" if decision in ("allow", "always_allow") else "deny"
-    info["decision"] = short
-    info["decided_ts"] = time.time()
-    info["decided_via"] = decision
-    if decision in ("always_allow", "always_deny"):
-        # Persistent rule. Pattern format: "tool_name" or "tool_name:argprefix" — for now,
-        # use exact-tool-name rules; argument-prefix rules can be added by /tool-permissions.
-        conn = db()
-        conn.execute(
-            """INSERT OR REPLACE INTO tool_permissions (pattern, decision, created_ts)
-               VALUES (?, ?, ?)""",
-            (info["tool_name"], short, time.time()),
-        )
-        conn.commit()
-        conn.close()
-    return {"ok": True, "decision": short}
-
-
-@app.get("/__proxy/api/control/tool-permissions")
-async def control_tool_permissions_list():
-    conn = db()
-    rows = conn.execute(
-        "SELECT pattern, decision, created_ts FROM tool_permissions ORDER BY created_ts DESC"
-    ).fetchall()
-    conn.close()
-    return {"items": [dict(r) for r in rows]}
-
-
-@app.delete("/__proxy/api/control/tool-permissions/{pattern}")
-async def control_tool_permissions_delete(pattern: str):
-    conn = db()
-    cur = conn.execute("DELETE FROM tool_permissions WHERE pattern = ?", (pattern,))
-    conn.commit()
-    conn.close()
-    return {"ok": True, "removed": cur.rowcount}
-
-
 # -------- Custom session labels (extension scrapes / user renames) --------
 
 @app.get("/__proxy/api/control/session-label/{conversation_id}")
@@ -6020,8 +5346,7 @@ async def control_panic_set(request: Request):
 
 # -------- Task queue REST API --------
 
-_VALID_TASK_MODES = {"chat", "agent"}
-_VALID_APPROVAL_MODES = {"rules-only", "notify-phone", "yolo"}
+_VALID_TASK_MODES = {"chat"}
 
 
 def _task_visible_to(viewer_ip: str | None, creator_ip: str | None) -> bool:
@@ -6054,9 +5379,8 @@ def _task_row_to_dict(r) -> dict:
 
 @app.post("/__proxy/api/control/tasks")
 async def control_task_create(request: Request):
-    """Create a queued task. Body: {prompt, mode, target_endpoint?, model?, schedule?,
-    tool_approval_mode?}. mode='chat'|'agent'. schedule null = one-shot, else cron expr or
-    'every Nm/Nh/Nd' for recurring."""
+    """Create a queued task. Body: {prompt, model?, schedule?}. mode is 'chat' (runs against
+    OLLAMA_URL directly). schedule null = one-shot, else cron expr or 'every Nm/Nh/Nd'."""
     try:
         payload = await request.json()
     except Exception as e:
@@ -6067,17 +5391,10 @@ async def control_task_create(request: Request):
     mode = (payload.get("mode") or "chat").strip().lower()
     if mode not in _VALID_TASK_MODES:
         return JSONResponse({"error": f"mode must be one of {sorted(_VALID_TASK_MODES)}"}, status_code=400)
-    target_endpoint = (payload.get("target_endpoint") or "").strip() or None
+    target_endpoint = None
     model = (payload.get("model") or "").strip() or None
     schedule = (payload.get("schedule") or "").strip() or None
-    approval = (payload.get("tool_approval_mode") or "").strip() or None
-    if approval and approval not in _VALID_APPROVAL_MODES:
-        return JSONResponse(
-            {"error": f"tool_approval_mode must be one of {sorted(_VALID_APPROVAL_MODES)}"},
-            status_code=400,
-        )
-    if mode == "agent" and not approval:
-        approval = "notify-phone"
+    approval = None
     now = time.time()
     next_run = _task_compute_next_run(schedule, now) if schedule else None
     if schedule and next_run is None:
@@ -6659,12 +5976,6 @@ async def generated_image(fname: str):
     return FileResponse(p)
 
 
-@app.get("/__proxy/remote")
-async def remote_pwa():
-    """Mobile-first PWA for sending prompts to registered control endpoints + panic toggle."""
-    return FileResponse(STATIC_DIR / "remote.html")
-
-
 @app.get("/__proxy")
 @app.get("/__proxy/")
 async def ui_index():
@@ -6991,18 +6302,13 @@ async def _bench_execute(bench_id: str, app: FastAPI):
 
 # -------- Task queue (one-shots + cron/interval recurring) --------
 #
-# Lets the user queue prompts (chat or agent mode) from the phone PWA and run them in the
-# background. Recurring rows fire on a cron expression or "every Nm/Nh/Nd" interval and
-# spawn a one-shot child each time. Agent tasks reuse the existing /api/control/chat +
-# /await flow; chat tasks hit OLLAMA_URL directly with non-streaming completions.
+# Lets the user queue prompts and run them in the background. Recurring rows fire on a cron
+# expression or "every Nm/Nh/Nd" interval and spawn a one-shot child each time. Chat tasks
+# hit OLLAMA_URL directly with non-streaming completions.
 
-# Concurrency: agent tasks are serialized (one VS Code session); chat tasks run up to 3
-# in parallel. Semaphores live module-global so the worker tick can fire-and-forget.
-_TASK_AGENT_SEM = asyncio.Semaphore(1)
+# Chat tasks run up to 3 in parallel. Semaphore lives module-global so the worker tick can
+# fire-and-forget.
 _TASK_CHAT_SEM = asyncio.Semaphore(3)
-# Tracks which task (if any) is currently driving an agent run, so /pending-tool/register
-# can apply that task's tool_approval_mode when no persistent rule matches.
-_CURRENT_AGENT_TASK: dict = {}
 
 
 def _task_compute_next_run(schedule: str | None, now_ts: float) -> float | None:
@@ -7079,84 +6385,6 @@ async def _task_run_chat(task_id: int, prompt: str, model: str | None) -> tuple[
         return r.text, None
 
 
-async def _task_run_agent(task_id: int, prompt: str, target: str | None,
-                          tool_approval_mode: str | None) -> tuple[str | None, str | None]:
-    """Run an agent-mode task by POSTing to /api/control/chat (an existing registered VS
-    Code endpoint) and polling /await for the resulting LLM call. Honors tool_approval_mode
-    via _CURRENT_AGENT_TASK so the @proxy participant respects rules-only / yolo / phone."""
-    _CURRENT_AGENT_TASK.clear()
-    _CURRENT_AGENT_TASK.update({"task_id": task_id, "mode": tool_approval_mode or "notify-phone"})
-    try:
-        conn = db()
-        if target:
-            row = conn.execute(
-                "SELECT name, url, token FROM control_endpoints WHERE name = ?", (target,),
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT name, url, token FROM control_endpoints ORDER BY last_seen_ts DESC LIMIT 1"
-            ).fetchone()
-        conn.close()
-        if not row:
-            return None, "no control endpoints registered"
-        fwd_url = row["url"].rstrip("/") + "/chat"
-        fwd_headers = {"content-type": "application/json"}
-        if row["token"]:
-            fwd_headers["authorization"] = f"Bearer {row['token']}"
-        send_id = uuid.uuid4().hex[:16]
-        send_ts = time.time()
-        client = httpx.AsyncClient(timeout=httpx.Timeout(None))
-        try:
-            try:
-                r = await client.post(
-                    fwd_url, headers=fwd_headers,
-                    content=json.dumps({"prompt": prompt, "newChat": True}).encode("utf-8"),
-                    timeout=httpx.Timeout(15.0),
-                )
-            except Exception as e:
-                return None, f"could not reach control endpoint {row['name']}: {e}"
-            if not r.is_success:
-                return None, f"control endpoint returned HTTP {r.status_code}: {r.text[:300]}"
-            _CONTROL_SENDS[send_id] = {
-                "ts": send_ts,
-                "target_name": row["name"],
-                "target_ip": _control_target_ip(row["url"]),
-                "prompt_hint": prompt[:120],
-            }
-        finally:
-            await client.aclose()
-        # Poll /await for up to 30 minutes (matches typical agent run length).
-        deadline = time.time() + 1800
-        last_text = ""
-        while time.time() < deadline:
-            await asyncio.sleep(2.0)
-            target_ip = _CONTROL_SENDS.get(send_id, {}).get("target_ip")
-            conn = db()
-            rows = conn.execute(
-                """SELECT id, status, response_body, stream_chunks, error
-                   FROM requests_v
-                   WHERE ts > ? AND client_ip = ?
-                     AND client_app IN ('vscode-copilot','claude-code','github-copilot','continue.dev','cursor')
-                     AND shadow_of IS NULL
-                   ORDER BY ts ASC LIMIT 1""",
-                (send_ts - 1, target_ip or ""),
-            ).fetchall()
-            conn.close()
-            if not rows:
-                continue
-            r0 = rows[0]
-            text = _extract_response_text(r0["response_body"], r0["stream_chunks"])
-            if text:
-                last_text = text
-            if r0["error"]:
-                return last_text or None, r0["error"]
-            if r0["status"] is not None:
-                return last_text or "(no text)", None
-        return last_text or None, "timed out after 30 minutes waiting for agent response"
-    finally:
-        _CURRENT_AGENT_TASK.clear()
-
-
 async def _task_execute(task_id: int):
     """Claim a task row, dispatch by mode, write result. Runs inside the appropriate sema."""
     conn = db()
@@ -7175,7 +6403,7 @@ async def _task_execute(task_id: int):
     conn.close()
     if cur.rowcount != 1:
         return  # another tick claimed it first
-    sem = _TASK_AGENT_SEM if row["mode"] == "agent" else _TASK_CHAT_SEM
+    sem = _TASK_CHAT_SEM
     async with sem:
         # Re-check that we weren't cancelled while waiting on the semaphore.
         conn = db()
@@ -7184,13 +6412,7 @@ async def _task_execute(task_id: int):
         if not cur_row or cur_row["status"] != "running":
             return
         try:
-            if row["mode"] == "agent":
-                result, err = await _task_run_agent(
-                    task_id, row["prompt"], row["target_endpoint"],
-                    row["tool_approval_mode"],
-                )
-            else:
-                result, err = await _task_run_chat(task_id, row["prompt"], row["model"])
+            result, err = await _task_run_chat(task_id, row["prompt"], row["model"])
         except Exception as e:
             result, err = None, f"worker exception: {e}"
         conn = db()

@@ -5556,13 +5556,10 @@ async function loadTasks() {
         <button id="tasks-refresh-btn" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
       </div>
       <div style="background:#141922;border:1px solid #262d38;border-radius:8px;padding:12px;margin-bottom:14px">
-        <div style="font-size:12px;color:#aaa;margin-bottom:8px"><strong>+ Queue a task</strong> — agent tasks drive your VS Code session; chat tasks hit Ollama directly.</div>
+        <div style="font-size:12px;color:#aaa;margin-bottom:8px"><strong>+ Queue a task</strong> — runs the prompt against the model (chat completion), one-shot or on a schedule.</div>
         <textarea id="t2-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
         <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:6px;align-items:center">
-          <label>Mode <select id="t2-mode" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px"><option value="chat">chat</option><option value="agent">agent</option></select></label>
           <label id="t2-model-wrap">Model <select id="t2-model" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px;min-width:220px"></select></label>
-          <label id="t2-target-wrap" style="display:none">Endpoint <select id="t2-target" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px;min-width:220px"></select></label>
-          <label id="t2-approval-wrap" style="display:none">Approval <select id="t2-approval" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px"><option value="notify-phone">notify phone</option><option value="rules-only">rules only</option><option value="yolo">yolo</option></select></label>
           <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
         </div>
         <button id="t2-add" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Queue task</button>
@@ -5575,10 +5572,7 @@ async function loadTasks() {
     `;
     $('tasks-refresh-btn').onclick = () => loadTasks();
     $('t2-add').onclick = _addTaskMain;
-    $('t2-mode').onchange = _t2ApplyMode;
-    _t2ApplyMode();
     _t2PopulateModels();
-    _t2PopulateEndpoints();
   }
   try {
     const r = await fetch('/__proxy/api/control/tasks?limit=200');
@@ -5647,13 +5641,6 @@ async function loadTasks() {
   if (view === 'tasks') _tasksTimer = setInterval(() => { if (view === 'tasks') loadTasks(); else { clearInterval(_tasksTimer); _tasksTimer = null; } }, 4000);
 }
 
-function _t2ApplyMode() {
-  const m = $('t2-mode').value;
-  $('t2-model-wrap').style.display = (m === 'chat') ? '' : 'none';
-  $('t2-target-wrap').style.display = (m === 'agent') ? '' : 'none';
-  $('t2-approval-wrap').style.display = (m === 'agent') ? '' : 'none';
-}
-
 async function _t2PopulateModels() {
   const sel = $('t2-model');
   sel.innerHTML = '<option value="">(first loaded)</option>';
@@ -5681,31 +5668,11 @@ async function _t2PopulateModels() {
   } catch {}
 }
 
-async function _t2PopulateEndpoints() {
-  const sel = $('t2-target');
-  sel.innerHTML = '<option value="">(newest registered)</option>';
-  try {
-    const d = await (await fetch('/__proxy/api/control/endpoints')).json();
-    for (const ep of (d.items || [])) {
-      const o = document.createElement('option');
-      o.value = ep.name;
-      o.textContent = `${ep.name} — ${ep.url}`;
-      sel.appendChild(o);
-    }
-  } catch {}
-}
-
 async function _addTaskMain() {
   const prompt = $('t2-prompt').value.trim();
   if (!prompt) { $('t2-err').textContent = 'prompt required'; return; }
-  const mode = $('t2-mode').value;
-  const body = { prompt, mode };
-  if (mode === 'agent') {
-    body.tool_approval_mode = $('t2-approval').value;
-    const tg = $('t2-target').value.trim(); if (tg) body.target_endpoint = tg;
-  } else {
-    const m = $('t2-model').value.trim(); if (m) body.model = m;
-  }
+  const body = { prompt, mode: 'chat' };
+  const m = $('t2-model').value.trim(); if (m) body.model = m;
   const sc = $('t2-schedule').value.trim(); if (sc) body.schedule = sc;
   $('t2-err').textContent = '';
   try {
