@@ -1820,6 +1820,22 @@ DEFAULT_RULES_CONFIG = {
         "max_prune_ratio": 0.8,          # cap: never drop more than this fraction of tools[]
         "include_hint": True,             # append a system note listing pruned tool names
     },
+    "context_compressor": {
+        # Deterministic prompt compressor: squeezes bulky tool outputs (and JSON blobs) already
+        # in the message history before forwarding upstream, reclaiming context / tokens. Lossy —
+        # opt in per condition. Runs after tool_pruner, before the body is re-serialized.
+        "enabled": False,
+        # mode: "shadow" measures potential savings only (does NOT change the request);
+        # "live" actually compresses the forwarded body. Start in shadow to see the numbers.
+        "mode": "shadow",
+        "tool_output_max_chars": 4000,   # head/tail-truncate tool results longer than this
+        "json_min_chars": 2000,          # minify (strip whitespace) JSON content larger than this
+        "min_saved_chars": 200,          # skip squeezes that don't save at least this much
+        # Optional conditions (all provided must hold):
+        "from_model_prefix": "",         # e.g. "qwen" — only for models whose name starts with this
+        "client_app": "",                # e.g. "claude-code"
+        "prompt_chars_gt": 0,            # only when the whole prompt exceeds this many chars
+    },
     "protocol_bridge": {
         # Translate Anthropic /v1/messages requests to OpenAI /v1/chat/completions when the
         # (post-router) target model isn't a Claude model. Lets Anthropic clients (Claude Code,
@@ -3353,6 +3369,107 @@ def _conversation_tool_history(conv_id: str, exclude_req_id: str | None) -> tupl
     return offered, invoked, turn_count
 
 
+# ---- Context compressor: deterministic squeeze of bulky tool outputs in the history ----
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+# Rolling in-memory savings tally (live + shadow), surfaced at /__proxy/api/compress-stats.
+_COMPRESS_STATS = {"live": {"reqs": 0, "orig": 0, "saved": 0},
+                   "shadow": {"reqs": 0, "orig": 0, "saved": 0}}
+
+def _squeeze_text(text, tool_max, json_min):
+    """Shrink one bulky tool-output string deterministically. Returns (new_text, saved_chars).
+    Strip ANSI → minify large JSON → head/tail-truncate anything still over the cap."""
+    if not isinstance(text, str):
+        return text, 0
+    orig_len = len(text)
+    if orig_len <= min(tool_max, json_min):
+        return text, 0
+    out = _ANSI_RE.sub("", text)
+    stripped = out.strip()
+    if orig_len >= json_min and stripped[:1] in "{[":
+        try:
+            out = json.dumps(json.loads(stripped), separators=(",", ":"), ensure_ascii=False)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    if len(out) > tool_max:
+        keep = max(400, tool_max)
+        head = int(keep * 0.7); tail = keep - head
+        elided = len(out) - head - tail
+        if elided > 0:
+            out = out[:head] + f"\n… [{elided} chars elided by proxy compressor] …\n" + out[-tail:]
+    saved = orig_len - len(out)
+    return (out, saved) if saved > 0 else (text, 0)
+
+
+def evaluate_context_compressor(body, ctx) -> dict | None:
+    """Squeeze bulky tool outputs in the message history. 'live' mode mutates body in place;
+    'shadow' mode only measures. Returns audit info, or None if it did/would do nothing."""
+    if not isinstance(body, dict):
+        return None
+    cfg = (load_rules_config().get("context_compressor") or {})
+    if not cfg.get("enabled", False):
+        return None
+    msgs = body.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return None
+    fmp = (cfg.get("from_model_prefix") or "").strip()
+    if fmp and not str(body.get("model") or "").startswith(fmp):
+        return None
+    capp = (cfg.get("client_app") or "").strip()
+    if capp and ctx.get("client_app") != capp:
+        return None
+    mode = "live" if (cfg.get("mode") or "shadow").lower() == "live" else "shadow"
+    tool_max = max(200, int(cfg.get("tool_output_max_chars", 4000) or 4000))
+    json_min = max(200, int(cfg.get("json_min_chars", 2000) or 2000))
+    min_saved = max(0, int(cfg.get("min_saved_chars", 200) or 200))
+    total_orig = sum(len(json.dumps(m)) for m in msgs if isinstance(m, dict))
+    if int(cfg.get("prompt_chars_gt") or 0) and total_orig < int(cfg.get("prompt_chars_gt")):
+        return None
+
+    saved_total = 0
+    n = 0
+    def _sq(s):
+        nonlocal saved_total, n
+        new, saved = _squeeze_text(s, tool_max, json_min)
+        if saved >= min_saved:
+            saved_total += saved; n += 1
+            return new, True
+        return s, False
+
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        content = m.get("content")
+        if m.get("role") == "tool" and isinstance(content, str):
+            new, changed = _sq(content)
+            if changed and mode == "live":
+                m["content"] = new
+        elif isinstance(content, list):  # Anthropic tool_result blocks ride in user messages
+            for blk in content:
+                if not (isinstance(blk, dict) and blk.get("type") == "tool_result"):
+                    continue
+                c = blk.get("content")
+                if isinstance(c, str):
+                    new, changed = _sq(c)
+                    if changed and mode == "live":
+                        blk["content"] = new
+                elif isinstance(c, list):
+                    for sub in c:
+                        if isinstance(sub, dict) and isinstance(sub.get("text"), str):
+                            new, changed = _sq(sub["text"])
+                            if changed and mode == "live":
+                                sub["text"] = new
+
+    if saved_total <= 0:
+        return None
+    st = _COMPRESS_STATS[mode]
+    st["reqs"] += 1; st["orig"] += total_orig; st["saved"] += saved_total
+    return {
+        "action": "compress" if mode == "live" else "measure",
+        "mode": mode, "orig_chars": total_orig, "saved_chars": saved_total,
+        "pct": round(100.0 * saved_total / total_orig, 1) if total_orig else 0.0, "n": n,
+    }
+
+
 def evaluate_tool_pruner(body, ctx) -> dict | None:
     """Drop tool definitions that have been offered repeatedly in this conversation but never
     invoked. Mutates body['tools'] in place when action is 'prune'. Returns audit info or None."""
@@ -3612,6 +3729,24 @@ def _save_gate(req_id: str, gate: dict):
 @app.get("/__proxy/api/info")
 async def info():
     return {"version": __version__, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL, "lmstudio": LMSTUDIO_URL, "port": PROXY_PORT}
+
+
+@app.get("/__proxy/api/compress-stats")
+async def compress_stats():
+    """Rolling context-compressor savings (since last restart), for the Stats readout."""
+    def _s(d):
+        return {"reqs": d["reqs"], "orig_chars": d["orig"], "saved_chars": d["saved"],
+                "pct": round(100.0 * d["saved"] / d["orig"], 1) if d["orig"] else 0.0}
+    cc = (load_rules_config().get("context_compressor") or {})
+    return {"live": _s(_COMPRESS_STATS["live"]), "shadow": _s(_COMPRESS_STATS["shadow"]),
+            "enabled": bool(cc.get("enabled")), "mode": (cc.get("mode") or "shadow")}
+
+
+@app.delete("/__proxy/api/compress-stats")
+async def compress_stats_reset():
+    for k in _COMPRESS_STATS:
+        _COMPRESS_STATS[k] = {"reqs": 0, "orig": 0, "saved": 0}
+    return {"ok": True}
 
 
 def _read_proc_self_status() -> dict:
@@ -4614,7 +4749,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
+    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -8767,6 +8902,16 @@ async def proxy(full_path: str, request: Request):
         _ti_ctx["memory_scope"] = _xms[:200]
     tool_injection_count = _inject_proxy_tools(body_json, _ti_ctx) if isinstance(body_json, dict) else 0
     tool_injection_active = tool_injection_count > 0
+    # context_compressor: squeeze bulky tool outputs in the history. In shadow mode it only
+    # tallies potential savings; in live mode it mutates body_json before re-serialize.
+    compressed = (evaluate_context_compressor(body_json, {**router_ctx, "client_app": _ti_ctx.get("client_app")})
+                  if isinstance(body_json, dict) else None)
+    if compressed and compressed.get("action") == "compress":
+        _save_gate(req_id, {
+            "verdict": "rewrite", "rule": "context_compressor",
+            "reason": f"compressed {compressed['n']} tool output(s): saved {compressed['saved_chars']} chars ({compressed['pct']}%)",
+            "details": compressed,
+        })
     # compaction_nudge: per-client strategy. Returns either a 'system_reminder' (mutates
     # body, forwards upstream) or 'synthetic_response' (short-circuits with a synthetic
     # assistant message — handled below).
@@ -8815,6 +8960,7 @@ async def proxy(full_path: str, request: Request):
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
         or ctx_capped or usage_injected
+        or (compressed and compressed.get("action") == "compress")
     )
     if body_mutated:
         # Re-serialize the body so all mutations are forwarded upstream.
@@ -9773,6 +9919,7 @@ def _render_digest_markdown(data: dict, samples: int, include_bodies: bool, reda
     lines.append("- `context_overflow_guard` (transform): estimate prompt tokens; warn / bump `num_ctx` / trim oldest messages / block when prompt exceeds the effective context window (prevents Ollama silent truncation). Keys: `enabled`, `action` (warn|bump|trim|block), `chars_per_token`, `headroom_ratio`, `max_ctx`, `bump_to`, `min_keep_messages`, `assumed_default_num_ctx`.")
     lines.append("- `compaction_nudge` (transform + intercept): when prompt size crosses `threshold_pct`% of num_ctx, nudge the client/model to compact. Strategy is per-client: `system_reminder` injects a `<system-reminder>` tag (Claude Code respects this strongly), `system_reminder_plain` injects a plain text reminder, `synthetic_response` short-circuits non-streaming requests with a synthetic assistant message. Streams fall back to `system_reminder_plain`. Adds `X-Proxy-Suggest: compact` response header on synthetic responses. Keys: `enabled`, `threshold_pct`, `chars_per_token`, `assumed_default_num_ctx`, `default_strategy`, `client_strategies` (map of client_app → strategy).")
     lines.append("- `tool_pruner` (transform): drop tool definitions the model has been offered repeatedly in this conversation but never invoked, cutting prompt tokens and reducing tool-selection noise. Keys: `enabled`, `action` (prune|warn), `min_turns_offered`, `min_history_turns`, `always_keep` (names), `max_prune_ratio`, `include_hint`.")
+    lines.append("- `context_compressor` (transform): deterministically squeeze bulky tool outputs (strip ANSI, minify JSON, head/tail-truncate) already in the history to reclaim context/tokens. Lossy. `mode: shadow` measures potential savings only; `mode: live` compresses the forwarded body. Keys: `enabled`, `mode` (shadow|live), `tool_output_max_chars`, `json_min_chars`, `min_saved_chars`, `from_model_prefix`, `client_app`, `prompt_chars_gt`. Savings show at `/__proxy/api/compress-stats` and on the Stats page.")
     lines.append("- `protocol_bridge` (transform): when an Anthropic-shape request gets routed (via `model_router`) to a non-Claude model, translate the body to OpenAI shape, send to OLLAMA_URL, and translate the response back. Lets Claude Code & Anthropic SDKs drive any OpenAI-compatible backend. Keys: `enabled`, `force` (when true, always bridge regardless of the target model — even Claude model names).")
     lines.append("- `tool_injector` (transform + post-flight): inject proxy-owned tools (memory: `remember`/`recall`/`list_memory`/`forget`; todos: `set_todos`/`get_todos`/`add_todo`/`complete_todo`) into outgoing requests, then intercept tool_use of those names, execute server-side, append tool_result, and re-call upstream so the model sees the answer and continues. Capped at `max_iterations`. Keys: `enabled`, `memory`, `todos`, `max_iterations`, `scopes`. `scopes` is a list of `{match, enabled?, memory?, todos?, max_iterations?}`; first matching scope wins. `match` accepts `ip`, `ip_cidr`, `user_agent` (substring), `client_app` (exact label).")
     lines.append("- `schema_validator` (post-flight): validate tool_call args against the request's `tools[].parameters` schema; replace bad calls with a corrective assistant message. Keys: `enabled`, `action`, `strict_types`, `reject_unknown_fields`.")

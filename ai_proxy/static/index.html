@@ -789,6 +789,16 @@
   .s2-explain > summary { cursor: pointer; color: #93a0b4; font-size: 12px; padding: 6px 8px; list-style: none; }
   .s2-explain > summary::-webkit-details-marker { display: none; }
   .s2-explain > div { margin-top: 6px; padding: 8px 12px; background: #12161d; border-left: 3px solid #b48ead; border-radius: 4px; font-size: 12px; color: #bbb; line-height: 1.5; }
+  .cc-card { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; background: #12161d; border: 1px solid #262d38; border-left: 3px solid #57d1e0; border-radius: 8px; padding: 9px 14px; margin-bottom: 16px; font-size: 12.5px; }
+  .cc-card .cc-t { font-weight: 600; color: #e9edf4; display: flex; align-items: center; gap: 7px; }
+  .cc-card .cc-line { color: #93a0b4; }
+  .cc-card .cc-line b { color: #e9edf4; }
+  .cc-card code { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: #c9d3e1; }
+  .cc-card .cc-reset { margin-left: auto; color: #57d1e0; font-size: 11px; }
+  .cc-mode { font-size: 10px; font-weight: 700; text-transform: uppercase; padding: 1px 7px; border-radius: 10px; letter-spacing: .04em; }
+  .cc-mode.live { background: rgba(104,211,145,.16); color: #68d391; }
+  .cc-mode.shadow { background: rgba(122,162,247,.16); color: #7aa2f7; }
+  .cc-mode.off { background: #20262f; color: #5f6b7e; }
   @media (max-width: 760px) { .s2-kpis { grid-template-columns: repeat(3, 1fr); } }
 </style>
 </head>
@@ -2591,11 +2601,12 @@ function _activateStatsTab(id) {
   root.querySelectorAll('.s2-pane').forEach(p => { p.style.display = p.dataset.stab === id ? '' : 'none'; });
 }
 async function loadStats() {
-  const [d, rules, audit, perfData] = await Promise.all([
+  const [d, rules, audit, perfData, compData] = await Promise.all([
     fetch('/__proxy/api/stats').then(r => r.json()),
     fetch('/__proxy/api/rules').then(r => r.json()).catch(() => null),
     fetch('/__proxy/api/audit?include_allow=true').then(r => r.json()).catch(() => null),
     fetch(`/__proxy/api/perf?window_h=${_perfWinH}`).then(r => r.json()).catch(() => null),
+    fetch('/__proxy/api/compress-stats').then(r => r.json()).catch(() => null),
   ]);
   const perfHtml = perfData ? renderPerf(perfData) : '';
   const flowHtml = _renderTrafficFlow(d, rules, audit);
@@ -2796,8 +2807,31 @@ async function loadStats() {
   const tabBar = tabs.map(([id, label]) => `<button data-stab="${id}" onclick="setStatsTab('${id}')">${label}</button>`).join('');
   const tabPanes = tabs.map(([id, , html]) => `<div class="s2-pane" data-stab="${id}">${html}</div>`).join('');
 
+  // Context-compressor savings readout (only when enabled or it has measured something).
+  let compHtml = '';
+  if (compData) {
+    const s = compData.mode === 'live' ? compData.live : compData.shadow;
+    const other = compData.mode === 'live' ? compData.shadow : compData.live;
+    const active = compData.enabled && (s.reqs || 0) > 0;
+    const shadowSeen = (compData.shadow.reqs || 0) > 0;
+    if (compData.enabled || shadowSeen) {
+      const kb = c => (c / 1024).toFixed(c >= 1024 * 100 ? 0 : 1) + ' KB';
+      const badge = compData.enabled
+        ? `<span class="cc-mode ${compData.mode}">${compData.mode}</span>`
+        : `<span class="cc-mode off">off</span>`;
+      const line = active
+        ? `saved <b>${kb(s.saved_chars)}</b> of <b>${kb(s.orig_chars)}</b> (<b>${s.pct}%</b>) across ${num(s.reqs)} request${s.reqs === 1 ? '' : 's'}`
+        : (shadowSeen
+            ? `shadow measured <b>${compData.shadow.pct}%</b> potential savings across ${num(compData.shadow.reqs)} request${compData.shadow.reqs === 1 ? '' : 's'} — flip <code>mode: "live"</code> to apply`
+            : `enabled, no compressible traffic yet`);
+      compHtml = `<div class="cc-card"><span class="cc-t">Context compressor ${badge}</span><span class="cc-line">${line}</span>
+        <a href="#" class="cc-reset" onclick="event.preventDefault();fetch('/__proxy/api/compress-stats',{method:'DELETE'}).then(()=>loadStats())">reset</a></div>`;
+    }
+  }
+
   $('stats').innerHTML = `
     ${kpiStrip}
+    ${compHtml}
     <div class="s2-detail"><div class="s2-tabs">${tabBar}</div><div class="s2-panes">${tabPanes}</div></div>
   `;
   _activateStatsTab(_statsTab);
