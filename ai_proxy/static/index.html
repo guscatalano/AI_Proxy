@@ -711,8 +711,7 @@
   .tl-user .tl-role { color: #57d1e0; }
   .tl-assistant { background: #16231a; border: 1px solid #26432c; }
   .tl-assistant .tl-role { color: #68d391; }
-  .tl-system { background: #211a2c; border: 1px solid #3a2a48; display: none; }
-  .conv-timeline.show-system .tl-system { display: block; }
+  .tl-system { background: #211a2c; border: 1px solid #3a2a48; }
   .tl-system .tl-role { color: #c3a6e6; }
   details.tl-tool, details.tl-tool-result { background: #211d14; border: 1px solid #3a3120; border-radius: 6px; margin: 5px 0 2px; padding: 4px 10px; }
   details.tl-tool-result { margin: 7px 0; }
@@ -740,7 +739,19 @@
   .tl-more { background: none; border: none; color: #57d1e0; font-size: 11px; cursor: pointer; padding: 4px 0 0; }
   mark.tl-hit { background: #5a4a00; color: #ffe08a; border-radius: 2px; padding: 0 1px; }
   .tl-msg.tl-current { box-shadow: 0 0 0 2px #f0c674; }
-  .conv-timeline .tl-system.tl-force-show { display: block; }
+  /* message-type filters (chips toggle f-no-<type> on the timeline root) */
+  .conv-filters { display: inline-flex; gap: 4px; flex-wrap: wrap; }
+  .conv-filter { background: #141922; color: #5f6b7e; border: 1px solid #262d38; border-radius: 20px; padding: 3px 11px; font-size: 11px; cursor: pointer; }
+  .conv-filter:hover { border-color: #3a4e6a; }
+  .conv-filter.on { color: #c9d3e1; border-color: #3a4e6a; background: #1a2230; }
+  .conv-timeline.f-no-user .tl-user, .conv-timeline.f-no-user .tl-break { display: none; }
+  .conv-timeline.f-no-assistant .tl-assistant .tl-body { display: none; }
+  .conv-timeline.f-no-assistant .tl-assistant:not(.tl-has-tools) { display: none; }
+  .conv-timeline.f-no-assistant.f-no-toolcalls .tl-assistant.tl-has-tools { display: none; }
+  .conv-timeline.f-no-toolcalls .tl-tool { display: none; }
+  .conv-timeline.f-no-toolresults .tl-tool-result { display: none; }
+  .conv-timeline.f-no-system .tl-system { display: none; }
+  .tl-system.tl-force-show { display: block !important; }
 </style>
 </head>
 <body class="shell-console">
@@ -3170,11 +3181,17 @@ async function loadConversationDetail(cid) {
       <span class="conv-search-count" id="conv-search-count"></span>
       <button class="conv-toolbtn" onclick="convSearchNav(-1)" title="Previous match (Shift+Enter)">↑</button>
       <button class="conv-toolbtn" onclick="convSearchNav(1)" title="Next match (Enter)">↓</button>
+      <span class="conv-filters">
+        <button class="conv-filter on" onclick="convFilterToggle(this,'user')">User</button>
+        <button class="conv-filter on" onclick="convFilterToggle(this,'assistant')">Responses</button>
+        <button class="conv-filter on" onclick="convFilterToggle(this,'toolcalls')">Tool calls</button>
+        <button class="conv-filter on" onclick="convFilterToggle(this,'toolresults')">Tool results</button>
+        <button class="conv-filter" onclick="convFilterToggle(this,'system')">System</button>
+      </span>
       <span style="flex:1"></span>
       <button class="conv-toolbtn" id="conv-expand-btn" onclick="convExpandAllMsgs()">Expand all</button>
-      <button class="conv-toolbtn" id="conv-sys-btn" onclick="convToggleSystem()">Show system</button>
     </div>
-    <div class="conv-timeline" id="conv-timeline"><div class="ct-loading" style="padding:20px">Loading transcript…</div></div>`;
+    <div class="conv-timeline f-no-system" id="conv-timeline"><div class="ct-loading" style="padding:20px">Loading transcript…</div></div>`;
   box.scrollTop = 0;
   if (!turns.length) { $('conv-timeline').innerHTML = '<div style="padding:22px;color:#888">No turns.</div>'; return; }
   // Fetch ONLY the last turn — its request body is the full history; its response is the final reply.
@@ -3292,7 +3309,7 @@ function _tlAssistant(txt, toolCalls) {
     return `<details class="tl-tool"><summary>🔧 <code>${esc(x.name)}</code>${hint ? `<span class="tl-tool-hint">${esc(hint)}</span>` : ''}</summary><pre>${esc(p || '')}</pre></details>`;
   }).join('');
   if (!txt && !tc) return '';
-  return `<div class="tl-msg tl-assistant"><div class="tl-role">assistant</div>${txt ? _tlBodyBlock(txt, 14000) : ''}${tc}</div>`;
+  return `<div class="tl-msg tl-assistant${tc ? ' tl-has-tools' : ''}"><div class="tl-role">assistant</div>${txt ? _tlBodyBlock(txt, 14000) : ''}${tc}</div>`;
 }
 function _tlToolResult(name, content) {
   const er = looksLikeToolError(content);
@@ -3372,6 +3389,13 @@ function convExpandAllMsgs() {
   tl.querySelectorAll('.tl-clamp').forEach(b => b.classList.toggle('tl-open', expanding));
   tl.querySelectorAll('.tl-more').forEach(b => b.textContent = expanding ? 'show less ⌃' : 'show more ⌄');
   const btn = $('conv-expand-btn'); if (btn) btn.textContent = expanding ? 'Collapse all' : 'Expand all';
+}
+// Show/hide a message type in the timeline (User / Responses / Tool calls / Tool results / System).
+// Lets you isolate e.g. just tool activity. Driven by f-no-<type> classes on the timeline root.
+function convFilterToggle(btn, type) {
+  const tl = $('conv-timeline'); if (!tl) return;
+  const on = btn.classList.toggle('on');
+  tl.classList.toggle('f-no-' + type, !on);
 }
 
 let rulesEditorBaseline = '';
