@@ -721,6 +721,26 @@
   details.tl-tool > summary::-webkit-details-marker, details.tl-tool-result > summary::-webkit-details-marker { display: none; }
   details.tl-tool pre, details.tl-tool-result pre { font-size: 11px; max-height: 320px; overflow: auto; background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 6px 8px; margin: 5px 0 2px; white-space: pre-wrap; word-break: break-word; color: #c9d3e1; }
   details.tl-tool-result.tool-error-msg { border-color: #6a3030; background: #2a1818; }
+  /* conversation search + long-message clamp */
+  .conv-tools { display: flex; align-items: center; gap: 8px; padding: 8px 16px; border-bottom: 1px solid #262d38; position: sticky; top: 0; background: #0c0f15; z-index: 4; flex-wrap: wrap; }
+  .conv-search-wrap { display: flex; align-items: center; gap: 6px; background: #12161d; border: 1px solid #262d38; border-radius: 7px; padding: 4px 10px; flex: 1; min-width: 180px; max-width: 440px; font-size: 12px; }
+  .conv-search-wrap:focus-within { border-color: #2c6b74; }
+  .conv-search { flex: 1; background: none; border: none; outline: none; color: #e9edf4; font-size: 12px; font-family: inherit; }
+  .conv-search::placeholder { color: #5f6b7e; }
+  .conv-search-count { font-size: 11px; color: #8b96a8; font-variant-numeric: tabular-nums; min-width: 54px; }
+  .conv-toolbtn { background: #141922; color: #9aa4b2; border: 1px solid #262d38; border-radius: 6px; padding: 4px 10px; font-size: 11.5px; cursor: pointer; }
+  .conv-toolbtn:hover { border-color: #3a4e6a; color: #e9edf4; }
+  .tl-clamp { max-height: 92px; overflow: hidden; position: relative; }
+  .tl-clamp.tl-open { max-height: none; }
+  .tl-clamp::after { content: ''; position: absolute; left: 0; right: 0; bottom: 0; height: 34px; pointer-events: none; }
+  .tl-user .tl-clamp::after { background: linear-gradient(transparent, #16202e); }
+  .tl-assistant .tl-clamp::after { background: linear-gradient(transparent, #16231a); }
+  .tl-system .tl-clamp::after { background: linear-gradient(transparent, #211a2c); }
+  .tl-clamp.tl-open::after { display: none; }
+  .tl-more { background: none; border: none; color: #57d1e0; font-size: 11px; cursor: pointer; padding: 4px 0 0; }
+  mark.tl-hit { background: #5a4a00; color: #ffe08a; border-radius: 2px; padding: 0 1px; }
+  .tl-msg.tl-current { box-shadow: 0 0 0 2px #f0c674; }
+  .conv-timeline .tl-system.tl-force-show { display: block; }
 </style>
 </head>
 <body class="shell-console">
@@ -3143,9 +3163,17 @@ async function loadConversationDetail(cid) {
         <div class="conv-head-title"><code>${esc(cid)}</code></div>
         <div class="conv-head-sub">${turns.length} turn${turns.length === 1 ? '' : 's'} · ${num(totalTok)} tok · ${esc(models.slice(0, 3).join(', ')) || '—'} · ${esc(clients.slice(0, 2).join(', '))} · span ${span}${nErr ? ` · <span class="cv-err">${nErr} error${nErr === 1 ? '' : 's'}</span>` : ''}</div>
       </div>
-      <button class="conv-expand-all" id="conv-sys-btn" onclick="convToggleSystem()">Show system</button>
     </div>
     ${_tlTurnsPanel(turns)}
+    <div class="conv-tools">
+      <span class="conv-search-wrap">🔎<input id="conv-search" class="conv-search" placeholder="Search this conversation…" autocomplete="off" oninput="convSearch(this.value)" onkeydown="if(event.key==='Enter'){event.preventDefault();convSearchNav(event.shiftKey?-1:1)}"></span>
+      <span class="conv-search-count" id="conv-search-count"></span>
+      <button class="conv-toolbtn" onclick="convSearchNav(-1)" title="Previous match (Shift+Enter)">↑</button>
+      <button class="conv-toolbtn" onclick="convSearchNav(1)" title="Next match (Enter)">↓</button>
+      <span style="flex:1"></span>
+      <button class="conv-toolbtn" id="conv-expand-btn" onclick="convExpandAllMsgs()">Expand all</button>
+      <button class="conv-toolbtn" id="conv-sys-btn" onclick="convToggleSystem()">Show system</button>
+    </div>
     <div class="conv-timeline" id="conv-timeline"><div class="ct-loading" style="padding:20px">Loading transcript…</div></div>`;
   box.scrollTop = 0;
   if (!turns.length) { $('conv-timeline').innerHTML = '<div style="padding:22px;color:#888">No turns.</div>'; return; }
@@ -3221,12 +3249,22 @@ function _renderConvTimeline(lastReq) {
   tl.innerHTML = html || '<div class="ct-empty" style="padding:20px">No renderable content.</div>';
 }
 function _tlClip(txt, n) { txt = txt || ''; return esc(txt.slice(0, n)) + (txt.length > n ? '\n…(clipped — “open” for full)' : ''); }
+// Long message bodies are clamped by default so long conversations stay scannable; a per-message
+// "show more" (and the header "Expand all") reveals the rest.
+const TL_CLAMP_CHARS = 520;
+function _tlBodyBlock(txt, limit) {
+  txt = txt || '';
+  const html = _tlClip(txt, limit);
+  if (txt.length <= TL_CLAMP_CHARS) return `<div class="tl-body">${html}</div>`;
+  return `<div class="tl-body tl-clamp">${html}</div><button class="tl-more" onclick="_tlToggleMore(this)">show more ⌄</button>`;
+}
+function _tlToggleMore(btn) { const b = btn.previousElementSibling; const o = b.classList.toggle('tl-open'); btn.textContent = o ? 'show less ⌃' : 'show more ⌄'; }
 function _tlSystem(txt) {
   if (!txt) return '';
-  return `<div class="tl-msg tl-system"><div class="tl-role">system</div><div class="tl-body">${_tlClip(txt, 16000)}</div></div>`;
+  return `<div class="tl-msg tl-system"><div class="tl-role">system</div>${_tlBodyBlock(txt, 16000)}</div>`;
 }
 function _tlUser(txt) {
-  return `<div class="tl-msg tl-user"><div class="tl-role">user</div><div class="tl-body">${txt ? _tlClip(txt, 14000) : '<span style="color:#5f6b7e">(no text)</span>'}</div></div>`;
+  return `<div class="tl-msg tl-user"><div class="tl-role">user</div>${txt ? _tlBodyBlock(txt, 14000) : '<div class="tl-body"><span style="color:#5f6b7e">(no text)</span></div>'}</div>`;
 }
 // Pull the most distinguishing bit out of a tool call's arguments, so N repeated calls to the
 // same tool are told apart at a glance (e.g. the URL for browser_navigate, the path for edit).
@@ -3254,12 +3292,86 @@ function _tlAssistant(txt, toolCalls) {
     return `<details class="tl-tool"><summary>🔧 <code>${esc(x.name)}</code>${hint ? `<span class="tl-tool-hint">${esc(hint)}</span>` : ''}</summary><pre>${esc(p || '')}</pre></details>`;
   }).join('');
   if (!txt && !tc) return '';
-  return `<div class="tl-msg tl-assistant"><div class="tl-role">assistant</div>${txt ? `<div class="tl-body">${_tlClip(txt, 14000)}</div>` : ''}${tc}</div>`;
+  return `<div class="tl-msg tl-assistant"><div class="tl-role">assistant</div>${txt ? _tlBodyBlock(txt, 14000) : ''}${tc}</div>`;
 }
 function _tlToolResult(name, content) {
   const er = looksLikeToolError(content);
   const hint = (content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
   return `<details class="tl-msg tl-tool-result${er.isError ? ' tool-error-msg' : ''}"><summary>↩ 🔧 <code>${esc(name)}</code>${er.isError ? ' <span class="ct-err">error</span>' : ''}${hint ? `<span class="tl-tool-hint">${esc(hint)}</span>` : ''}</summary><pre>${_tlClip(content, 10000)}</pre></details>`;
+}
+// ---- in-conversation search (filter + highlight + jump) and expand controls ----
+let _convHits = [], _convHitIdx = -1;
+function _tlClearMarks(root) {
+  root.querySelectorAll('mark.tl-hit').forEach(mk => { const p = mk.parentNode; if (p) { p.replaceChild(document.createTextNode(mk.textContent), mk); p.normalize(); } });
+}
+function _tlHighlight(el, q) {
+  const ql = q.toLowerCase();
+  const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT, {
+    acceptNode(n) { return n.nodeValue && n.parentNode && n.parentNode.nodeName !== 'MARK' && n.nodeValue.toLowerCase().includes(ql) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT; }
+  });
+  const nodes = []; let n; while (n = walker.nextNode()) nodes.push(n);
+  for (const node of nodes) {
+    const text = node.nodeValue, low = text.toLowerCase(), frag = document.createDocumentFragment();
+    let i = 0, idx;
+    while ((idx = low.indexOf(ql, i)) !== -1) {
+      if (idx > i) frag.appendChild(document.createTextNode(text.slice(i, idx)));
+      const mk = document.createElement('mark'); mk.className = 'tl-hit'; mk.textContent = text.slice(idx, idx + q.length); frag.appendChild(mk);
+      i = idx + q.length;
+    }
+    if (i < text.length) frag.appendChild(document.createTextNode(text.slice(i)));
+    node.parentNode.replaceChild(frag, node);
+  }
+}
+function convSearch(q) {
+  const tl = $('conv-timeline'); if (!tl) return;
+  q = (q || '').trim();
+  _tlClearMarks(tl);
+  tl.querySelectorAll('.tl-force-show').forEach(e => e.classList.remove('tl-force-show'));
+  tl.querySelectorAll('.tl-current').forEach(e => e.classList.remove('tl-current'));
+  _convHits = []; _convHitIdx = -1;
+  const items = [...tl.children].filter(el => el.classList);
+  if (!q) { items.forEach(el => { el.style.display = ''; }); _tlUpdateCount(null); return; }
+  const ql = q.toLowerCase();
+  for (const el of items) {
+    if (el.classList.contains('tl-break')) { el.style.display = 'none'; continue; }
+    if (!el.classList.contains('tl-msg')) { el.style.display = ''; continue; }
+    const hit = (el.textContent || '').toLowerCase().includes(ql);
+    el.style.display = hit ? '' : 'none';
+    if (hit) {
+      if (el.classList.contains('tl-system')) el.classList.add('tl-force-show');
+      el.querySelectorAll('.tl-clamp').forEach(b => b.classList.add('tl-open'));
+      el.querySelectorAll('.tl-more').forEach(b => b.textContent = 'show less ⌃');
+      el.querySelectorAll('details').forEach(d => d.open = true);
+      _tlHighlight(el, q);
+      _convHits.push(el);
+    }
+  }
+  _tlUpdateCount(_convHits.length);
+  if (_convHits.length) convSearchNav(1);
+}
+function _tlUpdateCount(n) {
+  const c = $('conv-search-count'); if (!c) return;
+  if (n == null) { c.textContent = ''; return; }
+  if (n === 0) { c.textContent = 'no matches'; c.style.color = '#f0857f'; return; }
+  c.style.color = '#8b96a8';
+  c.textContent = (_convHitIdx >= 0 ? (_convHitIdx + 1) + '/' : '') + n + ' msg' + (n === 1 ? '' : 's');
+}
+function convSearchNav(dir) {
+  if (!_convHits.length) return;
+  _convHitIdx = (_convHitIdx + dir + _convHits.length) % _convHits.length;
+  _convHits.forEach(e => e.classList.remove('tl-current'));
+  const el = _convHits[_convHitIdx];
+  el.classList.add('tl-current');
+  el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  _tlUpdateCount(_convHits.length);
+}
+function convExpandAllMsgs() {
+  const tl = $('conv-timeline'); if (!tl) return;
+  const expanding = !tl.classList.contains('tl-all-open');
+  tl.classList.toggle('tl-all-open', expanding);
+  tl.querySelectorAll('.tl-clamp').forEach(b => b.classList.toggle('tl-open', expanding));
+  tl.querySelectorAll('.tl-more').forEach(b => b.textContent = expanding ? 'show less ⌃' : 'show more ⌄');
+  const btn = $('conv-expand-btn'); if (btn) btn.textContent = expanding ? 'Collapse all' : 'Expand all';
 }
 
 let rulesEditorBaseline = '';
