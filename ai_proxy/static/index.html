@@ -689,6 +689,37 @@
   .conv-turn-body details.msg.tool > summary { cursor: pointer; font-size: 11px; }
   .conv-turn-body .msg .role { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 2px; }
   .conv-turn-body pre { font-size: 11px; max-height: 240px; overflow: auto; background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 6px 8px; margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
+  /* ---- conversation timeline (single-fetch chat transcript) ---- */
+  .tl-turns-panel { margin: 10px 16px 0; border: 1px solid #262d38; border-radius: 8px; background: #12161d; }
+  .tl-turns-panel > summary { cursor: pointer; padding: 8px 12px; font-size: 11px; color: #93a0b4; list-style: none; }
+  .tl-turns-panel > summary::-webkit-details-marker { display: none; }
+  .tl-turns-panel[open] > summary { border-bottom: 1px solid #262d38; }
+  .tl-turns-list { max-height: 260px; overflow: auto; padding: 4px 0; }
+  .tl-turnrow { display: flex; align-items: baseline; gap: 8px; padding: 4px 12px; font-size: 11px; color: #93a0b4; }
+  .tl-turnrow:hover { background: rgba(255,255,255,.02); }
+  .tl-turnrow .tl-tr-n { font-weight: 700; color: #e9edf4; width: 34px; flex: none; }
+  .tl-turnrow .tl-tr-meta { color: #5f6b7e; }
+  .tl-turnrow code { color: #c9d3e1; }
+  .tl-open { margin-left: auto; color: #57d1e0; font-size: 10.5px; flex: none; }
+  .conv-timeline { padding: 14px 16px 48px; display: flex; flex-direction: column; gap: 7px; max-width: 1020px; }
+  .tl-break { height: 1px; background: #1f2530; margin: 10px 0 3px; }
+  .tl-break:first-child { display: none; }
+  .tl-msg { border-radius: 8px; padding: 8px 12px; font-size: 12.5px; }
+  .tl-role { font-size: 9.5px; text-transform: uppercase; letter-spacing: .6px; color: #5f6b7e; margin-bottom: 3px; }
+  .tl-body { white-space: pre-wrap; word-break: break-word; color: #c9d3e1; line-height: 1.5; }
+  .tl-user { background: #16202e; border: 1px solid #22344a; }
+  .tl-user .tl-role { color: #57d1e0; }
+  .tl-assistant { background: #16231a; border: 1px solid #26432c; }
+  .tl-assistant .tl-role { color: #68d391; }
+  .tl-system { background: #211a2c; border: 1px solid #3a2a48; display: none; }
+  .conv-timeline.show-system .tl-system { display: block; }
+  .tl-system .tl-role { color: #c3a6e6; }
+  details.tl-tool, details.tl-tool-result { background: #211d14; border: 1px solid #3a3120; border-radius: 6px; margin: 5px 0 2px; padding: 4px 10px; }
+  details.tl-tool-result { margin: 7px 0; }
+  details.tl-tool > summary, details.tl-tool-result > summary { cursor: pointer; font-size: 11px; color: #f0c674; list-style: none; }
+  details.tl-tool > summary::-webkit-details-marker, details.tl-tool-result > summary::-webkit-details-marker { display: none; }
+  details.tl-tool pre, details.tl-tool-result pre { font-size: 11px; max-height: 320px; overflow: auto; background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 6px 8px; margin: 5px 0 2px; white-space: pre-wrap; word-break: break-word; color: #c9d3e1; }
+  details.tl-tool-result.tool-error-msg { border-color: #6a3030; background: #2a1818; }
 </style>
 </head>
 <body class="shell-console">
@@ -3069,42 +3100,41 @@ function _conversationTurnSummary(t, body, userText, assistantText, toolCalls, t
   return { snippet, outcome };
 }
 
-// ---------- Dedicated conversation detail page (lazy per-turn load) ----------
-// The list click opens this full-page view (replacing the conversations list). The endpoint
-// returns turn METADATA only; each turn's full body is fetched from /requests/{id} on expand,
-// so a long conversation loads instantly instead of transferring every turn's blobs at once.
+// ---------- Conversation timeline (single-fetch chat transcript) ----------
+// A conversation's LAST turn already carries the entire message history in its request body,
+// so we fetch just that one turn (+ its final response) and render the whole conversation as a
+// chat log — instead of N per-turn body fetches. Per-turn metadata lives in a collapsible panel.
 let _convReturnPage = 1;
+function _contentText(content) {
+  if (content == null) return '';
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    return content.map(p => {
+      if (typeof p === 'string') return p;
+      if (!p || typeof p !== 'object') return '';
+      if (typeof p.text === 'string') return p.text;
+      if (p.type === 'text') return p.text || '';
+      if (p.type === 'image' || p.type === 'image_url' || p.source) return '🖼 [image]';
+      if (p.type === 'tool_result') return _contentText(p.content);
+      return '';
+    }).filter(Boolean).join('\n');
+  }
+  if (typeof content === 'object') return JSON.stringify(content);
+  return String(content);
+}
 async function loadConversationDetail(cid) {
   _convReturnPage = _convsPage;
   const box = $('convs');
   box.innerHTML = '<div style="padding:26px;color:#888">Loading conversation…</div>';
-  let d;
-  try { d = await (await fetch('/__proxy/api/conversations/' + encodeURIComponent(cid))).json(); }
+  let meta;
+  try { meta = await (await fetch('/__proxy/api/conversations/' + encodeURIComponent(cid))).json(); }
   catch { box.innerHTML = '<div style="padding:26px;color:#e08080">Failed to load conversation. <a href="#" onclick="event.preventDefault();convBack()">← back</a></div>'; return; }
-  const turns = d.turns || [];
+  const turns = meta.turns || [];
   const totalTok = turns.reduce((s, t) => s + (t.total_tokens || 0), 0);
   const models = [...new Set(turns.map(t => t.model).filter(Boolean))];
   const clients = [...new Set(turns.map(t => t.client_app || t.client_ip).filter(Boolean))];
   const span = turns.length > 1 ? fmtSpan(turns[turns.length - 1].ts - turns[0].ts) : '—';
   const nErr = turns.filter(t => (t.status && t.status >= 400) || t.error).length;
-  const rows = turns.map((t, i) => {
-    const cache = t.cache_verdict === 'hit' ? '<span class="cv-badge hit">⚡ cache</span>'
-      : t.cache_verdict === 'partial' ? '<span class="cv-badge partial">⚡ partial</span>' : '';
-    const verd = (t.gate_verdict && t.gate_verdict !== 'allow')
-      ? `<span class="verdict ${esc(t.gate_verdict)}">${esc(t.gate_verdict)}${t.gate_rule ? ' · ' + esc(t.gate_rule) : ''}</span>` : '';
-    const st = t.status == null ? '<span class="cv-live">live</span>'
-      : ((t.status >= 400 || t.error) ? `<span class="cv-err">${esc(String(t.status || 'err'))}</span>`
-        : `<span class="cv-ok">${esc(String(t.status))}</span>`);
-    return `<details class="conv-turn" data-rid="${esc(t.id)}" data-idx="${i}" ontoggle="convTurnToggle(this)">
-      <summary class="conv-turn-h">
-        <span class="ct-n">Turn ${i + 1}</span>
-        <span class="ct-meta">${fmt(t.ts)} · <code>${esc(t.model || '')}</code> · ${num(t.total_tokens || 0)} tok · ${Math.round(t.duration_ms || 0)}ms</span>
-        ${st} ${cache} ${verd} ${t.has_images ? '<span title="vision request">🖼</span>' : ''}
-        <a href="#" class="ct-open" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(t.id)}')">open ${esc(t.id.slice(0, 8))}</a>
-      </summary>
-      <div class="conv-turn-body"><div class="ct-loading">Loading turn…</div></div>
-    </details>`;
-  }).join('');
   box.innerHTML = `
     <div class="conv-detail-head">
       <button class="conv-back" onclick="convBack()">← Conversations</button>
@@ -3112,59 +3142,102 @@ async function loadConversationDetail(cid) {
         <div class="conv-head-title"><code>${esc(cid)}</code></div>
         <div class="conv-head-sub">${turns.length} turn${turns.length === 1 ? '' : 's'} · ${num(totalTok)} tok · ${esc(models.slice(0, 3).join(', ')) || '—'} · ${esc(clients.slice(0, 2).join(', '))} · span ${span}${nErr ? ` · <span class="cv-err">${nErr} error${nErr === 1 ? '' : 's'}</span>` : ''}</div>
       </div>
-      <button class="conv-expand-all" onclick="convExpandAll()">Expand all</button>
+      <button class="conv-expand-all" id="conv-sys-btn" onclick="convToggleSystem()">Show system</button>
     </div>
-    <div class="conv-turns-list">${rows || '<div style="padding:22px;color:#888">No turns in this conversation.</div>'}</div>`;
-  const dets = [...box.querySelectorAll('details.conv-turn')];
-  dets.slice(-2).forEach(el => { el.open = true; convTurnToggle(el); });
+    ${_tlTurnsPanel(turns)}
+    <div class="conv-timeline" id="conv-timeline"><div class="ct-loading" style="padding:20px">Loading transcript…</div></div>`;
   box.scrollTop = 0;
+  if (!turns.length) { $('conv-timeline').innerHTML = '<div style="padding:22px;color:#888">No turns.</div>'; return; }
+  // Fetch ONLY the last turn — its request body is the full history; its response is the final reply.
+  const last = turns[turns.length - 1];
+  let lastReq;
+  try { lastReq = await (await fetch('/__proxy/api/requests/' + encodeURIComponent(last.id))).json(); }
+  catch { $('conv-timeline').innerHTML = '<div class="ct-err" style="padding:20px">Failed to load transcript.</div>'; return; }
+  _renderConvTimeline(lastReq);
 }
 function convBack() { _convsPage = _convReturnPage; loadConversations(); }
-function convExpandAll() {
-  for (const el of $('convs').querySelectorAll('details.conv-turn')) { if (!el.open) { el.open = true; convTurnToggle(el); } }
+function convToggleSystem() {
+  const tl = $('conv-timeline'); if (!tl) return;
+  const on = tl.classList.toggle('show-system');
+  const b = $('conv-sys-btn'); if (b) b.textContent = on ? 'Hide system' : 'Show system';
 }
-async function convTurnToggle(el) {
-  if (!el.open || el.dataset.loaded) return;
-  el.dataset.loaded = '1';
-  const bodyEl = el.querySelector('.conv-turn-body');
-  try {
-    const t = await (await fetch('/__proxy/api/requests/' + encodeURIComponent(el.dataset.rid))).json();
-    bodyEl.innerHTML = _renderTurnContent(t);
-  } catch {
-    bodyEl.innerHTML = '<div class="ct-err">Failed to load this turn.</div>';
-    el.dataset.loaded = '';
-  }
-}
-// Render one turn's transcript from a /requests/{id} detail. Reuses the shared response helpers.
-function _renderTurnContent(t) {
-  if (t && t._pii_redacted && !t.request_body && !t.response_body && !t.stream_chunks) {
-    return '<div class="ct-redacted">🔒 Redacted — body not viewable from this network.</div>';
-  }
-  let body = null; try { body = JSON.parse(t.request_body || ''); } catch {}
-  const msgs = (body && body.messages) || [];
-  const userMsgs = msgs.filter(m => m && m.role === 'user');
-  const lastUser = userMsgs[userMsgs.length - 1];
-  const userText = lastUser ? (typeof lastUser.content === 'string' ? lastUser.content : JSON.stringify(lastUser.content, null, 2)) : '';
-  let assistantText = '', toolCalls = [];
-  if (t.stream_chunks) { assistantText = reconstructStream(t.stream_chunks); toolCalls = analyzeResponse(null, t.stream_chunks).tool_calls; }
-  else if (t.response_body) { const a = analyzeResponse(t.response_body, null); assistantText = a.content; toolCalls = a.tool_calls; }
-  const tcMap = {};
-  for (const m of msgs) { if (m && m.role === 'assistant' && Array.isArray(m.tool_calls)) { for (const tc of m.tool_calls) { if (tc && tc.id && tc.function) tcMap[tc.id] = { name: tc.function.name, args: tc.function.arguments }; } } }
-  const toolResults = msgs.filter(m => m && m.role === 'tool').map(m => ({ ...m, _call: m.tool_call_id ? tcMap[m.tool_call_id] : null }));
-  const trHtml = toolResults.map(tr => {
-    const c = typeof tr.content === 'string' ? tr.content : JSON.stringify(tr.content || '');
-    const er = looksLikeToolError(c);
-    const name = (tr._call && tr._call.name) || tr.name || tr.tool_call_id || '?';
-    let argsHtml = '';
-    if (tr._call && tr._call.args) { let ap = tr._call.args; try { ap = JSON.stringify(JSON.parse(tr._call.args), null, 2); } catch {} argsHtml = `<div class="ct-lbl">→ called with</div><pre>${esc(ap)}</pre><div class="ct-lbl">→ returned</div>`; }
-    return `<details class="msg tool${er.isError ? ' tool-error-msg' : ''}"><summary>🔧 <code>${esc(name)}</code>${er.isError ? ' <span class="ct-err">error</span>' : ''}</summary>${argsHtml}<pre>${esc(c.slice(0, 6000))}</pre></details>`;
+function _tlTurnsPanel(turns) {
+  if (turns.length < 2) return '';
+  const rows = turns.map((t, i) => {
+    const cache = t.cache_verdict === 'hit' ? '<span class="cv-badge hit">⚡</span>' : t.cache_verdict === 'partial' ? '<span class="cv-badge partial">⚡</span>' : '';
+    const verd = (t.gate_verdict && t.gate_verdict !== 'allow') ? `<span class="verdict ${esc(t.gate_verdict)}">${esc(t.gate_verdict)}</span>` : '';
+    const st = t.status == null ? '<span class="cv-live">live</span>' : ((t.status >= 400 || t.error) ? `<span class="cv-err">${esc(String(t.status || 'err'))}</span>` : `<span class="cv-ok">${esc(String(t.status))}</span>`);
+    return `<div class="tl-turnrow">
+      <span class="tl-tr-n">T${i + 1}</span>
+      <span class="tl-tr-meta">${fmt(t.ts)} · <code>${esc(t.model || '')}</code> · ${num(t.total_tokens || 0)} tok · ${Math.round(t.duration_ms || 0)}ms</span>
+      ${st} ${cache} ${verd} ${t.has_images ? '🖼' : ''}
+      <a href="#" class="tl-open" onclick="event.preventDefault();setView('requests');selectItem('${esc(t.id)}')">open</a>
+    </div>`;
   }).join('');
-  const tcHtml = toolCalls.map(tc => { let p = tc.arguments; try { p = JSON.stringify(JSON.parse(tc.arguments), null, 2); } catch {} return `<details class="msg tool"><summary>🔧 <code>${esc(tc.name || '?')}</code></summary><pre>${esc(p || '')}</pre></details>`; }).join('');
-  const out = `${trHtml}
-    ${userText ? `<div class="msg user"><div class="role">user</div>${esc(userText.slice(0, 8000))}${userText.length > 8000 ? '\n…(truncated — use “open” for full)' : ''}</div>` : ''}
-    ${assistantText ? `<div class="msg assistant"><div class="role">assistant</div>${esc(assistantText.slice(0, 8000))}${assistantText.length > 8000 ? '\n…(truncated — use “open” for full)' : ''}</div>` : ''}
-    ${tcHtml}`;
-  return out.trim() || '<div class="ct-empty">No renderable content for this turn.</div>';
+  return `<details class="tl-turns-panel"><summary>▸ ${turns.length} turns · per-turn stats</summary><div class="tl-turns-list">${rows}</div></details>`;
+}
+function _renderConvTimeline(lastReq) {
+  const tl = $('conv-timeline');
+  if (lastReq && lastReq._pii_redacted && !lastReq.request_body) {
+    tl.innerHTML = '<div class="ct-redacted" style="padding:20px">🔒 Redacted — transcript not viewable from this network.</div>'; return;
+  }
+  let body = null; try { body = JSON.parse(lastReq.request_body || ''); } catch {}
+  const msgs = (body && body.messages) || [];
+  if (!msgs.length) { tl.innerHTML = '<div class="ct-empty" style="padding:20px">No messages in this conversation.</div>'; return; }
+  // final assistant reply (this turn's response — not embedded in any request body yet)
+  let finalText = '', finalToolCalls = [];
+  if (lastReq.stream_chunks) { finalText = reconstructStream(lastReq.stream_chunks); finalToolCalls = analyzeResponse(null, lastReq.stream_chunks).tool_calls; }
+  else if (lastReq.response_body) { const a = analyzeResponse(lastReq.response_body, null); finalText = a.content; finalToolCalls = a.tool_calls; }
+  // tool_call id -> name, across both OpenAI (tool_calls) and Anthropic (tool_use blocks)
+  const tcMap = {};
+  for (const m of msgs) {
+    if (!m || m.role !== 'assistant') continue;
+    if (Array.isArray(m.tool_calls)) for (const tc of m.tool_calls) if (tc && tc.id && tc.function) tcMap[tc.id] = tc.function.name;
+    if (Array.isArray(m.content)) for (const p of m.content) if (p && p.type === 'tool_use' && p.id) tcMap[p.id] = p.name;
+  }
+  let html = '';
+  for (const m of msgs) {
+    if (!m || !m.role) continue;
+    if (m.role === 'system') { html += _tlSystem(_contentText(m.content)); continue; }
+    if (m.role === 'tool') { html += _tlToolResult((tcMap[m.tool_call_id] || m.name || m.tool_call_id || 'result'), _contentText(m.content)); continue; }
+    if (m.role === 'user') {
+      const parts = Array.isArray(m.content) ? m.content : null;
+      const trBlocks = parts ? parts.filter(p => p && p.type === 'tool_result') : [];
+      for (const trb of trBlocks) html += _tlToolResult((tcMap[trb.tool_use_id] || 'result'), _contentText(trb.content));
+      const utext = _contentText(parts ? parts.filter(p => !p || p.type !== 'tool_result') : m.content);
+      if (utext || !trBlocks.length) { html += '<div class="tl-break"></div>' + _tlUser(utext); }
+      continue;
+    }
+    if (m.role === 'assistant') {
+      const tcs = [];
+      if (Array.isArray(m.tool_calls)) for (const tc of m.tool_calls) if (tc && tc.function) tcs.push({ name: tc.function.name, arguments: tc.function.arguments });
+      if (Array.isArray(m.content)) for (const p of m.content) if (p && p.type === 'tool_use') tcs.push({ name: p.name, arguments: JSON.stringify(p.input || {}) });
+      html += _tlAssistant(_contentText(m.content), tcs);
+      continue;
+    }
+  }
+  if (finalText || (finalToolCalls && finalToolCalls.length)) html += _tlAssistant(finalText, finalToolCalls);
+  tl.innerHTML = html || '<div class="ct-empty" style="padding:20px">No renderable content.</div>';
+}
+function _tlClip(txt, n) { txt = txt || ''; return esc(txt.slice(0, n)) + (txt.length > n ? '\n…(clipped — “open” for full)' : ''); }
+function _tlSystem(txt) {
+  if (!txt) return '';
+  return `<div class="tl-msg tl-system"><div class="tl-role">system</div><div class="tl-body">${_tlClip(txt, 16000)}</div></div>`;
+}
+function _tlUser(txt) {
+  return `<div class="tl-msg tl-user"><div class="tl-role">user</div><div class="tl-body">${txt ? _tlClip(txt, 14000) : '<span style="color:#5f6b7e">(no text)</span>'}</div></div>`;
+}
+function _tlAssistant(txt, toolCalls) {
+  const tc = (toolCalls || []).filter(x => x && x.name).map(x => {
+    let p = x.arguments; try { p = JSON.stringify(JSON.parse(x.arguments), null, 2); } catch {}
+    return `<details class="tl-tool"><summary>🔧 <code>${esc(x.name)}</code></summary><pre>${esc(p || '')}</pre></details>`;
+  }).join('');
+  if (!txt && !tc) return '';
+  return `<div class="tl-msg tl-assistant"><div class="tl-role">assistant</div>${txt ? `<div class="tl-body">${_tlClip(txt, 14000)}</div>` : ''}${tc}</div>`;
+}
+function _tlToolResult(name, content) {
+  const er = looksLikeToolError(content);
+  return `<details class="tl-msg tl-tool-result${er.isError ? ' tool-error-msg' : ''}"><summary>↩ 🔧 <code>${esc(name)}</code>${er.isError ? ' <span class="ct-err">error</span>' : ''}</summary><pre>${_tlClip(content, 10000)}</pre></details>`;
 }
 
 let rulesEditorBaseline = '';
