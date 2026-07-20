@@ -218,8 +218,8 @@
   .pf-win{margin-left:auto;display:flex;gap:5px}
   .pf-win button{font-family:var(--mono);font-size:10.5px;color:var(--pf-mute);background:transparent;border:1px solid #26303f;border-radius:6px;padding:3px 9px;cursor:pointer}
   .pf-win button.on{color:var(--pf-acc);border-color:color-mix(in srgb,var(--pf-acc) 55%,transparent);background:color-mix(in srgb,var(--pf-acc) 12%,transparent)}
-  .pf-grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
-  .pf-card{background:linear-gradient(160deg,#141a24,#0f141d);border:1px solid #26303f;border-radius:12px;padding:12px 14px 6px}
+  .pf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
+  .pf-card{background:linear-gradient(160deg,#141a24,#0f141d);border:1px solid #26303f;border-radius:10px;padding:9px 11px 4px}
   .pf-card.pf-wide{grid-column:1/-1}
   .pf-h{display:flex;align-items:baseline;gap:9px;margin-bottom:6px}
   .pf-t{font-size:13px;font-weight:600;color:#e9edf4}
@@ -2494,7 +2494,7 @@ let _perfWinH = 6;
 function setPerfWin(h){ _perfWinH = h; loadStats(); }
 function renderPerf(P){
   const S=P.series||[]; if(S.length<2) return '';
-  const HRS=Math.max(1,Math.round((P.now-P.since)/3600)), N=S.length, W=520,H=132,PADL=36,PADR=8,PADT=8,PADB=18;
+  const HRS=Math.max(1,Math.round((P.now-P.since)/3600)), N=S.length, W=520,H=104,PADL=36,PADR=8,PADT=8,PADB=18;
   const xAt=i=>PADL+(i/(N-1))*(W-PADL-PADR);
   const yAt=(v,mn,mx)=>PADT+(1-(v-mn)/((mx-mn)||1))*(H-PADT-PADB);
   const fmt=v=>v==null?'—':(Math.abs(v)>=100?Math.round(v):(Math.abs(v)>=10?v.toFixed(0):v.toFixed(1)));
