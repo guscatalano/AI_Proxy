@@ -727,36 +727,10 @@ def init_db():
             "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v9', '1', ?)",
             (time.time(),),
         )
-    # Backfill v10: re-classify rows tagged with a *generic* label using the detector's new
-    # system-prompt fingerprint layer (Cursor / Cline / Aider / Windsurf, etc. hiding behind a
-    # stock SDK UA). Only touches rows whose current label is generic, so confident IDE/header
-    # verdicts are never overwritten.
-    done_v10 = conn.execute("SELECT value FROM settings WHERE key='backfill_v10'").fetchone()
-    if not done_v10:
-        _generic = ("unknown", "openai-sdk", "openai-python", "openai-node",
-                    "anthropic-sdk", "anthropic-python", "anthropic-node", "httpx", "requests")
-        rows = conn.execute(
-            f"""SELECT id, request_headers, request_body FROM requests
-                WHERE client_app IN ({','.join('?' for _ in _generic)})""",
-            _generic,
-        ).fetchall()
-        for r in rows:
-            headers = body = None
-            try:
-                headers = json.loads(r["request_headers"]) if r["request_headers"] else None
-            except (TypeError, json.JSONDecodeError):
-                pass
-            try:
-                body = json.loads(r["request_body"]) if r["request_body"] else None
-            except (TypeError, json.JSONDecodeError):
-                pass
-            app = _detect_client_app(headers, body if isinstance(body, dict) else None)
-            if app != r["client_app"]:
-                conn.execute("UPDATE requests SET client_app=? WHERE id=?", (app, r["id"]))
-        conn.execute(
-            "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v10', '1', ?)",
-            (time.time(),),
-        )
+    # (Historical client_app reclassification after adding new system-prompt fingerprints is done
+    # via a one-off script, not a migration — the request bodies live in request_blobs which isn't
+    # cleanly queryable this early in init_db, and a failing backfill here crash-loops startup.
+    # See scripts/relabel_clients.py; the forward detector labels all new traffic correctly.)
     # Backfill v7: re-extract usage for Anthropic rows that have prompt-cache fields. Old
     # rows recorded only `input_tokens` (the fresh portion); we now sum fresh + cache_read +
     # cache_create so the prompt_tokens reflect the true prompt size.
@@ -7040,6 +7014,12 @@ def _turn_index(body) -> int | None:
 # the tool's system prompt, kept deliberately specific so a request whose prompt merely
 # *mentions* a tool isn't misattributed. Only consulted when header/UA detection is generic.
 _SYS_PROMPT_FINGERPRINTS = (
+    # Hermes Agent (Nous Research) often calls through the OpenAI Python SDK, which overwrites its
+    # UA with "OpenAI/Python" — so the same app splits between the 'hermes' (real UA) and
+    # 'openai-sdk' buckets. The system prompt is stable and unifies them. Its command-approval
+    # sub-agent uses a distinct "security reviewer" prompt (same host, OpenAI SDK) → hermes-safety.
+    ("you are hermes agent", "hermes"),
+    ("security reviewer for an ai coding agent", "hermes-safety"),
     ("you are pair programming with a user", "cursor"),
     ("you are cline", "cline"),
     ("you are roo,", "roo-code"),
