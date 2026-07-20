@@ -220,7 +220,7 @@
   .pf-win button.on{color:var(--pf-acc);border-color:color-mix(in srgb,var(--pf-acc) 55%,transparent);background:color-mix(in srgb,var(--pf-acc) 12%,transparent)}
   .pf-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:10px}
   .pf-card{background:linear-gradient(160deg,#141a24,#0f141d);border:1px solid #26303f;border-radius:10px;padding:9px 11px 4px}
-  .pf-card.pf-wide{grid-column:1/-1}
+  .pf-card.pf-wide{grid-column:auto}
   .pf-h{display:flex;align-items:baseline;gap:9px;margin-bottom:6px}
   .pf-t{font-size:13px;font-weight:600;color:#e9edf4}
   .pf-now{margin-left:auto;font-family:var(--mono);font-size:13px;font-variant-numeric:tabular-nums;color:#e9edf4}
@@ -2499,8 +2499,8 @@ function renderPerf(P){
   const yAt=(v,mn,mx)=>PADT+(1-(v-mn)/((mx-mn)||1))*(H-PADT-PADB);
   const fmt=v=>v==null?'—':(Math.abs(v)>=100?Math.round(v):(Math.abs(v)>=10?v.toFixed(0):v.toFixed(1)));
   function grid(mn,mx,unit){let g='';for(let k=0;k<=3;k++){const v=mn+(mx-mn)*k/3,y=yAt(v,mn,mx);
-    g+=`<line x1="${PADL}" y1="${y.toFixed(1)}" x2="${W-PADR}" y2="${y.toFixed(1)}" stroke="var(--pf-grid)" stroke-width="1"/><text x="${PADL-6}" y="${(y+3).toFixed(1)}" text-anchor="end" font-size="9" fill="var(--pf-mute)" font-family="var(--mono)">${fmt(v)}${unit||''}</text>`;}
-    for(let h=0;h<=HRS;h++){const x=xAt((N-1)*h/HRS);g+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="9" fill="var(--pf-mute)" font-family="var(--mono)">${h===HRS?'now':'-'+(HRS-h)+'h'}</text>`;}return g;}
+    g+=`<line x1="${PADL}" y1="${y.toFixed(1)}" x2="${W-PADR}" y2="${y.toFixed(1)}" stroke="var(--pf-grid)" stroke-width="1"/><text x="${PADL-6}" y="${(y+3).toFixed(1)}" text-anchor="end" font-size="13" fill="var(--pf-mute)" font-family="var(--mono)">${fmt(v)}${unit||''}</text>`;}
+    for(let h=0;h<=HRS;h++){const x=xAt((N-1)*h/HRS);g+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="13" fill="var(--pf-mute)" font-family="var(--mono)">${h===HRS?'now':'-'+(HRS-h)+'h'}</text>`;}return g;}
   function line(vals,mn,mx){let d='',pen=false;vals.forEach((v,i)=>{if(v==null){pen=false;return;}d+=`${pen?'L':'M'}${xAt(i).toFixed(1)},${yAt(v,mn,mx).toFixed(1)}`;pen=true;});return d;}
   function range(...arrs){const all=[].concat(...arrs).filter(v=>v!=null);if(!all.length)return[0,1];let mn=Math.min(...all),mx=Math.max(...all);const p=(mx-mn)*0.12||1;return[Math.max(0,mn-p),mx+p];}
   const lastNN=k=>{for(let i=S.length-1;i>=0;i--)if(S[i][k]!=null)return S[i][k];return null;};
@@ -2525,7 +2525,7 @@ function renderPerf(P){
     const xw=W-PADL-PADR,xmax=Math.max(10,...pts.map(p=>p[0])),ymax=Math.max(1,...pts.map(p=>p[1]))*1.1;
     let svg=`<svg viewBox="0 0 ${W} ${H}">${grid(0,ymax,'s')}`;
     pts.forEach(p=>{const x=PADL+(p[0]/xmax)*xw,y=yAt(p[1],0,ymax);svg+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="2.3" fill="${p[2]?'var(--pf-acc)':'var(--pf-err)'}" opacity=".7"/>`;});
-    for(let k=0;k<=4;k++){const v=Math.round(xmax*k/4),x=PADL+(v/xmax)*xw;svg+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="9" fill="var(--pf-mute)" font-family="var(--mono)">${v}k</text>`;}
+    for(let k=0;k<=4;k++){const v=Math.round(xmax*k/4),x=PADL+(v/xmax)*xw;svg+=`<text x="${x.toFixed(1)}" y="${H-4}" text-anchor="middle" font-size="13" fill="var(--pf-mute)" font-family="var(--mono)">${v}k</text>`;}
     svg+='</svg>';
     return `<div class="pf-card pf-wide"><div class="pf-h"><span class="pf-t">Latency vs prompt size</span><span class="pf-sub"><span style="color:var(--pf-acc)">●</span> hit · <span style="color:var(--pf-err)">●</span> miss</span></div>${svg}</div>`;}
   const charts=
@@ -2541,7 +2541,7 @@ function renderPerf(P){
 }
 // Decluttered Stats: one tabbed breakdown instead of seven stacked tables. The active tab
 // persists across the ~9s auto-refresh so a rebuild doesn't snap you back to Models.
-let _statsTab = 'models';
+let _statsTab = 'trends';
 function setStatsTab(id) { _statsTab = id; _activateStatsTab(id); }
 function _activateStatsTab(id) {
   const root = $('stats'); if (!root) return;
@@ -2742,6 +2742,7 @@ async function loadStats() {
       <tbody>${upstreamRows}</tbody></table>`;
 
   const tabs = [
+    ['trends', 'Trends', perfHtml || '<div class="empty" style="padding:22px">Not enough data yet for trends.</div>'],
     ['models', 'Models', `<table style="width:100%"><thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total</th><th class="num">Avg ms</th><th class="num" title="completion tokens per second">tok/s</th><th class="num" title="ms per 1,000 completion tokens">ms/1k</th><th class="num">Errors</th></tr></thead><tbody>${modelRows}</tbody></table>`],
     ['throughput', 'Throughput', tpPane],
     ['apps', 'Apps', `<table style="width:100%"><thead><tr><th>App</th><th class="num">Requests</th><th class="num">Convs</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Total</th><th class="num">Avg ms</th><th>Models</th><th>Last Seen</th></tr></thead><tbody>${appRows}</tbody></table>`],
@@ -2757,9 +2758,6 @@ async function loadStats() {
 
   $('stats').innerHTML = `
     ${kpiStrip}
-    <div class="s2-lbl">Trends</div>
-    ${perfHtml}
-    <div class="s2-lbl">Breakdown</div>
     <div class="s2-detail"><div class="s2-tabs">${tabBar}</div><div class="s2-panes">${tabPanes}</div></div>
   `;
   _activateStatsTab(_statsTab);
