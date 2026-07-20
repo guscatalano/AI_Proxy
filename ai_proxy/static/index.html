@@ -716,7 +716,8 @@
   .tl-system .tl-role { color: #c3a6e6; }
   details.tl-tool, details.tl-tool-result { background: #211d14; border: 1px solid #3a3120; border-radius: 6px; margin: 5px 0 2px; padding: 4px 10px; }
   details.tl-tool-result { margin: 7px 0; }
-  details.tl-tool > summary, details.tl-tool-result > summary { cursor: pointer; font-size: 11px; color: #f0c674; list-style: none; }
+  details.tl-tool > summary, details.tl-tool-result > summary { cursor: pointer; font-size: 11px; color: #f0c674; list-style: none; display: flex; align-items: baseline; gap: 6px; }
+  .tl-tool-hint { color: #8b96a8; font-family: ui-monospace, Consolas, monospace; font-size: 10.5px; font-weight: 400; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   details.tl-tool > summary::-webkit-details-marker, details.tl-tool-result > summary::-webkit-details-marker { display: none; }
   details.tl-tool pre, details.tl-tool-result pre { font-size: 11px; max-height: 320px; overflow: auto; background: #0c0f15; border: 1px solid #262d38; border-radius: 4px; padding: 6px 8px; margin: 5px 0 2px; white-space: pre-wrap; word-break: break-word; color: #c9d3e1; }
   details.tl-tool-result.tool-error-msg { border-color: #6a3030; background: #2a1818; }
@@ -3227,17 +3228,38 @@ function _tlSystem(txt) {
 function _tlUser(txt) {
   return `<div class="tl-msg tl-user"><div class="tl-role">user</div><div class="tl-body">${txt ? _tlClip(txt, 14000) : '<span style="color:#5f6b7e">(no text)</span>'}</div></div>`;
 }
+// Pull the most distinguishing bit out of a tool call's arguments, so N repeated calls to the
+// same tool are told apart at a glance (e.g. the URL for browser_navigate, the path for edit).
+function _toolArgHint(argsStr) {
+  if (argsStr == null || argsStr === '') return '';
+  let a; try { a = JSON.parse(argsStr); } catch { return String(argsStr).replace(/\s+/g, ' ').trim().slice(0, 100); }
+  if (a == null) return '';
+  if (typeof a !== 'object') return String(a).slice(0, 100);
+  const keys = ['url', 'uri', 'href', 'path', 'file_path', 'filePath', 'filename', 'file', 'command', 'cmd', 'query', 'q', 'pattern', 'search', 'selector', 'text', 'prompt', 'name', 'title', 'id', 'key', 'target', 'method', 'action', 'description', 'message', 'content'];
+  for (const k of keys) {
+    const v = a[k];
+    if (typeof v === 'string' || typeof v === 'number') { const s = String(v).replace(/\s+/g, ' ').trim(); if (s) return s.slice(0, 120); }
+  }
+  for (const k of Object.keys(a)) {
+    const v = a[k];
+    if (typeof v === 'string' || typeof v === 'number') { const s = String(v).replace(/\s+/g, ' ').trim(); if (s) return k + ': ' + s.slice(0, 100); }
+  }
+  const ks = Object.keys(a);
+  return ks.length ? '{ ' + ks.slice(0, 3).join(', ') + (ks.length > 3 ? ', …' : '') + ' }' : '';
+}
 function _tlAssistant(txt, toolCalls) {
   const tc = (toolCalls || []).filter(x => x && x.name).map(x => {
     let p = x.arguments; try { p = JSON.stringify(JSON.parse(x.arguments), null, 2); } catch {}
-    return `<details class="tl-tool"><summary>🔧 <code>${esc(x.name)}</code></summary><pre>${esc(p || '')}</pre></details>`;
+    const hint = _toolArgHint(x.arguments);
+    return `<details class="tl-tool"><summary>🔧 <code>${esc(x.name)}</code>${hint ? `<span class="tl-tool-hint">${esc(hint)}</span>` : ''}</summary><pre>${esc(p || '')}</pre></details>`;
   }).join('');
   if (!txt && !tc) return '';
   return `<div class="tl-msg tl-assistant"><div class="tl-role">assistant</div>${txt ? `<div class="tl-body">${_tlClip(txt, 14000)}</div>` : ''}${tc}</div>`;
 }
 function _tlToolResult(name, content) {
   const er = looksLikeToolError(content);
-  return `<details class="tl-msg tl-tool-result${er.isError ? ' tool-error-msg' : ''}"><summary>↩ 🔧 <code>${esc(name)}</code>${er.isError ? ' <span class="ct-err">error</span>' : ''}</summary><pre>${_tlClip(content, 10000)}</pre></details>`;
+  const hint = (content || '').replace(/\s+/g, ' ').trim().slice(0, 120);
+  return `<details class="tl-msg tl-tool-result${er.isError ? ' tool-error-msg' : ''}"><summary>↩ 🔧 <code>${esc(name)}</code>${er.isError ? ' <span class="ct-err">error</span>' : ''}${hint ? `<span class="tl-tool-hint">${esc(hint)}</span>` : ''}</summary><pre>${_tlClip(content, 10000)}</pre></details>`;
 }
 
 let rulesEditorBaseline = '';
