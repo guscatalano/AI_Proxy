@@ -428,6 +428,12 @@
   .reach-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
   .reach-dot.ok { background: #68d391; }
   .reach-dot.bad { background: #f07178; }
+  .sysprov-bar { display: flex; gap: 8px; margin: 16px 0 0; flex-wrap: wrap; border-bottom: 1px solid #262d38; }
+  .sysprov-tab { display: inline-flex; align-items: center; gap: 8px; background: transparent; border: 1px solid #262d38; border-bottom: none; color: #9aa4b2; font: inherit; font-size: 13px; padding: 9px 16px; border-radius: 8px 8px 0 0; cursor: pointer; margin-bottom: -1px; transition: color .15s, background .15s; }
+  .sysprov-tab:hover { color: #e9edf4; background: #141922; }
+  .sysprov-tab.on { color: #e9edf4; background: #141922; border-color: #2f8f9c; border-bottom-color: #141922; }
+  .sysprov-tab .sysprov-n { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: #5f6b7e; background: #0e131a; border: 1px solid #262d38; border-radius: 20px; padding: 1px 7px; min-width: 20px; text-align: center; }
+  .sysprov-tab.on .sysprov-n { color: #57d1e0; border-color: #2f8f9c; }
   .suggestion { background: #141922; border: 1px solid #262d38; border-left: 3px solid #5e81ac; padding: 10px 12px; border-radius: 4px; margin-bottom: 10px; }
   .suggestion.tune { border-left-color: #f0c674; }
   .suggestion.perf { border-left-color: #57d1e0; }
@@ -830,6 +836,7 @@
     <div class="shell-meta" id="shell-meta">
       <div class="k"><b>uptime</b><span id="sm-uptime">—</span></div>
       <div class="k"><b>version</b><span id="sm-version">—</span></div>
+      <div class="k"><b>access</b><span id="sm-access" title="What you're allowed to view in the proxy">—</span></div>
       <div class="k"><b>diagnostics</b><span class="diag-open" onclick="toggleDiag()" title="Ctrl+Shift+D">open ⚡</span></div>
     </div>
     <button class="sf-collapse" onclick="toggleRailCollapse()" title="Collapse sidebar">« Collapse</button>
@@ -1042,6 +1049,20 @@ async function shellVitals() {
   if (_shellVer == null) { try { const inf = await (await fetch('/__proxy/api/info')).json(); _shellVer = inf.version || '—'; } catch { _shellVer = '—'; } }
   // Boot time once (uptime lives at /health under process.uptime_s); tick it client-side after.
   if (_bootMs == null) { try { const hz = await (await fetch('/__proxy/api/health')).json(); const us = hz && hz.process && hz.process.uptime_s; if (us != null) _bootMs = Date.now() - us * 1000; } catch {} }
+  // One-time: surface the viewer's access level (admin / same-subnet / redaction-off).
+  if (!window._whoamiDone) { window._whoamiDone = 1; try {
+    const w = await (await fetch('/__proxy/api/whoami')).json();
+    const el = $('sm-access');
+    if (el) {
+      const map = {
+        admin:        ['admin · all',   '#68d391', 'Admin IP — you can view every request on any subnet.'],
+        subnet:       ['your subnet',   '#f0c674', 'Restricted — you see requests from your own /24 subnet + localhost (you are ' + (w.ip || '?') + '); other subnets are redacted. Add your IP to PROXY_ADMIN_IPS for full access.'],
+        unrestricted: ['unrestricted',  '#57d1e0', 'PII redaction is off (PROXY_REDACT_PII=0) — everyone sees everything.'],
+      };
+      const m = map[w.level] || ['—', '#9aa4b2', ''];
+      el.textContent = m[0]; el.style.color = m[1]; el.title = m[2];
+    }
+  } catch {} }
   if (_shellErr == null || _shellTick % 5 === 0) {
     try {
       const p = await (await fetch('/__proxy/api/perf?window_h=1')).json();
@@ -1710,16 +1731,19 @@ function renderAnalysis(d) {
     }).join('');
 
     const userPreview = req.lastUser ? `<div class="section"><h3>Latest User Message (${num(req.lastUser.length)} chars)</h3><pre data-k="lastuser" style="max-height:240px">${esc(req.lastUser.slice(0, 4000))}${req.lastUser.length > 4000 ? '\n…' : ''}</pre></div>` : '';
-    const sysPreview = req.lastSystem ? `<div class="section"><h3>System Message (${num(req.lastSystem.length)} chars)</h3><pre data-k="sys" style="max-height:280px">${esc(req.lastSystem)}</pre></div>` : '';
+    const sysPreview = req.lastSystem ? `<div class="section"><h3>System Message (${num(req.lastSystem.length)} chars)</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="sys" style="max-height:280px;margin-top:6px">${esc(req.lastSystem)}</pre></details></div>` : '';
 
     const toolList = req.tools.length ? `
       <div class="section"><h3>Tools Defined (${req.tools.length})</h3>
-        <table style="width:100%"><thead><tr><th>Name</th><th>Description</th></tr></thead>
+        <details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary>
+        <table style="width:100%;margin-top:6px"><thead><tr><th>Name</th><th>Description</th></tr></thead>
         <tbody>${req.tools.map(t => `<tr><td><code>${esc(t.name)}</code></td><td style="color:#aaa">${esc((t.description || '').slice(0, 200))}</td></tr>`).join('')}</tbody></table>
+        </details>
       </div>` : '';
 
     const toolResultsHtml = req.toolResults.length ? `
       <div class="section"><h3>Tool Results In Request (${req.toolResults.length})</h3>
+        <details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary>
         ${req.toolResults.map(t => {
           const er = looksLikeToolError(t.content);
           const cls = er.isError ? 'tool-error-msg' : '';
@@ -1733,6 +1757,7 @@ function renderAnalysis(d) {
           }
           return `<details class="${cls}" style="margin-bottom:6px"><summary class="${summaryCls}"><code>${esc(t.name)}</code> · ${num(t.content.length)} chars${excerpt}</summary>${argsHtml}<pre data-k="tr-${esc(t.name)}" style="max-height:200px">${esc(t.content.slice(0, 4000))}</pre></details>`;
         }).join('')}
+        </details>
       </div>` : '';
 
     reqHtml = `
@@ -2402,7 +2427,7 @@ async function loadDetail(id) {
     ${analysisHtml}
     <div class="section"><h3>Request Headers</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="reqh">${esc(reqHeaders)}</pre></details></div>
     ${imagesHtml}
-    <div class="section"><h3>Request Body (raw)</h3><details open><summary style="cursor:pointer;color:#888;font-size:11px">hide</summary><pre data-k="reqb">${esc(reqBody)}</pre></details></div>
+    <div class="section"><h3>Request Body (raw)</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="reqb">${esc(reqBody)}</pre></details></div>
     <div class="section"><h3>Response Headers</h3><details><summary style="cursor:pointer;color:#888;font-size:11px">show</summary><pre data-k="resph">${esc(respHeaders)}</pre></details></div>
     ${respSection}
   `;
@@ -3918,6 +3943,8 @@ async function loadSystem() {
   renderSystem();
 }
 
+function setSysProv(id) { window._sysProvTab = id; renderSystem(); }
+
 function renderSystem() {
   const now = systemNowCache;
   const hist = systemHistoryCache;
@@ -3976,6 +4003,8 @@ function renderSystem() {
 
   const ollama = now.ollama || {};
   const lmstudio = now.lmstudio || {};
+  const vllm = now.vllm || {};
+  const comfyui = now.comfyui || {};
 
   // Parallel-capability badge: whether a model can serve concurrent requests on its runtime.
   // Ollama serializes the Qwen3 family; LM Studio (llama.cpp batching) parallelizes everything.
@@ -4012,24 +4041,66 @@ function renderSystem() {
     <tr><td><code>${esc(m.id || '')}</code></td><td>${esc(m.type || '')}</td><td>${esc(m.state || '')}</td></tr>
   `).join('') || '<tr><td colspan="3" class="empty" style="padding:8px">No models</td></tr>';
 
-  $('system').innerHTML = `
-    ${renderProxyHealth(systemHealthCache)}
-    <div class="cards" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
-      ${cpuCard}
-      ${memCard}
-      ${gpuCards}
-    </div>
+  const vllmRows = (vllm.loaded || []).map(m => `
+    <tr><td><code>${esc(m.id || '')}</code></td>
+        <td class="num">${m.max_context_length ? num(m.max_context_length) : ''}</td>
+        <td class="num">${vllm.running != null ? vllm.running : '—'}</td>
+        <td class="num">${vllm.waiting != null ? vllm.waiting : '—'}</td>
+        <td class="num">${vllm.kv_cache_pct != null ? (vllm.kv_cache_pct*100).toFixed(0)+'%' : '—'}</td></tr>
+  `).join('') || '<tr><td colspan="5" class="empty" style="padding:8px">Not serving</td></tr>';
 
+  // Runtime tabs: one per backend, header always shows a reach dot + count of loaded models.
+  const activeProv = window._sysProvTab || (vllm.reachable ? 'vllm' : (lmstudio.reachable ? 'lmstudio' : 'ollama'));
+  const _pTab = (id, label, snap, n) => `<button class="sysprov-tab ${activeProv===id?'on':''}" onclick="setSysProv('${id}')"><span class="reach-dot ${snap.reachable ? 'ok' : 'bad'}"></span>${label}<span class="sysprov-n">${n}</span></button>`;
+  const provBar = `<div class="sysprov-bar">
+      ${_pTab('vllm','vLLM',vllm,(vllm.loaded||[]).length)}
+      ${_pTab('lmstudio','LM Studio',lmstudio,(lmstudio.loaded||[]).length)}
+      ${_pTab('ollama','Ollama',ollama,(ollama.ps||[]).length)}
+      ${_pTab('comfyui','ComfyUI',comfyui,(comfyui.queue_running||0)+(comfyui.queue_pending||0))}
+    </div>`;
+
+  // Launch args (docker command line): pair each --flag with its value; bare flags = "on".
+  const _vArgs = vllm.launch_args || [];
+  const vArgPairs = [];
+  for (let i = 0; i < _vArgs.length; i++) {
+    const t = _vArgs[i];
+    if (typeof t !== 'string' || !t.startsWith('--')) continue;
+    const nxt = _vArgs[i+1];
+    if (nxt != null && !String(nxt).startsWith('--')) { vArgPairs.push([t.replace(/^--/,''), String(nxt)]); i++; }
+    else vArgPairs.push([t.replace(/^--/,''), 'on']);
+  }
+  const argChips = vArgPairs.map(([k,v]) =>
+    `<span style="display:inline-flex;gap:4px;align-items:center;background:#1c222c;border:1px solid #2b333f;border-radius:4px;padding:2px 7px;font-size:11px;font-family:ui-monospace,monospace">`
+    + `<span style="color:#7fbef0">${esc(k)}</span>${v==='on'?'':`<span style="color:#e9edf4">${esc(v)}</span>`}</span>`).join(' ');
+  // Resolved engine config (from vllm:cache_config_info metric labels).
+  const cfg = vllm.config || {};
+  const cfgKeys = [['cache_dtype','KV dtype'],['enable_prefix_caching','Prefix cache'],['gpu_memory_utilization','GPU mem util'],
+                   ['block_size','Block size'],['num_gpu_blocks','GPU blocks'],['kv_cache_size_tokens','KV tokens'],
+                   ['mamba_cache_mode','Mamba cache'],['kv_cache_max_concurrency','Max concurrency']];
+  const cfgCells = cfgKeys.filter(([k]) => cfg[k] != null && cfg[k] !== '').map(([k,label]) => {
+    let v = cfg[k];
+    if (k === 'kv_cache_size_tokens' || k === 'num_gpu_blocks') v = num(parseInt(v,10)||0);
+    else if (k === 'kv_cache_max_concurrency') v = (parseFloat(v)||0).toFixed(1) + '×';
+    return `<div style="display:flex;flex-direction:column;gap:1px"><span style="color:#888;font-size:10px;text-transform:uppercase;letter-spacing:.04em">${label}</span><span style="font-size:12px;font-family:ui-monospace,monospace">${esc(String(v))}</span></div>`;
+  }).join('');
+  const paramsSection = (argChips || cfgCells) ? `
     <div class="stats-section">
-      <h2><span class="reach-dot ${ollama.reachable ? 'ok' : 'bad'}"></span>Ollama Loaded Models <span style="color:#888;font-weight:normal;font-size:11px">${esc(now.ts ? new Date(now.ts*1000).toLocaleTimeString() : '')}</span></h2>
+      <h2>Engine Parameters</h2>
+      ${cfgCells ? `<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:10px 16px;margin-bottom:12px">${cfgCells}</div>` : ''}
+      ${argChips ? `<details open><summary style="cursor:pointer;color:#888;font-size:11px;margin-bottom:6px">launch command (${vArgPairs.length} flags)</summary><div style="display:flex;flex-wrap:wrap;gap:5px">${argChips}</div></details>` : ''}
+    </div>` : '';
+
+  const vllmPanel = `
+    <div class="stats-section">
+      <h2><span class="reach-dot ${vllm.reachable ? 'ok' : 'bad'}"></span>vLLM ${vllm.reachable ? '<span style="color:#68d391;font-weight:normal;font-size:11px">serving</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
       <table style="width:100%">
-        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th class="num">VRAM</th><th>Parallel</th><th>Expires</th></tr></thead>
-        <tbody>${ollamaPs}</tbody>
+        <thead><tr><th>Served model</th><th class="num">Max context</th><th class="num">Running</th><th class="num">Waiting</th><th class="num">KV cache</th></tr></thead>
+        <tbody>${vllmRows}</tbody>
       </table>
     </div>
+    ${paramsSection}`;
 
-    ${ollamaConfigSection(ollama)}
-
+  const lmsPanel = `
     <div class="stats-section">
       <h2><span class="reach-dot ${lmstudio.reachable ? 'ok' : 'bad'}"></span>LM Studio Loaded Models</h2>
       <table style="width:100%">
@@ -4037,7 +4108,23 @@ function renderSystem() {
         <tbody>${lmsLoaded}</tbody>
       </table>
     </div>
+    <div class="stats-section">
+      <h2>LM Studio Available (top 25)</h2>
+      <table style="width:100%">
+        <thead><tr><th>ID</th><th>Type</th><th>State</th></tr></thead>
+        <tbody>${lmsAvailable}</tbody>
+      </table>
+    </div>`;
 
+  const ollamaPanel = `
+    <div class="stats-section">
+      <h2><span class="reach-dot ${ollama.reachable ? 'ok' : 'bad'}"></span>Ollama Loaded Models</h2>
+      <table style="width:100%">
+        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th class="num">VRAM</th><th>Parallel</th><th>Expires</th></tr></thead>
+        <tbody>${ollamaPs}</tbody>
+      </table>
+    </div>
+    ${ollamaConfigSection(ollama)}
     <div class="stats-section">
       <h2>Ollama Available (top 25)</h2>
       <table style="width:100%">
@@ -4045,7 +4132,6 @@ function renderSystem() {
         <tbody>${ollamaTags}</tbody>
       </table>
     </div>
-
     <div class="stats-section" id="ollama-update-section">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <h2 style="margin:0">Ollama Registry Updates</h2>
@@ -4054,17 +4140,23 @@ function renderSystem() {
         <span id="ollama-upd-status" style="color:#888;font-size:11px;margin-left:auto"></span>
       </div>
       <div id="ollama-upd-results" style="color:#666;font-size:12px;padding:6px">Click "Check" to compare local model digests against the Ollama registry.</div>
-    </div>
+    </div>`;
 
-    <div class="stats-section">
-      <h2>LM Studio Available (top 25)</h2>
-      <table style="width:100%">
-        <thead><tr><th>ID</th><th>Type</th><th>State</th></tr></thead>
-        <tbody>${lmsAvailable}</tbody>
-      </table>
-    </div>
+  const provPanels = { vllm: vllmPanel, lmstudio: lmsPanel, ollama: ollamaPanel, comfyui: renderComfyUISection(comfyui) };
 
-    ${renderComfyUISection(now.comfyui || {})}
+  $('system').innerHTML = `
+    ${renderProxyHealth(systemHealthCache)}
+    <div class="cards" style="grid-template-columns:repeat(auto-fill,minmax(280px,1fr))">
+      ${cpuCard}
+      ${memCard}
+      ${gpuCards}
+    </div>
+    <div style="margin-top:16px;display:flex;align-items:center;gap:10px">
+      <span style="font-family:ui-monospace,Consolas,monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#5f6b7e">Runtimes</span>
+      <span style="color:#666;font-size:11px">${esc(now.ts ? new Date(now.ts*1000).toLocaleTimeString() : '')}</span>
+    </div>
+    ${provBar}
+    ${provPanels[activeProv] || ''}
   `;
 }
 

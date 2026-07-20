@@ -46,6 +46,7 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 # Admin IPs bypass PII redaction entirely (see everything, regardless of subnet). Comma-separated.
 ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
+VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 
@@ -402,6 +403,7 @@ MIGRATIONS = [
     "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
     "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
     "ALTER TABLE system_metrics ADD COLUMN comfyui_json TEXT",
+    "ALTER TABLE system_metrics ADD COLUMN vllm_json TEXT",
     "ALTER TABLE requests ADD COLUMN ttft_ms REAL",
     "ALTER TABLE requests ADD COLUMN upstream TEXT",
     # Chars-based estimate of the prompt token count, stored at request time. Compared against
@@ -1468,6 +1470,91 @@ async def _lmstudio_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
+    """vLLM OpenAI-compat: /v1/models lists the served model(s) (always 'loaded' — vLLM serves
+    one config at a time); /metrics (Prometheus text) has live running/waiting counts + KV usage."""
+    out = {"reachable": False, "loaded": [], "available": []}
+    try:
+        r = await client.get(f"{VLLM_URL}/v1/models")
+        if r.status_code == 200:
+            out["reachable"] = True
+            for m in (r.json().get("data") or []):
+                rec = {"id": m.get("id"), "state": "loaded",
+                       "max_context_length": m.get("max_model_len"), "arch": "vllm"}
+                out["available"].append(rec)
+                out["loaded"].append(rec)
+    except (httpx.RequestError, ValueError):
+        return out
+    try:
+        r = await client.get(f"{VLLM_URL}/metrics")
+        if r.status_code == 200:
+            for key, metric in (("running", "vllm:num_requests_running"),
+                                ("waiting", "vllm:num_requests_waiting"),
+                                ("kv_cache_pct", "vllm:kv_cache_usage_perc")):
+                m = re.search(r"^" + re.escape(metric) + r"[^ ]*\s+([0-9.eE+-]+)", r.text, re.M)
+                if m:
+                    try:
+                        out[key] = float(m.group(1))
+                    except ValueError:
+                        pass
+            # cache_config_info exposes the resolved engine config as Prometheus labels.
+            cc = re.search(r"^vllm:cache_config_info\{([^}]*)\}", r.text, re.M)
+            if cc:
+                cfg = {}
+                for k, v in re.findall(r'(\w+)="([^"]*)"', cc.group(1)):
+                    cfg[k] = v
+                if cfg:
+                    out["config"] = cfg
+    except (httpx.RequestError, ValueError):
+        pass
+    # Best-effort: the actual launch command line (tool-call-parser, max-model-len, etc.)
+    # lives in the container args, not in any HTTP endpoint. Cheap, cached, non-fatal.
+    args = await asyncio.to_thread(_vllm_launch_args)
+    if args:
+        out["launch_args"] = args
+    return out
+
+
+_VLLM_ARGS_CACHE: dict = {"ts": 0.0, "args": None}
+
+
+def _vllm_launch_args() -> list | None:
+    """Read the vLLM container's launch args via `docker inspect` (proxy runs on the same
+    host, crimson is in the docker group). Cached 60s; returns None if docker/container absent."""
+    now = time.monotonic()
+    if _VLLM_ARGS_CACHE["args"] is not None and now - _VLLM_ARGS_CACHE["ts"] < 60:
+        return _VLLM_ARGS_CACHE["args"]
+    args = None
+    try:
+        if shutil.which("docker"):
+            _pm = re.search(r":(\d+)", VLLM_URL.rsplit("/", 1)[0])
+            port = _pm.group(1) if _pm else "8001"
+            ps = subprocess.run(
+                ["docker", "ps", "--format", "{{.ID}}\t{{.Image}}\t{{.Ports}}"],
+                capture_output=True, text=True, timeout=4)
+            cid = None
+            for line in ps.stdout.splitlines():
+                parts = line.split("\t")
+                if len(parts) < 3:
+                    continue
+                _id, image, ports = parts[0], parts[1], parts[2]
+                if ("vllm" in image.lower()) or (f":{port}->" in ports):
+                    cid = _id
+                    break
+            if cid:
+                ins = subprocess.run(
+                    ["docker", "inspect", cid, "--format", "{{json .Args}}"],
+                    capture_output=True, text=True, timeout=4)
+                data = json.loads(ins.stdout.strip() or "null")
+                if isinstance(data, list):
+                    args = [str(a) for a in data]
+    except (subprocess.SubprocessError, OSError, ValueError):
+        args = None
+    _VLLM_ARGS_CACHE["ts"] = now
+    _VLLM_ARGS_CACHE["args"] = args
+    return args
+
+
 # Priority queue: per-bucket semaphores. Initialized lazily on first request after config
 # load so OLLAMA_NUM_PARALLEL is readable. Reset whenever rules.json changes via the API.
 _PRIORITY_SEMS: dict[str, asyncio.Semaphore | None] = {}
@@ -1623,10 +1710,11 @@ async def _collect_once(app: FastAPI):
     cpu = _cpu_pct()
     mem = _mem_snapshot()
     gpus = _gpu_snapshot()
-    ollama, lmstudio, comfyui = await asyncio.gather(
+    ollama, lmstudio, comfyui, vllm = await asyncio.gather(
         _ollama_snapshot(app.state.metrics_client),
         _lmstudio_snapshot(app.state.metrics_client),
         _comfyui_snapshot(app.state.metrics_client),
+        _vllm_snapshot(app.state.metrics_client),
         return_exceptions=False,
     )
     ts = time.time()
@@ -1634,8 +1722,8 @@ async def _collect_once(app: FastAPI):
     conn.execute(
         """INSERT OR REPLACE INTO system_metrics
            (ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb, gpu_json,
-            ollama_json, lmstudio_json, comfyui_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ollama_json, lmstudio_json, comfyui_json, vllm_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             ts,
             cpu,
@@ -1647,6 +1735,7 @@ async def _collect_once(app: FastAPI):
             json.dumps(ollama),
             json.dumps(lmstudio),
             json.dumps(comfyui),
+            json.dumps(vllm),
         ),
     )
     # Retention
@@ -3728,7 +3817,35 @@ def _save_gate(req_id: str, gate: dict):
 
 @app.get("/__proxy/api/info")
 async def info():
-    return {"version": __version__, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL, "lmstudio": LMSTUDIO_URL, "port": PROXY_PORT}
+    return {"version": __version__, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL, "port": PROXY_PORT}
+
+
+@app.get("/__proxy/api/whoami")
+async def whoami(request: Request):
+    """What the current viewer is allowed to see. 'admin' → all requests on every subnet;
+    'subnet' → only requests from the same /24 (or loopback); 'unrestricted' → redaction off."""
+    ip = _client_ip(request)
+    is_loopback = False
+    try:
+        is_loopback = bool(ip) and ipaddress.ip_address(ip).is_loopback
+    except (ValueError, TypeError):
+        pass
+    is_admin = bool(ip and ip in ADMIN_IPS)
+    if not REDACT_PII_ENABLED:
+        level = "unrestricted"
+    elif is_admin:
+        level = "admin"
+    else:
+        level = "subnet"
+    return {
+        "ip": ip,
+        "level": level,
+        "is_admin": is_admin,
+        "admin_configured": bool(ADMIN_IPS),
+        "redact_pii": REDACT_PII_ENABLED,
+        "loopback": is_loopback,
+        "subnet_bits": REDACT_SUBNET_BITS_V4,
+    }
 
 
 @app.get("/__proxy/api/compress-stats")
@@ -3882,12 +3999,12 @@ async def system_now():
     conn = db()
     row = conn.execute(
         """SELECT ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb,
-                  gpu_json, ollama_json, lmstudio_json, comfyui_json
+                  gpu_json, ollama_json, lmstudio_json, comfyui_json, vllm_json
            FROM system_metrics ORDER BY ts DESC LIMIT 1"""
     ).fetchone()
     conn.close()
     if not row:
-        return {"ts": None, "cpu_pct": None, "mem": None, "gpus": [], "ollama": {}, "lmstudio": {}, "comfyui": {}}
+        return {"ts": None, "cpu_pct": None, "mem": None, "gpus": [], "ollama": {}, "lmstudio": {}, "comfyui": {}, "vllm": {}}
     d = dict(row)
     return {
         "ts": d["ts"],
@@ -3898,6 +4015,7 @@ async def system_now():
         "ollama": json.loads(d["ollama_json"]) if d["ollama_json"] else {},
         "lmstudio": json.loads(d["lmstudio_json"]) if d["lmstudio_json"] else {},
         "comfyui": json.loads(d["comfyui_json"]) if d["comfyui_json"] else {},
+        "vllm": json.loads(d["vllm_json"]) if d["vllm_json"] else {},
     }
 
 
@@ -8687,8 +8805,10 @@ async def proxy(full_path: str, request: Request):
         return JSONResponse({"error": "not found"}, status_code=404)
 
     # Panic kill-switch: refuse all upstream traffic until disabled. Proxy stays up so the
-    # UI / phone PWA / control endpoints remain reachable to flip it off again.
-    if _PANIC_MODE:
+    # UI / phone PWA / control endpoints remain reachable to flip it off again. The benchmark
+    # client is spared so a bench can run against a quiesced GPU (no competing traffic skewing
+    # the timings) simply by flipping panic mode on for the duration of the run.
+    if _PANIC_MODE and (request.headers.get("x-client-name") or "").lower() != "ai-proxy-bench":
         return JSONResponse(
             {"error": {"message": "AI Proxy is in PANIC MODE — all upstream traffic blocked. Disable via the phone PWA or POST /__proxy/api/control/panic with {\"on\": false}.",
                        "type": "proxy_panic", "code": "panic_mode"}},
@@ -8809,7 +8929,7 @@ async def proxy(full_path: str, request: Request):
     # both Ollama and LM Studio speak the same /v1 shape, so no body translation is needed.
     # "anthropic" is deliberately NOT a target: forwarding an OpenAI-shape body there without
     # the protocol bridge (which only goes anthropic→ollama) would produce 400s.
-    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL}
+    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL}
     if (rewrite and rewrite.get("upstream")
             and upstream_label != "anthropic"):
         _new_label = str(rewrite["upstream"]).lower()
