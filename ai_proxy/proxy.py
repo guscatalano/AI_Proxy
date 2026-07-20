@@ -9578,6 +9578,11 @@ async def proxy(full_path: str, request: Request):
         _do_incr_bridge = bridge_active and not do_intercept and not tool_injection_active
         _incr_bridge = IncrementalAnthropicBridge(bridge_original_model) if _do_incr_bridge else None
 
+        # Shared finalize-state so a client disconnect (which cancels streamer() mid-yield,
+        # before its own _save_finish runs) can still be finalized by the outer wrapper. Without
+        # this, an aborted stream leaves the row stuck 'pending' and leaks the inflight/live entry.
+        _fin: dict = {"saved": False, "chunks": None}
+
         async def streamer():
             # REVERTED to simple async-for. The earlier asyncio.wait keepalive pattern
             # broke bridged claude-code requests starting ~2026-05-15 (success rate went
@@ -9587,6 +9592,7 @@ async def proxy(full_path: str, request: Request):
             chunks: list[bytes] = []
             err: str | None = None
             first_chunk_ms: float | None = None
+            _fin["chunks"] = chunks   # expose accumulated bytes to the disconnect backstop
             if _ka_is_sse:
                 yield _ka_payload  # immediate "byte on wire" so the client doesn't TTFB-timeout
             if not bridge_active:
@@ -9792,6 +9798,7 @@ async def proxy(full_path: str, request: Request):
                     "details": {"fixes": xml_applied_s, "streaming": True, "replaced": True},
                 })
             _save_finish(req_id, upstream_resp.status_code, resp_headers_full, None, full, elapsed, err, ttft_ms=first_chunk_ms)
+            _fin["saved"] = True
 
         # Wrap streamer to (a) release the priority slot even on disconnect/error, (b)
         # optionally rewrite the `model` field in every emitted chunk when the user asked
@@ -9818,6 +9825,26 @@ async def proxy(full_path: str, request: Request):
                 _release_pri_slot()
                 if _dedup_fanout is not None:
                     _dedup_fanout.finish(stream_err)
+                # Backstop: if streamer() didn't reach its own _save_finish (client disconnected
+                # mid-stream → GeneratorExit/CancelledError, or an error before the final save),
+                # finalize the row here so it never stays 'pending' and the inflight/live entries
+                # are freed. Status 499 = client closed request (nginx convention).
+                if not _fin.get("saved"):
+                    try:
+                        _partial = b"".join(_fin.get("chunks") or []).decode("utf-8", errors="replace")
+                    except Exception:
+                        _partial = ""
+                    try:
+                        _save_finish(req_id, 499, resp_headers_full, None, _partial,
+                                     (time.perf_counter() - start) * 1000,
+                                     stream_err or "client disconnected before response completed")
+                    except Exception:
+                        pass
+                    _fin["saved"] = True
+                    try:
+                        await upstream_resp.aclose()   # free the upstream socket / GPU slot
+                    except Exception:
+                        pass
 
         return StreamingResponse(
             _gen_with_release(),
