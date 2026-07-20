@@ -627,13 +627,27 @@
   #shell-vitals .sv-bar i { display: block; height: 100%; border-radius: 3px; transition: width .5s, background .5s; }
   /* suppress the shell transition on first paint so a console-default load doesn't animate */
   body.shell-noanim, body.shell-noanim #shell-rail, body.shell-noanim .tabs { transition: none !important; }
+  /* Mobile menu button + drawer backdrop (both desktop-hidden; shown under the 760px block) */
+  #rail-toggle { display: none; align-items: center; justify-content: center; width: 34px; height: 34px; background: #141922; color: #c9d3e1; border: 1px solid #262d38; border-radius: 7px; font-size: 17px; line-height: 1; cursor: pointer; flex: none; padding: 0; }
+  #rail-toggle:hover { border-color: #3a4e6a; }
+  #rail-backdrop { display: none; }
   @media (prefers-reduced-motion: reduce) {
     body, #shell-rail { transition: none !important; }
     .snav-pip.live { animation: none; }
   }
   @media (max-width: 760px) {
+    /* Rail becomes a slide-over drawer (hidden until the hamburger opens it). */
     body.shell-console { padding-left: 0; }
-    #shell-rail { width: 200px; }
+    body.shell-console #shell-rail { width: 272px; transform: translateX(-100%); z-index: 60; box-shadow: 8px 0 40px -10px rgba(0,0,0,.75); }
+    body.shell-console.rail-open #shell-rail { transform: translateX(0); }
+    body.rail-open #rail-backdrop { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.55); z-index: 55; }
+    #rail-toggle { display: inline-flex; }
+    /* Compact header: drop the wide vitals strip on phones, keep menu + controls. */
+    body.shell-console #shell-vitals { display: none; }
+    body.shell-console header #count { display: none; }
+    body.shell-console header { min-height: 46px; padding: 6px 10px; gap: 8px; flex-wrap: wrap; }
+    /* The collapse control is meaningless in the drawer — hide it. */
+    body.shell-console .sf-collapse { display: none; }
   }
   /* Live full-screen: hide chrome, let the grid own the whole viewport */
   .lv-full-btn { margin-left: auto; background: #141922; color: #9aa4b2; border: 1px solid #262d38; border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; font-family: inherit; }
@@ -811,7 +825,9 @@
     <button class="sf-collapse" onclick="toggleRailCollapse()" title="Collapse sidebar">« Collapse</button>
   </div>
 </aside>
+<div id="rail-backdrop" onclick="toggleRail()"></div>
 <header>
+  <button id="rail-toggle" onclick="toggleRail()" title="Menu" aria-label="Open menu">☰</button>
   <h1>AI Proxy</h1>
   <span class="meta" id="upstream-chip">→ <code id="upstream">…</code></span>
   <!-- Badge state holders: updated by id elsewhere; mirrored onto the rail as pips. -->
@@ -963,6 +979,8 @@ let _shellPoll = null;
 function syncShellNav(v) {
   document.querySelectorAll('#shell-rail .snav').forEach(b => b.classList.toggle('on', b.dataset.view === v));
 }
+// Mobile: the rail is a slide-over drawer toggled by the header hamburger.
+function toggleRail() { document.body.classList.toggle('rail-open'); }
 function startShell() {
   syncShellNav(view);
   shellVitals();
@@ -970,6 +988,9 @@ function startShell() {
   // reuses the Live view's poll when it's open — the strip must not add background load
   // to the single process that also serves the models.
   if (!_shellPoll) _shellPoll = setInterval(shellVitals, 8000);
+  // Tapping a nav item (or the brand) closes the mobile drawer.
+  const rail = $('shell-rail');
+  if (rail && !rail._mnav) { rail._mnav = 1; rail.addEventListener('click', e => { if (e.target.closest('.snav, .shell-brand')) document.body.classList.remove('rail-open'); }); }
 }
 // Collapse the rail to an icon-only strip. Persisted in localStorage.
 const SHELL_COLLAPSE_KEY = 'ai-proxy-shell-collapsed';
