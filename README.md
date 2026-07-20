@@ -52,7 +52,14 @@ Built around two ideas:
 
 ### Prerequisites
 - Python 3.10+
-- An upstream to forward to (Ollama on `localhost:11434`, Anthropic API, etc.)
+- An upstream to forward to (Ollama on `localhost:11434`, LM Studio, the Anthropic API, etc.)
+
+No upstream yet? The fastest local one is [Ollama](https://ollama.com):
+
+```bash
+ollama pull llama3.2   # a small model to test with
+# Ollama serves on :11434 automatically after install
+```
 
 ### Install
 
@@ -78,6 +85,19 @@ ai-proxy
 ```
 
 UI: <http://127.0.0.1:8000/__proxy/>
+
+### Verify it's working
+
+The dashboard is empty until traffic flows through it. With an upstream running, send one request and watch it land in the **Requests** list:
+
+```bash
+# OpenAI-compatible upstream (Ollama / LM Studio)
+curl http://localhost:8000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model": "llama3.2", "messages": [{"role": "user", "content": "say hi"}]}'
+```
+
+Open the UI — the call appears with its client badge, tokens, latency, and full request/response body. Nothing shows up? See [Troubleshooting](#troubleshooting).
 
 ### Point your client at the proxy
 
@@ -107,12 +127,13 @@ The proxy routes by path: `/v1/messages*` and `/v1/complete*` go to Anthropic (`
 | `OLLAMA_URL` | `http://localhost:11434` | OpenAI-compat / Ollama upstream |
 | `ANTHROPIC_URL` | `https://api.anthropic.com` | Anthropic upstream for `/v1/messages*` |
 | `LMSTUDIO_URL` | `http://localhost:1234` | Optional LM Studio for the System tab |
-| `PROXY_HOST` | `127.0.0.1` | Bind address |
+| `PROXY_HOST` | `0.0.0.0` | Bind address (use `127.0.0.1` for local-only) |
 | `PROXY_PORT` | `8000` | Bind port |
 | `PROXY_DB` | `./proxy.db` | SQLite DB path |
 | `PROXY_RULES_FILE` | `./rules.json` | One-time rules import (subsequently stored in DB) |
 | `PROXY_REDACT_PII` | `1` | Redact bodies/headers from cross-subnet viewers |
 | `PROXY_REDACT_SUBNET_BITS` | `24` | IPv4 subnet width for PII gating |
+| `PROXY_ADMIN_IPS` | (none) | Comma-separated IPs that always see full bodies (bypass PII redaction) — set to your admin machine |
 | `MCP_ALLOW_WRITE` | `false` | Allow `update_rules` MCP tool |
 | `MCP_API_KEY` | (none) | Bearer token for MCP endpoint |
 

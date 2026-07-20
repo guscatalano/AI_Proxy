@@ -44,7 +44,7 @@ except ValueError:
     REDACT_SUBNET_BITS_V4 = 24
 REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as originator]"
 # Admin IPs bypass PII redaction entirely (see everything, regardless of subnet). Comma-separated.
-ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "192.168.6.113").split(",") if ip.strip()}
+ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
