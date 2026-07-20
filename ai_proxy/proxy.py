@@ -727,6 +727,36 @@ def init_db():
             "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v9', '1', ?)",
             (time.time(),),
         )
+    # Backfill v10: re-classify rows tagged with a *generic* label using the detector's new
+    # system-prompt fingerprint layer (Cursor / Cline / Aider / Windsurf, etc. hiding behind a
+    # stock SDK UA). Only touches rows whose current label is generic, so confident IDE/header
+    # verdicts are never overwritten.
+    done_v10 = conn.execute("SELECT value FROM settings WHERE key='backfill_v10'").fetchone()
+    if not done_v10:
+        _generic = ("unknown", "openai-sdk", "openai-python", "openai-node",
+                    "anthropic-sdk", "anthropic-python", "anthropic-node", "httpx", "requests")
+        rows = conn.execute(
+            f"""SELECT id, request_headers, request_body FROM requests
+                WHERE client_app IN ({','.join('?' for _ in _generic)})""",
+            _generic,
+        ).fetchall()
+        for r in rows:
+            headers = body = None
+            try:
+                headers = json.loads(r["request_headers"]) if r["request_headers"] else None
+            except (TypeError, json.JSONDecodeError):
+                pass
+            try:
+                body = json.loads(r["request_body"]) if r["request_body"] else None
+            except (TypeError, json.JSONDecodeError):
+                pass
+            app = _detect_client_app(headers, body if isinstance(body, dict) else None)
+            if app != r["client_app"]:
+                conn.execute("UPDATE requests SET client_app=? WHERE id=?", (app, r["id"]))
+        conn.execute(
+            "INSERT INTO settings (key, value, updated_ts) VALUES ('backfill_v10', '1', ?)",
+            (time.time(),),
+        )
     # Backfill v7: re-extract usage for Anthropic rows that have prompt-cache fields. Old
     # rows recorded only `input_tokens` (the fresh portion); we now sum fresh + cache_read +
     # cache_create so the prompt_tokens reflect the true prompt size.
@@ -6984,6 +7014,40 @@ def _turn_index(body) -> int | None:
     return sum(1 for m in msgs if isinstance(m, dict) and m.get("role") == "user")
 
 
+# High-precision system-prompt fingerprints for agentic clients that ride on a generic SDK
+# User-Agent (openai-sdk / anthropic-sdk / unknown). Each marker is a distinctive phrase from
+# the tool's system prompt, kept deliberately specific so a request whose prompt merely
+# *mentions* a tool isn't misattributed. Only consulted when header/UA detection is generic.
+_SYS_PROMPT_FINGERPRINTS = (
+    ("you are pair programming with a user", "cursor"),
+    ("you are cline", "cline"),
+    ("you are roo,", "roo-code"),
+    ("you are kilo code", "kilo-code"),
+    ("you are cascade", "windsurf"),
+    ("codeium engineering team", "windsurf"),
+    ("you are bolt", "bolt.new"),
+    ("search/replace block", "aider"),
+    ("act as an expert software developer", "aider"),
+    ("you are openhands", "openhands"),
+    ("ai agent called goose", "goose"),
+    ("running in the codex cli", "codex-cli"),
+    ("you are amazon q", "amazon-q"),
+    ("you are github copilot", "github-copilot"),
+)
+
+
+def _fingerprint_client_from_system(sys_text: str) -> str | None:
+    """Best-effort agentic-client identification from the system prompt. High-precision markers
+    only; returns None when nothing distinctive matches so the caller keeps its generic verdict."""
+    if not sys_text:
+        return None
+    t = sys_text.lower()
+    for marker, label in _SYS_PROMPT_FINGERPRINTS:
+        if marker in t:
+            return label
+    return None
+
+
 def _detect_client_app(headers: dict | None, body: dict | None) -> str:
     """Heuristic identification of the client SDK / app behind a request. Walks headers
     (User-Agent, x-stainless-*, Editor-Version, etc.) and falls back to fingerprints in
@@ -7048,6 +7112,14 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
         return "aider"
     if "zed" in ua:
         return "zed"
+
+    # No confident header/UA match. Before settling for a generic SDK label (openai-sdk /
+    # anthropic-sdk / unknown), try to fingerprint the agentic client from its system prompt —
+    # Cursor, Cline, Aider, Windsurf, etc. all ride on a stock SDK UA but embed a telltale
+    # system prompt. A fingerprint hit is strictly more specific than the SDK bucket below.
+    fp = _fingerprint_client_from_system(sys_text)
+    if fp:
+        return fp
 
     # Anthropic / OpenAI official SDKs (Stainless-generated)
     if h.get("anthropic-version") or "anthropic" in (h.get("x-stainless-package-version") or "").lower():
@@ -8976,6 +9048,24 @@ async def proxy(full_path: str, request: Request):
                 _conn.close()
             except Exception:
                 pass
+
+    # Ornith (vLLM) thinking control. Ornith honors thinking ONLY via
+    # chat_template_kwargs.enable_thinking — it ignores the OpenAI `reasoning_effort` knob, and
+    # its chat template defaults to thinking-ON. Benchmarks show no-think is faster and more
+    # correct for coding, so default it OFF here and let a client opt back in with
+    # reasoning_effort high/medium. A caller that already set chat_template_kwargs.enable_thinking
+    # explicitly is left untouched.
+    ornith_think = None
+    if (isinstance(body_json, dict) and upstream_label == "vllm"
+            and str(body_json.get("model") or "").lower().startswith("ornith")):
+        ctk = body_json.get("chat_template_kwargs")
+        if not isinstance(ctk, dict):
+            ctk = {}
+        if "enable_thinking" not in ctk:
+            eff = str(body_json.get("reasoning_effort") or "").lower()
+            ctk["enable_thinking"] = eff in ("high", "medium")
+            body_json["chat_template_kwargs"] = ctk
+            ornith_think = ctk["enable_thinking"]
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
     # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response
