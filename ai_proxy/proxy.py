@@ -2216,17 +2216,27 @@ def _artifact_tool_map() -> dict:
 
 
 def _paths_from_command(cmd: str) -> list:
-    """Best-effort file paths referenced in a shell command (for terminal/bash tools)."""
+    """Best-effort file paths referenced in a shell command (for terminal/bash tools). Rejects
+    grep/sed/regex fragments (which are often quoted and look path-ish) so they don't pollute the
+    artifact list."""
     if not isinstance(cmd, str) or not cmd or len(cmd) > 4000:
         return []
     seen = []
     for m in _PATH_IN_CMD_RE.finditer(cmd):
         p = m.group(1) or m.group(2) or m.group(3)
-        if p and ("/" in p or "\\" in p) and len(p) < 300 and p not in seen:
+        if not p or len(p) >= 300 or ("/" not in p and "\\" not in p):
+            continue
+        # Shell/regex noise: pipe-alternation, globs, redirects, var expansion, escaped-dot regex.
+        if _RE_PATH_NOISE.search(p) or "\\|" in p or ".*" in p or p.startswith("\\."):
+            continue
+        if p not in seen:
             seen.append(p)
         if len(seen) >= 6:
             break
     return seen
+
+
+_RE_PATH_NOISE = re.compile(r"[|*?<>$`;]")
 
 
 def _artifact_events_from_call(name, args, tmap):

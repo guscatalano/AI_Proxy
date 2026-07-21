@@ -3482,14 +3482,19 @@ function _artFolderInto(encName) { _artFolder = _artFolder.concat([decodeURIComp
 function _renderArtFolder() {
   const files = _artFilesCache.filter(it => it.kind === 'file');
   if (!files.length) return '<div class="empty">No files in this conversation.</div>';
-  // Windows paths (drive-letter) are case-insensitive: group by a lowercased KEY, but display the
-  // first-seen casing (drive letter uppercased). Unix paths stay case-sensitive.
-  const win = /^[A-Za-z]:$/.test(_artSegs(files[0].path)[0] || '');
+  // Canonicalize drive spellings so the same location doesn't split into duplicate folders:
+  //   c:\… , C:/… , and Git-Bash /c/… all collapse to  C:  . Windows paths (drive-letter) are
+  //   case-insensitive → group by a lowercased KEY but display the first-seen casing.
+  const canon = p => {
+    let s = String(p).replace(/\\/g, '/');
+    s = s.replace(/^\/([a-zA-Z])\//, (_m, d) => d.toUpperCase() + ':/');  // /c/… → C:/…
+    s = s.replace(/^([a-zA-Z]):/, (_m, d) => d.toUpperCase() + ':');       // c:… → C:…
+    return s;
+  };
   const recs = files.map(it => {
-    const raw = _artSegs(it.path);
-    const disp = raw.slice();
-    if (win && disp.length && /^[a-zA-Z]:$/.test(disp[0])) disp[0] = disp[0].toUpperCase();
-    return { it, key: win ? raw.map(s => s.toLowerCase()) : raw, disp };
+    const raw = canon(it.path).split('/').filter(Boolean);
+    const win = /^[A-Za-z]:$/.test(raw[0] || '');
+    return { it, key: win ? raw.map(s => s.toLowerCase()) : raw, disp: raw };
   });
   // Deepest common directory (on the normalized key), so we skip the shared C:\Users\… prefix.
   let common = recs[0].key.slice(0, -1);
