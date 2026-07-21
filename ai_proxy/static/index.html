@@ -3408,6 +3408,13 @@ function _artAgo(ts) {
   if (s < 86400) return Math.round(s / 3600) + 'h ago';
   return Math.round(s / 86400) + 'd ago';
 }
+function _fmtBytes(n) {
+  if (n == null) return '';
+  if (n === 0) return '0 B';
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+  return (n / 1048576).toFixed(1) + ' MB';
+}
 let _artKindFilter = '';
 let _artFilesCache = [];
 let _artFolder = null;   // folder-browser current dir (array of path segments); null = auto-root
@@ -3580,20 +3587,26 @@ async function renderArtFile() {
   catch { el.innerHTML = _artHead('artBackFiles()', backLbl, 'Artifact', '') + '<div class="empty">failed to load</div>'; return; }
   el.scrollTop = 0;
   const ep = encodeURIComponent(_artNav.path);
-  const events = (d.events || []).map(e => `
+  const events = (d.events || []).map(e => {
+    const sz = e.size;
+    const sizeHtml = (sz == null) ? ''
+      : `<span style="font-size:10px;color:${sz === 0 ? '#f0a35a' : '#667'}">${sz === 0 ? '0 B — empty' : _fmtBytes(sz)}</span>`;
+    return `
     <div class="art-event" style="padding:6px 0;font-size:12px;border-bottom:1px solid #1c2029">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
         <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
         <span style="color:#9aa4b2">${esc(e.tool || '')}</span>
-        ${e.size ? `<span style="color:#667">${(e.size / 1024).toFixed(1)}KB</span>` : ''}
-        <span style="margin-left:auto;display:flex;gap:12px">
-          ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();peekArtifact(this,'${esc(e.request_id)}','${ep}')" style="color:#57d1e0;font-size:11px">view content</a>` : ''}
-          ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(e.request_id)}')" style="color:#8b97a8;font-size:11px" title="open the full request">request&nbsp;&rarr;</a>` : ''}
+        <span style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:2px">
+          <span style="display:flex;gap:12px">
+            ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();peekArtifact(this,'${esc(e.request_id)}','${ep}')" style="color:#57d1e0;font-size:11px">view content</a>` : ''}
+            ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(e.request_id)}')" style="color:#8b97a8;font-size:11px" title="open the full request">request&nbsp;&rarr;</a>` : ''}
+          </span>
+          ${sizeHtml}
         </span>
       </div>
       <div class="art-peek" style="display:none;margin-top:6px"></div>
-    </div>`).join('') || '<div class="empty">no events</div>';
+    </div>`; }).join('') || '<div class="empty">no events</div>';
   const kind = (d.events && d.events[0]) ? d.events[0].kind : 'file';
   const title = `<span style="font-size:15px">${_artKIcon[kind] || '•'}</span> <code style="color:${_artKColor[kind] || '#8b97a8'};word-break:break-all">${esc(_artNav.path)}</code>`;
   el.innerHTML = _artHead('artBackFiles()', backLbl, title, `${(d.events || []).length} event${(d.events || []).length === 1 ? '' : 's'} in this conversation`)
