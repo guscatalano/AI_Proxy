@@ -3437,17 +3437,32 @@ async function renderArtConvs() {
   try { d = await (await fetch('/__proxy/api/artifacts/conversations')).json(); }
   catch { el.innerHTML = '<div class="empty">Failed to load.</div>'; return; }
   _artConvCache = {};
-  const rows = (d.items || []).map(c => {
+  const items = d.items || [];
+  const rows = items.map(c => {
     _artConvCache[c.conversation_id] = c.label || c.preview || c.conversation_id;
-    const name = c.label || c.preview || ('conversation ' + c.conversation_id.slice(0, 8));
-    const counts = [c.files ? `📄 ${c.files}` : '', c.urls ? `🌐 ${c.urls}` : '', c.images ? `🖼 ${c.images}` : ''].filter(Boolean).join('&nbsp;&nbsp;');
-    return `<div onclick="_artGo('files','${esc(c.conversation_id)}')" style="border:1px solid #262d38;border-radius:8px;padding:12px 14px;margin-bottom:6px;cursor:pointer;background:#141922">
-      <div style="display:flex;gap:12px;align-items:center">
-        <span style="flex:1;color:#e9edf4;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</span>
-        <span style="color:#9aa4b2;font-size:12px;white-space:nowrap">${counts}</span>
-        <span style="color:#667;font-size:11px;white-space:nowrap">${_artAgo(c.last_ts)}</span></div></div>`;
-  }).join('') || '<div class="empty">No conversations have touched files or URLs yet.</div>';
-  el.innerHTML = `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— by conversation</span></h2>${rows}</div>`;
+    const span = (c.last_ts && c.first_ts && c.last_ts > c.first_ts) ? fmtSpan(c.last_ts - c.first_ts) : '—';
+    const cell = (n, icon, color) => n ? `<span style="color:${color};white-space:nowrap">${icon}&nbsp;${n}</span>` : '<span style="color:#3a4250">—</span>';
+    return `<tr style="cursor:pointer" data-cid="${esc(c.conversation_id)}">
+      <td style="font-size:11px;color:#8b97a8;white-space:nowrap">${fmt(c.last_ts)}</td>
+      <td><code style="font-size:11px;color:#9aa4b2">${esc(c.conversation_id.slice(0, 12))}</code></td>
+      <td class="num">${cell(c.files, '📄', '#57d1e0')}</td>
+      <td class="num">${cell(c.urls, '🌐', '#e0a857')}</td>
+      <td class="num">${cell(c.images, '🖼', '#b48ead')}</td>
+      <td class="num">${cell(c.skills, '🧩', '#68d391')}</td>
+      <td class="num" style="color:#9aa4b2">${num(c.turns || 0)}</td>
+      <td style="font-size:11px;color:#667;white-space:nowrap">${span}</td>
+      <td style="color:#c9d3e1;font-size:12px;max-width:360px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.label || c.preview || '')}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9" class="empty" style="padding:30px">No conversations have touched files or URLs yet.</td></tr>';
+  el.innerHTML = `<div style="padding:6px 4px">
+    <h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— by conversation (${items.length})</span></h2>
+    <div class="tbl-wrap" style="overflow-x:auto"><table style="width:100%;font-size:13px">
+      <thead><tr>
+        <th>Last seen</th><th>Conversation</th>
+        <th class="num">Files</th><th class="num">Web</th><th class="num">Images</th><th class="num">Skills</th>
+        <th class="num">Turns</th><th>Span</th><th>First message</th>
+      </tr></thead><tbody>${rows}</tbody></table></div></div>`;
+  for (const tr of el.querySelectorAll('tbody tr[data-cid]')) tr.onclick = () => _artGo('files', tr.dataset.cid);
 }
 async function renderArtFiles() {
   const el = $('artifacts');
@@ -3499,7 +3514,7 @@ async function renderArtFile() {
   el.scrollTop = 0;
   const ep = encodeURIComponent(_artNav.path);
   const events = (d.events || []).map(e => `
-    <div style="padding:6px 0;font-size:12px;border-bottom:1px solid #1c2029">
+    <div class="art-event" style="padding:6px 0;font-size:12px;border-bottom:1px solid #1c2029">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
         <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
@@ -3519,7 +3534,7 @@ async function renderArtFile() {
 }
 
 async function peekArtifact(link, reqId, encPath) {
-  const rowDiv = link.closest('div[style*="padding:4px"]');
+  const rowDiv = link.closest('.art-event');
   const peek = rowDiv && rowDiv.querySelector('.art-peek');
   if (!peek) return;
   if (peek.style.display !== 'none') { peek.style.display = 'none'; return; }

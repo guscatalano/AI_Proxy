@@ -6011,9 +6011,11 @@ async def artifact_conversations(request: Request, limit: int = 150):
     conn = db()
     rows = conn.execute(
         """SELECT conversation_id, COUNT(*) events, COUNT(DISTINCT path) paths,
+                  COUNT(DISTINCT request_id) turns,
                   SUM(CASE WHEN kind='file' THEN 1 ELSE 0 END) files,
                   SUM(CASE WHEN kind='url' THEN 1 ELSE 0 END) urls,
                   SUM(CASE WHEN kind='image' THEN 1 ELSE 0 END) images,
+                  SUM(CASE WHEN kind='skill' THEN 1 ELSE 0 END) skills,
                   MIN(ts) first_ts, MAX(ts) last_ts,
                   GROUP_CONCAT(DISTINCT client_ip) clients
            FROM artifacts WHERE conversation_id IS NOT NULL
@@ -6039,8 +6041,8 @@ async def artifact_conversations(request: Request, limit: int = 150):
             except (json.JSONDecodeError, TypeError):
                 pass
         items.append({"conversation_id": r["conversation_id"], "label": labels.get(r["conversation_id"]),
-                      "preview": preview, "events": r["events"], "paths": r["paths"],
-                      "files": r["files"], "urls": r["urls"], "images": r["images"],
+                      "preview": preview, "events": r["events"], "paths": r["paths"], "turns": r["turns"],
+                      "files": r["files"], "urls": r["urls"], "images": r["images"], "skills": r["skills"],
                       "first_ts": r["first_ts"], "last_ts": r["last_ts"]})
     conn.close()
     return {"items": items, "total": len(items)}
