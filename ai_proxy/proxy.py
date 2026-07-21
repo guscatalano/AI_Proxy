@@ -2065,12 +2065,13 @@ DEFAULT_MODEL_QUIRKS = {
         "match": "prefix",
         "thinking": "default_off_optin",
         "reasoning_control": "chat_template_kwargs.enable_thinking",
-        "system_nudge": ("Start your response immediately with the answer itself — the code block, "
-                         "the command, the tool call, or the direct fact. NEVER open with a sentence "
-                         "describing what you are about to do, what you see, or what you need (no "
-                         "\"I'll...\", \"Let me...\", \"I need to see...\", \"First,...\", \"I can "
-                         "see...\", \"The user wants...\"). Zero preamble. If you need to act, emit "
-                         "the tool call directly with no narration before it."),
+        "system_nudge": ("Be concise and direct. Start immediately with the answer — the code, "
+                         "command, tool call, or the direct fact — with ZERO preamble (no \"I'll...\", "
+                         "\"Let me...\", \"I need to...\", \"First,...\", \"I can see...\", \"The user "
+                         "wants...\"). Give the minimal response that fully answers: do NOT add "
+                         "examples, alternative approaches, step-by-step breakdowns, caveats, or a "
+                         "closing summary unless explicitly asked. Prefer the shortest correct "
+                         "answer. If acting, emit the tool call directly with no narration."),
         "notes": ("Qwen3.5-MoE / gated-delta-net. Ignores OpenAI reasoning_effort — thinking is "
                   "only controllable via chat_template_kwargs.enable_thinking, and the template "
                   "defaults to ON. On vLLM, requires --reasoning-parser qwen3 to split reasoning "
