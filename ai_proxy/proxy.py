@@ -6003,15 +6003,64 @@ async def list_artifacts(request: Request, kind: str = "", q: str = "", conversa
     return {"items": items, "total": len(items)}
 
 
-@app.get("/__proxy/api/artifacts/timeline")
-async def artifact_timeline(request: Request, path: str):
-    """Event timeline for one file/url — each read/edit/fetch, newest first, with a link back to the
-    request that shows the content."""
+@app.get("/__proxy/api/artifacts/conversations")
+async def artifact_conversations(request: Request, limit: int = 150):
+    """Conversations that touched files/urls, newest first — the top level of the Artifacts view.
+    Each carries file/url counts + a preview (first user message) so you can recognize the session."""
     viewer = _client_ip(request)
     conn = db()
     rows = conn.execute(
-        "SELECT ts, op, tool_name, request_id, conversation_id, size_bytes, content_hash, client_ip, kind "
-        "FROM artifacts WHERE path = ? ORDER BY ts DESC LIMIT 500", (path,)).fetchall()
+        """SELECT conversation_id, COUNT(*) events, COUNT(DISTINCT path) paths,
+                  SUM(CASE WHEN kind='file' THEN 1 ELSE 0 END) files,
+                  SUM(CASE WHEN kind='url' THEN 1 ELSE 0 END) urls,
+                  SUM(CASE WHEN kind='image' THEN 1 ELSE 0 END) images,
+                  MIN(ts) first_ts, MAX(ts) last_ts,
+                  GROUP_CONCAT(DISTINCT client_ip) clients
+           FROM artifacts WHERE conversation_id IS NOT NULL
+           GROUP BY conversation_id ORDER BY last_ts DESC LIMIT ?""",
+        (max(1, min(500, limit)),)).fetchall()
+    labels = {r["conversation_id"]: r["label"] for r in
+              conn.execute("SELECT conversation_id, label FROM conversation_labels").fetchall()}
+    items = []
+    for r in rows:
+        ips = [ip.strip() for ip in (r["clients"] or "").split(",") if ip.strip()]
+        if not any(_can_view_pii(viewer, ip) for ip in (ips or [None])):
+            continue
+        preview = None
+        pv = conn.execute("SELECT request_body FROM requests_v WHERE conversation_id=? ORDER BY ts ASC LIMIT 1",
+                          (r["conversation_id"],)).fetchone()
+        if pv and pv["request_body"]:
+            try:
+                j = json.loads(pv["request_body"])
+                fu = next((m for m in (j.get("messages") or [])
+                           if isinstance(m, dict) and m.get("role") == "user"), None)
+                if fu:
+                    preview = _msg_text(fu)[:160]
+            except (json.JSONDecodeError, TypeError):
+                pass
+        items.append({"conversation_id": r["conversation_id"], "label": labels.get(r["conversation_id"]),
+                      "preview": preview, "events": r["events"], "paths": r["paths"],
+                      "files": r["files"], "urls": r["urls"], "images": r["images"],
+                      "first_ts": r["first_ts"], "last_ts": r["last_ts"]})
+    conn.close()
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/__proxy/api/artifacts/timeline")
+async def artifact_timeline(request: Request, path: str, conversation: str = ""):
+    """Event timeline for one file/url — each read/edit/fetch, newest first. Optionally scoped to one
+    conversation (the turns within that session where it was touched)."""
+    viewer = _client_ip(request)
+    conn = db()
+    if conversation:
+        rows = conn.execute(
+            "SELECT ts, op, tool_name, request_id, conversation_id, size_bytes, content_hash, client_ip, kind "
+            "FROM artifacts WHERE path = ? AND conversation_id = ? ORDER BY ts DESC LIMIT 500",
+            (path, conversation)).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT ts, op, tool_name, request_id, conversation_id, size_bytes, content_hash, client_ip, kind "
+            "FROM artifacts WHERE path = ? ORDER BY ts DESC LIMIT 500", (path,)).fetchall()
     conn.close()
     events = [{"ts": r["ts"], "op": r["op"], "tool": r["tool_name"], "request_id": r["request_id"],
                "conversation_id": r["conversation_id"], "size": r["size_bytes"],

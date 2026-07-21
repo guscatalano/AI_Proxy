@@ -3393,8 +3393,11 @@ async function killRequest(reqId, btn) {
   }
 }
 
-// ---------- Artifacts view ----------
-let _artifactFilter = { kind: '', q: '' };
+// ---------- Artifacts view (conversation → files → per-file turns) ----------
+const _artKIcon = { file: '📄', url: '🌐', image: '🖼', skill: '🧩', dir: '📁' };
+const _artKColor = { file: '#57d1e0', url: '#e0a857', image: '#b48ead', skill: '#68d391', dir: '#8b97a8' };
+let _artNav = { level: 'convs', conv: '', convLabel: '', path: '' };
+let _artConvCache = {};
 function _artAgo(ts) {
   if (!ts) return '';
   const s = Date.now() / 1000 - ts;
@@ -3403,59 +3406,71 @@ function _artAgo(ts) {
   if (s < 86400) return Math.round(s / 3600) + 'h ago';
   return Math.round(s / 86400) + 'd ago';
 }
-async function loadArtifacts() {
-  const el = $('artifacts');
-  if (!el.dataset.init) { el.dataset.init = '1'; el.innerHTML = '<div class="empty">Loading artifacts…</div>'; }
-  let d;
-  try {
-    const qs = new URLSearchParams();
-    if (_artifactFilter.kind) qs.set('kind', _artifactFilter.kind);
-    if (_artifactFilter.q) qs.set('q', _artifactFilter.q);
-    d = await (await fetch('/__proxy/api/artifacts?' + qs.toString())).json();
-  } catch { el.innerHTML = '<div class="empty">Failed to load artifacts.</div>'; return; }
-  renderArtifacts(d);
+function _artGo(level, arg) {
+  if (level === 'convs') { _artNav = { level: 'convs', conv: '', convLabel: '', path: '' }; }
+  else if (level === 'files') { if (arg) { _artNav.conv = arg; _artNav.convLabel = (_artConvCache[arg] || '').slice(0, 60); } _artNav.level = 'files'; _artNav.path = ''; }
+  else if (level === 'file') { _artNav.path = decodeURIComponent(arg); _artNav.level = 'file'; }
+  loadArtifacts();
 }
-function renderArtifacts(d) {
+function _artCrumb() {
+  const sep = ' <span style="color:#556">/</span> ';
+  const p = [`<a href="#" onclick="event.preventDefault();_artGo('convs')" style="color:#57d1e0;text-decoration:none">Conversations</a>`];
+  if (_artNav.level !== 'convs') p.push(`<a href="#" onclick="event.preventDefault();_artGo('files','${esc(_artNav.conv)}')" style="color:#57d1e0;text-decoration:none">${esc(_artNav.convLabel || _artNav.conv.slice(0, 10))}</a>`);
+  if (_artNav.level === 'file') p.push(`<span style="color:#e9edf4">${esc((_artNav.path.split(/[\\/]/).pop()) || _artNav.path)}</span>`);
+  return `<div style="font-size:12px;margin:0 0 14px">${p.join(sep)}</div>`;
+}
+async function loadArtifacts() {
+  if (_artNav.level === 'file') return renderArtFile();
+  if (_artNav.level === 'files') return renderArtFiles();
+  return renderArtConvs();
+}
+async function renderArtConvs() {
   const el = $('artifacts');
-  const kColor = { file: '#57d1e0', url: '#e0a857', image: '#b48ead', skill: '#68d391', dir: '#8b97a8' };
-  const kIcon = { file: '📄', url: '🌐', image: '🖼', skill: '🧩', dir: '📁' };
-  const kinds = ['', 'file', 'url', 'image', 'skill', 'dir'];
-  const filterBar = `<div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
-    <input id="artifact-search" placeholder="search path / url…" value="${esc(_artifactFilter.q)}"
-      oninput="_artifactFilter.q=this.value" onkeydown="if(event.key==='Enter')loadArtifacts()"
-      style="background:#10141c;border:1px solid #262d38;color:#e9edf4;border-radius:6px;padding:6px 10px;font-size:13px;min-width:220px">
-    ${kinds.map(k => `<button onclick="_artifactFilter.kind='${k}';loadArtifacts()" style="background:${_artifactFilter.kind === k ? '#1c3a44' : '#161b24'};border:1px solid ${_artifactFilter.kind === k ? '#2f8f9c' : '#262d38'};color:${_artifactFilter.kind === k ? '#57d1e0' : '#9aa4b2'};border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">${k || 'all'}</button>`).join('')}
-    <span style="margin-left:auto;color:#8b97a8;font-size:12px">${d.total} artifact${d.total === 1 ? '' : 's'}</span></div>`;
+  if (!el.dataset.init) { el.dataset.init = '1'; el.innerHTML = '<div class="empty">Loading…</div>'; }
+  let d;
+  try { d = await (await fetch('/__proxy/api/artifacts/conversations')).json(); }
+  catch { el.innerHTML = '<div class="empty">Failed to load.</div>'; return; }
+  _artConvCache = {};
+  const rows = (d.items || []).map(c => {
+    _artConvCache[c.conversation_id] = c.label || c.preview || c.conversation_id;
+    const name = c.label || c.preview || ('conversation ' + c.conversation_id.slice(0, 8));
+    const counts = [c.files ? `📄 ${c.files}` : '', c.urls ? `🌐 ${c.urls}` : '', c.images ? `🖼 ${c.images}` : ''].filter(Boolean).join('&nbsp;&nbsp;');
+    return `<div onclick="_artGo('files','${esc(c.conversation_id)}')" style="border:1px solid #262d38;border-radius:8px;padding:12px 14px;margin-bottom:6px;cursor:pointer;background:#141922">
+      <div style="display:flex;gap:12px;align-items:center">
+        <span style="flex:1;color:#e9edf4;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</span>
+        <span style="color:#9aa4b2;font-size:12px;white-space:nowrap">${counts}</span>
+        <span style="color:#667;font-size:11px;white-space:nowrap">${_artAgo(c.last_ts)}</span></div></div>`;
+  }).join('') || '<div class="empty">No conversations have touched files or URLs yet.</div>';
+  el.innerHTML = `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— by conversation</span></h2>${rows}</div>`;
+}
+async function renderArtFiles() {
+  const el = $('artifacts');
+  let d;
+  try { d = await (await fetch('/__proxy/api/artifacts?conversation=' + encodeURIComponent(_artNav.conv) + '&limit=500')).json(); }
+  catch { el.innerHTML = '<div class="empty">Failed to load.</div>'; return; }
   const rows = (d.items || []).map(it => {
-    const col = kColor[it.kind] || '#8b97a8';
+    const col = _artKColor[it.kind] || '#8b97a8';
     const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
     const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px">${it.versions} versions</span>` : '';
-    return `<div class="artifact-row" data-path="${encodeURIComponent(it.path)}" onclick="toggleArtifact(this)"
-      style="border:1px solid #262d38;border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:#141922">
+    return `<div onclick="_artGo('file','${encodeURIComponent(it.path)}')" style="border:1px solid #262d38;border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:#141922">
       <div style="display:flex;align-items:center;gap:10px">
-        <span style="font-size:15px">${kIcon[it.kind] || '•'}</span>
+        <span style="font-size:15px">${_artKIcon[it.kind] || '•'}</span>
         <code style="color:${col};font-size:12.5px;word-break:break-all;flex:1">${esc(it.path)}</code>
         <span style="color:#8b97a8;font-size:11px">${it.n}×</span></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">${ops} ${ver}
-        <span style="margin-left:auto;color:#667;font-size:11px">${_artAgo(it.last_ts)} · ${esc(it.last_op || '')}</span></div>
-      <div class="artifact-timeline" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid #262d38"></div></div>`;
-  }).join('') || '<div class="empty">No artifacts yet. Files edited and pages fetched through the proxy will appear here as traffic flows.</div>';
-  el.innerHTML = `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— files &amp; URLs touched through the proxy</span></h2>${filterBar}${rows}</div>`;
+        <span style="margin-left:auto;color:#667;font-size:11px">${_artAgo(it.last_ts)} · ${esc(it.last_op || '')}</span></div></div>`;
+  }).join('') || '<div class="empty">No files or URLs in this conversation.</div>';
+  el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}<div style="color:#8b97a8;font-size:12px;margin-bottom:10px">${d.total} artifact${d.total === 1 ? '' : 's'} touched in this conversation</div>${rows}</div>`;
 }
-async function toggleArtifact(row) {
-  const tl = row.querySelector('.artifact-timeline');
-  if (tl.style.display !== 'none') { tl.style.display = 'none'; return; }
-  tl.style.display = 'block';
-  if (tl.dataset.loaded) return;
-  tl.innerHTML = '<span style="color:#8b97a8;font-size:12px">loading…</span>';
-  const path = decodeURIComponent(row.dataset.path);
+async function renderArtFile() {
+  const el = $('artifacts');
+  el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}<div class="empty">loading timeline…</div></div>`;
   let d;
-  try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(path))).json(); }
-  catch { tl.innerHTML = '<span style="color:#e08080">failed to load timeline</span>'; return; }
-  tl.dataset.loaded = '1';
-  const ep = encodeURIComponent(path);
-  tl.innerHTML = (d.events || []).map(e => `
-    <div style="padding:4px 0;font-size:12px">
+  try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(_artNav.path) + '&conversation=' + encodeURIComponent(_artNav.conv))).json(); }
+  catch { el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}<div class="empty">failed to load</div></div>`; return; }
+  const ep = encodeURIComponent(_artNav.path);
+  const events = (d.events || []).map(e => `
+    <div style="padding:6px 0;font-size:12px;border-bottom:1px solid #1c2029">
       <div style="display:flex;align-items:center;gap:10px">
         <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
         <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
@@ -3467,7 +3482,12 @@ async function toggleArtifact(row) {
         </span>
       </div>
       <div class="art-peek" style="display:none;margin-top:6px"></div>
-    </div>`).join('') || '<span style="color:#8b97a8;font-size:12px">no events</span>';
+    </div>`).join('') || '<div class="empty">no events</div>';
+  const kind = (d.events && d.events[0]) ? d.events[0].kind : 'file';
+  el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><span style="font-size:16px">${_artKIcon[kind] || '•'}</span>
+      <code style="color:${_artKColor[kind] || '#8b97a8'};font-size:12.5px;word-break:break-all">${esc(_artNav.path)}</code></div>
+    <div style="border:1px solid #262d38;border-radius:8px;padding:6px 12px;background:#141922">${events}</div></div>`;
 }
 
 async function peekArtifact(link, reqId, encPath) {
