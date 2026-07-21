@@ -47,12 +47,6 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
-# "Buggy models" whose reasoning is broken/malformed — the proxy forces thinking OFF for these
-# (Ornith-1.0-35B never emits a closing </think>, so thinking output is verbose + un-parseable;
-# no-think is also the bench-preferred mode for coding). Comma-separated model-name substrings,
-# matched case-insensitively against the (post-routing) model name. Set to "" to disable.
-FORCE_NO_THINK_MODELS = {p.strip().lower() for p in
-                         os.environ.get("PROXY_FORCE_NO_THINK_MODELS", "ornith").split(",") if p.strip()}
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 
@@ -2051,6 +2045,77 @@ DEFAULT_RULES_CONFIG = {
 RULES_FILE = _resolve_state_path(
     "PROXY_RULES_FILE", "rules.json", Path(__file__).parent / "rules.json", "rules.json"
 )
+
+# ---- Per-model quirks -------------------------------------------------------------------------
+# Known model-specific workarounds the proxy applies automatically. Loaded from a JSON file
+# (PROXY_MODEL_QUIRKS or the state dir), merged over the baked-in defaults below, hot-reloaded on
+# file change. Each entry maps a model-name pattern to:
+#   match:    "prefix" | "substring" | "exact"      (default "substring")
+#   thinking: "force_off" | "default_off_optin" | "normal"
+#             - force_off:          always inject chat_template_kwargs.enable_thinking=false
+#             - default_off_optin:  off by default, but reasoning_effort high/medium turns it on
+#             - normal:             don't touch thinking
+#   notes:    human-readable description of the quirk (surfaced via /api/model-quirks)
+MODEL_QUIRKS_FILE = _resolve_state_path(
+    "PROXY_MODEL_QUIRKS", "model_quirks.json",
+    Path(__file__).parent / "model_quirks.json", "model_quirks.json"
+)
+DEFAULT_MODEL_QUIRKS = {
+    "ornith": {
+        "match": "prefix",
+        "thinking": "default_off_optin",
+        "reasoning_control": "chat_template_kwargs.enable_thinking",
+        "notes": ("Qwen3.5-MoE / gated-delta-net. Ignores OpenAI reasoning_effort — thinking is "
+                  "only controllable via chat_template_kwargs.enable_thinking, and the template "
+                  "defaults to ON. On vLLM, requires --reasoning-parser qwen3 to split reasoning "
+                  "into the `reasoning` field (else it bleeds into `content`). Over-reasons and can "
+                  "return empty content when thinking is on, so default OFF (bench-optimal for "
+                  "coding); reasoning_effort high/medium opts in."),
+    },
+}
+_QUIRKS_CACHE: dict = {"mtime": None, "data": None}
+
+
+def load_model_quirks() -> dict:
+    """Baked-in DEFAULT_MODEL_QUIRKS merged with the JSON file (file wins per-key). Cached on mtime
+    so an edit to the file takes effect without a restart; malformed JSON falls back to defaults."""
+    try:
+        mt = os.path.getmtime(MODEL_QUIRKS_FILE)
+    except OSError:
+        mt = None
+    if _QUIRKS_CACHE["data"] is not None and _QUIRKS_CACHE["mtime"] == mt:
+        return _QUIRKS_CACHE["data"]
+    data = {k: dict(v) for k, v in DEFAULT_MODEL_QUIRKS.items()}
+    if mt is not None:
+        try:
+            with open(MODEL_QUIRKS_FILE, encoding="utf-8") as f:
+                file_q = json.load(f)
+            if isinstance(file_q, dict):
+                for k, v in file_q.items():
+                    if isinstance(v, dict):
+                        data[k] = {**data.get(k, {}), **v}
+        except (OSError, ValueError):
+            pass
+    _QUIRKS_CACHE["mtime"] = mt
+    _QUIRKS_CACHE["data"] = data
+    return data
+
+
+def _model_quirk(model_name: str) -> dict | None:
+    """First quirk whose pattern matches the (post-routing) model name, else None."""
+    if not model_name:
+        return None
+    ml = model_name.lower()
+    for pat, q in load_model_quirks().items():
+        if not isinstance(q, dict):
+            continue
+        mode = q.get("match", "substring")
+        p = str(pat).lower()
+        if ((mode == "prefix" and ml.startswith(p))
+                or (mode == "exact" and ml == p)
+                or (mode == "substring" and p in ml)):
+            return q
+    return None
 
 
 def get_setting(key: str):
@@ -5651,6 +5716,14 @@ async def control_panic_set(request: Request):
     return {"ok": True, "panic": _PANIC_MODE}
 
 
+@app.get("/__proxy/api/model-quirks")
+async def get_model_quirks_endpoint():
+    """Effective per-model quirks (baked-in defaults merged with model_quirks.json). Edit the file
+    to override; changes hot-reload without a restart."""
+    return {"quirks": load_model_quirks(), "path": MODEL_QUIRKS_FILE,
+            "file_exists": Path(MODEL_QUIRKS_FILE).exists()}
+
+
 @app.get("/__proxy/api/control/redact-pii")
 async def control_redact_status():
     return {"redact_pii": REDACT_PII_ENABLED,
@@ -9085,22 +9158,25 @@ async def proxy(full_path: str, request: Request):
             except Exception:
                 pass
 
-    # Buggy-model thinking control. Some models have broken reasoning that the OpenAI knobs can't
-    # fix: Ornith honors thinking only via chat_template_kwargs.enable_thinking (ignores
-    # reasoning_effort), defaults to thinking-ON, and never emits a closing </think> — so its
-    # thinking is verbose and un-parseable. For any model in FORCE_NO_THINK_MODELS we force
-    # enable_thinking=false unconditionally (overriding reasoning_effort and any client-set value),
-    # which is also the bench-preferred mode for coding. Matches the post-routing model name.
+    # Per-model quirk thinking control (see DEFAULT_MODEL_QUIRKS / model_quirks.json). Some models
+    # need thinking managed via chat_template_kwargs.enable_thinking because they ignore the OpenAI
+    # reasoning_effort knob (e.g. Ornith). The quirk says whether to force thinking off, or default
+    # it off but let reasoning_effort high/medium opt in. A client that set enable_thinking itself
+    # is left untouched.
     ornith_think = None
-    _model_l = str(body_json.get("model") or "").lower() if isinstance(body_json, dict) else ""
-    if _model_l and any(pat in _model_l for pat in FORCE_NO_THINK_MODELS):
+    _qmodel = str(body_json.get("model") or "") if isinstance(body_json, dict) else ""
+    _tmode = (_model_quirk(_qmodel) or {}).get("thinking")
+    if _tmode in ("force_off", "default_off_optin"):
         ctk = body_json.get("chat_template_kwargs")
         if not isinstance(ctk, dict):
             ctk = {}
-        if ctk.get("enable_thinking") is not False:
-            ctk["enable_thinking"] = False
+        if "enable_thinking" not in ctk:
+            want = False
+            if _tmode == "default_off_optin":
+                want = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
+            ctk["enable_thinking"] = want
             body_json["chat_template_kwargs"] = ctk
-            ornith_think = False
+            ornith_think = want
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
     # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response

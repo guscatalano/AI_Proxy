@@ -1,0 +1,9 @@
+{
+  "_readme": "Per-model quirks the AI Proxy applies automatically. Each key (except _readme) is a model-name pattern matched against the post-routing model name. Fields: match = prefix|substring|exact (default substring); thinking = force_off (always disable reasoning) | default_off_optin (off unless reasoning_effort is high/medium) | normal (leave alone); notes = free text. This file is merged OVER the baked-in defaults (file wins per key) and hot-reloads on save — no restart needed. See GET /__proxy/api/model-quirks for the effective config.",
+  "ornith": {
+    "match": "prefix",
+    "thinking": "default_off_optin",
+    "reasoning_control": "chat_template_kwargs.enable_thinking",
+    "notes": "Qwen3.5-MoE / gated-delta-net. Ignores OpenAI reasoning_effort — thinking is only controllable via chat_template_kwargs.enable_thinking, and the template defaults to ON. On vLLM, requires --reasoning-parser qwen3 to split reasoning into the `reasoning` field (else it bleeds into `content`). Over-reasons and can return empty content when thinking is on with a tight max_tokens, so default OFF (bench-optimal for coding); reasoning_effort high/medium opts in."
+  }
+}
