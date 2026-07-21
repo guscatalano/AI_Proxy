@@ -1016,7 +1016,7 @@ function setView(v) {
   if (v === 'stats') loadStats();
   else if (v === 'audit') { loadAudit(); refreshAuditBadge().then(dismissAuditBadge); }
   else if (v === 'convs') loadConversations();
-  else if (v === 'artifacts') loadArtifacts();
+  else if (v === 'artifacts') { _artNav = { level: 'convs', conv: '', convLabel: '', path: '' }; loadArtifacts(); }
   else if (v === 'system') loadSystem();
   else if (v === 'setup') loadSetup();
   else if (v === 'chat') loadChat();
@@ -3408,18 +3408,22 @@ function _artAgo(ts) {
   if (s < 86400) return Math.round(s / 3600) + 'h ago';
   return Math.round(s / 86400) + 'd ago';
 }
+let _artKindFilter = '';
+let _artFilesCache = [];
 function _artGo(level, arg) {
   if (level === 'convs') { _artNav = { level: 'convs', conv: '', convLabel: '', path: '' }; }
-  else if (level === 'files') { if (arg) { _artNav.conv = arg; _artNav.convLabel = (_artConvCache[arg] || '').slice(0, 60); } _artNav.level = 'files'; _artNav.path = ''; }
+  else if (level === 'files') { if (arg) { _artNav.conv = arg; _artNav.convLabel = (_artConvCache[arg] || '').slice(0, 60); } _artNav.level = 'files'; _artNav.path = ''; _artKindFilter = ''; }
   else if (level === 'file') { _artNav.path = decodeURIComponent(arg); _artNav.level = 'file'; }
   loadArtifacts();
 }
-function _artCrumb() {
-  const sep = ' <span style="color:#556">/</span> ';
-  const p = [`<a href="#" onclick="event.preventDefault();_artGo('convs')" style="color:#57d1e0;text-decoration:none">Conversations</a>`];
-  if (_artNav.level !== 'convs') p.push(`<a href="#" onclick="event.preventDefault();_artGo('files','${esc(_artNav.conv)}')" style="color:#57d1e0;text-decoration:none">${esc(_artNav.convLabel || _artNav.conv.slice(0, 10))}</a>`);
-  if (_artNav.level === 'file') p.push(`<span style="color:#e9edf4">${esc((_artNav.path.split(/[\\/]/).pop()) || _artNav.path)}</span>`);
-  return `<div style="font-size:12px;margin:0 0 14px">${p.join(sep)}</div>`;
+function artBackFiles() { _artNav.level = 'files'; _artNav.path = ''; loadArtifacts(); }
+function _artHead(backOnclick, backLabel, titleHtml, subHtml) {
+  return `<div class="conv-detail-head">
+    <button class="conv-back" onclick="${backOnclick}">← ${esc(backLabel)}</button>
+    <div class="conv-head-main">
+      <div class="conv-head-title">${titleHtml}</div>
+      ${subHtml ? `<div class="conv-head-sub">${subHtml}</div>` : ''}
+    </div></div>`;
 }
 async function loadArtifacts() {
   if (_artNav.level === 'file') return renderArtFile();
@@ -3447,10 +3451,29 @@ async function renderArtConvs() {
 }
 async function renderArtFiles() {
   const el = $('artifacts');
+  el.innerHTML = _artHead("_artGo('convs')", "Conversations", esc(_artNav.convLabel || _artNav.conv.slice(0, 12)), 'loading…');
   let d;
   try { d = await (await fetch('/__proxy/api/artifacts?conversation=' + encodeURIComponent(_artNav.conv) + '&limit=500')).json(); }
-  catch { el.innerHTML = '<div class="empty">Failed to load.</div>'; return; }
-  const rows = (d.items || []).map(it => {
+  catch { el.innerHTML = _artHead("_artGo('convs')", "Conversations", "Artifacts", '') + '<div class="empty">Failed to load.</div>'; return; }
+  _artFilesCache = d.items || [];
+  el.scrollTop = 0;
+  _renderArtFilesList();
+}
+function _artSetKind(k) { _artKindFilter = k; _renderArtFilesList(); }
+function _renderArtFilesList() {
+  const el = $('artifacts');
+  const items = _artFilesCache;
+  const counts = {};
+  for (const it of items) counts[it.kind] = (counts[it.kind] || 0) + 1;
+  const catDefs = [['', 'All'], ['file', 'Files'], ['url', 'Webpages'], ['image', 'Images'], ['skill', 'Skills'], ['dir', 'Folders']];
+  const catBar = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px">` + catDefs.map(([k, label]) => {
+    const n = k ? (counts[k] || 0) : items.length;
+    if (k && !n) return '';
+    const on = _artKindFilter === k;
+    return `<button onclick="_artSetKind('${k}')" style="background:${on ? '#1c3a44' : '#161b24'};border:1px solid ${on ? '#2f8f9c' : '#262d38'};color:${on ? '#57d1e0' : '#9aa4b2'};border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer">${label} <span style="opacity:.55">${n}</span></button>`;
+  }).join('') + `</div>`;
+  const filtered = _artKindFilter ? items.filter(it => it.kind === _artKindFilter) : items;
+  const rows = filtered.map(it => {
     const col = _artKColor[it.kind] || '#8b97a8';
     const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
     const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px">${it.versions} versions</span>` : '';
@@ -3461,19 +3484,23 @@ async function renderArtFiles() {
         <span style="color:#8b97a8;font-size:11px">${it.n}×</span></div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">${ops} ${ver}
         <span style="margin-left:auto;color:#667;font-size:11px">${_artAgo(it.last_ts)} · ${esc(it.last_op || '')}</span></div></div>`;
-  }).join('') || '<div class="empty">No files or URLs in this conversation.</div>';
-  el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}<div style="color:#8b97a8;font-size:12px;margin-bottom:10px">${d.total} artifact${d.total === 1 ? '' : 's'} touched in this conversation</div>${rows}</div>`;
+  }).join('') || '<div class="empty">Nothing in this category.</div>';
+  const head = _artHead("_artGo('convs')", "Conversations", esc(_artNav.convLabel || _artNav.conv.slice(0, 12)),
+    `${items.length} artifact${items.length === 1 ? '' : 's'} touched`);
+  el.innerHTML = head + `<div style="padding:14px 16px">${catBar}${rows}</div>`;
 }
 async function renderArtFile() {
   const el = $('artifacts');
-  el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}<div class="empty">loading timeline…</div></div>`;
+  const backLbl = _artNav.convLabel ? (_artNav.convLabel.slice(0, 24) + (_artNav.convLabel.length > 24 ? '…' : '')) : 'Files';
+  el.innerHTML = _artHead('artBackFiles()', backLbl, 'loading…', '');
   let d;
   try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(_artNav.path) + '&conversation=' + encodeURIComponent(_artNav.conv))).json(); }
-  catch { el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}<div class="empty">failed to load</div></div>`; return; }
+  catch { el.innerHTML = _artHead('artBackFiles()', backLbl, 'Artifact', '') + '<div class="empty">failed to load</div>'; return; }
+  el.scrollTop = 0;
   const ep = encodeURIComponent(_artNav.path);
   const events = (d.events || []).map(e => `
     <div style="padding:6px 0;font-size:12px;border-bottom:1px solid #1c2029">
-      <div style="display:flex;align-items:center;gap:10px">
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
         <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
         <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
         <span style="color:#9aa4b2">${esc(e.tool || '')}</span>
@@ -3486,10 +3513,9 @@ async function renderArtFile() {
       <div class="art-peek" style="display:none;margin-top:6px"></div>
     </div>`).join('') || '<div class="empty">no events</div>';
   const kind = (d.events && d.events[0]) ? d.events[0].kind : 'file';
-  el.innerHTML = `<div style="padding:6px 4px">${_artCrumb()}
-    <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><span style="font-size:16px">${_artKIcon[kind] || '•'}</span>
-      <code style="color:${_artKColor[kind] || '#8b97a8'};font-size:12.5px;word-break:break-all">${esc(_artNav.path)}</code></div>
-    <div style="border:1px solid #262d38;border-radius:8px;padding:6px 12px;background:#141922">${events}</div></div>`;
+  const title = `<span style="font-size:15px">${_artKIcon[kind] || '•'}</span> <code style="color:${_artKColor[kind] || '#8b97a8'};word-break:break-all">${esc(_artNav.path)}</code>`;
+  el.innerHTML = _artHead('artBackFiles()', backLbl, title, `${(d.events || []).length} event${(d.events || []).length === 1 ? '' : 's'} in this conversation`)
+    + `<div style="padding:14px 16px"><div style="border:1px solid #262d38;border-radius:8px;padding:6px 12px;background:#141922">${events}</div></div>`;
 }
 
 async function peekArtifact(link, reqId, encPath) {
