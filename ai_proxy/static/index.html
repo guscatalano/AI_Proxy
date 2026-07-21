@@ -3410,9 +3410,10 @@ function _artAgo(ts) {
 }
 let _artKindFilter = '';
 let _artFilesCache = [];
+let _artFolder = null;   // folder-browser current dir (array of path segments); null = auto-root
 function _artGo(level, arg) {
   if (level === 'convs') { _artNav = { level: 'convs', conv: '', convLabel: '', path: '' }; }
-  else if (level === 'files') { if (arg) { _artNav.conv = arg; _artNav.convLabel = (_artConvCache[arg] || '').slice(0, 60); } _artNav.level = 'files'; _artNav.path = ''; _artKindFilter = ''; }
+  else if (level === 'files') { if (arg) { _artNav.conv = arg; _artNav.convLabel = (_artConvCache[arg] || '').slice(0, 60); } _artNav.level = 'files'; _artNav.path = ''; _artKindFilter = ''; _artFolder = null; }
   else if (level === 'file') { _artNav.path = decodeURIComponent(arg); _artNav.level = 'file'; }
   loadArtifacts();
 }
@@ -3474,7 +3475,48 @@ async function renderArtFiles() {
   el.scrollTop = 0;
   _renderArtFilesList();
 }
-function _artSetKind(k) { _artKindFilter = k; _renderArtFilesList(); }
+function _artSetKind(k) { _artKindFilter = k; _artFolder = null; _renderArtFilesList(); }
+function _artSegs(p) { return String(p).replace(/\\/g, '/').split('/').filter(Boolean); }
+function _artFolderGo(len) { _artFolder = _artFolder.slice(0, len); _renderArtFilesList(); }
+function _artFolderInto(encName) { _artFolder = _artFolder.concat([decodeURIComponent(encName)]); _renderArtFilesList(); }
+function _renderArtFolder() {
+  const files = _artFilesCache.filter(it => it.kind === 'file');
+  if (!files.length) return '<div class="empty">No files in this conversation.</div>';
+  // Deepest common directory across all paths, so we skip the shared C:\Users\… prefix.
+  let common = _artSegs(files[0].path).slice(0, -1);
+  for (const f of files) {
+    const segs = _artSegs(f.path).slice(0, -1);
+    let i = 0; while (i < common.length && i < segs.length && common[i] === segs[i]) i++;
+    common = common.slice(0, i);
+  }
+  if (_artFolder === null || _artFolder.length < common.length) _artFolder = common.slice();
+  const cur = _artFolder;
+  const subs = {}; const here = [];
+  for (const it of files) {
+    const segs = _artSegs(it.path);
+    if (!cur.every((s, i) => segs[i] === s)) continue;
+    const rest = segs.slice(cur.length);
+    if (rest.length === 1) here.push({ it, name: rest[0] });
+    else if (rest.length > 1) subs[rest[0]] = (subs[rest[0]] || 0) + 1;
+  }
+  const rootName = common.length ? common[common.length - 1] : '/';
+  const crumb = [`<a href="#" onclick="event.preventDefault();_artFolderGo(${common.length})" style="color:#57d1e0;text-decoration:none">${esc(rootName)}</a>`];
+  for (let i = common.length; i < cur.length; i++)
+    crumb.push(`<a href="#" onclick="event.preventDefault();_artFolderGo(${i + 1})" style="color:#57d1e0;text-decoration:none">${esc(cur[i])}</a>`);
+  const crumbHtml = `<div style="font-family:ui-monospace,monospace;font-size:12px;margin-bottom:12px;color:#9aa4b2">📂 ${crumb.join(' <span style="color:#556">/</span> ')}</div>`;
+  const folderRows = Object.keys(subs).sort((a, b) => a.localeCompare(b)).map(name => `
+    <div onclick="_artFolderInto('${encodeURIComponent(name)}')" style="border:1px solid #262d38;border-radius:8px;padding:9px 12px;margin-bottom:5px;cursor:pointer;background:#141922;display:flex;gap:10px;align-items:center">
+      <span style="font-size:15px">📁</span><span style="color:#e9edf4;font-size:12.5px;flex:1;word-break:break-all">${esc(name)}</span>
+      <span style="color:#8b97a8;font-size:11px">${subs[name]} item${subs[name] === 1 ? '' : 's'}</span></div>`).join('');
+  const fileRows = here.sort((a, b) => a.name.localeCompare(b.name)).map(({ it, name }) => {
+    const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
+    const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px;margin-left:4px">${it.versions} ver</span>` : '';
+    return `<div onclick="_artGo('file','${encodeURIComponent(it.path)}')" style="border:1px solid #262d38;border-radius:8px;padding:9px 12px;margin-bottom:5px;cursor:pointer;background:#141922;display:flex;gap:10px;align-items:center">
+      <span style="font-size:15px">📄</span><code style="color:#57d1e0;font-size:12.5px;flex:1;word-break:break-all">${esc(name)}</code>
+      ${ops}${ver}<span style="color:#8b97a8;font-size:11px;margin-left:4px">${it.n}×</span></div>`;
+  }).join('');
+  return crumbHtml + folderRows + fileRows + ((folderRows || fileRows) ? '' : '<div class="empty">empty folder</div>');
+}
 function _renderArtFilesList() {
   const el = $('artifacts');
   const items = _artFilesCache;
@@ -3487,22 +3529,27 @@ function _renderArtFilesList() {
     const on = _artKindFilter === k;
     return `<button onclick="_artSetKind('${k}')" style="background:${on ? '#1c3a44' : '#161b24'};border:1px solid ${on ? '#2f8f9c' : '#262d38'};color:${on ? '#57d1e0' : '#9aa4b2'};border-radius:6px;padding:5px 11px;font-size:12px;cursor:pointer">${label} <span style="opacity:.55">${n}</span></button>`;
   }).join('') + `</div>`;
-  const filtered = _artKindFilter ? items.filter(it => it.kind === _artKindFilter) : items;
-  const rows = filtered.map(it => {
-    const col = _artKColor[it.kind] || '#8b97a8';
-    const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
-    const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px">${it.versions} versions</span>` : '';
-    return `<div onclick="_artGo('file','${encodeURIComponent(it.path)}')" style="border:1px solid #262d38;border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:#141922">
-      <div style="display:flex;align-items:center;gap:10px">
-        <span style="font-size:15px">${_artKIcon[it.kind] || '•'}</span>
-        <code style="color:${col};font-size:12.5px;word-break:break-all;flex:1">${esc(it.path)}</code>
-        <span style="color:#8b97a8;font-size:11px">${it.n}×</span></div>
-      <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">${ops} ${ver}
-        <span style="margin-left:auto;color:#667;font-size:11px">${_artAgo(it.last_ts)} · ${esc(it.last_op || '')}</span></div></div>`;
-  }).join('') || '<div class="empty">Nothing in this category.</div>';
+  let body;
+  if (_artKindFilter === 'file') {
+    body = _renderArtFolder();
+  } else {
+    const filtered = _artKindFilter ? items.filter(it => it.kind === _artKindFilter) : items;
+    body = filtered.map(it => {
+      const col = _artKColor[it.kind] || '#8b97a8';
+      const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
+      const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px">${it.versions} versions</span>` : '';
+      return `<div onclick="_artGo('file','${encodeURIComponent(it.path)}')" style="border:1px solid #262d38;border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:#141922">
+        <div style="display:flex;align-items:center;gap:10px">
+          <span style="font-size:15px">${_artKIcon[it.kind] || '•'}</span>
+          <code style="color:${col};font-size:12.5px;word-break:break-all;flex:1">${esc(it.path)}</code>
+          <span style="color:#8b97a8;font-size:11px">${it.n}×</span></div>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">${ops} ${ver}
+          <span style="margin-left:auto;color:#667;font-size:11px">${_artAgo(it.last_ts)} · ${esc(it.last_op || '')}</span></div></div>`;
+    }).join('') || '<div class="empty">Nothing in this category.</div>';
+  }
   const head = _artHead("_artGo('convs')", "Conversations", esc(_artNav.convLabel || _artNav.conv.slice(0, 12)),
     `${items.length} artifact${items.length === 1 ? '' : 's'} touched`);
-  el.innerHTML = head + `<div style="padding:14px 16px">${catBar}${rows}</div>`;
+  el.innerHTML = head + `<div style="padding:14px 16px">${catBar}${body}</div>`;
 }
 async function renderArtFile() {
   const el = $('artifacts');
