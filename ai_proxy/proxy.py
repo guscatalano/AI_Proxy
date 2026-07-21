@@ -3554,8 +3554,9 @@ def _conversation_tool_history(conv_id: str, exclude_req_id: str | None) -> tupl
 # ---- Context compressor: deterministic squeeze of bulky tool outputs in the history ----
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 # Rolling in-memory savings tally (live + shadow), surfaced at /__proxy/api/compress-stats.
-_COMPRESS_STATS = {"live": {"reqs": 0, "orig": 0, "saved": 0},
-                   "shadow": {"reqs": 0, "orig": 0, "saved": 0}}
+# by_tool maps tool name -> {saved, n} so the Stats page can show which outputs are the bloat.
+_COMPRESS_STATS = {"live": {"reqs": 0, "orig": 0, "saved": 0, "by_tool": {}},
+                   "shadow": {"reqs": 0, "orig": 0, "saved": 0, "by_tool": {}}}
 
 def _squeeze_text(text, tool_max, json_min):
     """Shrink one bulky tool-output string deterministically. Returns (new_text, saved_chars).
@@ -3607,13 +3608,30 @@ def evaluate_context_compressor(body, ctx) -> dict | None:
     if int(cfg.get("prompt_chars_gt") or 0) and total_orig < int(cfg.get("prompt_chars_gt")):
         return None
 
+    # Map tool_call_id / tool_use_id -> tool name from assistant turns, so savings can be
+    # attributed to the tool that produced the bloated output.
+    tcnames: dict = {}
+    for m in msgs:
+        if not (isinstance(m, dict) and m.get("role") == "assistant"):
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if isinstance(tc, dict) and tc.get("id") and (tc.get("function") or {}).get("name"):
+                tcnames[tc["id"]] = tc["function"]["name"]
+        if isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id") and blk.get("name"):
+                    tcnames[blk["id"]] = blk["name"]
+
     saved_total = 0
     n = 0
-    def _sq(s):
+    by_tool: dict = {}
+    def _sq(s, name="?"):
         nonlocal saved_total, n
         new, saved = _squeeze_text(s, tool_max, json_min)
         if saved >= min_saved:
             saved_total += saved; n += 1
+            bt = by_tool.setdefault(name or "?", {"saved": 0, "n": 0})
+            bt["saved"] += saved; bt["n"] += 1
             return new, True
         return s, False
 
@@ -3622,22 +3640,24 @@ def evaluate_context_compressor(body, ctx) -> dict | None:
             continue
         content = m.get("content")
         if m.get("role") == "tool" and isinstance(content, str):
-            new, changed = _sq(content)
+            tname = m.get("name") or tcnames.get(m.get("tool_call_id")) or "?"
+            new, changed = _sq(content, tname)
             if changed and mode == "live":
                 m["content"] = new
         elif isinstance(content, list):  # Anthropic tool_result blocks ride in user messages
             for blk in content:
                 if not (isinstance(blk, dict) and blk.get("type") == "tool_result"):
                     continue
+                tname = tcnames.get(blk.get("tool_use_id")) or "?"
                 c = blk.get("content")
                 if isinstance(c, str):
-                    new, changed = _sq(c)
+                    new, changed = _sq(c, tname)
                     if changed and mode == "live":
                         blk["content"] = new
                 elif isinstance(c, list):
                     for sub in c:
                         if isinstance(sub, dict) and isinstance(sub.get("text"), str):
-                            new, changed = _sq(sub["text"])
+                            new, changed = _sq(sub["text"], tname)
                             if changed and mode == "live":
                                 sub["text"] = new
 
@@ -3645,6 +3665,9 @@ def evaluate_context_compressor(body, ctx) -> dict | None:
         return None
     st = _COMPRESS_STATS[mode]
     st["reqs"] += 1; st["orig"] += total_orig; st["saved"] += saved_total
+    for name, bt in by_tool.items():
+        agg = st["by_tool"].setdefault(name, {"saved": 0, "n": 0})
+        agg["saved"] += bt["saved"]; agg["n"] += bt["n"]
     return {
         "action": "compress" if mode == "live" else "measure",
         "mode": mode, "orig_chars": total_orig, "saved_chars": saved_total,
@@ -3948,17 +3971,23 @@ async def whoami(request: Request):
 async def compress_stats():
     """Rolling context-compressor savings (since last restart), for the Stats readout."""
     def _s(d):
+        tools = sorted(
+            ({"name": k, "saved_chars": v["saved"], "n": v["n"]} for k, v in (d.get("by_tool") or {}).items()),
+            key=lambda t: t["saved_chars"], reverse=True)[:12]
         return {"reqs": d["reqs"], "orig_chars": d["orig"], "saved_chars": d["saved"],
-                "pct": round(100.0 * d["saved"] / d["orig"], 1) if d["orig"] else 0.0}
+                "pct": round(100.0 * d["saved"] / d["orig"], 1) if d["orig"] else 0.0,
+                "by_tool": tools}
     cc = (load_rules_config().get("context_compressor") or {})
     return {"live": _s(_COMPRESS_STATS["live"]), "shadow": _s(_COMPRESS_STATS["shadow"]),
-            "enabled": bool(cc.get("enabled")), "mode": (cc.get("mode") or "shadow")}
+            "enabled": bool(cc.get("enabled")), "mode": (cc.get("mode") or "shadow"),
+            "config": {k: cc.get(k) for k in ("tool_output_max_chars", "json_min_chars",
+                       "min_saved_chars", "from_model_prefix", "client_app", "prompt_chars_gt")}}
 
 
 @app.delete("/__proxy/api/compress-stats")
 async def compress_stats_reset():
     for k in _COMPRESS_STATS:
-        _COMPRESS_STATS[k] = {"reqs": 0, "orig": 0, "saved": 0}
+        _COMPRESS_STATS[k] = {"reqs": 0, "orig": 0, "saved": 0, "by_tool": {}}
     return {"ok": True}
 
 

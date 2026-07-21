@@ -3008,26 +3008,54 @@ async function loadStats() {
   const tabBar = tabs.map(([id, label]) => `<button data-stab="${id}" onclick="setStatsTab('${id}')">${label}</button>`).join('');
   const tabPanes = tabs.map(([id, , html]) => `<div class="s2-pane" data-stab="${id}">${html}</div>`).join('');
 
-  // Context-compressor savings readout (only when enabled or it has measured something).
+  // Context-compressor panel (shown when enabled or it has measured something in shadow).
   let compHtml = '';
-  if (compData) {
-    const s = compData.mode === 'live' ? compData.live : compData.shadow;
-    const other = compData.mode === 'live' ? compData.shadow : compData.live;
-    const active = compData.enabled && (s.reqs || 0) > 0;
-    const shadowSeen = (compData.shadow.reqs || 0) > 0;
-    if (compData.enabled || shadowSeen) {
-      const kb = c => (c / 1024).toFixed(c >= 1024 * 100 ? 0 : 1) + ' KB';
-      const badge = compData.enabled
-        ? `<span class="cc-mode ${compData.mode}">${compData.mode}</span>`
-        : `<span class="cc-mode off">off</span>`;
-      const line = active
-        ? `saved <b>${kb(s.saved_chars)}</b> of <b>${kb(s.orig_chars)}</b> (<b>${s.pct}%</b>) across ${num(s.reqs)} request${s.reqs === 1 ? '' : 's'}`
-        : (shadowSeen
-            ? `shadow measured <b>${compData.shadow.pct}%</b> potential savings across ${num(compData.shadow.reqs)} request${compData.shadow.reqs === 1 ? '' : 's'} — flip <code>mode: "live"</code> to apply`
-            : `enabled, no compressible traffic yet`);
-      compHtml = `<div class="cc-card"><span class="cc-t">Context compressor ${badge}</span><span class="cc-line">${line}</span>
-        <a href="#" class="cc-reset" onclick="event.preventDefault();fetch('/__proxy/api/compress-stats',{method:'DELETE'}).then(()=>loadStats())">reset</a></div>`;
-    }
+  if (compData && (compData.enabled || (compData.shadow.reqs || 0) > 0)) {
+    const kb = c => (c / 1024).toFixed(c >= 1024 * 100 ? 0 : 1) + ' KB';
+    const sh = compData.shadow, lv = compData.live, cfg = compData.config || {};
+    const modeBadge = compData.enabled
+      ? `<span class="cc-mode ${compData.mode}">${compData.mode}</span>`
+      : `<span class="cc-mode off">disabled</span>`;
+    const statCard = (title, s, on) => `
+      <div style="flex:1;min-width:158px;background:var(--panel-2,#10141c);border:1px solid ${on ? 'var(--accent-deep,#2f8f9c)' : 'var(--border,#262d38)'};border-radius:10px;padding:12px 14px">
+        <div style="font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#8b97a8">${title}${on ? ' · active' : ''}</div>
+        <div style="font-family:ui-monospace,monospace;font-size:24px;font-weight:600;color:${on ? 'var(--accent,#57d1e0)' : '#e9edf4'};margin-top:3px">${s.pct}%</div>
+        <div style="font-size:12px;color:#c9d3e1;margin-top:2px">${kb(s.saved_chars)} saved of ${kb(s.orig_chars)}</div>
+        <div style="font-size:11px;color:#8b97a8">${num(s.reqs)} request${s.reqs === 1 ? '' : 's'} compressed</div>
+      </div>`;
+    const tools = ((compData.mode === 'live' ? lv.by_tool : sh.by_tool) || []);
+    const toolRows = tools.length
+      ? tools.map(t => `<tr><td style="padding:3px 0"><code>${esc(t.name)}</code></td><td class="num" style="text-align:right">${kb(t.saved_chars)}</td><td class="num" style="text-align:right;color:#8b97a8">${num(t.n)}×</td></tr>`).join('')
+      : `<tr><td colspan="3" style="color:#8b97a8;padding:6px 0">no compressible tool output seen yet</td></tr>`;
+    const cfgChips = [
+      ['tool cap', (cfg.tool_output_max_chars || 0) + 'c'], ['json min', (cfg.json_min_chars || 0) + 'c'],
+      ['min saved', (cfg.min_saved_chars || 0) + 'c'],
+      cfg.from_model_prefix ? ['model~', cfg.from_model_prefix] : null,
+      cfg.client_app ? ['client', cfg.client_app] : null,
+      (cfg.prompt_chars_gt > 0) ? ['prompt>', cfg.prompt_chars_gt + 'c'] : null,
+    ].filter(Boolean).map(([k, v]) => `<span style="font-family:ui-monospace,monospace;font-size:11px;background:var(--panel-2,#10141c);border:1px solid var(--border,#262d38);border-radius:4px;padding:1px 7px"><span style="color:#8b97a8">${k}</span> ${esc(String(v))}</span>`).join(' ');
+    const hint = !compData.enabled
+      ? 'Disabled — enable it in Rules to start measuring.'
+      : (compData.mode === 'shadow'
+          ? (sh.reqs > 0 ? `Shadow mode (measure-only). Flip <code>mode: "live"</code> in Rules to actually apply this ~${sh.pct}% saving to forwarded requests.` : 'Shadow mode on — waiting for compressible tool traffic.')
+          : 'Live — compressing forwarded requests in place.');
+    compHtml = `
+    <div style="background:var(--panel,#141922);border:1px solid var(--border,#262d38);border-radius:12px;padding:16px 18px;margin:14px 0">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px">
+        <span style="font-weight:600">Context Compressor</span> ${modeBadge}
+        <a href="#" style="margin-left:auto;font-size:11px;color:#8b97a8" onclick="event.preventDefault();fetch('/__proxy/api/compress-stats',{method:'DELETE'}).then(()=>loadStats())">reset</a>
+      </div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap">
+        ${statCard('Shadow · potential', sh, compData.mode === 'shadow' && compData.enabled)}
+        ${statCard('Live · applied', lv, compData.mode === 'live' && compData.enabled)}
+      </div>
+      <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:6px">${cfgChips}</div>
+      <div style="margin-top:14px">
+        <div style="font-family:ui-monospace,monospace;font-size:10px;letter-spacing:.08em;text-transform:uppercase;color:#8b97a8;margin-bottom:4px">Top compressed tools · ${compData.mode}</div>
+        <table style="width:100%;font-size:12.5px"><tbody>${toolRows}</tbody></table>
+      </div>
+      <div style="margin-top:12px;font-size:12.5px;color:#c9d3e1">${hint}</div>
+    </div>`;
   }
 
   $('stats').innerHTML = `
