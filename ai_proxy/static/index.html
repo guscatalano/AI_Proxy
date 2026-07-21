@@ -3482,32 +3482,47 @@ function _artFolderInto(encName) { _artFolder = _artFolder.concat([decodeURIComp
 function _renderArtFolder() {
   const files = _artFilesCache.filter(it => it.kind === 'file');
   if (!files.length) return '<div class="empty">No files in this conversation.</div>';
-  // Deepest common directory across all paths, so we skip the shared C:\Users\… prefix.
-  let common = _artSegs(files[0].path).slice(0, -1);
-  for (const f of files) {
-    const segs = _artSegs(f.path).slice(0, -1);
+  // Windows paths (drive-letter) are case-insensitive: group by a lowercased KEY, but display the
+  // first-seen casing (drive letter uppercased). Unix paths stay case-sensitive.
+  const win = /^[A-Za-z]:$/.test(_artSegs(files[0].path)[0] || '');
+  const recs = files.map(it => {
+    const raw = _artSegs(it.path);
+    const disp = raw.slice();
+    if (win && disp.length && /^[a-zA-Z]:$/.test(disp[0])) disp[0] = disp[0].toUpperCase();
+    return { it, key: win ? raw.map(s => s.toLowerCase()) : raw, disp };
+  });
+  // Deepest common directory (on the normalized key), so we skip the shared C:\Users\… prefix.
+  let common = recs[0].key.slice(0, -1);
+  for (const r of recs) {
+    const segs = r.key.slice(0, -1);
     let i = 0; while (i < common.length && i < segs.length && common[i] === segs[i]) i++;
     common = common.slice(0, i);
   }
   if (_artFolder === null || _artFolder.length < common.length) _artFolder = common.slice();
-  const cur = _artFolder;
-  const subs = {}; const here = [];
-  for (const it of files) {
-    const segs = _artSegs(it.path);
-    if (!cur.every((s, i) => segs[i] === s)) continue;
-    const rest = segs.slice(cur.length);
-    if (rest.length === 1) here.push({ it, name: rest[0] });
-    else if (rest.length > 1) subs[rest[0]] = (subs[rest[0]] || 0) + 1;
+  const cur = _artFolder;   // normalized key segments
+  const subs = {};          // keySeg -> { count, disp }
+  const here = [];
+  let dispCur = [];
+  for (const r of recs) {
+    if (!cur.every((s, i) => r.key[i] === s)) continue;
+    if (!dispCur.length) dispCur = r.disp.slice(0, cur.length);   // display names for the current path
+    const rest = r.key.slice(cur.length), restDisp = r.disp.slice(cur.length);
+    if (rest.length === 1) here.push({ it: r.it, name: restDisp[0] });
+    else if (rest.length > 1) {
+      const k = rest[0];
+      if (!subs[k]) subs[k] = { count: 0, disp: restDisp[0] };
+      subs[k].count++;
+    }
   }
-  const rootName = common.length ? common[common.length - 1] : '/';
+  const rootName = common.length ? (dispCur[common.length - 1] || cur[common.length - 1]) : '/';
   const crumb = [`<a href="#" onclick="event.preventDefault();_artFolderGo(${common.length})" style="color:#57d1e0;text-decoration:none">${esc(rootName)}</a>`];
   for (let i = common.length; i < cur.length; i++)
-    crumb.push(`<a href="#" onclick="event.preventDefault();_artFolderGo(${i + 1})" style="color:#57d1e0;text-decoration:none">${esc(cur[i])}</a>`);
+    crumb.push(`<a href="#" onclick="event.preventDefault();_artFolderGo(${i + 1})" style="color:#57d1e0;text-decoration:none">${esc(dispCur[i] || cur[i])}</a>`);
   const crumbHtml = `<div style="font-family:ui-monospace,monospace;font-size:12px;margin-bottom:12px;color:#9aa4b2">📂 ${crumb.join(' <span style="color:#556">/</span> ')}</div>`;
-  const folderRows = Object.keys(subs).sort((a, b) => a.localeCompare(b)).map(name => `
-    <div onclick="_artFolderInto('${encodeURIComponent(name)}')" style="border:1px solid #262d38;border-radius:8px;padding:9px 12px;margin-bottom:5px;cursor:pointer;background:#141922;display:flex;gap:10px;align-items:center">
-      <span style="font-size:15px">📁</span><span style="color:#e9edf4;font-size:12.5px;flex:1;word-break:break-all">${esc(name)}</span>
-      <span style="color:#8b97a8;font-size:11px">${subs[name]} item${subs[name] === 1 ? '' : 's'}</span></div>`).join('');
+  const folderRows = Object.keys(subs).sort((a, b) => subs[a].disp.localeCompare(subs[b].disp)).map(k => `
+    <div onclick="_artFolderInto('${encodeURIComponent(k)}')" style="border:1px solid #262d38;border-radius:8px;padding:9px 12px;margin-bottom:5px;cursor:pointer;background:#141922;display:flex;gap:10px;align-items:center">
+      <span style="font-size:15px">📁</span><span style="color:#e9edf4;font-size:12.5px;flex:1;word-break:break-all">${esc(subs[k].disp)}</span>
+      <span style="color:#8b97a8;font-size:11px;white-space:nowrap">${subs[k].count} file${subs[k].count === 1 ? '' : 's'}</span></div>`).join('');
   const fileRows = here.sort((a, b) => a.name.localeCompare(b.name)).map(({ it, name }) => {
     const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
     const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px;margin-left:4px">${it.versions} ver</span>` : '';
