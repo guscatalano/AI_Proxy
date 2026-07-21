@@ -5965,28 +5965,40 @@ async def list_artifacts(request: Request, kind: str = "", q: str = "", conversa
         where.append("conversation_id = ?"); params.append(conversation)
     if q:
         where.append("path LIKE ?"); params.append("%" + q + "%")
+    lim = max(1, min(2000, limit))
     conn = db()
-    rows = conn.execute(
-        f"""SELECT path, kind,
-                   COUNT(*) n, MAX(ts) last_ts, MIN(ts) first_ts,
-                   GROUP_CONCAT(DISTINCT op) ops,
-                   COUNT(DISTINCT content_hash) versions,
-                   (SELECT op FROM artifacts x WHERE x.path=a.path ORDER BY ts DESC LIMIT 1) last_op,
-                   (SELECT request_id FROM artifacts x WHERE x.path=a.path ORDER BY ts DESC LIMIT 1) last_request,
-                   (SELECT client_ip FROM artifacts x WHERE x.path=a.path ORDER BY ts DESC LIMIT 1) client_ip
-            FROM artifacts a WHERE {' AND '.join(where)}
+    # 1) Aggregates per path — plain GROUP BY on the indexed `path`, no correlated subqueries
+    #    (those were O(paths x rows) and got slow as the table grew).
+    agg = conn.execute(
+        f"""SELECT path, kind, COUNT(*) n, MIN(ts) first_ts, MAX(ts) last_ts,
+                   GROUP_CONCAT(DISTINCT op) ops, COUNT(DISTINCT content_hash) versions
+            FROM artifacts WHERE {' AND '.join(where)}
             GROUP BY path, kind ORDER BY last_ts DESC LIMIT ?""",
-        (*params, max(1, min(2000, limit)))).fetchall()
+        (*params, lim)).fetchall()
+    # 2) Latest-event fields (op / request / client_ip) for just those paths, via one windowed pass.
+    paths = [r["path"] for r in agg]
+    last: dict = {}
+    if paths:
+        ph = ",".join("?" for _ in paths)
+        for r in conn.execute(
+                f"""SELECT path, last_op, last_request, client_ip FROM (
+                      SELECT path, op AS last_op, request_id AS last_request, client_ip,
+                             ROW_NUMBER() OVER (PARTITION BY path ORDER BY ts DESC) rn
+                      FROM artifacts WHERE path IN ({ph})
+                    ) WHERE rn = 1""", paths).fetchall():
+            last[r["path"]] = r
     conn.close()
     items = []
-    for r in rows:
-        if not _can_view_pii(viewer, r["client_ip"]):
+    for r in agg:
+        lr = last.get(r["path"])
+        if not _can_view_pii(viewer, lr["client_ip"] if lr else None):
             continue
         items.append({
             "path": r["path"], "kind": r["kind"], "n": r["n"],
             "ops": [o for o in (r["ops"] or "").split(",") if o],
             "versions": r["versions"], "first_ts": r["first_ts"], "last_ts": r["last_ts"],
-            "last_op": r["last_op"], "last_request": r["last_request"],
+            "last_op": lr["last_op"] if lr else None,
+            "last_request": lr["last_request"] if lr else None,
         })
     return {"items": items, "total": len(items)}
 
@@ -6006,6 +6018,80 @@ async def artifact_timeline(request: Request, path: str):
                "content_hash": r["content_hash"], "kind": r["kind"]}
               for r in rows if _can_view_pii(viewer, r["client_ip"])]
     return {"path": path, "events": events}
+
+
+@app.get("/__proxy/api/artifacts/content")
+async def artifact_content(request: Request, request_id: str, path: str):
+    """The content of one artifact, extracted inline from its request blob — file contents for a
+    write/edit (from the tool-call args), or the returned text for a read/fetch (from the matching
+    tool result). Lets the Artifacts view show content without jumping to the requests page."""
+    conn = db()
+    row = conn.execute("SELECT client_ip, request_body FROM requests_v WHERE id = ?", (request_id,)).fetchone()
+    conn.close()
+    if not row:
+        return JSONResponse({"error": "request not found"}, status_code=404)
+    if not _can_view_pii(_client_ip(request), row["client_ip"]):
+        return JSONResponse({"error": "forbidden"}, status_code=403)
+    try:
+        body = json.loads(row["request_body"] or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return {"content": None}
+    tmap = _artifact_tool_map()
+    tcid_to_path: dict = {}      # tool_call_id -> path, so read/fetch RESULTS can be matched back
+    written = None               # content from a write/edit call (path is in the args)
+
+    def _args(a):
+        if isinstance(a, str):
+            try:
+                return json.loads(a)
+            except (json.JSONDecodeError, ValueError):
+                return {}
+        return a if isinstance(a, dict) else {}
+
+    for m in (body.get("messages") or []):
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            a = _args(fn.get("arguments"))
+            spec = tmap.get(str(fn.get("name") or "").lower())
+            if spec:
+                _, _, path_arg, content_arg = spec
+                if a.get(path_arg) == path:
+                    if tc.get("id"):
+                        tcid_to_path[tc["id"]] = path
+                    if written is None and content_arg and isinstance(a.get(content_arg), str):
+                        written = a[content_arg]
+        if isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                    spec = tmap.get(str(blk.get("name") or "").lower())
+                    a = blk.get("input") or {}
+                    if spec and isinstance(a, dict):
+                        _, _, path_arg, content_arg = spec
+                        if a.get(path_arg) == path:
+                            if blk.get("id"):
+                                tcid_to_path[blk["id"]] = path
+                            if written is None and content_arg and isinstance(a.get(content_arg), str):
+                                written = a[content_arg]
+    if written is not None:
+        return {"content": written[:200000], "source": "write", "truncated": len(written) > 200000}
+    # Else look for the tool RESULT of a read/fetch of this path.
+    for m in (body.get("messages") or []):
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool" and m.get("tool_call_id") in tcid_to_path and isinstance(m.get("content"), str):
+            c = m["content"]
+            return {"content": c[:200000], "source": "result", "truncated": len(c) > 200000}
+        if isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict) and blk.get("type") == "tool_result" and blk.get("tool_use_id") in tcid_to_path:
+                    inner = blk.get("content")
+                    if isinstance(inner, list):
+                        inner = "\n".join(p.get("text", "") for p in inner if isinstance(p, dict) and p.get("text"))
+                    if isinstance(inner, str):
+                        return {"content": inner[:200000], "source": "result", "truncated": len(inner) > 200000}
+    return {"content": None, "source": None}
 
 
 @app.get("/__proxy/api/model-quirks")

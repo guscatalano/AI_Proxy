@@ -3453,14 +3453,37 @@ async function toggleArtifact(row) {
   try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(path))).json(); }
   catch { tl.innerHTML = '<span style="color:#e08080">failed to load timeline</span>'; return; }
   tl.dataset.loaded = '1';
+  const ep = encodeURIComponent(path);
   tl.innerHTML = (d.events || []).map(e => `
-    <div style="display:flex;align-items:center;gap:10px;padding:4px 0;font-size:12px">
-      <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
-      <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
-      <span style="color:#9aa4b2">${esc(e.tool || '')}</span>
-      ${e.size ? `<span style="color:#667">${(e.size / 1024).toFixed(1)}KB</span>` : ''}
-      ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(e.request_id)}')" style="margin-left:auto;color:#57d1e0;font-size:11px">open request →</a>` : ''}
+    <div style="padding:4px 0;font-size:12px">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
+        <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
+        <span style="color:#9aa4b2">${esc(e.tool || '')}</span>
+        ${e.size ? `<span style="color:#667">${(e.size / 1024).toFixed(1)}KB</span>` : ''}
+        <span style="margin-left:auto;display:flex;gap:12px">
+          ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();peekArtifact(this,'${esc(e.request_id)}','${ep}')" style="color:#57d1e0;font-size:11px">view content</a>` : ''}
+          ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(e.request_id)}')" style="color:#8b97a8;font-size:11px" title="open the full request">request&nbsp;&rarr;</a>` : ''}
+        </span>
+      </div>
+      <div class="art-peek" style="display:none;margin-top:6px"></div>
     </div>`).join('') || '<span style="color:#8b97a8;font-size:12px">no events</span>';
+}
+
+async function peekArtifact(link, reqId, encPath) {
+  const rowDiv = link.closest('div[style*="padding:4px"]');
+  const peek = rowDiv && rowDiv.querySelector('.art-peek');
+  if (!peek) return;
+  if (peek.style.display !== 'none') { peek.style.display = 'none'; return; }
+  peek.style.display = 'block';
+  peek.innerHTML = '<span style="color:#8b97a8;font-size:11px">loading…</span>';
+  let d;
+  try { d = await (await fetch(`/__proxy/api/artifacts/content?request_id=${encodeURIComponent(reqId)}&path=${encPath}`)).json(); }
+  catch { peek.innerHTML = '<span style="color:#e08080;font-size:11px">failed</span>'; return; }
+  if (d.content == null) { peek.innerHTML = '<span style="color:#8b97a8;font-size:11px">content not in this request (rotated out) — use request&nbsp;&rarr;</span>'; return; }
+  const tag = d.source === 'write' ? 'written content' : 'fetched/returned content';
+  peek.innerHTML = `<div style="color:#667;font-size:10px;margin-bottom:3px">${tag}${d.truncated ? ' · truncated' : ''}</div>`
+    + `<pre style="max-height:340px;overflow:auto;background:#0c0f15;border:1px solid #262d38;border-radius:6px;padding:10px;font-size:11.5px;white-space:pre-wrap;color:#c9d3e1">${esc(d.content)}</pre>`;
 }
 
 async function loadConversations() {
