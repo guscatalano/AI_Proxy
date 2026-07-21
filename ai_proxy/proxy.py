@@ -373,6 +373,25 @@ CREATE TABLE IF NOT EXISTS proxy_tasks (
     enabled INTEGER NOT NULL DEFAULT 1, -- recurring tasks: 0 to pause without deleting
     creator_ip TEXT                     -- caller IP at create time, for subnet-scoped visibility
 );
+
+-- Artifact tracking: one row per distinct file/url/image touch extracted from tool calls in the
+-- traffic. Metadata only (no content) — the `sig` dedups the same action re-appearing across a
+-- conversation's resent history, and `request_id` links back to the request that shows the content.
+CREATE TABLE IF NOT EXISTS artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sig TEXT UNIQUE,                    -- sha256(conv + tool + op + path + content_hash): dedup key
+    ts REAL NOT NULL,
+    request_id TEXT,                    -- the request this was first seen in (for the content view)
+    conversation_id TEXT,
+    client_ip TEXT,                     -- originator, for PII/subnet gating
+    kind TEXT,                          -- file | url | image | skill | dir
+    op TEXT,                            -- read | write | edit | create | fetch | search | list | vision
+    path TEXT,                          -- file path or URL (indexed)
+    tool_name TEXT,
+    size_bytes INTEGER,                 -- of the content arg, if any
+    content_hash TEXT,                  -- sha256(content) prefix, if the tool carried content
+    meta_json TEXT
+);
 """
 
 SCHEMA_INDEXES = """
@@ -385,6 +404,9 @@ CREATE INDEX IF NOT EXISTS idx_metrics_ts ON system_metrics(ts DESC);
 CREATE INDEX IF NOT EXISTS idx_tasks_status ON proxy_tasks(status, created_ts);
 CREATE INDEX IF NOT EXISTS idx_tasks_schedule ON proxy_tasks(schedule, enabled, next_run_ts) WHERE schedule IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_tasks_parent ON proxy_tasks(parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_artifacts_path ON artifacts(path, ts);
+CREATE INDEX IF NOT EXISTS idx_artifacts_conv ON artifacts(conversation_id, ts);
+CREATE INDEX IF NOT EXISTS idx_artifacts_ts ON artifacts(ts DESC);
 """
 
 MIGRATIONS = [
@@ -1752,6 +1774,12 @@ async def _collect_once(app: FastAPI):
         conn.execute("DELETE FROM requests WHERE ts < ?", (ts - REQUEST_RETENTION_DAYS * 86400,))
     conn.commit()
     conn.close()
+    # Artifact sweep: extract file/url/image touches from recent requests (off-thread so the
+    # metrics loop never blocks on DB work). Dedup makes it idempotent.
+    try:
+        await asyncio.to_thread(_artifact_sweep)
+    except Exception:
+        pass
 
 
 async def _metrics_loop(app: FastAPI):
@@ -2142,6 +2170,177 @@ def set_setting(key: str, value: str):
     )
     conn.commit()
     conn.close()
+
+
+# ---- Artifact extraction ---------------------------------------------------------------------
+# Maps tool name -> (kind, op, path_arg, content_arg). path_arg may hold a list (web_extract 'urls')
+# → one artifact per entry. content_arg (if present) is hashed for change-detection + size. Extend
+# via the tool_artifact_map rule ({"tools": {"my_tool": ["file","write","path","content"]}}).
+TOOL_ARTIFACT_MAP = {
+    "write_file": ("file", "write", "path", "content"),
+    "create_file": ("file", "create", "path", "content"),
+    "read_file": ("file", "read", "path", None),
+    "view_file": ("file", "read", "path", None),
+    "edit_file": ("file", "edit", "path", "content"),
+    "patch": ("file", "edit", "path", "new_string"),
+    "str_replace": ("file", "edit", "path", "new_str"),
+    "str_replace_editor": ("file", "edit", "path", "new_str"),
+    "apply_patch": ("file", "edit", "path", "patch"),
+    "delete_file": ("file", "delete", "path", None),
+    "skill_view": ("skill", "read", "name", None),
+    "skill_manage": ("skill", "edit", "name", "new_string"),
+    "web_extract": ("url", "fetch", "urls", None),
+    "web_fetch": ("url", "fetch", "url", None),
+    "fetch": ("url", "fetch", "url", None),
+    "browser_navigate": ("url", "fetch", "url", None),
+    "web_search": ("url", "search", "query", None),
+    "search_files": ("dir", "search", "pattern", None),
+    "list_dir": ("dir", "list", "path", None),
+    "glob": ("dir", "search", "pattern", None),
+}
+_TERMINAL_TOOLS = ("terminal", "bash", "shell", "run_command", "execute_command")
+_PATH_IN_CMD_RE = re.compile(
+    r'"([^"]+\.[A-Za-z0-9]{1,8})"|\'([^\']+\.[A-Za-z0-9]{1,8})\'|((?:[A-Za-z]:)?[\w.\\/-]*[\\/][\w.\\/-]*\.[A-Za-z0-9]{1,8})')
+
+
+def _artifact_tool_map() -> dict:
+    cfg = (load_rules_config().get("tool_artifact_map") or {})
+    extra = cfg.get("tools") if isinstance(cfg, dict) else None
+    if not isinstance(extra, dict):
+        return TOOL_ARTIFACT_MAP
+    merged = dict(TOOL_ARTIFACT_MAP)
+    for k, v in extra.items():
+        if isinstance(v, (list, tuple)) and len(v) >= 3:
+            merged[str(k).lower()] = (v[0], v[1], v[2], v[3] if len(v) > 3 else None)
+    return merged
+
+
+def _paths_from_command(cmd: str) -> list:
+    """Best-effort file paths referenced in a shell command (for terminal/bash tools)."""
+    if not isinstance(cmd, str) or not cmd or len(cmd) > 4000:
+        return []
+    seen = []
+    for m in _PATH_IN_CMD_RE.finditer(cmd):
+        p = m.group(1) or m.group(2) or m.group(3)
+        if p and ("/" in p or "\\" in p) and len(p) < 300 and p not in seen:
+            seen.append(p)
+        if len(seen) >= 6:
+            break
+    return seen
+
+
+def _artifact_events_from_call(name, args, tmap):
+    if not name:
+        return
+    name_l = str(name).lower()
+    spec = tmap.get(name_l)
+    if spec:
+        kind, op, path_arg, content_arg = spec
+        if not isinstance(args, dict):
+            return
+        raw = args.get(path_arg)
+        content = args.get(content_arg) if content_arg else None
+        chash = csize = None
+        if isinstance(content, str) and content:
+            chash = hashlib.sha256(content.encode("utf-8", "replace")).hexdigest()[:16]
+            csize = len(content)
+        paths = raw if isinstance(raw, list) else ([raw] if raw is not None else [])
+        for p in paths:
+            if p is None:
+                continue
+            yield {"kind": kind, "op": op, "path": str(p)[:500], "tool": name_l,
+                   "content_hash": chash, "size": csize}
+        return
+    if name_l in _TERMINAL_TOOLS and isinstance(args, dict):
+        cmd = args.get("command") or args.get("cmd") or ""
+        for p in _paths_from_command(cmd):
+            yield {"kind": "file", "op": "access", "path": p, "tool": name_l,
+                   "content_hash": None, "size": None}
+
+
+def _extract_artifacts_into(conn, req_id, conv_id, client_ip, ts, body) -> int:
+    """Extract artifacts from a request body's recent history; insert (dedup by sig). Returns #new."""
+    if not isinstance(body, dict):
+        return 0
+    msgs = body.get("messages")
+    if not isinstance(msgs, list):
+        return 0
+    tmap = _artifact_tool_map()
+    events = []
+    for m in msgs[-24:]:   # tail only — dedup catches earlier turns as they scroll through the tail
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            a = fn.get("arguments")
+            if isinstance(a, str):
+                try:
+                    a = json.loads(a)
+                except (json.JSONDecodeError, ValueError):
+                    a = None
+            events.extend(_artifact_events_from_call(fn.get("name"), a, tmap))
+        c = m.get("content")
+        if isinstance(c, list):
+            for blk in c:
+                if not isinstance(blk, dict):
+                    continue
+                if blk.get("type") == "tool_use":
+                    events.extend(_artifact_events_from_call(blk.get("name"), blk.get("input") or {}, tmap))
+                elif blk.get("type") in ("image", "image_url"):
+                    src = blk.get("image_url") or blk.get("source") or {}
+                    url = src.get("url") if isinstance(src, dict) else None
+                    if isinstance(url, str) and url.startswith("http"):
+                        events.append({"kind": "image", "op": "vision", "path": url[:500],
+                                       "tool": "image", "content_hash": None, "size": None})
+                    else:
+                        events.append({"kind": "image", "op": "vision", "path": "(inline image)",
+                                       "tool": "image", "content_hash": None, "size": None})
+    n = 0
+    for ev in events:
+        sig = hashlib.sha256(
+            f"{conv_id}|{ev['tool']}|{ev['op']}|{ev['path']}|{ev.get('content_hash') or ''}"
+            .encode("utf-8", "replace")).hexdigest()
+        try:
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO artifacts (sig, ts, request_id, conversation_id, client_ip, "
+                "kind, op, path, tool_name, size_bytes, content_hash, meta_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sig, ts, req_id, conv_id, client_ip, ev["kind"], ev["op"], ev["path"],
+                 ev["tool"], ev.get("size"), ev.get("content_hash"), None))
+            n += cur.rowcount
+        except sqlite3.Error:
+            pass
+    return n
+
+
+def _artifact_sweep() -> None:
+    """Extract artifacts from requests completed since the last watermark. Dedup makes reprocessing
+    safe, so a small ts lookback catches out-of-order stragglers. LIMIT bounds per-cycle work."""
+    conn = db()
+    s = get_setting("artifact_watermark")
+    try:
+        wm = float(s["value"]) if s and s.get("value") else 0.0
+    except (ValueError, TypeError):
+        wm = 0.0
+    try:
+        rows = conn.execute(
+            "SELECT id, conversation_id, client_ip, ts, request_body FROM requests_v "
+            "WHERE ts > ? AND request_body IS NOT NULL ORDER BY ts LIMIT 300", (wm - 30,)).fetchall()
+    except sqlite3.Error:
+        conn.close()
+        return
+    maxts = wm
+    for r in rows:
+        if r["ts"] and r["ts"] > maxts:
+            maxts = r["ts"]
+        try:
+            body = json.loads(r["request_body"])
+        except (json.JSONDecodeError, TypeError):
+            continue
+        _extract_artifacts_into(conn, r["id"], r["conversation_id"], r["client_ip"], r["ts"] or 0, body)
+    conn.commit()
+    conn.close()
+    if maxts > wm:
+        set_setting("artifact_watermark", str(maxts))
 
 
 def delete_setting(key: str):
@@ -5751,6 +5950,62 @@ async def control_panic_set(request: Request):
     on = bool(payload.get("on", not _PANIC_MODE))  # if `on` not provided, toggle current
     _set_panic_mode(on)
     return {"ok": True, "panic": _PANIC_MODE}
+
+
+@app.get("/__proxy/api/artifacts")
+async def list_artifacts(request: Request, kind: str = "", q: str = "", conversation: str = "", limit: int = 300):
+    """Artifacts (files/urls/images touched via tool calls), aggregated by path. PII-gated per the
+    originator's subnet. Each row carries its most-recent event + request link for the content view."""
+    viewer = _client_ip(request)
+    where = ["1=1"]
+    params: list = []
+    if kind:
+        where.append("kind = ?"); params.append(kind)
+    if conversation:
+        where.append("conversation_id = ?"); params.append(conversation)
+    if q:
+        where.append("path LIKE ?"); params.append("%" + q + "%")
+    conn = db()
+    rows = conn.execute(
+        f"""SELECT path, kind,
+                   COUNT(*) n, MAX(ts) last_ts, MIN(ts) first_ts,
+                   GROUP_CONCAT(DISTINCT op) ops,
+                   COUNT(DISTINCT content_hash) versions,
+                   (SELECT op FROM artifacts x WHERE x.path=a.path ORDER BY ts DESC LIMIT 1) last_op,
+                   (SELECT request_id FROM artifacts x WHERE x.path=a.path ORDER BY ts DESC LIMIT 1) last_request,
+                   (SELECT client_ip FROM artifacts x WHERE x.path=a.path ORDER BY ts DESC LIMIT 1) client_ip
+            FROM artifacts a WHERE {' AND '.join(where)}
+            GROUP BY path, kind ORDER BY last_ts DESC LIMIT ?""",
+        (*params, max(1, min(2000, limit)))).fetchall()
+    conn.close()
+    items = []
+    for r in rows:
+        if not _can_view_pii(viewer, r["client_ip"]):
+            continue
+        items.append({
+            "path": r["path"], "kind": r["kind"], "n": r["n"],
+            "ops": [o for o in (r["ops"] or "").split(",") if o],
+            "versions": r["versions"], "first_ts": r["first_ts"], "last_ts": r["last_ts"],
+            "last_op": r["last_op"], "last_request": r["last_request"],
+        })
+    return {"items": items, "total": len(items)}
+
+
+@app.get("/__proxy/api/artifacts/timeline")
+async def artifact_timeline(request: Request, path: str):
+    """Event timeline for one file/url — each read/edit/fetch, newest first, with a link back to the
+    request that shows the content."""
+    viewer = _client_ip(request)
+    conn = db()
+    rows = conn.execute(
+        "SELECT ts, op, tool_name, request_id, conversation_id, size_bytes, content_hash, client_ip, kind "
+        "FROM artifacts WHERE path = ? ORDER BY ts DESC LIMIT 500", (path,)).fetchall()
+    conn.close()
+    events = [{"ts": r["ts"], "op": r["op"], "tool": r["tool_name"], "request_id": r["request_id"],
+               "conversation_id": r["conversation_id"], "size": r["size_bytes"],
+               "content_hash": r["content_hash"], "kind": r["kind"]}
+              for r in rows if _can_view_pii(viewer, r["client_ip"])]
+    return {"path": path, "events": events}
 
 
 @app.get("/__proxy/api/model-quirks")

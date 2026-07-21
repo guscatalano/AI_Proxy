@@ -818,6 +818,7 @@
     <button class="snav" data-view="live" onclick="setView('live')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 12h4l3 8 4-16 3 8h4"/></svg><span class="lbl2">Live</span><i class="snav-pip live"></i></button>
     <button class="snav" data-view="requests" onclick="setView('requests')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M3 12h18M3 18h18"/></svg><span class="lbl2">Requests</span><span class="cntx" id="rail-req-count"></span></button>
     <button class="snav" data-view="convs" onclick="setView('convs')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Conversations</span></button>
+    <button class="snav" data-view="artifacts" onclick="setView('artifacts')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M13 2v7h7"/></svg><span class="lbl2">Artifacts</span></button>
   </div>
   <div class="shell-grp"><div class="gl">Analyze</div>
     <button class="snav" data-view="stats" onclick="setView('stats')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 3v18h18M7 14l3-4 4 3 5-7"/></svg><span class="lbl2">Stats</span></button>
@@ -871,6 +872,7 @@
   <div id="stats"></div>
   <div id="audit"></div>
   <div id="convs"></div>
+  <div id="artifacts"></div>
   <div id="live"></div>
   <div id="system"></div>
   <div id="setup"></div>
@@ -1000,7 +1002,7 @@ function setView(v) {
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
   try { syncShellNav(v); } catch {}
-  for (const c of ['stats','audit','convs','system','setup','chat','tasks','bench','live']) {
+  for (const c of ['stats','audit','convs','artifacts','system','setup','chat','tasks','bench','live']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
@@ -1012,6 +1014,7 @@ function setView(v) {
   if (v === 'stats') loadStats();
   else if (v === 'audit') { loadAudit(); refreshAuditBadge().then(dismissAuditBadge); }
   else if (v === 'convs') loadConversations();
+  else if (v === 'artifacts') loadArtifacts();
   else if (v === 'system') loadSystem();
   else if (v === 'setup') loadSetup();
   else if (v === 'chat') loadChat();
@@ -3388,6 +3391,76 @@ async function killRequest(reqId, btn) {
     alert(e.message);
     if (btn) { btn.disabled = false; btn.textContent = '🛑 Kill'; }
   }
+}
+
+// ---------- Artifacts view ----------
+let _artifactFilter = { kind: '', q: '' };
+function _artAgo(ts) {
+  if (!ts) return '';
+  const s = Date.now() / 1000 - ts;
+  if (s < 60) return Math.round(s) + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  if (s < 86400) return Math.round(s / 3600) + 'h ago';
+  return Math.round(s / 86400) + 'd ago';
+}
+async function loadArtifacts() {
+  const el = $('artifacts');
+  if (!el.dataset.init) { el.dataset.init = '1'; el.innerHTML = '<div class="empty">Loading artifacts…</div>'; }
+  let d;
+  try {
+    const qs = new URLSearchParams();
+    if (_artifactFilter.kind) qs.set('kind', _artifactFilter.kind);
+    if (_artifactFilter.q) qs.set('q', _artifactFilter.q);
+    d = await (await fetch('/__proxy/api/artifacts?' + qs.toString())).json();
+  } catch { el.innerHTML = '<div class="empty">Failed to load artifacts.</div>'; return; }
+  renderArtifacts(d);
+}
+function renderArtifacts(d) {
+  const el = $('artifacts');
+  const kColor = { file: '#57d1e0', url: '#e0a857', image: '#b48ead', skill: '#68d391', dir: '#8b97a8' };
+  const kIcon = { file: '📄', url: '🌐', image: '🖼', skill: '🧩', dir: '📁' };
+  const kinds = ['', 'file', 'url', 'image', 'skill', 'dir'];
+  const filterBar = `<div style="display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap">
+    <input id="artifact-search" placeholder="search path / url…" value="${esc(_artifactFilter.q)}"
+      oninput="_artifactFilter.q=this.value" onkeydown="if(event.key==='Enter')loadArtifacts()"
+      style="background:#10141c;border:1px solid #262d38;color:#e9edf4;border-radius:6px;padding:6px 10px;font-size:13px;min-width:220px">
+    ${kinds.map(k => `<button onclick="_artifactFilter.kind='${k}';loadArtifacts()" style="background:${_artifactFilter.kind === k ? '#1c3a44' : '#161b24'};border:1px solid ${_artifactFilter.kind === k ? '#2f8f9c' : '#262d38'};color:${_artifactFilter.kind === k ? '#57d1e0' : '#9aa4b2'};border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer">${k || 'all'}</button>`).join('')}
+    <span style="margin-left:auto;color:#8b97a8;font-size:12px">${d.total} artifact${d.total === 1 ? '' : 's'}</span></div>`;
+  const rows = (d.items || []).map(it => {
+    const col = kColor[it.kind] || '#8b97a8';
+    const ops = (it.ops || []).map(o => `<span style="font-size:10px;background:#161b24;border:1px solid #262d38;border-radius:3px;padding:0 5px;color:#9aa4b2">${esc(o)}</span>`).join(' ');
+    const ver = it.versions > 1 ? `<span style="color:#e0a857;font-size:11px">${it.versions} versions</span>` : '';
+    return `<div class="artifact-row" data-path="${encodeURIComponent(it.path)}" onclick="toggleArtifact(this)"
+      style="border:1px solid #262d38;border-radius:8px;padding:10px 12px;margin-bottom:6px;cursor:pointer;background:#141922">
+      <div style="display:flex;align-items:center;gap:10px">
+        <span style="font-size:15px">${kIcon[it.kind] || '•'}</span>
+        <code style="color:${col};font-size:12.5px;word-break:break-all;flex:1">${esc(it.path)}</code>
+        <span style="color:#8b97a8;font-size:11px">${it.n}×</span></div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">${ops} ${ver}
+        <span style="margin-left:auto;color:#667;font-size:11px">${_artAgo(it.last_ts)} · ${esc(it.last_op || '')}</span></div>
+      <div class="artifact-timeline" style="display:none;margin-top:10px;padding-top:10px;border-top:1px solid #262d38"></div></div>`;
+  }).join('') || '<div class="empty">No artifacts yet. Files edited and pages fetched through the proxy will appear here as traffic flows.</div>';
+  el.innerHTML = `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— files &amp; URLs touched through the proxy</span></h2>${filterBar}${rows}</div>`;
+}
+async function toggleArtifact(row) {
+  const tl = row.querySelector('.artifact-timeline');
+  if (tl.style.display !== 'none') { tl.style.display = 'none'; return; }
+  tl.style.display = 'block';
+  if (tl.dataset.loaded) return;
+  tl.innerHTML = '<span style="color:#8b97a8;font-size:12px">loading…</span>';
+  const path = decodeURIComponent(row.dataset.path);
+  let d;
+  try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(path))).json(); }
+  catch { tl.innerHTML = '<span style="color:#e08080">failed to load timeline</span>'; return; }
+  tl.dataset.loaded = '1';
+  tl.innerHTML = (d.events || []).map(e => `
+    <div style="display:flex;align-items:center;gap:10px;padding:4px 0;font-size:12px">
+      <span style="color:#8b97a8;min-width:118px">${new Date(e.ts * 1000).toLocaleString()}</span>
+      <span style="color:#57d1e0;min-width:50px">${esc(e.op || '')}</span>
+      <span style="color:#9aa4b2">${esc(e.tool || '')}</span>
+      ${e.size ? `<span style="color:#667">${(e.size / 1024).toFixed(1)}KB</span>` : ''}
+      ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(e.request_id)}')" style="margin-left:auto;color:#57d1e0;font-size:11px">open request →</a>` : ''}
+    </div>`).join('') || '<span style="color:#8b97a8;font-size:12px">no events</span>';
 }
 
 async function loadConversations() {
