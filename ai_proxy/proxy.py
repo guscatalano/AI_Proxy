@@ -6058,6 +6058,47 @@ async def artifact_conversations(request: Request, limit: int = 150):
     return {"items": items, "total": len(items)}
 
 
+@app.get("/__proxy/api/artifacts/top")
+async def top_artifacts(request: Request, kind: str = "file", limit: int = 30):
+    """Most-active artifacts across all conversations — ranked by total touches, with edit/view
+    breakdowns, so hot files surface without drilling. PII-gated per originator subnet."""
+    viewer = _client_ip(request)
+    where = ["1=1"]
+    params: list = []
+    if kind:
+        where.append("kind = ?"); params.append(kind)
+    lim = max(1, min(100, limit))
+    conn = db()
+    agg = conn.execute(
+        f"""SELECT path, kind, COUNT(*) touches,
+                   SUM(CASE WHEN op IN ('write','edit','create') THEN 1 ELSE 0 END) edits,
+                   SUM(CASE WHEN op IN ('read','fetch','access','list','search') THEN 1 ELSE 0 END) views,
+                   COUNT(DISTINCT content_hash) versions,
+                   COUNT(DISTINCT conversation_id) convs, MAX(ts) last_ts
+            FROM artifacts WHERE {' AND '.join(where)}
+            GROUP BY path, kind ORDER BY touches DESC, last_ts DESC LIMIT ?""",
+        (*params, lim)).fetchall()
+    paths = [r["path"] for r in agg]
+    ip_of: dict = {}
+    if paths:
+        ph = ",".join("?" for _ in paths)
+        for r in conn.execute(
+                f"""SELECT path, client_ip FROM (
+                      SELECT path, client_ip, ROW_NUMBER() OVER (PARTITION BY path ORDER BY ts DESC) rn
+                      FROM artifacts WHERE path IN ({ph})
+                    ) WHERE rn = 1""", paths).fetchall():
+            ip_of[r["path"]] = r["client_ip"]
+    conn.close()
+    items = []
+    for r in agg:
+        if not _can_view_pii(viewer, ip_of.get(r["path"])):
+            continue
+        items.append({"path": r["path"], "kind": r["kind"], "touches": r["touches"],
+                      "edits": r["edits"], "views": r["views"], "versions": r["versions"],
+                      "convs": r["convs"], "last_ts": r["last_ts"]})
+    return {"items": items, "total": len(items)}
+
+
 @app.get("/__proxy/api/artifacts/timeline")
 async def artifact_timeline(request: Request, path: str, conversation: str = ""):
     """Event timeline for one file/url — each read/edit/fetch, newest first. Optionally scoped to one

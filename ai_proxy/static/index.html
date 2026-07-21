@@ -3418,6 +3418,8 @@ function _fmtBytes(n) {
 let _artKindFilter = '';
 let _artFilesCache = [];
 let _artFolder = null;   // folder-browser current dir (array of path segments); null = auto-root
+let _artTopMode = 'convs';   // landing mode: 'convs' (by conversation) | 'active' (most active)
+function _artSetLanding(m) { _artTopMode = m; renderArtConvs(); }
 function _artGo(level, arg) {
   if (level === 'convs') { _artNav = { level: 'convs', conv: '', convLabel: '', path: '' }; }
   else if (level === 'files') { if (arg) { _artNav.conv = arg; _artNav.convLabel = (_artConvCache[arg] || '').slice(0, 60); } _artNav.level = 'files'; _artNav.path = ''; _artKindFilter = ''; _artFolder = null; }
@@ -3425,6 +3427,21 @@ function _artGo(level, arg) {
   loadArtifacts();
 }
 function artBackFiles() { _artNav.level = 'files'; _artNav.path = ''; loadArtifacts(); }
+// Open a request from an artifact. The request may not be on the list's current page, and the
+// detail panel may be collapsed — so switch view, force the detail panel visible, and load it
+// directly (loadDetail fetches by id, independent of the list).
+function artOpenRequest(id) {
+  selected = id; compareView = null; lastDetailSig = null;
+  setView('requests');
+  const m = $('main'); if (m) m.classList.remove('detail-collapsed');
+  loadDetail(id);
+}
+// Open a file's timeline directly (used by the global "most active" list — conv may be blank).
+function _artGoFile(encPath, conv) {
+  _artNav.conv = conv || ''; _artNav.convLabel = conv ? (_artConvCache[conv] || '') : '';
+  _artNav.path = decodeURIComponent(encPath); _artNav.level = 'file'; _artFolder = null;
+  loadArtifacts();
+}
 function _artHead(backOnclick, backLabel, titleHtml, subHtml) {
   return `<div class="conv-detail-head">
     <button class="conv-back" onclick="${backOnclick}">← ${esc(backLabel)}</button>
@@ -3438,8 +3455,36 @@ async function loadArtifacts() {
   if (_artNav.level === 'files') return renderArtFiles();
   return renderArtConvs();
 }
+function _artLandingToggle() {
+  return `<div style="display:flex;gap:6px;margin:0 0 14px">` + [['convs', 'By conversation'], ['active', 'Most active']].map(([m, l]) =>
+    `<button onclick="_artSetLanding('${m}')" style="background:${_artTopMode === m ? '#1c3a44' : '#161b24'};border:1px solid ${_artTopMode === m ? '#2f8f9c' : '#262d38'};color:${_artTopMode === m ? '#57d1e0' : '#9aa4b2'};border-radius:6px;padding:5px 12px;font-size:12px;cursor:pointer">${l}</button>`).join('') + `</div>`;
+}
+async function renderArtTop() {
+  const el = $('artifacts');
+  const toggle = _artLandingToggle();
+  const wrap = body => `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px">Artifacts</h2>${toggle}${body}</div>`;
+  el.innerHTML = wrap('<div class="empty">loading…</div>');
+  let d;
+  try { d = await (await fetch('/__proxy/api/artifacts/top?limit=40')).json(); }
+  catch { el.innerHTML = wrap('<div class="empty">Failed to load.</div>'); return; }
+  const rows = (d.items || []).map((it, i) => {
+    const name = (it.path.split(/[\\/]/).pop()) || it.path;
+    return `<div onclick="_artGoFile('${encodeURIComponent(it.path)}','')" style="border:1px solid #262d38;border-radius:8px;padding:9px 12px;margin-bottom:5px;cursor:pointer;background:#141922;display:flex;gap:10px;align-items:center">
+      <span style="color:#667;width:22px;text-align:right;font-family:ui-monospace,monospace;font-size:12px">${i + 1}</span>
+      <span style="font-size:14px">${_artKIcon[it.kind] || '📄'}</span>
+      <div style="flex:1;min-width:0">
+        <div style="color:#e9edf4;font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(name)}</div>
+        <div style="color:#667;font-size:10.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(it.path)}</div></div>
+      <span style="color:#e0a857;font-size:11px;white-space:nowrap" title="edits / writes">✎&nbsp;${it.edits}</span>
+      <span style="color:#57d1e0;font-size:11px;white-space:nowrap" title="reads / fetches">👁&nbsp;${it.views}</span>
+      ${it.versions > 1 ? `<span style="color:#8b97a8;font-size:11px;white-space:nowrap" title="distinct versions">${it.versions}v</span>` : ''}
+      <span style="color:#c9d3e1;font-size:11px;white-space:nowrap;min-width:34px;text-align:right" title="total touches">${it.touches}×</span></div>`;
+  }).join('') || '<div class="empty">No file activity captured yet.</div>';
+  el.innerHTML = wrap(`<div style="color:#8b97a8;font-size:12px;margin-bottom:10px">Most active files across all conversations — ranked by total touches (✎ edits · 👁 reads)</div>${rows}`);
+}
 async function renderArtConvs() {
   const el = $('artifacts');
+  if (_artTopMode === 'active') return renderArtTop();
   if (!el.dataset.init) { el.dataset.init = '1'; el.innerHTML = '<div class="empty">Loading…</div>'; }
   let d;
   try { d = await (await fetch('/__proxy/api/artifacts/conversations')).json(); }
@@ -3464,6 +3509,7 @@ async function renderArtConvs() {
   }).join('') || '<tr><td colspan="9" class="empty" style="padding:30px">No conversations have touched files or URLs yet.</td></tr>';
   el.innerHTML = `<div style="padding:6px 4px">
     <h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— by conversation (${items.length})</span></h2>
+    ${_artLandingToggle()}
     <div class="tbl-wrap" style="overflow-x:auto"><table style="width:100%;font-size:13px">
       <thead><tr>
         <th>Last seen</th><th>Conversation</th>
@@ -3580,11 +3626,15 @@ function _renderArtFilesList() {
 }
 async function renderArtFile() {
   const el = $('artifacts');
-  const backLbl = _artNav.convLabel ? (_artNav.convLabel.slice(0, 24) + (_artNav.convLabel.length > 24 ? '…' : '')) : 'Files';
-  el.innerHTML = _artHead('artBackFiles()', backLbl, 'loading…', '');
+  // Came from a conversation → back to its file list; from the global "most active" list → back
+  // to the landing.
+  const hasConv = !!_artNav.conv;
+  const backOnclick = hasConv ? 'artBackFiles()' : "_artGo('convs')";
+  const backLbl = hasConv ? (_artNav.convLabel ? (_artNav.convLabel.slice(0, 24) + (_artNav.convLabel.length > 24 ? '…' : '')) : 'Files') : 'Artifacts';
+  el.innerHTML = _artHead(backOnclick, backLbl, 'loading…', '');
   let d;
-  try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(_artNav.path) + '&conversation=' + encodeURIComponent(_artNav.conv))).json(); }
-  catch { el.innerHTML = _artHead('artBackFiles()', backLbl, 'Artifact', '') + '<div class="empty">failed to load</div>'; return; }
+  try { d = await (await fetch('/__proxy/api/artifacts/timeline?path=' + encodeURIComponent(_artNav.path) + (_artNav.conv ? '&conversation=' + encodeURIComponent(_artNav.conv) : ''))).json(); }
+  catch { el.innerHTML = _artHead(backOnclick, backLbl, 'Artifact', '') + '<div class="empty">failed to load</div>'; return; }
   el.scrollTop = 0;
   const ep = encodeURIComponent(_artNav.path);
   const events = (d.events || []).map(e => {
@@ -3600,7 +3650,7 @@ async function renderArtFile() {
         <span style="margin-left:auto;display:flex;flex-direction:column;align-items:flex-end;gap:2px">
           <span style="display:flex;gap:12px">
             ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();peekArtifact(this,'${esc(e.request_id)}','${ep}')" style="color:#57d1e0;font-size:11px">view content</a>` : ''}
-            ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();setView('requests');selectItem('${esc(e.request_id)}')" style="color:#8b97a8;font-size:11px" title="open the full request">request&nbsp;&rarr;</a>` : ''}
+            ${e.request_id ? `<a href="#" onclick="event.preventDefault();event.stopPropagation();artOpenRequest('${esc(e.request_id)}')" style="color:#8b97a8;font-size:11px" title="open the full request">request&nbsp;&rarr;</a>` : ''}
           </span>
           ${sizeHtml}
         </span>
@@ -3609,7 +3659,7 @@ async function renderArtFile() {
     </div>`; }).join('') || '<div class="empty">no events</div>';
   const kind = (d.events && d.events[0]) ? d.events[0].kind : 'file';
   const title = `<span style="font-size:15px">${_artKIcon[kind] || '•'}</span> <code style="color:${_artKColor[kind] || '#8b97a8'};word-break:break-all">${esc(_artNav.path)}</code>`;
-  el.innerHTML = _artHead('artBackFiles()', backLbl, title, `${(d.events || []).length} event${(d.events || []).length === 1 ? '' : 's'} in this conversation`)
+  el.innerHTML = _artHead(backOnclick, backLbl, title, `${(d.events || []).length} event${(d.events || []).length === 1 ? '' : 's'}${hasConv ? ' in this conversation' : ' across all conversations'}`)
     + `<div style="padding:14px 16px"><div style="border:1px solid #262d38;border-radius:8px;padding:6px 12px;background:#141922">${events}</div></div>`;
 }
 
