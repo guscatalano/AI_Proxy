@@ -2065,12 +2065,19 @@ DEFAULT_MODEL_QUIRKS = {
         "match": "prefix",
         "thinking": "default_off_optin",
         "reasoning_control": "chat_template_kwargs.enable_thinking",
+        "system_nudge": ("Start your response immediately with the answer itself — the code block, "
+                         "the command, the tool call, or the direct fact. NEVER open with a sentence "
+                         "describing what you are about to do, what you see, or what you need (no "
+                         "\"I'll...\", \"Let me...\", \"I need to see...\", \"First,...\", \"I can "
+                         "see...\", \"The user wants...\"). Zero preamble. If you need to act, emit "
+                         "the tool call directly with no narration before it."),
         "notes": ("Qwen3.5-MoE / gated-delta-net. Ignores OpenAI reasoning_effort — thinking is "
                   "only controllable via chat_template_kwargs.enable_thinking, and the template "
                   "defaults to ON. On vLLM, requires --reasoning-parser qwen3 to split reasoning "
                   "into the `reasoning` field (else it bleeds into `content`). Over-reasons and can "
                   "return empty content when thinking is on, so default OFF (bench-optimal for "
-                  "coding); reasoning_effort high/medium opts in."),
+                  "coding); reasoning_effort high/medium opts in. Even with thinking off it narrates "
+                  "reasoning in the content, so system_nudge curbs that (only applied when no-think)."),
     },
 }
 _QUIRKS_CACHE: dict = {"mtime": None, "data": None}
@@ -9194,7 +9201,8 @@ async def proxy(full_path: str, request: Request):
     # is left untouched.
     ornith_think = None
     _qmodel = str(body_json.get("model") or "") if isinstance(body_json, dict) else ""
-    _tmode = (_model_quirk(_qmodel) or {}).get("thinking")
+    _quirk = _model_quirk(_qmodel) or {}
+    _tmode = _quirk.get("thinking")
     if _tmode in ("force_off", "default_off_optin"):
         ctk = body_json.get("chat_template_kwargs")
         if not isinstance(ctk, dict):
@@ -9206,6 +9214,12 @@ async def proxy(full_path: str, request: Request):
             ctk["enable_thinking"] = want
             body_json["chat_template_kwargs"] = ctk
             ornith_think = want
+    # system_nudge: some reasoning-trained models (Ornith) narrate their reasoning in the *content*
+    # even with the <think> block disabled. A short system-prompt instruction is the only lever
+    # that curbs that (the thinking toggle can't — it's not in a think block). Appended, not replaced.
+    _nudge = _quirk.get("system_nudge")
+    if _nudge and isinstance(body_json, dict) and not ornith_think:
+        _inject_system_reminder(body_json, str(_nudge))
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
     # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response
