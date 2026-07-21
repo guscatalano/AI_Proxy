@@ -1056,6 +1056,19 @@ function toggleRailCollapse() { setRailCollapsed(!document.body.classList.contai
 let _shellTick = 0, _shellErr = null, _shellVer = null, _bootMs = null;
 function fmtUptime(s) { s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); if (d > 0) return d + 'd ' + String(h).padStart(2, '0') + 'h'; if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm'; return m + 'm'; }
 function fmtCompact(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n); }
+// Admin-only: flip PII redaction at runtime (POST /control/redact-pii). `on`=redaction enabled.
+// Disabling exposes every client's bodies to all viewers, so we confirm before turning it off.
+async function toggleRedact(on) {
+  if (!on && !confirm('Disable PII redaction?\n\nRequest/response bodies + headers from ALL clients become visible to everyone on this network. It auto-reverts when the proxy restarts.')) return;
+  try {
+    const r = await fetch('/__proxy/api/control/redact-pii', {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({on}),
+    });
+    if (!r.ok) { alert('Not allowed — PII toggle is admin-IP / loopback only.'); return; }
+  } catch { return; }
+  if (typeof shellVitals === 'function') shellVitals();   // refresh the badge immediately
+}
+
 async function shellVitals() {
   if (document.hidden) return;              // no background-tab polling
   _shellTick++;
@@ -1082,20 +1095,36 @@ async function shellVitals() {
   if (_shellVer == null) { try { const inf = await (await fetch('/__proxy/api/info')).json(); _shellVer = inf.version || '—'; } catch { _shellVer = '—'; } }
   // Boot time once (uptime lives at /health under process.uptime_s); tick it client-side after.
   if (_bootMs == null) { try { const hz = await (await fetch('/__proxy/api/health')).json(); const us = hz && hz.process && hz.process.uptime_s; if (us != null) _bootMs = Date.now() - us * 1000; } catch {} }
-  // One-time: surface the viewer's access level (admin / same-subnet / redaction-off).
-  if (!window._whoamiDone) { window._whoamiDone = 1; try {
+  // Access badge + admin PII-redaction toggle. Refreshed each tick so a global OFF state stays
+  // visible to everyone (not just whoever flipped it). Only admin/loopback viewers get the toggle.
+  try {
     const w = await (await fetch('/__proxy/api/whoami')).json();
     const el = $('sm-access');
     if (el) {
       const map = {
         admin:        ['admin · all',   '#68d391', 'Admin IP — you can view every request on any subnet.'],
         subnet:       ['your subnet',   '#f0c674', 'Restricted — you see requests from your own /24 subnet + localhost (you are ' + (w.ip || '?') + '); other subnets are redacted. Add your IP to PROXY_ADMIN_IPS for full access.'],
-        unrestricted: ['unrestricted',  '#57d1e0', 'PII redaction is off (PROXY_REDACT_PII=0) — everyone sees everything.'],
+        unrestricted: ['unrestricted',  '#57d1e0', 'PII redaction is off — everyone sees everything.'],
       };
       const m = map[w.level] || ['—', '#9aa4b2', ''];
-      el.textContent = m[0]; el.style.color = m[1]; el.title = m[2];
+      let html;
+      if (!w.redact_pii) {
+        // Loud, global signal — bodies are exposed to every viewer on the network.
+        html = '<span title="PII redaction is OFF — request/response bodies + headers are visible to all viewers on this network. Reverts to on when the proxy restarts." style="color:#f0a35a;font-weight:600">⚠ PII off</span>';
+      } else {
+        html = '<span title="' + esc(m[2]) + '" style="color:' + m[1] + '">' + esc(m[0]) + '</span>';
+      }
+      if (w.is_admin || w.loopback) {
+        const turnOn = !w.redact_pii;   // if currently off, the button re-enables; else disables
+        html += ' <button onclick="toggleRedact(' + turnOn + ')" title="'
+          + (turnOn ? 'Re-enable PII redaction now' : 'Temporarily disable PII redaction — bodies become visible to everyone; auto-reverts on proxy restart')
+          + '" style="margin-left:7px;background:#1c222c;border:1px solid ' + (turnOn ? '#3a6a4a' : '#5a2828')
+          + ';color:' + (turnOn ? '#68d391' : '#e08080') + ';border-radius:4px;padding:1px 7px;font-size:10px;cursor:pointer">'
+          + (turnOn ? 'enable' : 'disable') + '</button>';
+      }
+      el.innerHTML = html;
     }
-  } catch {} }
+  } catch {}
   if (_shellErr == null || _shellTick % 5 === 0) {
     try {
       const p = await (await fetch('/__proxy/api/perf?window_h=1')).json();

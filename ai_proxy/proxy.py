@@ -5651,6 +5651,35 @@ async def control_panic_set(request: Request):
     return {"ok": True, "panic": _PANIC_MODE}
 
 
+@app.get("/__proxy/api/control/redact-pii")
+async def control_redact_status():
+    return {"redact_pii": REDACT_PII_ENABLED,
+            "env_default": os.environ.get("PROXY_REDACT_PII", "1")}
+
+
+@app.post("/__proxy/api/control/redact-pii")
+async def control_redact_set(request: Request):
+    """Toggle PII redaction at runtime, no restart. Body: {"on": bool} — `on` = redaction ENABLED.
+    Admin/loopback only: turning redaction OFF exposes every client's request/response bodies and
+    headers to any viewer, so it must not be flippable by arbitrary subnet users. This is an
+    in-memory override; it reverts to the PROXY_REDACT_PII env default on the next restart."""
+    ip = _client_ip(request)
+    is_loopback = False
+    try:
+        is_loopback = bool(ip) and ipaddress.ip_address(ip).is_loopback
+    except (ValueError, TypeError):
+        pass
+    if not (is_loopback or (ip and ip in ADMIN_IPS)):
+        return JSONResponse({"error": "forbidden — admin IP or loopback only"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    global REDACT_PII_ENABLED
+    REDACT_PII_ENABLED = bool(payload.get("on", not REDACT_PII_ENABLED))
+    return {"ok": True, "redact_pii": REDACT_PII_ENABLED}
+
+
 # -------- Task queue REST API --------
 
 _VALID_TASK_MODES = {"chat"}
