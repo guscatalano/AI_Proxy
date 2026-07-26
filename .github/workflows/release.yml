@@ -129,7 +129,10 @@ jobs:
               echo "skip: $name@$VERSION already published"
             else
               echo "publishing $name@$VERSION"
-              npm publish --access public "$dir"
+              # "./$dir", not "$dir": npm resolves a bare `foo/bar` argument as the
+              # GitHub owner/repo shorthand and tries to clone it, instead of
+              # publishing the local directory.
+              npm publish --access public "./$dir"
             fi
           done
 
@@ -144,7 +147,7 @@ jobs:
           if npm view "guscatalano-ai-proxy@$VERSION" version >/dev/null 2>&1; then
             echo "skip: guscatalano-ai-proxy@$VERSION already published"
           else
-            npm publish --access public npm/ai-proxy
+            npm publish --access public ./npm/ai-proxy
           fi
 
   publish-pypi:
