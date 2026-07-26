@@ -1,0 +1,31 @@
+<svg viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="AI Proxy">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#191d29"/>
+      <stop offset="1" stop-color="#2a3350"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0.1" y1="0.1" x2="0.9" y2="0.9">
+      <stop offset="0" stop-color="#5ec8ff"/>
+      <stop offset="1" stop-color="#a486ff"/>
+    </linearGradient>
+  </defs>
+
+  <!-- tile -->
+  <rect width="512" height="512" fill="url(#bg)"/>
+
+  <!-- traffic flowing through the proxy (bidirectional) -->
+  <g stroke="url(#accent)" stroke-linecap="round" fill="none">
+    <line x1="70"  y1="256" x2="176" y2="256" stroke-width="26" opacity="0.5"/>
+    <line x1="336" y1="256" x2="442" y2="256" stroke-width="26" opacity="0.5"/>
+    <circle cx="120" cy="256" r="15" fill="url(#accent)" stroke="none" opacity="0.9"/>
+    <circle cx="392" cy="256" r="15" fill="url(#accent)" stroke="none" opacity="0.9"/>
+  </g>
+
+  <!-- inspection node -->
+  <circle cx="256" cy="256" r="100" fill="#141824"/>
+  <circle cx="256" cy="256" r="100" fill="none" stroke="url(#accent)" stroke-width="24"/>
+
+  <!-- forward chevron inside the node -->
+  <polyline points="230,206 300,256 230,306" fill="none" stroke="url(#accent)"
+            stroke-width="30" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

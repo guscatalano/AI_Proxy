@@ -20,7 +20,7 @@ await page.waitForSelector('#rows tr', { timeout: 20000 });
 
 const info = await page.evaluate(() => ({
   title: document.title,
-  tabCount: document.querySelectorAll('.tab').length,
+  tabCount: document.querySelectorAll('.tab, #shell-rail .snav').length,
   rowCount: document.querySelectorAll('#rows tr').length,
   hasClientFilter: !!document.getElementById('rq-client'),
   clientOptions: document.getElementById('rq-client')
@@ -41,7 +41,7 @@ await browser.close();
 
 const fail = [];
 if (info.title !== 'AI Proxy') fail.push(`title is ${JSON.stringify(info.title)}`);
-if (info.tabCount < 5) fail.push(`only ${info.tabCount} tabs rendered`);
+if (info.tabCount < 5) fail.push(`only ${info.tabCount} nav items rendered`);
 if (info.rowCount < 1) fail.push('request table rendered no rows');
 if (!info.hasClientFilter) fail.push('client filter dropdown missing');
 if (!info.hasPagerJump) fail.push('pager jump input missing');

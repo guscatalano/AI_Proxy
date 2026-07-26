@@ -43,7 +43,7 @@ and the Store signs it. Steps:
    exactly, or the Store rejects the upload).
 4. Build the `.msix` (command above) and **upload it** in a new submission.
 5. Replace the placeholder logos in `packaging/windows/msix/assets/` with real artwork for
-   a polished listing (regenerate placeholders with `make-assets.ps1`).
+   a polished listing (regenerate from logo.svg with `make-assets.mjs`).
 
 The release CI produces the `.msix` as a build artifact (not a release asset, since an
 unsigned MSIX isn't directly installable) — download it from the workflow run to submit.
