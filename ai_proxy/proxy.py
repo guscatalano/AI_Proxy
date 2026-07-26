@@ -9190,6 +9190,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     if not row or row["status"] != "pending":
         conn.close()
         return
+    index = await _bench_model_index()
     try:
         cfg = json.loads(row["config_json"])
     except (json.JSONDecodeError, TypeError):
@@ -9202,6 +9203,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     models = cfg.get("models") or [row["model"]]
     cells = _bench_expand_matrix(models, cfg)
     child_ids = []
+    skipped = 0
     now = time.time()
     for axes in cells:
         cid = "b_" + uuid.uuid4().hex[:12]
@@ -9225,6 +9227,23 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         child_cfg["concurrency"] = axes.get("concurrency") or 1
         # The suite owns quiescing for the whole sweep; children must not toggle it per cell.
         child_cfg["quiesce"] = False
+        meta = _bench_resolve_model(index, axes["model"], axes.get("upstream", ""))
+        window = meta.get("loaded_context") or meta.get("max_context")
+        # The reply needs room too, and the char-per-token estimate drifts by ~15% between
+        # tokenisers, so leave headroom rather than sail right up to the limit.
+        budget = (window - int(child_cfg.get("max_tokens", 256))) * 0.9 if window else None
+        if budget and axes["prompt_tokens"] > budget:
+            conn.execute(
+                """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
+                                           parent_id, axes_json, label, error, finished_ts)
+                   VALUES (?, ?, ?, ?, 'skipped', ?, ?, ?, ?, ?, ?)""",
+                (cid, now, axes["model"], json.dumps(child_cfg), creator_ip, parent_id,
+                 json.dumps(axes), _bench_cell_label(axes),
+                 f"skipped — {axes['prompt_tokens']:,} prompt tokens will not fit "
+                 f"{axes['model']}'s {window:,}-token window", now),
+            )
+            skipped += 1
+            continue
         conn.execute(
             """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
                                        parent_id, axes_json, label)
@@ -9236,7 +9255,8 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     conn.execute(
         "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=?, "
         "results_json=? WHERE id=?",
-        (time.time(), len(cells), json.dumps({"children": child_ids}), parent_id),
+        (time.time(), len(child_ids),
+         json.dumps({"children": child_ids, "skipped": skipped}), parent_id),
     )
     conn.commit()
     conn.close()

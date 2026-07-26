@@ -6110,8 +6110,9 @@ async function loadBench() {
         </div>
         <div class="bench-preset">
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px">
-            <button type="button" class="bench-preset-opt" data-preset="quick" aria-pressed="true">Quick <span style="opacity:.7">· 36 requests / model</span></button>
-            <button type="button" class="bench-preset-opt" data-preset="full" aria-pressed="false">Full report <span style="opacity:.7">· 864 requests / model</span></button>
+            <button type="button" class="bench-preset-opt" data-preset="quick" aria-pressed="true">Quick <span class="cost" style="opacity:.7"></span></button>
+            <button type="button" class="bench-preset-opt" data-preset="full" aria-pressed="false">Full report <span class="cost" style="opacity:.7"></span></button>
+            <button type="button" class="bench-preset-opt" data-preset="long" aria-pressed="false">Long context <span class="cost" style="opacity:.7"></span></button>
           </div>
           <div id="bench-preset-desc"></div>
           <label class="bench-check" style="margin-top:9px" title="Other clients keep their connections and resume as soon as the benchmark finishes — they wait, they don't fail. Without this, whatever else is using the model gets measured along with it.">
@@ -6248,6 +6249,7 @@ async function loadBench() {
       };
     }
     _benchRenderPreset();
+    _benchRenderPresetCosts();
     const _hold = $('bench-hold');
     if (_hold) _hold.addEventListener('change', _benchUpdatePlan);
     let _mode = 'simple';
@@ -6289,6 +6291,7 @@ async function _benchPopulateModels() {
     // up describing itself two different ways depending on whether a fetch succeeded.
     if (sel2) sel2.innerHTML = '<option value="">none — measure speed only</option>' +
       (s.suites || []).map(x => `<option value="${esc(x.name)}">${esc(x.name)} — ${x.task_count} tasks / ${x.case_count} cases</option>`).join('');
+    _benchRenderPresetCosts();   // task count is only known once the suites have loaded
   } catch { /* suites are optional */ }
   _benchUpdatePlan();
 }
@@ -6474,6 +6477,15 @@ const _BENCH_PRESETS = {
     cache: ['cold', 'cached'],
     concurrency: [1, 4],
   }),
+  // Depth only. Cold prefill at 128K–256K runs into minutes per request, so this drops the
+  // thinking and concurrency axes rather than multiplying them by it.
+  long: Object.assign({}, _BENCH_COMMON, {
+    prompt_tokens: [32000, 131072, 262144],
+    thinking: 'off',
+    cache: ['cold', 'cached'],
+    concurrency: 1,
+    runs: 2,
+  }),
 };
 function _benchPreset() {
   const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
@@ -6484,8 +6496,22 @@ function _benchPreset() {
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
 
+// Label each preset with what it will actually cost, derived from the suite that is loaded —
+// a number written into the markup goes stale the moment the suite changes, which is exactly
+// what happened when coding-v1 grew from 12 tasks to 18.
+function _benchRenderPresetCosts() {
+  for (const btn of document.querySelectorAll('.bench-preset-opt')) {
+    const preset = _BENCH_PRESETS[btn.dataset.preset];
+    const span = btn.querySelector('.cost');
+    if (!preset || !span) continue;
+    const {total} = _benchPlanCounts(Object.assign({models: [{}]}, preset));
+    span.textContent = `· ${total.toLocaleString()} requests / model`;
+  }
+}
+
 const _BENCH_PRESET_DESC = {
   quick: 'One measurement point per model: <b>32K context</b>, reasoning <b>off</b>, prompt cache warm, graded on <b>coding-v1</b>, <b>3 runs</b> per task. Enough to rank models on speed and correctness.',
+  long: 'Depth only, per model: <b>32K, 128K and 256K</b> context × <b>cold and cached</b> prompts, reasoning <b>off</b>, <b>2 runs</b> per task. Cold prefill at these sizes runs into minutes per request, so the thinking and concurrency axes are left out rather than multiplied by it. Cells whose prompt will not fit the model window are skipped rather than run into an empty completion.',
   full: 'The full comparison, per model: <b>three context sizes</b> (short, 8K, 32K) × reasoning <b>off and on</b> × <b>cold and cached</b> prompts × <b>1 and 4 parallel</b>, graded on <b>coding-v1</b>, <b>3 runs</b> per task. Answers what depth costs, what reasoning costs, whether the prompt cache is working, and how throughput holds up under load.',
 };
 

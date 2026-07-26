@@ -584,3 +584,35 @@ def test_tier_section_is_omitted_when_a_run_predates_tiers():
     html = p._bench_report_html([run], [p._bench_report_row(run)])
     assert "Per-task correctness" in html
     assert "Correctness by tier" not in html
+
+
+def test_long_context_cells_that_cannot_fit_are_skipped(monkeypatch):
+    """A prompt larger than the window returns 200 with no tokens — indistinguishable from a fast
+    success without the empty-completion check, and it burns a full cold prefill to learn
+    nothing. At 256K that is minutes per request."""
+    cells = p._bench_expand_matrix(
+        [{"model": "small", "upstream": "vllm"}],
+        {"prompt_tokens": [32000, 131072, 262144], "cache": ["cold", "cached"]})
+    assert len(cells) == 6
+    index = {"vllm:small": {"model": "small", "upstream": "vllm", "loaded": True,
+                            "max_context": 40960}}
+    # Same arithmetic the suite executor applies: reply budget plus tokeniser headroom.
+    fits = []
+    for c in cells:
+        meta = p._bench_resolve_model(index, c["model"], c.get("upstream", ""))
+        window = meta.get("loaded_context") or meta.get("max_context")
+        budget = (window - 512) * 0.9 if window else None
+        if not (budget and c["prompt_tokens"] > budget):
+            fits.append(c)
+    assert {c["prompt_tokens"] for c in fits} == {32000}, "128K/256K must not run on a 40K window"
+
+
+def test_resolve_model_prefers_the_exact_backend_pair():
+    index = {
+        "vllm:m": {"model": "m", "upstream": "vllm", "loaded": True, "max_context": 262144},
+        "lmstudio:m": {"model": "m", "upstream": "lmstudio", "loaded": False, "max_context": 32768},
+    }
+    assert p._bench_resolve_model(index, "m", "lmstudio")["max_context"] == 32768
+    assert p._bench_resolve_model(index, "m", "vllm")["max_context"] == 262144
+    # Without an upstream, a loaded copy wins over an unloaded one.
+    assert p._bench_resolve_model(index, "m")["upstream"] == "vllm"
