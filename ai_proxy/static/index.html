@@ -859,6 +859,10 @@
 .bench-preset { font-size:11.5px; color:#8b97a8; line-height:1.55; padding:10px 14px;
                 background:#101720; border-bottom:1px solid #1e242e; }
 .bench-preset b { color:#c9d3e1; font-weight:600; }
+.bench-preset-opt { background:#0a0d12; border:1px solid #262d38; color:#8b97a8; border-radius:5px;
+                    padding:4px 13px; font-size:11.5px; cursor:pointer; font-family:inherit; }
+.bench-preset-opt[aria-pressed=true] { background:#1c3a44; border-color:#2f8f9c; color:#57d1e0; font-weight:600; }
+.bench-preset-opt:focus-visible { outline:2px solid #2f8f9c; outline-offset:1px; }
 body.bench-simple .bench-adv { display:none; }
 body.bench-simple .bench-groups { grid-template-columns:minmax(280px,440px); }
 body.bench-simple .bench-group { border-right:none; }
@@ -6060,7 +6064,11 @@ async function loadBench() {
           <span class="bench-adv">Selecting more than one model, prompt size, thinking mode or temperature sweeps every combination, one at a time.</span>
         </div>
         <div class="bench-preset">
-          Pick the models, press run. Each one is measured at <b>three context sizes</b> (short, 4K, 32K) and graded on the <b>coding-v1</b> suite, <b>3 runs</b> per combination, with a warm-up and routing pinned — the same shape every time, so two reports are comparable. Switch to <b>Advanced</b> to change any of it.
+          <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px">
+            <button type="button" class="bench-preset-opt" data-preset="quick" aria-pressed="true">Quick</button>
+            <button type="button" class="bench-preset-opt" data-preset="full" aria-pressed="false">Full report</button>
+          </div>
+          <div id="bench-preset-desc"></div>
         </div>
         <div class="bench-groups">
 
@@ -6181,6 +6189,16 @@ async function loadBench() {
     for (const b of document.querySelectorAll('.bench-mode')) {
       b.onclick = () => _benchSetMode(b.dataset.mode);
     }
+    for (const b of document.querySelectorAll('.bench-preset-opt')) {
+      b.onclick = () => {
+        for (const o of document.querySelectorAll('.bench-preset-opt')) {
+          o.setAttribute('aria-pressed', String(o === b));
+        }
+        _benchRenderPreset();
+        _benchUpdatePlan();
+      };
+    }
+    _benchRenderPreset();
     let _mode = 'simple';
     try { _mode = localStorage.getItem('ai-proxy-bench-mode') || 'simple'; } catch {}
     _benchSetMode(_mode);
@@ -6377,25 +6395,54 @@ function _benchTemps() {
 
 // The standard sweep. Fixed on purpose: a report is only worth comparing to another report if
 // both were produced the same way, and picking sizes by hand each time guarantees they weren't.
-const _BENCH_PRESET = {
-  prompt_tokens: [0, 4000, 32000],
-  thinking: 'auto',
+const _BENCH_COMMON = {
   runs: 3,
   max_tokens: 512,
-  concurrency: 1,
   suite: 'coding-v1',
   warmup: true,
   bypass_router: true,
   no_nudge: true,
-  randomize: false,
+  temperature: 0,
   // Left off deliberately: both disrupt other users of the box, which is not a reasonable
   // default for a button labelled "run".
   exclusive: false,
   quiesce: false,
   drain_seconds: 5,
 };
+const _BENCH_PRESETS = {
+  quick: Object.assign({}, _BENCH_COMMON, {
+    prompt_tokens: 32000, thinking: 'off', cache: 'cached', concurrency: 1,
+  }),
+  // The shape of a real comparison: context depth, what reasoning costs, whether the prompt
+  // cache is doing anything, and how throughput holds up under load. One press instead of a
+  // dozen submissions collated by hand afterwards.
+  full: Object.assign({}, _BENCH_COMMON, {
+    prompt_tokens: [0, 8000, 32000],
+    thinking: ['off', 'on'],
+    cache: ['cold', 'cached'],
+    concurrency: [1, 4],
+  }),
+};
+function _benchPreset() {
+  const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
+  return _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
+}
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
+
+const _BENCH_PRESET_DESC = {
+  quick: 'One measurement point per model: <b>32K context</b>, reasoning <b>off</b>, prompt cache warm, graded on <b>coding-v1</b>, <b>3 runs</b> per task. Enough to rank models on speed and correctness.',
+  full: 'The full comparison, per model: <b>three context sizes</b> (short, 8K, 32K) × reasoning <b>off and on</b> × <b>cold and cached</b> prompts × <b>1 and 4 parallel</b>, graded on <b>coding-v1</b>, <b>3 runs</b> per task. Answers what depth costs, what reasoning costs, whether the prompt cache is working, and how throughput holds up under load.',
+};
+
+function _benchRenderPreset() {
+  const el = $('bench-preset-desc');
+  if (!el) return;
+  const cur = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
+  const key = (cur && cur.dataset.preset) || 'quick';
+  el.innerHTML = _BENCH_PRESET_DESC[key]
+    + ' Routing is pinned and a warm-up runs first. Switch to <b>Advanced</b> to change any of it.';
+}
 
 function _benchSetMode(mode) {
   document.body.classList.toggle('bench-simple', mode !== 'advanced');
@@ -6415,7 +6462,7 @@ function _benchBody() {
     .map(m => ({model: m.model, upstream: m.upstream}));
   // Simple mode ignores the hidden controls entirely rather than reading whatever they happen
   // to hold — otherwise a value set in Advanced would silently leak into a "standard" run.
-  if (_benchSimple()) return Object.assign({models}, _BENCH_PRESET);
+  if (_benchSimple()) return Object.assign({models}, _benchPreset());
   // Sorted so the sweep runs smallest-context-first and the cell order is predictable.
   const prompts = Array.from(_benchPromptSel).map(v => parseInt(v, 10) || 0).sort((a, b) => a - b);
   const thinking = Array.from(_benchThinkSel);
@@ -6449,7 +6496,9 @@ function _benchUpdatePlan() {
   const b = _benchBody();
   const n = arr => (Array.isArray(arr) ? arr.length : 1);
   const cells = Math.max(1, b.models.length) * n(b.prompt_tokens) * n(b.thinking) *
-                (b.temperature === undefined ? 1 : n(b.temperature));
+                (b.temperature === undefined ? 1 : n(b.temperature)) *
+                (b.cache === undefined ? 1 : n(b.cache)) *
+                (b.concurrency === undefined ? 1 : n(b.concurrency));
   const suiteSel = $('bench-suite');
   // Task count comes from the option text in advanced mode; in simple mode the suite is fixed,
   // so fall back to whatever the suites endpoint reported for it.

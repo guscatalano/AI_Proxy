@@ -370,3 +370,85 @@ def test_report_html_escapes_model_names():
     html = p._bench_report_html([run], [p._bench_report_row(run)])
     assert "<script>alert(1)</script>" not in html
     assert "&lt;script&gt;" in html
+
+
+# ---- cache / concurrency axes -------------------------------------------------------------
+
+def test_cache_axis_expands_and_maps_to_randomize():
+    """cold = salted prompts so nothing can be reused; cached = one identical prompt. Comparing
+    the pair is the only way to see whether a backend's prefix caching is doing anything —
+    caching silently disabled otherwise reads as ordinary slowness."""
+    cells = p._bench_expand_matrix([{"model": "m", "upstream": "vllm"}],
+                                   {"cache": ["cold", "cached"]})
+    assert [c["cache"] for c in cells] == ["cold", "cached"]
+    assert all(c["upstream"] == "vllm" for c in cells)
+
+
+def test_concurrency_axis_expands():
+    cells = p._bench_expand_matrix(["m"], {"concurrency": [1, 4]})
+    # concurrency 1 is the default and stays off the label; 4 is recorded.
+    assert [c.get("concurrency") for c in cells] == [None, 4]
+
+
+def test_full_report_matrix_size_is_what_the_ui_claims():
+    """3 contexts x 2 thinking x 2 cache x 2 concurrency = 24 cells per model."""
+    cells = p._bench_expand_matrix(
+        [{"model": "m", "upstream": "ollama"}],
+        {"prompt_tokens": [0, 8000, 32000], "thinking": ["off", "on"],
+         "cache": ["cold", "cached"], "concurrency": [1, 4]})
+    assert len(cells) == 24
+
+
+def test_cell_label_carries_the_distinguishing_axes():
+    label = p._bench_cell_label({"model": "m", "upstream": "vllm", "prompt_tokens": 32000,
+                                 "thinking": "off", "cache": "cached", "concurrency": 4})
+    for bit in ("m", "vllm", "32k", "off", "cached", "4"):
+        assert bit in label
+
+
+def test_submit_rejects_an_unknown_cache_value(client):
+    r = client.post("/__proxy/api/bench/run", json={"model": "m", "cache": "warm-ish"})
+    assert r.status_code == 400
+    assert "cache" in r.json()["error"]
+
+
+def test_suite_has_twelve_tasks():
+    """The original study graded 12 tasks; a 6-task suite is a weaker signal for the same cost
+    in wall-clock, since latency dominates."""
+    suite = p._BENCH_SUITES["coding-v1"]
+    assert len(suite) == 12
+    assert len({t["id"] for t in suite}) == 12
+    assert all(t["cases"] and t["entry"] for t in suite)
+
+
+def test_chart_labels_elide_the_middle_not_the_tail():
+    """Sweep labels share a long prefix and differ at the end. Tail-truncation renders every row
+    of a sweep identically, which is the one thing a comparison chart must not do."""
+    rows = [{"label": "fake-model · @ollama · 4k ctx · think=off · cold", "v": 10},
+            {"label": "fake-model · @ollama · 4k ctx · think=off · cached", "v": 12}]
+    svg = p._bench_bar_svg(rows, "v", "X", "u")
+    assert "cold" in svg and "cached" in svg
+
+
+def test_report_pairs_cold_and_cached():
+    def mk(cache, ttft):
+        return {"id": "b_" + cache, "ts": 1785000000.0, "label": "m · " + cache, "model": "m",
+                "config": {"cache": cache, "prompt_tokens": 32000, "thinking": "off",
+                           "upstream": "vllm"},
+                "env": {}, "results": {"summary": {"n_total": 1, "n_success": 1,
+                                                   "ttft_ms": {"p50": ttft}}}}
+    runs = [mk("cold", 6146.0), mk("cached", 300.0)]
+    html = p._bench_report_html(runs, [p._bench_report_row(r) for r in runs])
+    assert "Prompt cache" in html
+    assert "cache is working" in html      # 20x speed-up, as in the vLLM prefix-caching finding
+
+
+def test_report_flags_a_backend_with_no_cache_reuse():
+    def mk(cache, ttft):
+        return {"id": "b_" + cache, "ts": 1785000000.0, "label": "m · " + cache, "model": "m",
+                "config": {"cache": cache, "prompt_tokens": 32000, "thinking": "off"},
+                "env": {}, "results": {"summary": {"n_total": 1, "n_success": 1,
+                                                   "ttft_ms": {"p50": ttft}}}}
+    runs = [mk("cold", 320.0), mk("cached", 300.0)]
+    html = p._bench_report_html(runs, [p._bench_report_row(r) for r in runs])
+    assert "no measurable reuse" in html

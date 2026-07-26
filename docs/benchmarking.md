@@ -97,19 +97,42 @@ The summary reports the upstream's own `prompt_tokens` so you can see what was r
 
 ## Simple mode
 
-The Bench tab opens in **Simple** mode: pick the models, press run. Every model is measured at
-three context sizes (short, 4K, 32K) and graded on `coding-v1`, three runs per combination, with
-a warm-up and routing pinned.
+The Bench tab opens in **Simple** mode: pick the models, choose a preset, press run.
 
-The preset is fixed on purpose. A report is only worth comparing against another report if both
-were produced the same way, and choosing sizes by hand each time guarantees they weren't. It also
-means one press produces the whole comparison rather than you running the benchmark once per
-context size and collating the results afterwards.
+| Preset | Shape | Cost per model |
+|---|---|---|
+| **Quick** | 32K context, reasoning off, cache warm | 12 tasks × 3 runs = **36 requests** |
+| **Full report** | 3 contexts (short/8K/32K) × reasoning off·on × cold·cached × 1·4 parallel | 24 cells × 36 = **864 requests** |
 
-Two things it deliberately leaves off: holding other clients, and freeing the GPU. Both disrupt
+Both grade on `coding-v1` at temperature 0, with a warm-up and routing pinned.
+
+Quick ranks models on speed and correctness. **Full report** is the shape of a real
+investigation — it answers what context depth costs, what reasoning costs, whether the prompt
+cache is doing anything, and how throughput holds up under load, in one submission instead of a
+dozen collated by hand. The form shows the request count before you start; a full sweep is a
+long job, not a click.
+
+The presets are fixed on purpose: a report is only worth comparing against another report if both
+were produced the same way, and choosing sizes by hand each time guarantees they weren't.
+
+Two things they deliberately leave off: holding other clients, and freeing the GPU. Both disrupt
 everyone else using the box, which is not a reasonable default for a button labelled "run".
 
 **Advanced** exposes every control described below. The choice is remembered.
+
+## The cache axis
+
+`cold` salts every prompt so nothing can be served from the prefix cache; `cached` repeats one
+identical prompt after a priming request. Reported as a pair, with the speed-up and a verdict.
+
+This exists because a backend whose prefix caching is off doesn't look broken — it looks *slow*.
+A single number can't tell "this engine is slower" apart from "this engine re-prefills every
+repeated prompt", and those have very different fixes. Comparing cold against cached separates
+them: a working cache shows a large gap, a disabled one shows none.
+
+In cached mode the warm-up sends the prompt the measured runs will send. A short throwaway would
+prime nothing, and the first "cached" request would actually be a cold prefill — exactly the
+confound the axis exists to expose.
 
 ## Reports
 
@@ -126,9 +149,9 @@ Same data at `GET /__proxy/api/bench/report?ids=<comma-separated>&format=html`.
 
 ## Matrix runs
 
-Any of **models**, **prompt size**, **thinking** and **temperature** can take several values, and
-the submission expands into one child run per combination — 3 models × 2 context sizes × 2
-thinking modes is 12 cells. The form shows the cell and request count before you start.
+Any of **models**, **prompt size**, **thinking**, **temperature**, **cache** and **concurrency**
+can take several values, and the submission expands into one child run per combination — 3 models
+× 2 context sizes × 2 thinking modes is 12 cells. The form shows the cell and request count before you start.
 
 Cells run **one at a time**. Running them concurrently would have them contend for the same GPU
 and corrupt every number in the sweep.
@@ -154,8 +177,11 @@ and a model that is mediocre throughout can share an identical average.
 > environment. That contains accidents and runaway loops — it is **not** a sandbox against
 > deliberately hostile code. Grading is opt-in per run, and the UI confirms before starting.
 
-`coding-v1` ships with 6 tasks / 27 cases: binary search, interval merging, word frequency, Roman
-numerals, bracket balancing, and list flattening.
+`coding-v1` ships with 12 tasks / 49 cases: binary search, interval merging, word frequency,
+Roman numerals, bracket balancing, list flattening, two-sum, an LRU cache simulation, anagram
+grouping, run-length encoding, version comparison, and spiral matrix traversal. Every task is
+verified solvable by a reference implementation — a task its own reference can't pass would cap
+every model's score forever.
 
 ## Getting clean numbers
 

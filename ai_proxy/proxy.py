@@ -6632,7 +6632,8 @@ async def _bench_model_index() -> dict:
                 put(t.get("name"), "ollama", False)
         for m in (ollama.get("ps") or []):
             if isinstance(m, dict):
-                put(m.get("name") or m.get("model"), "ollama", True)
+                put(m.get("name") or m.get("model"), "ollama", True,
+                    size_mb=round((m.get("size_vram") or m.get("size") or 0) / 1048576) or None)
         # NOTE: both snapshots expose `loaded` / `available`, NOT `models`. Reading the wrong
         # key here is why LM Studio and vLLM models never showed up in the bench picker.
         lms = sysinfo.get("lmstudio") or {}
@@ -6643,6 +6644,7 @@ async def _bench_model_index() -> dict:
                     quant=m.get("quant"), arch=m.get("arch"),
                     max_context=m.get("max_context_length"),
                     loaded_context=m.get("loaded_context_length"),
+                    size_mb=round((m.get("size_bytes") or 0) / 1048576) or None,
                     parallel=m.get("parallel"))
         vll = sysinfo.get("vllm") or {}
         for m in (vll.get("available") or []):
@@ -6816,6 +6818,10 @@ async def bench_run(request: Request):
     upstream = str(payload.get("upstream") or "").strip().lower()
     if upstream and upstream not in ("ollama", "lmstudio", "vllm"):
         return JSONResponse({"error": "upstream must be ollama, lmstudio or vllm"}, status_code=400)
+    cache = payload.get("cache")
+    for c in (cache if isinstance(cache, list) else [cache]):
+        if c is not None and str(c) not in ("cold", "cached"):
+            return JSONResponse({"error": "cache must be 'cold' or 'cached'"}, status_code=400)
     suite = str(payload.get("suite") or "").strip()
     if suite and suite not in _BENCH_SUITES:
         return JSONResponse(
@@ -6834,7 +6840,8 @@ async def bench_run(request: Request):
         "max_tokens": int(payload.get("max_tokens", 256) or 256),
         "prompt_tokens": keep("prompt_tokens") if isinstance(payload.get("prompt_tokens"), list)
                          else int(payload.get("prompt_tokens", 0) or 0),
-        "concurrency": int(payload.get("concurrency", 1) or 1),
+        "concurrency": (payload["concurrency"] if isinstance(payload.get("concurrency"), list)
+                        else int(payload.get("concurrency", 1) or 1)),
         "randomize": bool(payload.get("randomize", False)),
         "exclusive": bool(payload.get("exclusive", False)),
         "drain_seconds": float(payload.get("drain_seconds", 5.0) or 0.0),
@@ -6846,6 +6853,12 @@ async def bench_run(request: Request):
         # measured request. Turn it off only when cold-start IS what you're measuring.
         "warmup": bool(payload.get("warmup", True)),
     }
+    if cache is not None:
+        config["cache"] = cache
+        # A single cache setting still has to drive randomize, since only the matrix path
+        # translates the axis into the flag.
+        if not isinstance(cache, list):
+            config["randomize"] = (str(cache) == "cold")
     if upstream:
         # Explicit pin. Left unset, each cell resolves its own backend from the model, which is
         # what makes a mixed-model sweep (Ollama + vLLM in one submission) work.
@@ -6885,6 +6898,11 @@ async def bench_run(request: Request):
             config["temperature"] = only["temperature"]
         if only.get("upstream"):
             config["upstream"] = only["upstream"]
+        if only.get("cache"):
+            config["cache"] = only["cache"]
+            config["randomize"] = (only["cache"] == "cold")
+        if only.get("concurrency"):
+            config["concurrency"] = only["concurrency"]
         config.pop("models", None)
         conn.execute(
             """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip, axes_json, label)
@@ -7022,10 +7040,18 @@ def _bench_report_row(run: dict) -> dict:
         "perfect_rate": q.get("perfect_rate"),
         "case_pass_rate": q.get("case_pass_rate"),
         "suite": cfg.get("suite"),
+        # Mean output length: the report's thinking-vs-not chapter turned on this number as much
+        # as on latency — ~18x more tokens generated for no quality gain.
+        "mean_tokens": (s.get("completion_tokens") or {}).get("mean"),
+        "cache": cfg.get("cache"),
+        "concurrency": cfg.get("concurrency") or 1,
+        "quant": (run.get("env") or {}).get("quant"),
+        "size_mb": (run.get("env") or {}).get("size_mb"),
+        "warmup_ms": s.get("warmup_ms"),
     }
 
 
-def _bench_bar_svg(rows, key, label, unit, better="high", width=560):
+def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
     """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
     or printed. Charts here exist to make the ordering obvious at a glance; the table beside
     them carries the actual numbers."""
@@ -7034,8 +7060,18 @@ def _bench_bar_svg(rows, key, label, unit, better="high", width=560):
         return ""
     top = max(v for _n, v in vals) or 1
     best = max(v for _n, v in vals) if better == "high" else min(v for _n, v in vals)
-    bar_h, gap, pad_l = 20, 8, 210
+    bar_h, gap, pad_l = 20, 8, 250
     height = len(vals) * (bar_h + gap) + 26
+
+    def elide(name, limit=42):
+        """Elide the MIDDLE, not the tail. Cell labels share a long prefix (the model) and
+        differ in their last few segments (the axis values), so tail-truncation renders every
+        row of a sweep identically — which is the one thing a chart must not do."""
+        if len(name) <= limit:
+            return name
+        head = limit // 3
+        return name[:head] + "…" + name[-(limit - head - 1):]
+
     parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
              f'role="img" aria-label="{_h(label)}">',
              f'<text x="0" y="12" class="ct">{_h(label)} ({_h(unit)})</text>']
@@ -7043,7 +7079,7 @@ def _bench_bar_svg(rows, key, label, unit, better="high", width=560):
         y = 26 + i * (bar_h + gap)
         w = max(2, int((v / top) * (width - pad_l - 60)))
         fill = "#57d1e0" if v == best else "#33566b"
-        parts.append(f'<text x="0" y="{y + 14}" class="cl">{_h(name[:34])}</text>')
+        parts.append(f'<text x="0" y="{y + 14}" class="cl">{_h(elide(name))}</text>')
         parts.append(f'<rect x="{pad_l}" y="{y}" width="{w}" height="{bar_h}" rx="3" fill="{fill}"/>')
         parts.append(f'<text x="{pad_l + w + 6}" y="{y + 14}" class="cv">{v:,.1f}</text>')
     parts.append("</svg>")
@@ -7080,10 +7116,13 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         return "—" if v is None else f"{v * 100:.0f}%"
 
     # Table -------------------------------------------------------------------------------
-    head = ["Configuration", "Model", "Backend", "Think", "Context",
-            "TTFT p50", "TTFC p50", "Decode p50", "Total p50", "OK"]
+    head = ["Configuration", "Model", "Quant", "Size", "Backend", "Think", "Cache", "Context",
+            "TTFT p50", "Decode p50", "Tokens", "Total p50", "vs best", "OK"]
     if graded:
-        head[9:9] = ["Fully correct", "Cases"]
+        head[12:12] = ["Fully correct", "Cases"]
+    # Slowdown against the fastest configuration in the set. A raw latency column doesn't make
+    # "16x slower for no quality gain" jump out; a ratio does.
+    fastest = min((r["total_p50"] for r in rows if r["total_p50"]), default=None)
     best_dec = max((r["decode_p50"] for r in rows if r["decode_p50"] is not None), default=None)
     best_ttft = min((r["ttft_p50"] for r in rows if r["ttft_p50"] is not None), default=None)
     best_q = max((r["perfect_rate"] for r in rows if r["perfect_rate"] is not None), default=None)
@@ -7091,16 +7130,21 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     body_rows = []
     for r, run in zip(rows, runs):
         cfg = run.get("config") or {}
+        slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
         cells = [
             f'<th scope="row">{_h(r["label"])}</th>',
             f'<td><code>{_h(r["served"] or r["model"])}</code></td>',
+            f'<td>{_h(r.get("quant") or "—")}</td>',
+            f'<td class="n">{(str(round(r["size_mb"] / 1024, 1)) + " GB") if r.get("size_mb") else "—"}</td>',
             f'<td>{_h(cfg.get("upstream") or "—")}</td>',
             f'<td>{_h(r["thinking"] or "auto")}</td>',
+            f'<td>{_h(r.get("cache") or "—")}</td>',
             f'<td class="n">{fmt(r["prompt_tokens"])}</td>',
             f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
-            f'<td class="n">{fmt(r["ttfc_p50"], 0, " ms")}</td>',
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
+            f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>',
             f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>',
+            f'<td class="n{" slow" if (slow or 0) >= 2 else ""}">{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>',
         ]
         if graded:
             cells.append(f'<td class="n{" win" if r["perfect_rate"] == best_q else ""}">{pct(r["perfect_rate"])}</td>')
@@ -7136,6 +7180,38 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
 everywhere except one task and a model mediocre throughout can share an overall average.</p>
 <table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table>"""
 
+    # Cold vs cached, paired by everything except the cache axis. This is the comparison that
+    # exposes a backend serving every repeated prompt as a fresh prefill.
+    cache_html = ""
+    pairs: dict = {}
+    for r in rows:
+        if not r.get("cache"):
+            continue
+        key = (r["model"], r["prompt_tokens"], r["thinking"], r.get("concurrency"))
+        pairs.setdefault(key, {})[r["cache"]] = r
+    both = {k: v for k, v in pairs.items() if "cold" in v and "cached" in v}
+    if both:
+        trs = []
+        for (model, ctx, think, _cc), v in both.items():
+            cold, cached = v["cold"]["ttft_p50"], v["cached"]["ttft_p50"]
+            speedup = (cold / cached) if (cold and cached) else None
+            verdict = ("cache is working" if speedup and speedup >= 1.5 else
+                       "no measurable reuse" if speedup else "—")
+            trs.append(
+                f'<tr><th scope="row"><code>{_h(model)}</code></th>'
+                f'<td class="n">{fmt(ctx)}</td><td>{_h(think)}</td>'
+                f'<td class="n">{fmt(cold, 0, " ms")}</td>'
+                f'<td class="n">{fmt(cached, 0, " ms")}</td>'
+                f'<td class="n{" win" if speedup and speedup >= 1.5 else ""}">{fmt(speedup, 1, "x") if speedup else "—"}</td>'
+                f'<td>{_h(verdict)}</td></tr>')
+        cache_html = f"""<h2>Prompt cache</h2>
+<p class="note">Cold sends a uniquely salted prompt every time so nothing can be reused; cached
+repeats one identical prompt after a priming request. A backend whose prefix caching is off or
+unsupported shows roughly the same first-token latency in both columns — which looks like
+ordinary slowness rather than a misconfiguration.</p>
+<table><thead><tr><th>Model</th><th>Context</th><th>Think</th><th>Cold TTFT</th>
+<th>Cached TTFT</th><th>Speed-up</th><th></th></tr></thead><tbody>{"".join(trs)}</tbody></table>"""
+
     warm = [f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}"
             for r, run in zip(rows, runs)
             if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
@@ -7163,6 +7239,7 @@ everywhere except one task and a model mediocre throughout can share an overall 
   tbody th {{ font-weight:600; }}
   td.n {{ text-align:right; font-variant-numeric:tabular-nums; }}
   td.win {{ color:#0a7d4f; font-weight:700; }}
+  td.slow {{ color:#b3261e; font-weight:600; }}
   td.ok {{ color:#0a7d4f; }} td.bad {{ color:#b3261e; font-weight:600; }}
   code {{ font:12px ui-monospace,SFMono-Regular,Menlo,monospace; background:#eef0f3;
           padding:1px 5px; border-radius:3px; }}
@@ -7201,6 +7278,8 @@ everywhere except one task and a model mediocre throughout can share an overall 
 
   <h2>At a glance</h2>
   {charts}
+
+  {cache_html}
 
   {task_html}
 
@@ -7803,6 +7882,88 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                 {"args": [[[], [[]], [[[1]]]]], "expect": [1]},
             ],
         },
+        {
+            "id": "two_sum",
+            "prompt": ("Write a Python function `two_sum(nums: list[int], target: int) -> list[int]` "
+                       "returning the indices of the two numbers that add to target, as a list of two "
+                       "ascending indices. Exactly one solution exists and an element can't be reused. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "two_sum",
+            "cases": [
+                {"args": [[2, 7, 11, 15], 9], "expect": [0, 1]},
+                {"args": [[3, 2, 4], 6], "expect": [1, 2]},
+                {"args": [[3, 3], 6], "expect": [0, 1]},
+                {"args": [[-1, -2, -3, -4], -7], "expect": [2, 3]},
+            ],
+        },
+        {
+            "id": "lru_cache_sim",
+            "prompt": ("Write a Python function `lru(capacity: int, ops: list) -> list` simulating an "
+                       "LRU cache. ops is a list of ['put', key, value] or ['get', key]. Return the list "
+                       "of results of every 'get', using -1 for a miss. A get or put counts as a use. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "lru",
+            "cases": [
+                {"args": [2, [["put", 1, 1], ["put", 2, 2], ["get", 1], ["put", 3, 3], ["get", 2], ["get", 3]]],
+                 "expect": [1, -1, 3]},
+                {"args": [1, [["put", 1, 1], ["put", 2, 2], ["get", 1], ["get", 2]]], "expect": [-1, 2]},
+            ],
+        },
+        {
+            "id": "group_anagrams",
+            "prompt": ("Write a Python function `group_anagrams(words: list[str]) -> list[list[str]]` "
+                       "grouping words that are anagrams. Each group is sorted alphabetically, and the "
+                       "groups are sorted by their first word. Return only the function in a single "
+                       "```python code block."),
+            "entry": "group_anagrams",
+            "cases": [
+                {"args": [["eat", "tea", "tan", "ate", "nat", "bat"]],
+                 "expect": [["ate", "eat", "tea"], ["bat"], ["nat", "tan"]]},
+                {"args": [[]], "expect": []},
+                {"args": [["a"]], "expect": [["a"]]},
+            ],
+        },
+        {
+            "id": "run_length",
+            "prompt": ("Write a Python function `rle(s: str) -> str` performing run-length encoding: "
+                       "each run becomes the character followed by its count, including runs of length 1 "
+                       "(so 'aab' becomes 'a2b1'). Return only the function in a single ```python code block."),
+            "entry": "rle",
+            "cases": [
+                {"args": ["aab"], "expect": "a2b1"},
+                {"args": [""], "expect": ""},
+                {"args": ["abc"], "expect": "a1b1c1"},
+                {"args": ["aaaaaaaaaaaa"], "expect": "a12"},
+            ],
+        },
+        {
+            "id": "compare_versions",
+            "prompt": ("Write a Python function `compare_versions(a: str, b: str) -> int` comparing "
+                       "dotted version strings. Return -1 if a < b, 1 if a > b, 0 if equal. Segments "
+                       "are integers, missing segments count as 0, and leading zeros are ignored "
+                       "('1.02' equals '1.2'). Return only the function in a single ```python code block."),
+            "entry": "compare_versions",
+            "cases": [
+                {"args": ["1.2", "1.10"], "expect": -1},
+                {"args": ["1.02", "1.2"], "expect": 0},
+                {"args": ["1.0.0", "1"], "expect": 0},
+                {"args": ["2.1", "2.0.9"], "expect": 1},
+                {"args": ["1.0.1", "1"], "expect": 1},
+            ],
+        },
+        {
+            "id": "spiral",
+            "prompt": ("Write a Python function `spiral(matrix: list[list[int]]) -> list[int]` returning "
+                       "the elements of the matrix in clockwise spiral order starting at the top-left. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "spiral",
+            "cases": [
+                {"args": [[[1, 2, 3], [4, 5, 6], [7, 8, 9]]], "expect": [1, 2, 3, 6, 9, 8, 7, 4, 5]},
+                {"args": [[[1, 2], [3, 4]]], "expect": [1, 2, 4, 3]},
+                {"args": [[]], "expect": []},
+                {"args": [[[1]]], "expect": [1]},
+            ],
+        },
     ],
 }
 
@@ -8297,6 +8458,12 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
     prompts = as_list(cfg.get("prompt_tokens"), 0)
     thinks = as_list(cfg.get("thinking"), "auto")
     temps = as_list(cfg.get("temperature"), None)
+    # "cold" salts every prompt so nothing can be served from the prefix cache; "cached" repeats
+    # an identical prompt so everything after the warm-up should hit it. Comparing the pair is
+    # the only way to see whether a backend's caching is working at all — a backend with caching
+    # silently disabled looks merely slow, not misconfigured.
+    caches = as_list(cfg.get("cache"), None)
+    concs = as_list(cfg.get("concurrency"), 1)
     cells = []
     for m in model_axis:
         # Entries may be bare names (older callers) or {model, upstream} pairs, so a sweep can
@@ -8306,13 +8473,19 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
         for pt in prompts:
             for th in thinks:
                 for tp in temps:
-                    axes = {"model": name, "prompt_tokens": int(pt or 0),
-                            "thinking": str(th or "auto")}
-                    if up:
-                        axes["upstream"] = up
-                    if tp is not None:
-                        axes["temperature"] = float(tp)
-                    cells.append(axes)
+                    for ca in caches:
+                        for cc in concs:
+                            axes = {"model": name, "prompt_tokens": int(pt or 0),
+                                    "thinking": str(th or "auto")}
+                            if up:
+                                axes["upstream"] = up
+                            if tp is not None:
+                                axes["temperature"] = float(tp)
+                            if ca:
+                                axes["cache"] = str(ca)
+                            if int(cc or 1) != 1:
+                                axes["concurrency"] = int(cc)
+                            cells.append(axes)
     return cells
 
 
@@ -8324,6 +8497,10 @@ def _bench_cell_label(axes: dict) -> str:
     bits.append(f"{int(pt) // 1000}k ctx" if pt >= 1000 else (f"{pt} ctx" if pt else "short"))
     if axes.get("thinking") and axes["thinking"] != "auto":
         bits.append(f"think={axes['thinking']}")
+    if axes.get("cache"):
+        bits.append(str(axes["cache"]))
+    if axes.get("concurrency"):
+        bits.append(f"{axes['concurrency']}×parallel")
     if axes.get("temperature") is not None:
         bits.append(f"t={axes['temperature']}")
     return " · ".join(bits)
@@ -8363,6 +8540,13 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         # backends without them collapsing into each other.
         if axes.get("upstream"):
             child_cfg["upstream"] = axes["upstream"]
+        if axes.get("cache"):
+            # The cache axis IS the randomize flag, named for what it measures rather than for
+            # the mechanism, so a result column reads "cold / cached" not "randomize true/false".
+            child_cfg["cache"] = axes["cache"]
+            child_cfg["randomize"] = (axes["cache"] == "cold")
+        if axes.get("concurrency"):
+            child_cfg["concurrency"] = axes["concurrency"]
         # The suite owns quiescing for the whole sweep; children must not toggle it per cell.
         child_cfg["quiesce"] = False
         conn.execute(
@@ -8453,6 +8637,9 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             cfg["upstream_inferred"] = True
         env["model_loaded_at_start"] = model_meta.get("loaded")
         env["resolved_upstream"] = cfg.get("upstream")
+        for k in ("quant", "size_mb", "max_context", "loaded_context"):
+            if model_meta.get(k) is not None:
+                env[k] = model_meta[k]
         conn = db()
         conn.execute("UPDATE bench_runs SET env_json=?, config_json=? WHERE id=?",
                      (json.dumps(env), json.dumps(cfg), bench_id))
@@ -8480,8 +8667,15 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 # large model) and the run's min/max are nonsense. The warm-up result is
                 # discarded, never scored, and never counted in the summary.
                 if warmup:
-                    warm = await _bench_run_one(client, base, model, 16,
-                                                _bench_build_prompt(0, True, 0), 0, cfg=cfg)
+                    # In cached mode the warm-up must send the prompt the measured runs will
+                    # send, otherwise it primes nothing and the first "cached" request is
+                    # actually a cold prefill — which is exactly the confound this axis exists
+                    # to expose. In cold mode a short throwaway is enough.
+                    warm_prompt = (_bench_build_prompt(prompt_tokens, False, 1)
+                                   if not randomize else _bench_build_prompt(0, True, 0))
+                    warm_max = max_tokens if not randomize else 16
+                    warm = await _bench_run_one(client, base, model, warm_max,
+                                                warm_prompt, 0, cfg=cfg)
                     conn = db()
                     conn.execute("UPDATE bench_runs SET results_json=? WHERE id=?",
                                  (json.dumps({"rows": [], "warmup": warm}), bench_id))
