@@ -829,13 +829,30 @@
 .bench-form select, .bench-form input[type=number], .bench-form input[type=text] {
   background:#0a0d12; border:1px solid #262d38; color:#c9d3e1; border-radius:4px;
   padding:4px 6px; font-size:12px; font-family:inherit; width:100%; min-width:0; }
-.bench-form select[multiple] { padding:2px; }
-/* Selected options drive the sweep, so they have to be unmistakable. Browsers grey out the
-   native selection once the list loses focus; the gradient is the reliable way to override an
-   <option> background in Chrome. */
-.bench-form select[multiple] option { padding:2px 5px; border-radius:3px; }
-.bench-form select[multiple] option:checked {
-  background:#1c3a44 linear-gradient(0deg,#1c3a44 0%,#1c3a44 100%); color:#57d1e0; font-weight:600; }
+/* The sweep axes are multi-select by nature, but a native <select multiple> is the wrong
+   control for them: its selection is painted by the platform (grey unfocused, the OS accent
+   when focused, and neither matches this palette), it requires ctrl-click, and a stray plain
+   click silently discards every other selection. These are checkbox lists and toggle pills
+   instead — same state, fully styled, and one click means one change. */
+.bench-list { background:#0a0d12; border:1px solid #262d38; border-radius:4px;
+              max-height:158px; overflow-y:auto; }
+.bench-list-row { display:flex; align-items:center; gap:7px; padding:4px 7px; font-size:12px;
+                  color:#c9d3e1; cursor:pointer; border-bottom:1px solid #12161d; }
+.bench-list-row:last-child { border-bottom:none; }
+.bench-list-row:hover { background:#111722; }
+.bench-list-row input { margin:0; flex:none; cursor:pointer; }
+.bench-list-row.on { background:#16303a; color:#9fe4ef; }
+.bench-list-row .dot { flex:none; font-size:9px; }
+.bench-list-row .nm { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.bench-list-row .meta { flex:none; color:#5d6775; font-size:10.5px; }
+.bench-list-row.on .meta { color:#4f8894; }
+.bench-list-empty { padding:10px 8px; color:#5d6775; font-size:11.5px; }
+.bench-toggles { display:flex; flex-wrap:wrap; gap:4px; }
+.bench-toggle { background:#0a0d12; border:1px solid #262d38; color:#8b97a8; border-radius:4px;
+                padding:3px 8px; font-size:11px; cursor:pointer; font-family:inherit; }
+.bench-toggle:hover { border-color:#39434f; color:#c9d3e1; }
+.bench-toggle[aria-pressed=true] { background:#1c3a44; border-color:#2f8f9c; color:#57d1e0; font-weight:600; }
+.bench-toggle:focus-visible { outline:2px solid #2f8f9c; outline-offset:1px; }
 .bench-form select:focus, .bench-form input:focus { outline:2px solid #2f8f9c; outline-offset:-1px; }
 .bench-form input[type=number] { width:76px; }
 /* Checkboxes read as a list of statements, one per line, with the rationale as a tooltip
@@ -6028,27 +6045,16 @@ async function loadBench() {
               <div id="bench-upstreams" class="bench-chips"></div>
             </div>
             <div class="bench-row stack">
-              <label for="bench-model">Models <span style="color:#4d5765">— ● loaded, ○ not</span></label>
-              <select id="bench-model" multiple size="6"></select>
+              <label id="bench-model-label">Models <span style="color:#4d5765">— ● loaded, ○ not</span></label>
+              <div id="bench-model" class="bench-list" role="group" aria-labelledby="bench-model-label"></div>
             </div>
             <div class="bench-row stack">
-              <label for="bench-prompt">Prompt size</label>
-              <select id="bench-prompt" multiple size="4">
-                <option value="0" selected>short (~80 tok)</option>
-                <option value="2000">2K</option><option value="4000">4K</option>
-                <option value="8000">8K</option><option value="16000">16K</option>
-                <option value="32000">32K</option><option value="65536">64K</option>
-                <option value="131072">128K</option><option value="262144">256K</option>
-              </select>
+              <label id="bench-prompt-label">Prompt size</label>
+              <div id="bench-prompt" class="bench-toggles" role="group" aria-labelledby="bench-prompt-label"></div>
             </div>
             <div class="bench-row stack">
-              <label for="bench-thinking">Thinking</label>
-              <select id="bench-thinking" multiple size="4">
-                <option value="auto" selected>auto — leave the proxy's quirks in place</option>
-                <option value="off">off — enable_thinking + reasoning_effort</option>
-                <option value="off_prefill">off — via &lt;think&gt; prefill, for LM Studio</option>
-                <option value="on">on</option>
-              </select>
+              <label id="bench-thinking-label">Thinking</label>
+              <div id="bench-thinking" class="bench-toggles" role="group" aria-labelledby="bench-thinking-label"></div>
             </div>
             <div class="bench-row">
               <label for="bench-temp">Temperature</label>
@@ -6131,13 +6137,15 @@ async function loadBench() {
     $('bench-go').onclick = _benchSubmit;
     // Keep the "N cells × M requests" preview honest as the axes change — a 4-model ×
     // 3-context × 2-thinking sweep is 24 cells, which is worth seeing before you start it.
-    ['bench-model', 'bench-prompt', 'bench-thinking', 'bench-temp', 'bench-runs', 'bench-suite',
-     'bench-upstream', 'bench-warmup']
+    // The axis widgets keep their own state and call _benchUpdatePlan directly; these are the
+    // plain form controls that still need a listener.
+    ['bench-temp', 'bench-runs', 'bench-maxtok', 'bench-suite', 'bench-warmup', 'bench-concur']
       .forEach(id => { const el = $(id); if (el) el.addEventListener('change', _benchUpdatePlan); });
     const tempEl = $('bench-temp');
     if (tempEl) tempEl.addEventListener('input', _benchUpdatePlan);
     $('bench-compare-btn').onclick = _benchRenderCompare;
     $('bench-compare-clear').onclick = () => { _benchSelected.clear(); _benchUpdateCompareBar(); loadBench(); };
+    _benchRenderAxes();
     await _benchPopulateModels();
   }
   await _benchRefreshHistory();
@@ -6209,58 +6217,116 @@ function _benchRenderUpstreams() {
   }
 }
 
+function _benchModelCount() {
+  // The backend filter is a view, not a reset — selections on other backends stay in the sweep.
+  // That's only safe if the count says so, otherwise they're invisible but still running.
+  const lab = $('bench-model-label');
+  if (!lab) return;
+  const total = _benchModelSel.size;
+  const hidden = _benchUpFilter
+    ? Array.from(_benchModelSel).filter(k => (_benchModelIndex[k] || {}).upstream !== _benchUpFilter).length
+    : 0;
+  const legend = total
+    ? `— ${total} selected` + (hidden ? `, ${hidden} on another backend` : '')
+    : '— none selected';
+  lab.innerHTML = `Models <span style="color:${hidden ? '#f0a35a' : '#4d5765'}">${esc(legend)}</span>`;
+}
+
 function _benchRenderModels() {
-  const sel = $('bench-model');
-  if (!sel) return;
-  const prev = new Set(Array.from(sel.selectedOptions).map(o => o.value));
+  const host = $('bench-model');
+  if (!host) return;
   const items = _benchUpFilter
     ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels;
   if (!items.length) {
-    sel.innerHTML = '<option disabled>(no models on this backend)</option>';
+    host.innerHTML = '<div class="bench-list-empty">No models on this backend.</div>';
+    _benchModelCount();
     return;
   }
-  // Option values are the "<upstream>:<model>" key, not the bare name: the same model can be
-  // served by two backends, and selecting by name alone couldn't tell them apart.
+  // Default to something already resident, so the obvious first run measures a warm model.
+  if (!_benchModelSel.size) {
+    const first = items.find(i => i.loaded) || items[0];
+    if (first) _benchModelSel.add(first.key);
+  }
+  const ctx = n => n == null ? '' : (n >= 1024 ? Math.round(n / 1024) + 'K' : String(n));
   const byUp = {};
   for (const it of items) (byUp[it.upstream] = byUp[it.upstream] || []).push(it);
-  const label = {
-    ollama: 'Ollama — loads on demand',
-    lmstudio: 'LM Studio — JIT-loads on demand',
-    vllm: 'vLLM — fixed, serves only what it was launched with',
-  };
-  const ctx = n => n == null ? '' : (n >= 1024 ? Math.round(n / 1024) + 'K' : String(n));
-  // Only group when more than one backend is in view; filtered to one, the group header is noise.
+  const groupLabel = {ollama: 'Ollama', lmstudio: 'LM Studio', vllm: 'vLLM'};
   const ups = Object.keys(byUp).sort();
-  const optFor = it => {
-    // Quant and window are the two facts you need beside a benchmark number.
-    const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(', ');
-    return `<option value="${esc(it.key)}">${it.loaded ? '● ' : '○ '}${esc(it.model)}${meta ? '  [' + esc(meta) + ']' : ''}${it.loaded ? '' : '  (not loaded)'}</option>`;
-  };
-  sel.innerHTML = ups.length > 1
-    ? ups.map(up => `<optgroup label="${esc(label[up] || up)}">${byUp[up].map(optFor).join('')}</optgroup>`).join('')
-    : byUp[ups[0]].map(optFor).join('');
-
-  // Keep whatever was already selected and still visible; otherwise default to something
-  // already resident, so the obvious first click measures a warm model.
-  let kept = 0;
-  for (const o of sel.options) {
-    if (prev.has(o.value)) { o.selected = true; kept++; }
-  }
-  if (!kept) {
-    const first = items.find(i => i.loaded) || items[0];
-    const opt = first && sel.querySelector(`option[value="${CSS.escape(first.key)}"]`);
-    if (opt) opt.selected = true;
+  host.innerHTML = ups.map(up => {
+    // Only label the group when more than one backend is in view; filtered to one it's noise.
+    const head = ups.length > 1
+      ? `<div class="bench-list-empty" style="padding:3px 7px;color:#6b7787;background:#0d1117">${esc(groupLabel[up] || up)}</div>`
+      : '';
+    return head + byUp[up].map(it => {
+      const on = _benchModelSel.has(it.key);
+      // Quant and window are the two facts you need beside a benchmark number.
+      const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(' · ');
+      return `<label class="bench-list-row${on ? ' on' : ''}" title="${esc(it.model)}${it.loaded ? ' — loaded' : ' — not loaded'}">
+        <input type="checkbox" data-key="${esc(it.key)}"${on ? ' checked' : ''}>
+        <span class="dot" style="color:${it.loaded ? '#3f8f5f' : '#4d5765'}">${it.loaded ? '●' : '○'}</span>
+        <span class="nm">${esc(it.model)}</span>
+        <span class="meta">${esc(meta)}</span>
+      </label>`;
+    }).join('');
+  }).join('');
+  _benchModelCount();
+  for (const cb of host.querySelectorAll('input[data-key]')) {
+    cb.onchange = () => {
+      if (cb.checked) _benchModelSel.add(cb.dataset.key);
+      else _benchModelSel.delete(cb.dataset.key);
+      // Toggle the row in place rather than re-rendering the list: a full re-render throws
+      // away scroll position and keyboard focus mid-interaction.
+      cb.closest('.bench-list-row').classList.toggle('on', cb.checked);
+      _benchModelCount();
+      _benchUpdatePlan();
+    };
   }
 }
 
+// Sweep axes with a small fixed set of values render as toggle pills — compact, and every
+// option stays visible instead of hiding below a scroll line.
+const _BENCH_PROMPT_SIZES = [
+  ['0', 'short'], ['2000', '2K'], ['4000', '4K'], ['8000', '8K'], ['16000', '16K'],
+  ['32000', '32K'], ['65536', '64K'], ['131072', '128K'], ['262144', '256K'],
+];
+const _BENCH_THINK_OPTS = [
+  ['auto', 'auto', "Leave the proxy's per-model quirks in place — what production traffic sees"],
+  ['off', 'off', 'enable_thinking=false plus reasoning_effort=none'],
+  ['off_prefill', 'off (prefill)', 'Off via an empty <think> block — the only lever LM Studio honors'],
+  ['on', 'on', 'enable_thinking=true plus reasoning_effort=high'],
+];
+
+function _benchRenderToggles(hostId, opts, sel) {
+  const host = $(hostId);
+  if (!host) return;
+  host.innerHTML = opts.map(([val, label, tip]) =>
+    `<button type="button" class="bench-toggle" data-val="${esc(val)}" aria-pressed="${sel.has(val)}"${tip ? ` title="${esc(tip)}"` : ''}>${esc(label)}</button>`).join('');
+  for (const b of host.querySelectorAll('button[data-val]')) {
+    b.onclick = () => {
+      const v = b.dataset.val;
+      if (sel.has(v)) sel.delete(v); else sel.add(v);
+      // An axis with nothing selected has no meaning, so the last one can't be turned off.
+      if (!sel.size) sel.add(v);
+      // Same reasoning as the model list: update state in place, don't rebuild the group.
+      for (const other of host.querySelectorAll('button[data-val]')) {
+        other.setAttribute('aria-pressed', String(sel.has(other.dataset.val)));
+      }
+      _benchUpdatePlan();
+    };
+  }
+}
+
+function _benchRenderAxes() {
+  _benchRenderToggles('bench-prompt', _BENCH_PROMPT_SIZES, _benchPromptSel);
+  _benchRenderToggles('bench-thinking', _BENCH_THINK_OPTS, _benchThinkSel);
+}
+
+let _benchModelSel = new Set();
+let _benchPromptSel = new Set(['0']);
+let _benchThinkSel = new Set(['auto']);
 let _benchModels = [], _benchUpstreams = [], _benchUpFilter = '';
-let _benchModelIndex = {};
 
-function _benchMulti(id) {
-  const el = $(id);
-  if (!el) return [];
-  return Array.from(el.selectedOptions).map(o => o.value);
-}
+let _benchModelIndex = {};
 
 function _benchTemps() {
   // Free-text so a sweep can be typed: "0, 0.2". Empty means "leave the engine's default".
@@ -6271,14 +6337,15 @@ function _benchTemps() {
 }
 
 function _benchBody() {
-  // Selected values are "<upstream>:<model>" keys — send them as explicit pairs so a sweep can
-  // span backends and a name served by two of them stays two distinct cells.
-  const models = _benchMulti('bench-model')
+  // Selections are "<upstream>:<model>" keys — sent as explicit pairs so a sweep can span
+  // backends and a name served by two of them stays two distinct cells.
+  const models = Array.from(_benchModelSel)
     .map(k => _benchModelIndex[k])
     .filter(Boolean)
     .map(m => ({model: m.model, upstream: m.upstream}));
-  const prompts = _benchMulti('bench-prompt').map(v => parseInt(v, 10) || 0);
-  const thinking = _benchMulti('bench-thinking');
+  // Sorted so the sweep runs smallest-context-first and the cell order is predictable.
+  const prompts = Array.from(_benchPromptSel).map(v => parseInt(v, 10) || 0).sort((a, b) => a - b);
+  const thinking = Array.from(_benchThinkSel);
   const temps = _benchTemps();
   const body = {
     models,
