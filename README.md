@@ -55,7 +55,7 @@ Built around two ideas:
 ### Automate
 
 - **Auditor suggestions** — the proxy analyzes recent traffic and recommends config changes (route slow-short requests off Opus, prune unused tools, bump `OLLAMA_NUM_PARALLEL`, etc.).
-- **Benchmarks** — queue a run against any model with configurable request count, token budget, and concurrency, optionally taking exclusive use of the GPU after a drain period.
+- **Benchmarks** — compare models on speed *and* correctness. Sweep models × context sizes × thinking modes × temperatures in one submission; grade the output against executable task suites; isolate the GPU for clean numbers. Reasoning-aware throughout. See [docs/benchmarking.md](docs/benchmarking.md).
 - **Scheduled tasks** — queue a prompt to run one-shot or on a schedule (cron expression, or `every 10m` / `every 2h` / `every 1d`), with pause/resume/run-now controls.
 - **MCP server** — exposes the same data via Model Context Protocol so an LLM can query traffic patterns directly.
 - **Restart from the UI** — one button to bounce the service-managed proxy, with health-check polling for confirmation.
@@ -195,7 +195,7 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | **Stats** | KPI strip plus a tabbed breakdown by model, client, app, and tool; a Trends tab with per-chart enlarge. |
 | **Audit** | Gate verdict log, the rules editor, routing-mode toggle, and the auditor's automatic suggestions. |
 | **System** | CPU, memory, GPU, loaded models per upstream, Ollama config and update check, access badge, and the restart button. |
-| **Bench** | Queue and inspect benchmark runs. |
+| **Bench** | Queue and inspect benchmark runs and sweeps, with graded quality scoring and N-way comparison. |
 | **Tasks** | One-shot and scheduled prompt runs. |
 | **Chat** | A minimal chat client that talks through the proxy, so you can exercise a model without another tool. |
 | **Setup** | Client configuration snippets. |
@@ -277,6 +277,7 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | `PROXY_REDACT_PII` | `1` | Redact bodies/headers from cross-subnet viewers (toggleable at runtime from the UI) |
 | `PROXY_REDACT_SUBNET_BITS` | `24` | IPv4 subnet width for the PII gate |
 | `PROXY_ADMIN_IPS` | (none) | Comma-separated IPs that always see full bodies |
+| `PROXY_ARTIFACTS` | `1` | Record files/URLs/directories touched via tool calls. Set `0` to capture nothing at all (toggleable at runtime from the Artifacts tab) |
 | `MCP_ALLOW_WRITE` | `false` | Allow the `update_rules` MCP tool |
 | `MCP_API_KEY` | (none) | Bearer token required on the MCP endpoint |
 
@@ -439,8 +440,11 @@ Everything the dashboard does is a plain HTTP call under `/__proxy/api/`.
 | `/control/session-label/{id}` | GET / POST | Name a conversation |
 | `/control/tasks` | GET / POST | Scheduled and one-shot task runs |
 | `/control/tasks/{id}/{cancel\|pause\|resume\|run-now}` | POST | Task lifecycle |
-| `/bench/run` | POST | Queue a benchmark |
+| `/bench/run` | POST | Queue a benchmark or a matrix sweep |
 | `/bench/runs`, `/bench/runs/{id}` | GET | Benchmark results and progress |
+| `/bench/suites`, `/bench/models` | GET | Graded task suites; models across all upstreams |
+| `/bench/report` | GET | N-way comparison, `format=json\|markdown` |
+| `/control/artifacts` | GET / POST | Artifact-capture kill switch (+ optional purge) |
 | `/restart` | POST | Self-restart (requires `X-Confirm: restart-now`) |
 | `/db/reset` | POST | Wipe stored traffic |
 

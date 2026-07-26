@@ -1,0 +1,151 @@
+# Benchmarking models through the proxy
+
+The Bench tab measures how fast a model is **and** whether it is still correct, across as many
+models, context sizes, thinking modes and temperatures as you want to compare. Everything runs
+through the proxy, so every bench request is logged and inspectable like any other traffic.
+
+## Why measurement is not obvious
+
+### Reasoning models break naive TTFT
+
+A thinking model emits its reasoning as `reasoning_content` deltas *before* any `content`
+arrives. If you time "first token" by watching only `content` — the obvious implementation —
+you report time-to-**end**-of-reasoning as TTFT and drop every reasoning token from the decode
+rate. The model looks far slower to first token and slower to generate than it is.
+
+The runner records both boundaries:
+
+| Metric | Meaning |
+|---|---|
+| **TTFT** | first token of *any* kind — the real prefill latency |
+| **TTFC** | first *content* token — when the user starts seeing the answer |
+| **Reasoning phase** | TTFC − TTFT, plus the reasoning token count when the engine reports it |
+
+For a non-thinking model the two collapse and the reasoning rows are hidden.
+
+### Thinking is disabled three different ways
+
+There is no portable switch. Each engine has its own, and the wrong one is silently ignored:
+
+| Mechanism | Works on | Notes |
+|---|---|---|
+| `chat_template_kwargs.enable_thinking: false` | Qwen3-lineage on vLLM | These models ignore OpenAI's `reasoning_effort` entirely |
+| `reasoning_effort: "none"` | ds4 / DwarfStar | Its knob is binary — `low`/`medium`/`high` all mean "think" |
+| Empty `<think></think>` assistant prefill | LM Studio / llama.cpp | Drops `chat_template_kwargs` on the floor, so pre-closing the block in the model's mouth is the only lever |
+
+The `thinking` setting maps onto these:
+
+- `auto` — change nothing, so the proxy's own per-model quirks apply. This is what production
+  traffic actually sees.
+- `off` — sets both `enable_thinking: false` and `reasoning_effort: "none"`.
+- `off_prefill` — as `off`, plus the pre-closed `<think>` block. Use for LM Studio.
+- `on` — `enable_thinking: true` and `reasoning_effort: "high"`.
+
+### Routing silently substitutes the model
+
+A `model_router` rule can rewrite the model *and* the upstream. Benchmark `qwen` with a rule in
+place and you may actually measure a different model on a different backend, with the result
+filed under the name you asked for. Two controls prevent this, both on by default in the UI:
+
+- **Pin model** (`bypass_router`) — sends `x-proxy-no-router`, so the request goes to the model
+  you named.
+- **No system nudge** (`no_nudge`) — sends `x-proxy-no-nudge`, suppressing quirk-injected system
+  prompt text. That injection is a real confound when you are measuring the model rather than
+  using it.
+
+Either way, the summary reports `served_models` — the model name the upstream echoed back — so
+you can always see what actually answered.
+
+### An empty completion is a failure, not a fast success
+
+A prompt that overflows the model's context window typically returns HTTP 200 with zero tokens,
+which naive timing records as an extremely fast run. Any run producing zero completion tokens is
+marked as an error.
+
+Related trap: prompt sizing is estimated at ~3.5 chars/token, but tokenizer density varies by
+roughly 15% between model families. A prompt that fits one model's window can overflow another's.
+The summary reports the upstream's own `prompt_tokens` so you can see what was really sent.
+
+## Matrix runs
+
+Any of **models**, **prompt size**, **thinking** and **temperature** can take several values, and
+the submission expands into one child run per combination — 3 models × 2 context sizes × 2
+thinking modes is 12 cells. The form shows the cell and request count before you start.
+
+Cells run **one at a time**. Running them concurrently would have them contend for the same GPU
+and corrupt every number in the sweep.
+
+Each cell is a full run with its own percentiles, and the parent aggregates them. Deleting the
+parent deletes its cells.
+
+## Graded suites
+
+Selecting a suite replaces the synthetic prompt with real tasks. Each asks for one named Python
+function and carries deterministic input → expected cases. The model's code block is extracted
+and executed, and two rates are reported:
+
+- **Fully correct** — the fraction of responses that passed *every* case. This is the headline
+  number: partially-right code is still broken code.
+- **Cases passed** — partial credit, useful for telling "close" from "hopeless".
+
+A per-task breakdown comes with it, because a model that is perfect everywhere except one task
+and a model that is mediocre throughout can share an identical average.
+
+> **Security.** Grading executes model-generated Python. It runs in a separate process with a
+> hard timeout, an isolated interpreter (`-I`), a scratch working directory and a stripped
+> environment. That contains accidents and runaway loops — it is **not** a sandbox against
+> deliberately hostile code. Grading is opt-in per run, and the UI confirms before starting.
+
+`coding-v1` ships with 6 tasks / 27 cases: binary search, interval merging, word frequency, Roman
+numerals, bracket balancing, and list flattening.
+
+## Getting clean numbers
+
+Competing traffic ruins timings. Two levels of isolation:
+
+- **Exclusive mode** — other proxy clients queue for the duration. Bench requests carry
+  `x-client-name: ai-proxy-bench`, which is also what panic mode whitelists.
+- **Quiesce GPU** — additionally enables panic mode and unloads every loaded Ollama model, then
+  restores them afterward. Exclusive mode alone only gates traffic *through the proxy*; Ollama
+  still answers anything that asks it directly on its own port, and an idle loaded model still
+  holds VRAM.
+
+Also relevant:
+
+- **Randomize prompt** defeats the prompt cache. Without it, repeated identical prompts hit the
+  KV cache and report a prefill time that has nothing to do with a cold request.
+- **Drain** waits before starting so in-flight requests finish first.
+- The exclusive-mode safety cap scales with the workload, so a long sweep can't have the gate
+  expire underneath it and let traffic back in halfway through.
+
+## Reproducibility
+
+Every run stores an environment snapshot: proxy version, GPU model / utilization / VRAM, system
+memory, loaded Ollama models and server config, and the model lists from LM Studio and vLLM.
+Without it, a number from three weeks ago is uninterpretable — you can't tell which quant was
+loaded or whether the GPU was already half-full when the run started.
+
+## Comparing and exporting
+
+Select any number of runs to compare. Two produce a delta table; more produce a ranked table with
+the best value in each column highlighted. **Copy Markdown** puts a pasteable table on the
+clipboard; a suite parent expands to one row per cell.
+
+The same data is available at `GET /__proxy/api/bench/report?ids=<comma-separated>&format=markdown`.
+
+## API
+
+| Endpoint | Method | Purpose |
+|---|---|---|
+| `/__proxy/api/bench/run` | POST | Queue a run or a matrix |
+| `/__proxy/api/bench/runs` | GET | History |
+| `/__proxy/api/bench/runs/{id}` | GET | Full detail, incl. suite children |
+| `/__proxy/api/bench/runs/{id}` | DELETE | Delete (cascades to cells) |
+| `/__proxy/api/bench/suites` | GET | Available graded suites and thinking modes |
+| `/__proxy/api/bench/models` | GET | Models across Ollama, LM Studio and vLLM |
+| `/__proxy/api/bench/report` | GET | Comparison report, `format=json\|markdown` |
+
+Submit body: `{model | models[], runs, max_tokens, prompt_tokens, concurrency, randomize,
+exclusive, drain_seconds, thinking, temperature, top_p, top_k, min_p, seed, extra_body, upstream,
+bypass_router, no_nudge, suite, grade_timeout, quiesce}`. `models`, `prompt_tokens`, `thinking`
+and `temperature` accept lists.

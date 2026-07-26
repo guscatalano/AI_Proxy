@@ -11,6 +11,7 @@ import hashlib
 import asyncio
 import shutil
 import subprocess
+import tempfile
 import collections
 import gzip
 import ipaddress
@@ -38,6 +39,10 @@ ANTHROPIC_URL = os.environ.get("ANTHROPIC_URL", "https://api.anthropic.com").rst
 # fields unless the viewer's IP matches the originator's IP or shares its subnet (default /24
 # for v4, /64 for v6). Loopback viewers (127.0.0.1) always see everything (admin local access).
 REDACT_PII_ENABLED = os.environ.get("PROXY_REDACT_PII", "1").lower() in ("1", "true", "yes", "on")
+# Artifact capture records which files, URLs and directories a model touched via tool calls —
+# i.e. the paths of the user's own source tree. That's more than some deployments want stored,
+# so it's a single switch: off means nothing is extracted and no artifact rows are written.
+ARTIFACTS_ENABLED = os.environ.get("PROXY_ARTIFACTS", "1").lower() in ("1", "true", "yes", "on")
 try:
     REDACT_SUBNET_BITS_V4 = int(os.environ.get("PROXY_REDACT_SUBNET_BITS", "24") or 24)
 except ValueError:
@@ -342,7 +347,11 @@ CREATE TABLE IF NOT EXISTS bench_runs (
     error TEXT,
     started_ts REAL,
     finished_ts REAL,
-    creator_ip TEXT
+    creator_ip TEXT,
+    parent_id TEXT,                      -- set on children of a matrix suite
+    axes_json TEXT,                      -- the axis values this cell represents
+    env_json TEXT,                       -- machine/engine snapshot taken at run time
+    label TEXT                            -- human-readable cell label
 );
 
 CREATE TABLE IF NOT EXISTS proxy_personalities (
@@ -435,6 +444,13 @@ MIGRATIONS = [
     # 1 if the request carried image/non-text content, so the list can badge it without
     # re-parsing the (large) body per row.
     "ALTER TABLE requests ADD COLUMN has_images INTEGER",
+    # Bench suites: a matrix submission creates one parent row plus a child row per cell.
+    # env_json snapshots the machine/engine state at run time so a result stays interpretable
+    # weeks later (which quant, which context length, how much VRAM was free).
+    "ALTER TABLE bench_runs ADD COLUMN parent_id TEXT",
+    "ALTER TABLE bench_runs ADD COLUMN axes_json TEXT",
+    "ALTER TABLE bench_runs ADD COLUMN env_json TEXT",
+    "ALTER TABLE bench_runs ADD COLUMN label TEXT",
     # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
     # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
     # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
@@ -2269,7 +2285,12 @@ def _artifact_events_from_call(name, args, tmap):
 
 
 def _extract_artifacts_into(conn, req_id, conv_id, client_ip, ts, body) -> int:
-    """Extract artifacts from a request body's recent history; insert (dedup by sig). Returns #new."""
+    """Extract artifacts from a request body's recent history; insert (dedup by sig). Returns #new.
+
+    The kill switch is enforced here as well as at the sweep, so no path — sweep, backfill, or a
+    future caller — can write artifact rows while capture is disabled."""
+    if not ARTIFACTS_ENABLED:
+        return 0
     if not isinstance(body, dict):
         return 0
     msgs = body.get("messages")
@@ -2325,6 +2346,8 @@ def _extract_artifacts_into(conn, req_id, conv_id, client_ip, ts, body) -> int:
 def _artifact_sweep() -> None:
     """Extract artifacts from requests completed since the last watermark. Dedup makes reprocessing
     safe, so a small ts lookback catches out-of-order stragglers. LIMIT bounds per-cycle work."""
+    if not ARTIFACTS_ENABLED:
+        return
     conn = db()
     s = get_setting("artifact_watermark")
     try:
@@ -6010,7 +6033,9 @@ async def list_artifacts(request: Request, kind: str = "", q: str = "", conversa
             "last_op": lr["last_op"] if lr else None,
             "last_request": lr["last_request"] if lr else None,
         })
-    return {"items": items, "total": len(items)}
+    # `enabled` lets the UI tell "nothing captured yet" apart from "capture is switched
+    # off", which otherwise both render as an empty list.
+    return {"items": items, "total": len(items), "enabled": ARTIFACTS_ENABLED}
 
 
 @app.get("/__proxy/api/artifacts/conversations")
@@ -6055,7 +6080,9 @@ async def artifact_conversations(request: Request, limit: int = 150):
                       "files": r["files"], "urls": r["urls"], "images": r["images"], "skills": r["skills"],
                       "first_ts": r["first_ts"], "last_ts": r["last_ts"]})
     conn.close()
-    return {"items": items, "total": len(items)}
+    # `enabled` lets the UI tell "nothing captured yet" apart from "capture is switched
+    # off", which otherwise both render as an empty list.
+    return {"items": items, "total": len(items), "enabled": ARTIFACTS_ENABLED}
 
 
 @app.get("/__proxy/api/artifacts/top")
@@ -6096,7 +6123,9 @@ async def top_artifacts(request: Request, kind: str = "file", limit: int = 30):
         items.append({"path": r["path"], "kind": r["kind"], "touches": r["touches"],
                       "edits": r["edits"], "views": r["views"], "versions": r["versions"],
                       "convs": r["convs"], "last_ts": r["last_ts"]})
-    return {"items": items, "total": len(items)}
+    # `enabled` lets the UI tell "nothing captured yet" apart from "capture is switched
+    # off", which otherwise both render as an empty list.
+    return {"items": items, "total": len(items), "enabled": ARTIFACTS_ENABLED}
 
 
 @app.get("/__proxy/api/artifacts/timeline")
@@ -6231,6 +6260,62 @@ async def control_redact_set(request: Request):
     global REDACT_PII_ENABLED
     REDACT_PII_ENABLED = bool(payload.get("on", not REDACT_PII_ENABLED))
     return {"ok": True, "redact_pii": REDACT_PII_ENABLED}
+
+
+@app.get("/__proxy/api/control/artifacts")
+async def control_artifacts_status():
+    """Whether artifact capture is on, plus how many rows already exist (so the UI can offer to
+    purge what was collected before it was switched off)."""
+    conn = db()
+    try:
+        n = conn.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"]
+    except sqlite3.Error:
+        n = 0
+    conn.close()
+    return {"artifacts": ARTIFACTS_ENABLED,
+            "env_default": os.environ.get("PROXY_ARTIFACTS", "1"),
+            "stored_rows": n}
+
+
+@app.post("/__proxy/api/control/artifacts")
+async def control_artifacts_set(request: Request):
+    """Turn artifact capture on or off at runtime. Body: {"on": bool, "purge": bool}.
+
+    Admin/loopback only, same reasoning as the PII toggle: artifacts are a record of the paths
+    in someone's source tree, so who may flip capture back on is not an arbitrary-viewer
+    decision. `purge` additionally deletes everything already captured — irreversible, and only
+    honored when turning capture OFF, so it can't be used as a drive-by wipe. This is an
+    in-memory override; it reverts to the PROXY_ARTIFACTS env default on the next restart.
+    """
+    ip = _client_ip(request)
+    is_loopback = False
+    try:
+        is_loopback = bool(ip) and ipaddress.ip_address(ip).is_loopback
+    except (ValueError, TypeError):
+        pass
+    if not (is_loopback or (ip and ip in ADMIN_IPS)):
+        return JSONResponse({"error": "forbidden — admin IP or loopback only"}, status_code=403)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    global ARTIFACTS_ENABLED
+    ARTIFACTS_ENABLED = bool(payload.get("on", not ARTIFACTS_ENABLED))
+    purged = None
+    if payload.get("purge") and not ARTIFACTS_ENABLED:
+        conn = db()
+        try:
+            purged = conn.execute("SELECT COUNT(*) c FROM artifacts").fetchone()["c"]
+            conn.execute("DELETE FROM artifacts")
+            # Reset the watermark too, otherwise re-enabling capture would resume from the old
+            # position and silently skip everything in between.
+            set_setting("artifact_watermark", "0")
+            conn.commit()
+        except sqlite3.Error as e:
+            conn.close()
+            return JSONResponse({"error": f"purge failed: {e}"}, status_code=500)
+        conn.close()
+    return {"ok": True, "artifacts": ARTIFACTS_ENABLED, "purged_rows": purged}
 
 
 # -------- Task queue REST API --------
@@ -6447,39 +6532,161 @@ def _bench_visible_to(viewer_ip: str | None, creator_ip: str | None) -> bool:
     return _ips_share_subnet(viewer_ip, creator_ip)
 
 
+@app.get("/__proxy/api/bench/suites")
+async def bench_suites():
+    """The graded task suites available to bench runs, with their task ids and case counts."""
+    return {
+        "suites": [
+            {
+                "name": name,
+                "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"])}
+                          for t in tasks],
+                "task_count": len(tasks),
+                "case_count": sum(len(t["cases"]) for t in tasks),
+            }
+            for name, tasks in _BENCH_SUITES.items()
+        ],
+        "thinking_modes": list(_BENCH_THINK_MODES),
+    }
+
+
+@app.get("/__proxy/api/bench/models")
+async def bench_models():
+    """Every model the proxy can reach, grouped by upstream, so a bench can target LM Studio or
+    vLLM and not just Ollama."""
+    out: dict = {"ollama": {"loaded": [], "available": []}, "lmstudio": [], "vllm": []}
+    try:
+        sysinfo = await system_now()
+        ollama = sysinfo.get("ollama") or {}
+        loaded = [m.get("name") or m.get("model") for m in (ollama.get("ps") or [])
+                  if isinstance(m, dict)]
+        out["ollama"]["loaded"] = [m for m in loaded if m]
+        tags = [t.get("name") for t in (ollama.get("tags") or []) if isinstance(t, dict)]
+        loaded_set = set(out["ollama"]["loaded"])
+        out["ollama"]["available"] = sorted(t for t in tags if t and t not in loaded_set)
+        out["lmstudio"] = sorted(m.get("id") for m in
+                                 ((sysinfo.get("lmstudio") or {}).get("models") or [])
+                                 if isinstance(m, dict) and m.get("id"))
+        out["vllm"] = sorted(m.get("id") for m in
+                             ((sysinfo.get("vllm") or {}).get("models") or [])
+                             if isinstance(m, dict) and m.get("id"))
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 @app.post("/__proxy/api/bench/run")
 async def bench_run(request: Request):
-    """Queue a benchmark. Body: {model, runs?, max_tokens?, prompt_tokens?, concurrency?,
-    randomize?, exclusive?, drain_seconds?}. Returns the bench id; poll /api/bench/runs/{id}
-    for progress and results."""
+    """Queue a benchmark. Body: {model | models[], runs?, max_tokens?, prompt_tokens?,
+    concurrency?, randomize?, exclusive?, drain_seconds?, thinking?, temperature?, top_p?,
+    top_k?, min_p?, seed?, extra_body?, upstream?, bypass_router?, no_nudge?, suite?,
+    grade_timeout?, quiesce?}.
+
+    models/prompt_tokens/thinking/temperature accept lists, which expands the submission into a
+    matrix: one child run per combination, executed serially. Returns the bench id; poll
+    /api/bench/runs/{id} for progress and results.
+    """
     try:
         payload = await request.json()
     except Exception as e:
         return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
-    model = (payload.get("model") or "").strip()
-    if not model:
-        return JSONResponse({"error": "'model' is required"}, status_code=400)
+
+    models = payload.get("models")
+    if isinstance(models, list):
+        models = [str(m).strip() for m in models if str(m or "").strip()]
+    else:
+        models = []
+    single = (payload.get("model") or "").strip()
+    if single and not models:
+        models = [single]
+    if not models:
+        return JSONResponse({"error": "'model' or 'models' is required"}, status_code=400)
+
+    thinking = payload.get("thinking")
+    for t in (thinking if isinstance(thinking, list) else [thinking]):
+        if t is not None and str(t) not in _BENCH_THINK_MODES:
+            return JSONResponse(
+                {"error": f"thinking must be one of {list(_BENCH_THINK_MODES)}"}, status_code=400)
+    upstream = str(payload.get("upstream") or "").strip().lower()
+    if upstream and upstream not in ("ollama", "lmstudio", "vllm"):
+        return JSONResponse({"error": "upstream must be ollama, lmstudio or vllm"}, status_code=400)
+    suite = str(payload.get("suite") or "").strip()
+    if suite and suite not in _BENCH_SUITES:
+        return JSONResponse(
+            {"error": f"unknown suite {suite!r}; available: {list(_BENCH_SUITES)}"}, status_code=400)
+
+    def keep(key, cast=None):
+        v = payload.get(key)
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return v
+        return cast(v) if cast else v
+
     config = {
         "runs": int(payload.get("runs", 5) or 5),
         "max_tokens": int(payload.get("max_tokens", 256) or 256),
-        "prompt_tokens": int(payload.get("prompt_tokens", 0) or 0),
+        "prompt_tokens": keep("prompt_tokens") if isinstance(payload.get("prompt_tokens"), list)
+                         else int(payload.get("prompt_tokens", 0) or 0),
         "concurrency": int(payload.get("concurrency", 1) or 1),
         "randomize": bool(payload.get("randomize", False)),
         "exclusive": bool(payload.get("exclusive", False)),
         "drain_seconds": float(payload.get("drain_seconds", 5.0) or 0.0),
+        "thinking": thinking if thinking is not None else "auto",
+        "bypass_router": bool(payload.get("bypass_router", False)),
+        "no_nudge": bool(payload.get("no_nudge", False)),
+        "quiesce": bool(payload.get("quiesce", False)),
     }
+    if upstream:
+        config["upstream"] = upstream
+    if suite:
+        config["suite"] = suite
+        config["grade_timeout"] = float(payload.get("grade_timeout", 10.0) or 10.0)
+    for key, cast in (("temperature", float), ("top_p", float), ("top_k", int),
+                      ("min_p", float), ("seed", int), ("presence_penalty", float),
+                      ("frequency_penalty", float), ("repetition_penalty", float)):
+        v = keep(key, cast)
+        if v is not None:
+            config[key] = v
+    if isinstance(payload.get("extra_body"), dict):
+        config["extra_body"] = payload["extra_body"]
+
+    # A matrix is any submission with more than one cell across the four sweepable axes.
+    cells = _bench_expand_matrix(models, config)
+    is_matrix = len(cells) > 1
     bench_id = "b_" + uuid.uuid4().hex[:12]
     creator_ip = _client_ip(request)
     conn = db()
-    conn.execute(
-        """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip)
-           VALUES (?, ?, ?, ?, 'pending', ?)""",
-        (bench_id, time.time(), model, json.dumps(config), creator_ip),
-    )
+    if is_matrix:
+        config["models"] = models
+        label = f"{len(cells)} cells · {len(models)} model(s)"
+        conn.execute(
+            """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip, label)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
+            (bench_id, time.time(), models[0], json.dumps(config), creator_ip, label),
+        )
+    else:
+        # Flatten the single cell so the child config carries scalars, not one-element lists.
+        only = cells[0]
+        config["prompt_tokens"] = only["prompt_tokens"]
+        config["thinking"] = only["thinking"]
+        if only.get("temperature") is not None:
+            config["temperature"] = only["temperature"]
+        config.pop("models", None)
+        conn.execute(
+            """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip, axes_json, label)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?)""",
+            (bench_id, time.time(), only["model"], json.dumps(config), creator_ip,
+             json.dumps(only), _bench_cell_label(only)),
+        )
     conn.commit()
     conn.close()
-    asyncio.create_task(_bench_execute(bench_id, request.app))
-    return {"id": bench_id, "model": model, "config": config}
+    if is_matrix:
+        asyncio.create_task(_bench_execute_suite(bench_id, request.app))
+    else:
+        asyncio.create_task(_bench_execute(bench_id, request.app))
+    return {"id": bench_id, "model": models[0], "config": config,
+            "matrix": is_matrix, "cells": len(cells)}
 
 
 @app.get("/__proxy/api/bench/runs")
@@ -6488,7 +6695,7 @@ async def bench_runs_list(request: Request, limit: int = 50):
     conn = db()
     rows = conn.execute(
         "SELECT id, ts, model, config_json, status, progress, progress_total, "
-        "started_ts, finished_ts, error, creator_ip "
+        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label "
         "FROM bench_runs ORDER BY ts DESC LIMIT ?",
         (limit,),
     ).fetchall()
@@ -6503,6 +6710,10 @@ async def bench_runs_list(request: Request, limit: int = 50):
             d["config"] = json.loads(d.pop("config_json") or "{}")
         except (json.JSONDecodeError, TypeError):
             d["config"] = {}
+        try:
+            d["axes"] = json.loads(d.pop("axes_json") or "null")
+        except (json.JSONDecodeError, TypeError):
+            d["axes"] = None
         items.append(d)
     return {"items": items}
 
@@ -6515,14 +6726,39 @@ async def bench_run_get(bench_id: str, request: Request):
     if not row or not _bench_visible_to(_client_ip(request), row["creator_ip"]):
         return JSONResponse({"error": "not found"}, status_code=404)
     d = dict(row)
-    try:
-        d["config"] = json.loads(d.pop("config_json") or "{}")
-    except (json.JSONDecodeError, TypeError):
-        d["config"] = {}
-    try:
-        d["results"] = json.loads(d.pop("results_json") or "null")
-    except (json.JSONDecodeError, TypeError):
-        d["results"] = None
+    for src, dst, default in (("config_json", "config", {}), ("results_json", "results", None),
+                              ("axes_json", "axes", None), ("env_json", "env", None)):
+        try:
+            d[dst] = json.loads(d.pop(src) or "null")
+            if d[dst] is None and default is not None:
+                d[dst] = default
+        except (json.JSONDecodeError, TypeError):
+            d[dst] = default
+    # A suite parent carries its children inline so the UI renders the whole sweep in one fetch.
+    if not d.get("parent_id"):
+        conn = db()
+        kids = conn.execute(
+            "SELECT id, model, label, status, axes_json, results_json, error "
+            "FROM bench_runs WHERE parent_id=? ORDER BY ts, rowid", (bench_id,),
+        ).fetchall()
+        conn.close()
+        if kids:
+            children = []
+            for k in kids:
+                kd = dict(k)
+                try:
+                    kd["axes"] = json.loads(kd.pop("axes_json") or "null")
+                except (json.JSONDecodeError, TypeError):
+                    kd["axes"] = None
+                try:
+                    res = json.loads(kd.pop("results_json") or "null")
+                except (json.JSONDecodeError, TypeError):
+                    res = None
+                # Summary only — the per-request rows across a whole sweep are far too much
+                # to ship into a list view.
+                kd["summary"] = (res or {}).get("summary")
+                children.append(kd)
+            d["children"] = children
     return d
 
 
@@ -6533,10 +6769,106 @@ async def bench_run_delete(bench_id: str, request: Request):
     if not row or not _bench_visible_to(_client_ip(request), row["creator_ip"]):
         conn.close()
         return JSONResponse({"error": "not found"}, status_code=404)
-    conn.execute("DELETE FROM bench_runs WHERE id=?", (bench_id,))
+    # Cascade: deleting a suite parent must take its cells with it, or they become orphans
+    # that no view lists and nothing can clean up.
+    conn.execute("DELETE FROM bench_runs WHERE id=? OR parent_id=?", (bench_id, bench_id))
     conn.commit()
     conn.close()
     return {"ok": True}
+
+
+def _bench_fmt(v, digits=1, suffix=""):
+    if v is None:
+        return "—"
+    if isinstance(v, float):
+        return f"{v:.{digits}f}{suffix}"
+    return f"{v}{suffix}"
+
+
+def _bench_report_row(run: dict) -> dict:
+    """Flatten one run into the fields a comparison table needs."""
+    res = run.get("results") or {}
+    s = res.get("summary") or {}
+    q = s.get("quality") or {}
+    cfg = run.get("config") or {}
+    return {
+        "id": run.get("id"),
+        "label": run.get("label") or run.get("model"),
+        "model": run.get("model"),
+        "served": ", ".join(s.get("served_models") or []) or None,
+        "thinking": cfg.get("thinking"),
+        "temperature": cfg.get("temperature"),
+        "prompt_tokens": cfg.get("prompt_tokens"),
+        "n_success": s.get("n_success"),
+        "n_total": s.get("n_total"),
+        "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
+        "ttfc_p50": (s.get("ttfc_ms") or {}).get("p50"),
+        "decode_p50": (s.get("decode_tps") or {}).get("p50"),
+        "total_p50": (s.get("total_ms") or {}).get("p50"),
+        "reasoning_tok_p50": (s.get("reasoning_tokens") or {}).get("p50"),
+        "perfect_rate": q.get("perfect_rate"),
+        "case_pass_rate": q.get("case_pass_rate"),
+        "suite": cfg.get("suite"),
+    }
+
+
+@app.get("/__proxy/api/bench/report")
+async def bench_report(request: Request, ids: str = "", format: str = "json"):
+    """Comparison report over any number of runs. `ids` is comma-separated; a suite parent
+    expands to its cells. format=markdown returns a pasteable table."""
+    wanted = [i.strip() for i in (ids or "").split(",") if i.strip()]
+    if not wanted:
+        return JSONResponse({"error": "'ids' is required (comma-separated bench ids)"},
+                            status_code=400)
+    viewer = _client_ip(request)
+    conn = db()
+    runs: list[dict] = []
+    for bid in wanted:
+        row = conn.execute("SELECT * FROM bench_runs WHERE id=?", (bid,)).fetchone()
+        if not row or not _bench_visible_to(viewer, row["creator_ip"]):
+            continue
+        kids = conn.execute("SELECT * FROM bench_runs WHERE parent_id=? ORDER BY ts, rowid",
+                            (bid,)).fetchall()
+        for r in (kids or [row]):
+            d = dict(r)
+            for src, dst in (("config_json", "config"), ("results_json", "results"),
+                             ("axes_json", "axes"), ("env_json", "env")):
+                try:
+                    d[dst] = json.loads(d.pop(src) or "null")
+                except (json.JSONDecodeError, TypeError):
+                    d[dst] = None
+            runs.append(d)
+    conn.close()
+    if not runs:
+        return JSONResponse({"error": "no visible runs for those ids"}, status_code=404)
+    rows = [_bench_report_row(r) for r in runs]
+    if format != "markdown":
+        return {"rows": rows, "env": [r.get("env") for r in runs]}
+
+    graded = any(r.get("perfect_rate") is not None for r in rows)
+    head = ["Run", "Model", "Think", "Ctx", "TTFT p50", "Decode p50", "Total p50"]
+    if graded:
+        head += ["Fully correct", "Cases"]
+    lines = ["| " + " | ".join(head) + " |",
+             "|" + "|".join(["---"] * len(head)) + "|"]
+    for r in rows:
+        cells = [
+            str(r["label"] or "—"),
+            str(r["served"] or r["model"] or "—"),
+            str(r["thinking"] or "auto"),
+            _bench_fmt(r["prompt_tokens"], 0),
+            _bench_fmt(r["ttft_p50"], 0, " ms"),
+            _bench_fmt(r["decode_p50"], 1, " tok/s"),
+            _bench_fmt(r["total_p50"], 0, " ms"),
+        ]
+        if graded:
+            pr = r["perfect_rate"]
+            cr = r["case_pass_rate"]
+            cells += [f"{pr * 100:.0f}%" if pr is not None else "—",
+                      f"{cr * 100:.0f}%" if cr is not None else "—"]
+        lines.append("| " + " | ".join(cells) + " |")
+    md = "\n".join(lines)
+    return Response(content=md, media_type="text/markdown; charset=utf-8")
 
 
 # -------- Chat personalities (server-side, subnet-scoped) --------
@@ -6974,6 +7306,197 @@ _BENCH_BASE_TASK = (
     "at the bottom that exercises edge cases. Be thorough."
 )
 
+# ---- Graded task suite -------------------------------------------------------------------------
+# Perf without correctness is a speedometer, not a decision tool: a model that streams 40% faster
+# but gets the code wrong is not the better model. Each task asks for one named Python function
+# and carries deterministic (input → expected) cases. The model's code block is extracted and run
+# in a subprocess, and the score is the fraction of cases that produced the expected value.
+#
+# SECURITY: this executes model-generated code. It runs in a separate process with a hard timeout,
+# in a scratch cwd, with the parent's env stripped down. That contains accidents and runaway loops
+# — it is NOT a sandbox against deliberately hostile code. Grading is opt-in per bench run.
+_BENCH_SUITES: dict[str, list[dict]] = {
+    "coding-v1": [
+        {
+            "id": "binary_search",
+            "prompt": ("Write a Python function `binary_search(items: list[int], target: int) -> int` "
+                       "that returns the index of target in the sorted list items, or -1 if absent. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "binary_search",
+            "cases": [
+                {"args": [[1, 3, 5, 7, 9], 7], "expect": 3},
+                {"args": [[1, 3, 5, 7, 9], 1], "expect": 0},
+                {"args": [[1, 3, 5, 7, 9], 9], "expect": 4},
+                {"args": [[1, 3, 5, 7, 9], 4], "expect": -1},
+                {"args": [[], 1], "expect": -1},
+                {"args": [[42], 42], "expect": 0},
+            ],
+        },
+        {
+            "id": "merge_intervals",
+            "prompt": ("Write a Python function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` "
+                       "that merges all overlapping intervals and returns them sorted by start. "
+                       "Touching intervals like [1,2] and [2,3] count as overlapping. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "merge_intervals",
+            "cases": [
+                {"args": [[[1, 3], [2, 6], [8, 10], [15, 18]]], "expect": [[1, 6], [8, 10], [15, 18]]},
+                {"args": [[[1, 4], [4, 5]]], "expect": [[1, 5]]},
+                {"args": [[]], "expect": []},
+                {"args": [[[5, 6], [1, 2]]], "expect": [[1, 2], [5, 6]]},
+            ],
+        },
+        {
+            "id": "word_freq",
+            "prompt": ("Write a Python function `word_freq(text: str, n: int) -> list[tuple[str, int]]` "
+                       "returning the n most common lowercase words in text, as (word, count) tuples "
+                       "sorted by count descending then word ascending. Words are runs of letters; "
+                       "ignore case and punctuation. Return only the function in a single ```python code block."),
+            "entry": "word_freq",
+            "cases": [
+                {"args": ["the cat the dog THE bird", 2], "expect": [["the", 3], ["bird", 1]]},
+                {"args": ["a b c", 2], "expect": [["a", 1], ["b", 1]]},
+                {"args": ["", 3], "expect": []},
+            ],
+        },
+        {
+            "id": "roman",
+            "prompt": ("Write a Python function `to_roman(n: int) -> str` converting an integer "
+                       "between 1 and 3999 into a Roman numeral. Return only the function in a "
+                       "single ```python code block."),
+            "entry": "to_roman",
+            "cases": [
+                {"args": [1], "expect": "I"},
+                {"args": [4], "expect": "IV"},
+                {"args": [9], "expect": "IX"},
+                {"args": [58], "expect": "LVIII"},
+                {"args": [1994], "expect": "MCMXCIV"},
+                {"args": [3999], "expect": "MMMCMXCIX"},
+            ],
+        },
+        {
+            "id": "balanced",
+            "prompt": ("Write a Python function `is_balanced(s: str) -> bool` returning True when "
+                       "every (), [] and {} in s is correctly matched and nested. Ignore all other "
+                       "characters. Return only the function in a single ```python code block."),
+            "entry": "is_balanced",
+            "cases": [
+                {"args": ["({[]})"], "expect": True},
+                {"args": ["(]"], "expect": False},
+                {"args": [""], "expect": True},
+                {"args": ["a(b)c[d]{e}"], "expect": True},
+                {"args": ["((("], "expect": False},
+            ],
+        },
+        {
+            "id": "flatten",
+            "prompt": ("Write a Python function `flatten(nested: list) -> list` that fully flattens "
+                       "an arbitrarily nested list of lists into a single flat list, preserving order. "
+                       "Non-list values pass through. Return only the function in a single ```python code block."),
+            "entry": "flatten",
+            "cases": [
+                {"args": [[1, [2, [3, [4]]], 5]], "expect": [1, 2, 3, 4, 5]},
+                {"args": [[]], "expect": []},
+                {"args": [[[], [[]], [[[1]]]]], "expect": [1]},
+            ],
+        },
+    ],
+}
+
+_BENCH_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+
+
+def _bench_extract_code(text: str) -> str:
+    """Pull the Python out of a model response. Prefers fenced blocks (taking the longest, since
+    models often emit a short usage example alongside the real implementation); falls back to the
+    raw text when the model skipped the fence."""
+    blocks = _BENCH_CODE_BLOCK_RE.findall(text or "")
+    if blocks:
+        return max(blocks, key=len)
+    # Unfenced fallback, but only when the text plausibly *is* code — otherwise prose gets
+    # handed to the compiler and the failure is reported as a SyntaxError, which reads like a
+    # broken implementation rather than "the model never wrote any code".
+    if "def " in (text or ""):
+        return text
+    return ""
+
+
+# Runner executed in the child process: import the model's code, call the entry point on each
+# case, and report what came back. Kept as a string so it can be fed to `python -c` without
+# needing a file on disk that the parent has to clean up.
+_BENCH_GRADER_SRC = r'''
+import json, sys
+payload = json.loads(sys.stdin.read())
+ns = {}
+out = []
+try:
+    exec(compile(payload["code"], "<model>", "exec"), ns)
+except Exception as e:
+    print(json.dumps({"fatal": "%s: %s" % (type(e).__name__, e)}))
+    sys.exit(0)
+fn = ns.get(payload["entry"])
+if not callable(fn):
+    print(json.dumps({"fatal": "no callable named %r" % payload["entry"]}))
+    sys.exit(0)
+for case in payload["cases"]:
+    try:
+        got = fn(*case["args"])
+        # Tuples and lists are interchangeable for grading: JSON can't tell them apart, and a
+        # model returning [("a",1)] vs [["a",1]] is not a correctness difference.
+        def norm(v):
+            if isinstance(v, tuple):
+                return [norm(x) for x in v]
+            if isinstance(v, list):
+                return [norm(x) for x in v]
+            return v
+        out.append({"got": norm(got), "ok": norm(got) == norm(case["expect"])})
+    except Exception as e:
+        out.append({"got": None, "ok": False, "error": "%s: %s" % (type(e).__name__, e)})
+print(json.dumps({"results": out}))
+'''
+
+
+def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float) -> dict:
+    """Run one task's code against its cases in a subprocess. Blocking — call via to_thread."""
+    payload = json.dumps({"code": code, "entry": entry, "cases": cases})
+    env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+    try:
+        proc = subprocess.run(
+            [sys.executable, "-I", "-c", _BENCH_GRADER_SRC],
+            input=payload, capture_output=True, text=True,
+            timeout=timeout_s, cwd=tempfile.gettempdir(), env=env,
+        )
+    except subprocess.TimeoutExpired:
+        return {"passed": 0, "total": len(cases), "error": f"timeout after {timeout_s}s"}
+    except Exception as e:
+        return {"passed": 0, "total": len(cases), "error": f"{type(e).__name__}: {e}"}
+    raw = (proc.stdout or "").strip().splitlines()
+    if not raw:
+        return {"passed": 0, "total": len(cases),
+                "error": (proc.stderr or "no output from grader")[:300]}
+    try:
+        parsed = json.loads(raw[-1])
+    except (json.JSONDecodeError, TypeError):
+        return {"passed": 0, "total": len(cases), "error": "grader output was not JSON"}
+    if parsed.get("fatal"):
+        return {"passed": 0, "total": len(cases), "error": parsed["fatal"]}
+    results = parsed.get("results") or []
+    passed = sum(1 for r in results if r.get("ok"))
+    return {"passed": passed, "total": len(cases), "cases": results}
+
+
+async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
+    """Grade one response against one task definition."""
+    code = _bench_extract_code(text)
+    if not code.strip():
+        return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
+                "score": 0.0, "error": "no code in response"}
+    res = await asyncio.to_thread(_bench_grade_sync, code, task["entry"], task["cases"], timeout_s)
+    total = res.get("total") or len(task["cases"])
+    res["task"] = task["id"]
+    res["score"] = (res.get("passed", 0) / total) if total else 0.0
+    return res
+
 
 def _bench_build_prompt(prompt_tokens: int, randomize: bool, seq: int) -> str:
     """Build a prompt of approximately prompt_tokens. randomize=True salts each call so
@@ -6992,29 +7515,113 @@ def _bench_build_prompt(prompt_tokens: int, randomize: bool, seq: int) -> str:
     return head + body + tail
 
 
-async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
-                         max_tokens: int, prompt: str, run_seq: int) -> dict:
-    """Issue one streaming chat-completion request via the proxy and collect timings."""
-    body = json.dumps({
+# Thinking control. Three different engines expose three different switches, and each was
+# established empirically (see docs/benchmarking.md):
+#   - chat_template_kwargs.enable_thinking  → Qwen3-lineage on vLLM (ignores reasoning_effort)
+#   - reasoning_effort: "none"              → ds4 / DwarfStar (its only off switch; low/med/high
+#                                             all map to the same "think" mode)
+#   - empty <think></think> assistant prefill → LM Studio / llama.cpp, which drops
+#                                             chat_template_kwargs entirely, so the prefill is
+#                                             the ONLY thing that suppresses reasoning there
+_BENCH_THINK_MODES = ("auto", "on", "off", "off_prefill")
+_BENCH_THINK_PREFILL = "<think>\n\n</think>\n\n"
+
+
+def _bench_apply_thinking(body: dict, mode: str) -> None:
+    """Mutate a chat-completions body to force reasoning on or off. 'auto' leaves the body
+    alone so the proxy's own per-model quirks apply (which is what production traffic sees)."""
+    if mode == "auto":
+        return
+    want_on = mode == "on"
+    ctk = body.get("chat_template_kwargs")
+    if not isinstance(ctk, dict):
+        ctk = {}
+    ctk["enable_thinking"] = want_on
+    body["chat_template_kwargs"] = ctk
+    body["reasoning_effort"] = "high" if want_on else "none"
+    if mode == "off_prefill":
+        # Pre-close the think block by putting a spent one in the model's mouth. Must be the
+        # final message so the model continues from it.
+        body.setdefault("messages", []).append(
+            {"role": "assistant", "content": _BENCH_THINK_PREFILL})
+
+
+def _bench_apply_sampling(body: dict, cfg: dict) -> None:
+    """Copy sampling knobs from the bench config onto the request body, skipping unset ones
+    so the engine's own defaults stand."""
+    for key in ("temperature", "top_p", "top_k", "min_p", "seed", "presence_penalty",
+                "frequency_penalty", "repetition_penalty"):
+        v = cfg.get(key)
+        if v is not None:
+            body[key] = v
+    extra = cfg.get("extra_body")
+    if isinstance(extra, dict):
+        for k, v in extra.items():
+            body[k] = v
+
+
+def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict) -> dict:
+    """Assemble the full request body for one bench request."""
+    body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
         "stream_options": {"include_usage": True},
         "max_tokens": max_tokens,
-    }).encode("utf-8")
-    headers = {
+    }
+    _bench_apply_thinking(body, str(cfg.get("thinking") or "auto"))
+    _bench_apply_sampling(body, cfg)
+    return body
+
+
+def _bench_headers(cfg: dict) -> dict:
+    """Headers for a bench request. x-client-name is what panic mode and the exclusive-mode
+    gate whitelist; the x-proxy-* headers pin routing so we measure the model we named."""
+    h = {
         "content-type": "application/json",
         "x-client-name": "ai-proxy-bench",
         "x-priority": "high",
     }
+    if cfg.get("bypass_router"):
+        h["x-proxy-no-router"] = "1"
+    if cfg.get("no_nudge"):
+        h["x-proxy-no-nudge"] = "1"
+    up = str(cfg.get("upstream") or "").strip().lower()
+    if up:
+        h["x-proxy-upstream"] = up
+    return h
+
+
+async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
+                         max_tokens: int, prompt: str, run_seq: int,
+                         cfg: dict | None = None, capture_text: bool = False) -> dict:
+    """Issue one streaming chat-completion request via the proxy and collect timings.
+
+    Reasoning-aware: a thinking model emits its reasoning as `reasoning_content` deltas before
+    any `content` arrives. Timing only `content` (as this did originally) reports time-to-END-of-
+    reasoning as TTFT and drops every reasoning token from the decode rate — which understates
+    throughput and overstates latency by whatever the model spent thinking. We record both
+    boundaries: `ttft_ms` (first token of either kind) and `ttfc_ms` (first content token).
+    """
+    cfg = cfg or {}
+    body = json.dumps(_bench_build_body(model, prompt, max_tokens, cfg)).encode("utf-8")
+    headers = _bench_headers(cfg)
     t0 = time.perf_counter()
-    ttft_ms: float | None = None
+    ttft_ms: float | None = None       # first token of ANY kind (reasoning or content)
+    ttfc_ms: float | None = None       # first content token
     upstream_ct: int | None = None
-    chunk_ct = 0
+    upstream_pt: int | None = None
+    upstream_rt: int | None = None
+    content_words = 0
+    reasoning_words = 0
+    served_model: str | None = None
+    text_parts: list[str] = []
     err: str | None = None
+    status_code: int | None = None
     try:
         async with client.stream("POST", base + "/v1/chat/completions",
                                  headers=headers, content=body, timeout=httpx.Timeout(600.0)) as resp:
+            status_code = resp.status_code
             if resp.status_code != 200:
                 err = f"HTTP {resp.status_code}: {(await resp.aread()).decode('utf-8', errors='replace')[:300]}"
             else:
@@ -7029,30 +7636,64 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                         j = json.loads(data)
                     except (json.JSONDecodeError, TypeError):
                         continue
+                    if served_model is None and j.get("model"):
+                        served_model = str(j["model"])
                     for ch in (j.get("choices") or []):
                         delta = ch.get("delta") or {}
-                        if delta.get("content"):
+                        # Engines disagree on the field name for reasoning deltas.
+                        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                        if reasoning:
                             if ttft_ms is None:
                                 ttft_ms = (time.perf_counter() - t0) * 1000
-                            chunk_ct += len(re.findall(r"\S+", delta["content"]))
+                            reasoning_words += len(re.findall(r"\S+", reasoning))
+                        if delta.get("content"):
+                            now_ms = (time.perf_counter() - t0) * 1000
+                            if ttft_ms is None:
+                                ttft_ms = now_ms
+                            if ttfc_ms is None:
+                                ttfc_ms = now_ms
+                            content_words += len(re.findall(r"\S+", delta["content"]))
+                            if capture_text:
+                                text_parts.append(delta["content"])
                     u = j.get("usage")
-                    if isinstance(u, dict) and u.get("completion_tokens"):
-                        upstream_ct = u["completion_tokens"]
+                    if isinstance(u, dict):
+                        if u.get("completion_tokens"):
+                            upstream_ct = u["completion_tokens"]
+                        if u.get("prompt_tokens"):
+                            upstream_pt = u["prompt_tokens"]
+                        details = u.get("completion_tokens_details")
+                        if isinstance(details, dict) and details.get("reasoning_tokens"):
+                            upstream_rt = details["reasoning_tokens"]
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
     total_ms = (time.perf_counter() - t0) * 1000
-    completion_tokens = upstream_ct if upstream_ct is not None else chunk_ct
+    # Prefer the upstream's own token accounting; fall back to a word count only when absent.
+    completion_tokens = upstream_ct if upstream_ct is not None else (content_words + reasoning_words)
+    # Decode rate spans first token → end, so reasoning tokens count as generated work.
     decode_tps: float | None = None
-    if (ttft_ms is not None and total_ms > ttft_ms and completion_tokens > 0):
+    if ttft_ms is not None and total_ms > ttft_ms and completion_tokens > 0:
         decode_tps = completion_tokens / ((total_ms - ttft_ms) / 1000.0)
-    return {
+    # An empty completion is a failure, not a very fast success. This is how a prompt that
+    # overflows the model's context window presents (see the tokenizer-density note in
+    # docs/benchmarking.md) — the request 200s and returns nothing.
+    if not err and completion_tokens == 0:
+        err = "empty completion (0 tokens) — possible context overflow or refused generation"
+    row = {
         "seq": run_seq,
         "ttft_ms": ttft_ms,
+        "ttfc_ms": ttfc_ms,
         "total_ms": total_ms,
         "completion_tokens": completion_tokens,
+        "reasoning_tokens": upstream_rt if upstream_rt is not None else (reasoning_words or None),
+        "prompt_tokens": upstream_pt,
         "decode_tps": decode_tps,
+        "served_model": served_model,
+        "status": status_code,
         "error": err,
     }
+    if capture_text:
+        row["text"] = "".join(text_parts)
+    return row
 
 
 def _bench_pct(values: list, p: float):
@@ -7068,34 +7709,282 @@ def _bench_pct(values: list, p: float):
     return s[lo] * (1 - frac) + s[hi] * frac
 
 
-def _bench_summarize(rows: list[dict]) -> dict:
-    """Roll up per-request timings into min / p50 / p90 / max for TTFT and decode."""
-    successes = [r for r in rows if not r.get("error")]
-    ttfts = [r["ttft_ms"] for r in successes if r["ttft_ms"] is not None]
-    decodes = [r["decode_tps"] for r in successes if r["decode_tps"] is not None]
-    totals = [r["total_ms"] for r in successes]
+def _bench_stat(values: list) -> dict:
+    """min / p50 / p90 / max / mean for one metric, all None when there's nothing to report."""
+    vals = [v for v in values if v is not None]
+    if not vals:
+        return {"min": None, "p50": None, "p90": None, "max": None, "mean": None}
     return {
+        "min": min(vals),
+        "p50": _bench_pct(vals, 50),
+        "p90": _bench_pct(vals, 90),
+        "max": max(vals),
+        "mean": sum(vals) / len(vals),
+    }
+
+
+def _bench_summarize(rows: list[dict]) -> dict:
+    """Roll up per-request timings. Reports TTFT (first token of any kind) and TTFC (first
+    *content* token) separately — for a thinking model the gap between them is the reasoning
+    phase, and conflating the two is what made the original bench misreport reasoning models."""
+    successes = [r for r in rows if not r.get("error")]
+    reasoning_ms = [
+        r["ttfc_ms"] - r["ttft_ms"]
+        for r in successes
+        if r.get("ttfc_ms") is not None and r.get("ttft_ms") is not None
+    ]
+    reasoning_tok = [r.get("reasoning_tokens") for r in successes]
+    served = sorted({r["served_model"] for r in successes if r.get("served_model")})
+    out = {
         "n_total": len(rows),
         "n_success": len(successes),
-        "ttft_ms": {
-            "min": min(ttfts) if ttfts else None,
-            "p50": _bench_pct(ttfts, 50),
-            "p90": _bench_pct(ttfts, 90),
-            "max": max(ttfts) if ttfts else None,
-        },
-        "decode_tps": {
-            "min": min(decodes) if decodes else None,
-            "p50": _bench_pct(decodes, 50),
-            "p90": _bench_pct(decodes, 90),
-            "max": max(decodes) if decodes else None,
-            "mean": (sum(decodes) / len(decodes)) if decodes else None,
-        },
-        "total_ms": {
-            "min": min(totals) if totals else None,
-            "p50": _bench_pct(totals, 50),
-            "max": max(totals) if totals else None,
-        },
+        "ttft_ms": _bench_stat([r.get("ttft_ms") for r in successes]),
+        "ttfc_ms": _bench_stat([r.get("ttfc_ms") for r in successes]),
+        "decode_tps": _bench_stat([r.get("decode_tps") for r in successes]),
+        "total_ms": _bench_stat([r.get("total_ms") for r in successes]),
+        "completion_tokens": _bench_stat([r.get("completion_tokens") for r in successes]),
+        "prompt_tokens": _bench_stat([r.get("prompt_tokens") for r in successes]),
+        "served_models": served,
     }
+    # Only surface the reasoning block when the model actually reasoned, so non-thinking
+    # runs don't carry a wall of nulls.
+    if any(v for v in reasoning_tok if v):
+        out["reasoning_tokens"] = _bench_stat(reasoning_tok)
+    if reasoning_ms:
+        out["reasoning_ms"] = _bench_stat(reasoning_ms)
+    errors = [r["error"] for r in rows if r.get("error")]
+    if errors:
+        # Collapse to distinct messages so a systematic failure reads as one line, not N.
+        seen: dict = {}
+        for e in errors:
+            seen[e] = seen.get(e, 0) + 1
+        out["errors"] = [{"message": k, "count": v} for k, v in
+                         sorted(seen.items(), key=lambda kv: -kv[1])]
+    return out
+
+
+def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
+    """Aggregate graded results: overall pass rate plus a per-task breakdown, so a model that
+    is strong everywhere except one task is distinguishable from one that is mediocre
+    throughout — the two look identical in a single average."""
+    per_task: dict[str, dict] = {}
+    for task in suite:
+        per_task[task["id"]] = {"task": task["id"], "runs": 0, "passed_cases": 0,
+                                "total_cases": 0, "perfect_runs": 0, "errors": 0}
+    for r in rows:
+        tid = r.get("task")
+        if not tid or tid not in per_task:
+            continue
+        slot = per_task[tid]
+        slot["runs"] += 1
+        g = r.get("grade")
+        if not g:
+            slot["errors"] += 1
+            continue
+        slot["passed_cases"] += g.get("passed", 0)
+        slot["total_cases"] += g.get("total", 0)
+        if g.get("total") and g.get("passed") == g.get("total"):
+            slot["perfect_runs"] += 1
+    for slot in per_task.values():
+        slot["case_pass_rate"] = (slot["passed_cases"] / slot["total_cases"]
+                                  if slot["total_cases"] else None)
+        slot["perfect_rate"] = (slot["perfect_runs"] / slot["runs"] if slot["runs"] else None)
+    total_cases = sum(s["total_cases"] for s in per_task.values())
+    passed_cases = sum(s["passed_cases"] for s in per_task.values())
+    total_runs = sum(s["runs"] for s in per_task.values())
+    perfect_runs = sum(s["perfect_runs"] for s in per_task.values())
+    return {
+        "suite_size": len(suite),
+        "case_pass_rate": (passed_cases / total_cases) if total_cases else None,
+        "passed_cases": passed_cases,
+        "total_cases": total_cases,
+        # The headline number: fraction of responses that were fully correct. Partial credit
+        # is useful for diagnosis but "mostly right" code is still broken code.
+        "perfect_rate": (perfect_runs / total_runs) if total_runs else None,
+        "perfect_runs": perfect_runs,
+        "total_runs": total_runs,
+        "tasks": list(per_task.values()),
+    }
+
+
+async def _bench_env_snapshot() -> dict:
+    """Machine + engine state at run time. Without this a number from three weeks ago is
+    uninterpretable: you can't tell which quant was loaded, how much context it was serving,
+    or whether the GPU was already half-full when the run started."""
+    env: dict = {"ts": time.time(), "proxy_version": __version__}
+    try:
+        sysinfo = await system_now()
+        gpus = sysinfo.get("gpus") or []
+        env["gpus"] = [
+            {"name": g.get("name"), "mem_used_mb": g.get("mem_used_mb"),
+             "mem_total_mb": g.get("mem_total_mb"), "util_pct": g.get("util_pct")}
+            for g in gpus if isinstance(g, dict)
+        ]
+        env["mem"] = sysinfo.get("mem")
+        ollama = sysinfo.get("ollama") or {}
+        env["ollama_loaded"] = [
+            {"name": m.get("name") or m.get("model"), "size_vram": m.get("size_vram")}
+            for m in (ollama.get("ps") or []) if isinstance(m, dict)
+        ]
+        env["ollama_config"] = ollama.get("config")
+        lms = sysinfo.get("lmstudio") or {}
+        env["lmstudio_loaded"] = [m.get("id") for m in (lms.get("models") or [])
+                                  if isinstance(m, dict)]
+        vllm = sysinfo.get("vllm") or {}
+        env["vllm_models"] = [m.get("id") for m in (vllm.get("models") or [])
+                              if isinstance(m, dict)]
+    except Exception as e:
+        env["error"] = f"{type(e).__name__}: {e}"
+    return env
+
+
+async def _bench_quiesce(enable: bool, prior: dict | None = None) -> dict:
+    """Quiet the box for a clean run, and put it back afterward.
+
+    Exclusive mode only gates traffic *through the proxy* — Ollama still serves whatever asks
+    it directly on its own port, and an idle loaded model still holds VRAM. So quiescing also
+    means stopping Ollama's loaded models. Returns the prior state so it can be restored.
+    """
+    state: dict = {"panic_was": _PANIC_MODE, "ollama_was": []}
+    if enable:
+        try:
+            _set_panic_mode(True)
+        except Exception as e:
+            state["panic_error"] = f"{type(e).__name__}: {e}"
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+                loaded = [m.get("name") or m.get("model") for m in (ps.get("models") or [])]
+                state["ollama_was"] = [m for m in loaded if m]
+                for name in state["ollama_was"]:
+                    # keep_alive=0 is Ollama's "unload now" — no separate stop endpoint.
+                    await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "keep_alive": 0, "prompt": ""})
+        except Exception as e:
+            state["ollama_error"] = f"{type(e).__name__}: {e}"
+        return state
+    # Restore.
+    prior = prior or {}
+    try:
+        if not prior.get("panic_was"):
+            _set_panic_mode(False)
+    except Exception:
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+            for name in (prior.get("ollama_was") or []):
+                # Zero-token generate warms the model back into VRAM without producing output.
+                await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": name, "prompt": "", "keep_alive": "30m"})
+    except Exception:
+        pass
+    return prior
+
+
+def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
+    """Expand axis lists into one cell per combination. Axes are models × prompt_tokens ×
+    thinking × temperature; anything given as a scalar is treated as a single-value axis."""
+    def as_list(v, default):
+        if v is None:
+            return [default]
+        if isinstance(v, list):
+            return v or [default]
+        return [v]
+
+    prompts = as_list(cfg.get("prompt_tokens"), 0)
+    thinks = as_list(cfg.get("thinking"), "auto")
+    temps = as_list(cfg.get("temperature"), None)
+    cells = []
+    for m in model_axis:
+        for pt in prompts:
+            for th in thinks:
+                for tp in temps:
+                    axes = {"model": m, "prompt_tokens": int(pt or 0), "thinking": str(th or "auto")}
+                    if tp is not None:
+                        axes["temperature"] = float(tp)
+                    cells.append(axes)
+    return cells
+
+
+def _bench_cell_label(axes: dict) -> str:
+    bits = [str(axes.get("model") or "?")]
+    pt = axes.get("prompt_tokens") or 0
+    bits.append(f"{int(pt) // 1000}k ctx" if pt >= 1000 else (f"{pt} ctx" if pt else "short"))
+    if axes.get("thinking") and axes["thinking"] != "auto":
+        bits.append(f"think={axes['thinking']}")
+    if axes.get("temperature") is not None:
+        bits.append(f"t={axes['temperature']}")
+    return " · ".join(bits)
+
+
+async def _bench_execute_suite(parent_id: str, app: FastAPI):
+    """Run a matrix submission: expand the axes, then run each cell serially as its own child
+    bench so every cell gets a full set of percentiles. Serial by design — running cells
+    concurrently would have them contend for the same GPU and corrupt every number."""
+    conn = db()
+    row = conn.execute("SELECT * FROM bench_runs WHERE id=?", (parent_id,)).fetchone()
+    if not row or row["status"] != "pending":
+        conn.close()
+        return
+    try:
+        cfg = json.loads(row["config_json"])
+    except (json.JSONDecodeError, TypeError):
+        conn.execute("UPDATE bench_runs SET status='failed', error='invalid config JSON', finished_ts=? WHERE id=?",
+                     (time.time(), parent_id))
+        conn.commit()
+        conn.close()
+        return
+    creator_ip = row["creator_ip"]
+    models = cfg.get("models") or [row["model"]]
+    cells = _bench_expand_matrix(models, cfg)
+    child_ids = []
+    now = time.time()
+    for axes in cells:
+        cid = "b_" + uuid.uuid4().hex[:12]
+        child_cfg = dict(cfg)
+        child_cfg.pop("models", None)
+        child_cfg["prompt_tokens"] = axes["prompt_tokens"]
+        child_cfg["thinking"] = axes["thinking"]
+        if axes.get("temperature") is not None:
+            child_cfg["temperature"] = axes["temperature"]
+        # The suite owns quiescing for the whole sweep; children must not toggle it per cell.
+        child_cfg["quiesce"] = False
+        conn.execute(
+            """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
+                                       parent_id, axes_json, label)
+               VALUES (?, ?, ?, ?, 'pending', ?, ?, ?, ?)""",
+            (cid, now, axes["model"], json.dumps(child_cfg), creator_ip, parent_id,
+             json.dumps(axes), _bench_cell_label(axes)),
+        )
+        child_ids.append(cid)
+    conn.execute(
+        "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=?, "
+        "results_json=? WHERE id=?",
+        (time.time(), len(cells), json.dumps({"children": child_ids}), parent_id),
+    )
+    conn.commit()
+    conn.close()
+
+    quiesce_state = None
+    if cfg.get("quiesce"):
+        quiesce_state = await _bench_quiesce(True)
+    try:
+        for i, cid in enumerate(child_ids, start=1):
+            await _bench_execute(cid, app)
+            conn = db()
+            conn.execute("UPDATE bench_runs SET progress=? WHERE id=?", (i, parent_id))
+            conn.commit()
+            conn.close()
+    finally:
+        if quiesce_state is not None:
+            await _bench_quiesce(False, quiesce_state)
+    conn = db()
+    conn.execute(
+        "UPDATE bench_runs SET status='done', finished_ts=?, results_json=? WHERE id=?",
+        (time.time(), json.dumps({"children": child_ids, "cells": len(cells)}), parent_id),
+    )
+    conn.commit()
+    conn.close()
 
 
 async def _bench_execute(bench_id: str, app: FastAPI):
@@ -7117,43 +8006,85 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             conn.close()
             return
         runs = max(1, min(int(cfg.get("runs", 5)), 50))
-        max_tokens = max(16, min(int(cfg.get("max_tokens", 256)), 4096))
-        prompt_tokens = max(0, min(int(cfg.get("prompt_tokens", 0)), 65536))
+        max_tokens = max(16, min(int(cfg.get("max_tokens", 256)), 8192))
+        prompt_tokens = max(0, min(int(cfg.get("prompt_tokens", 0)), 262144))
         concurrency = max(1, min(int(cfg.get("concurrency", 1)), 8))
         randomize = bool(cfg.get("randomize", False))
         exclusive = bool(cfg.get("exclusive", False))
         drain_seconds = max(0.0, min(float(cfg.get("drain_seconds", 5.0)), 30.0))
         model = row["model"]
+        # Graded mode replaces the synthetic prompt with a suite of real tasks, one request
+        # each, and scores the returned code. runs is then per-task rather than total.
+        suite_name = str(cfg.get("suite") or "").strip()
+        suite = _BENCH_SUITES.get(suite_name) if suite_name else None
+        grade_timeout = max(1.0, min(float(cfg.get("grade_timeout", 10.0)), 60.0))
+        total_units = (len(suite) * runs) if suite else runs
         conn.execute(
             "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=? WHERE id=?",
-            (time.time(), runs, bench_id),
+            (time.time(), total_units, bench_id),
         )
+        conn.commit()
+        conn.close()
+        env = await _bench_env_snapshot()
+        conn = db()
+        conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?", (json.dumps(env), bench_id))
         conn.commit()
         conn.close()
         # Exclusive mode: clear the gate, optionally drain in-flight requests, run, then re-set.
         gate_held = False
         if exclusive:
             _BENCH_TRAFFIC_OK.clear()
-            _BENCH_EXCLUSIVE_DEADLINE = time.time() + 300  # 5-minute safety cap
+            # Safety cap scales with the workload — a 256k-context graded sweep legitimately
+            # runs past the old fixed 5 minutes, and expiring mid-run would let competing
+            # traffic in and silently poison the second half of the results.
+            _BENCH_EXCLUSIVE_DEADLINE = time.time() + max(300.0, 60.0 * total_units)
             gate_held = True
             if drain_seconds > 0:
                 await asyncio.sleep(drain_seconds)
+        quiesce_state = await _bench_quiesce(True) if cfg.get("quiesce") else None
         try:
             base = f"http://127.0.0.1:{PROXY_PORT}"
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
             try:
                 rows: list[dict] = []
-                # Run in batches of `concurrency`. e.g. concurrency=4, runs=8 → 2 waves of 4.
+                # Each unit is one request. Without a suite that's the synthetic prompt N times;
+                # with one it's every task × N repeats, so each task gets its own percentiles
+                # and a repeatable score.
+                units: list[tuple[str, dict | None]] = []
+                if suite:
+                    for task in suite:
+                        for _ in range(runs):
+                            units.append((task["prompt"], task))
+                else:
+                    units = [(None, None)] * runs  # prompt built per-seq below (salting needs seq)
+
                 seq_counter = 0
-                while seq_counter < runs:
-                    wave_size = min(concurrency, runs - seq_counter)
-                    wave_seqs = list(range(seq_counter + 1, seq_counter + wave_size + 1))
-                    coros = [
-                        _bench_run_one(client, base, model, max_tokens,
-                                       _bench_build_prompt(prompt_tokens, randomize, s), s)
-                        for s in wave_seqs
-                    ]
+                while seq_counter < len(units):
+                    wave_size = min(concurrency, len(units) - seq_counter)
+                    coros = []
+                    wave_tasks = []
+                    for offset in range(wave_size):
+                        idx = seq_counter + offset
+                        seq = idx + 1
+                        task_prompt, task = units[idx]
+                        prompt = (task_prompt if task_prompt is not None
+                                  else _bench_build_prompt(prompt_tokens, randomize, seq))
+                        wave_tasks.append(task)
+                        coros.append(_bench_run_one(client, base, model, max_tokens, prompt, seq,
+                                                    cfg=cfg, capture_text=bool(task)))
                     results = await asyncio.gather(*coros, return_exceptions=False)
+                    # Grade after the wave so scoring never overlaps generation — a busy CPU
+                    # during generation would show up as slower decode.
+                    for res, task in zip(results, wave_tasks):
+                        if task:
+                            res["task"] = task["id"]
+                            if not res.get("error"):
+                                res["grade"] = await _bench_grade(res.get("text") or "", task,
+                                                                  grade_timeout)
+                            # The full response can be megabytes across a suite; the grade is
+                            # the durable artifact, so keep only a readable excerpt.
+                            if "text" in res:
+                                res["text"] = res["text"][:4000]
                     rows.extend(results)
                     seq_counter += wave_size
                     # Persist progress incrementally so the UI can poll.
@@ -7165,7 +8096,9 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     conn.commit()
                     conn.close()
                 summary = _bench_summarize(rows)
-                final = {"rows": rows, "summary": summary, "config_used": cfg}
+                if suite:
+                    summary["quality"] = _bench_quality_summary(rows, suite)
+                final = {"rows": rows, "summary": summary, "config_used": cfg, "env": env}
                 conn = db()
                 conn.execute(
                     "UPDATE bench_runs SET status='done', results_json=?, finished_ts=? WHERE id=?",
@@ -7184,6 +8117,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             conn.commit()
             conn.close()
         finally:
+            if quiesce_state is not None:
+                await _bench_quiesce(False, quiesce_state)
             if gate_held:
                 _BENCH_TRAFFIC_OK.set()
                 _BENCH_EXCLUSIVE_DEADLINE = 0.0
@@ -9604,7 +10539,12 @@ async def proxy(full_path: str, request: Request):
     # Phase 1: transforms — model_router rewrite + ollama_options injection (both mutate body_json).
     # Anthropic requests skip ollama_options entirely (num_ctx etc. don't apply).
     router_ctx = {"client_ip": _client_ip(request), "path": "/" + full_path, "req_id": req_id, "upstream": upstream_label}
-    rewrite = evaluate_router(body_json, router_ctx) if isinstance(body_json, dict) else None
+    # x-proxy-no-router pins the request to the model it names. Benchmarks need this: with a
+    # routing rule in play, asking for "qwen" can silently measure a different model on a
+    # different backend, and the stored result would attribute the numbers to "qwen".
+    _skip_router = (request.headers.get("x-proxy-no-router") or "").strip().lower() in ("1", "true", "yes")
+    rewrite = (evaluate_router(body_json, router_ctx)
+               if isinstance(body_json, dict) and not _skip_router else None)
 
     # Per-rule upstream override: a model_router rule may carry {"upstream": "lmstudio"} to
     # send that (rewritten) model to a different backend than the path-based default. This is
@@ -9614,6 +10554,12 @@ async def proxy(full_path: str, request: Request):
     # "anthropic" is deliberately NOT a target: forwarding an OpenAI-shape body there without
     # the protocol bridge (which only goes anthropic→ollama) would produce 400s.
     _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL}
+    # x-proxy-upstream forces the backend directly, without needing a routing rule. Same
+    # motivation as x-proxy-no-router: benchmark the engine you meant to benchmark.
+    _pin_upstream = (request.headers.get("x-proxy-upstream") or "").strip().lower()
+    if _pin_upstream in _UPSTREAM_BASES and upstream_label != "anthropic":
+        rewrite = dict(rewrite or {})
+        rewrite["upstream"] = _pin_upstream
     if (rewrite and rewrite.get("upstream")
             and upstream_label != "anthropic"):
         _new_label = str(rewrite["upstream"]).lower()
@@ -9661,8 +10607,11 @@ async def proxy(full_path: str, request: Request):
     # system_nudge: some reasoning-trained models (Ornith) narrate their reasoning in the *content*
     # even with the <think> block disabled. A short system-prompt instruction is the only lever
     # that curbs that (the thinking toggle can't — it's not in a think block). Appended, not replaced.
+    # x-proxy-no-nudge suppresses it: the nudge is an extra system message, which is a real
+    # confound when the point of the request is to measure the model rather than use it.
+    _skip_nudge = (request.headers.get("x-proxy-no-nudge") or "").strip().lower() in ("1", "true", "yes")
     _nudge = _quirk.get("system_nudge")
-    if _nudge and isinstance(body_json, dict) and not ornith_think:
+    if _nudge and isinstance(body_json, dict) and not ornith_think and not _skip_nudge:
         _inject_system_reminder(body_json, str(_nudge))
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a

@@ -11,6 +11,44 @@ release workflow (publishes to PyPI and npm, and creates a `vX.Y.Z` GitHub Relea
 
 ## [Unreleased]
 
+### Added
+- **Benchmark runner, rebuilt around model comparison** — see
+  [docs/benchmarking.md](docs/benchmarking.md).
+  - **Reasoning-aware timing.** TTFT is now the first token of *any* kind; TTFC is the first
+    *content* token, and the gap between them is reported as the reasoning phase along with the
+    reasoning token count. Token counts come from the upstream's own `usage` rather than a word
+    count. A run that returns zero completion tokens is recorded as a failure instead of a very
+    fast success (this is how a context overflow presents).
+  - **Thinking control** per run: `auto` / `on` / `off` / `off_prefill`, mapping onto the three
+    mechanisms different engines actually honor — `chat_template_kwargs.enable_thinking`,
+    `reasoning_effort: "none"`, and an empty `<think></think>` assistant prefill for
+    LM Studio/llama.cpp.
+  - **Sampling knobs** (temperature, top_p, top_k, min_p, seed, penalties) and an `extra_body`
+    passthrough.
+  - **Routing pinned by default.** New `x-proxy-no-router`, `x-proxy-upstream` and
+    `x-proxy-no-nudge` request headers let a bench measure the model it named rather than
+    whatever `model_router` would have substituted. The summary reports the model the upstream
+    echoed back.
+  - **Matrix sweeps.** models × prompt sizes × thinking modes × temperatures expand into one
+    child run per cell, executed serially so cells never contend for the GPU.
+  - **Graded task suites.** `coding-v1` (6 tasks / 27 cases) asks for named Python functions and
+    executes the returned code against deterministic cases in a subprocess with a hard timeout,
+    reporting a fully-correct rate, a case pass rate, and a per-task breakdown. Opt-in.
+  - **Environment capture** per run — proxy version, GPU/VRAM, system memory, loaded models and
+    Ollama config — so a result stays interpretable weeks later.
+  - **GPU quiesce.** One toggle enables panic mode and unloads loaded Ollama models for the
+    duration, restoring them afterward; exclusive mode alone only gates traffic through the
+    proxy. The exclusive-mode safety cap now scales with the workload instead of expiring after
+    a fixed 5 minutes mid-sweep.
+  - **N-way comparison** (was hard-limited to 2) with quality beside perf, plus Markdown export
+    and `GET /api/bench/report`. New `GET /api/bench/suites` and `GET /api/bench/models` (the
+    model picker now spans Ollama, LM Studio and vLLM instead of Ollama only).
+- **Artifact-capture kill switch.** `PROXY_ARTIFACTS=0` disables recording of files/URLs/
+  directories touched via tool calls entirely, with a runtime toggle and an optional purge of
+  already-stored rows at `GET`/`POST /api/control/artifacts` (admin/loopback only, same rule as
+  the PII toggle). Enforced at both the sweep and the extraction function, so no path can write
+  artifact rows while capture is off.
+
 ## [0.2.0] - 2026-07-25
 
 The dashboard is rebuilt around a console shell, and the proxy grows three new

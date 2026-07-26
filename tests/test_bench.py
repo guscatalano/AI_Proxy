@@ -1,0 +1,240 @@
+"""Tests for the benchmark runner: measurement correctness, matrix expansion, grading.
+
+No upstream is required — the pieces exercised here are pure functions plus the submit
+endpoint's validation. The one part that genuinely runs a subprocess is the grader, which is
+the point: it executes model-written code, so its containment behavior is worth asserting.
+"""
+import asyncio
+
+import pytest
+
+import ai_proxy.proxy as p
+
+
+# ---- measurement ------------------------------------------------------------------------
+
+def test_summarize_separates_reasoning_from_content_latency():
+    """TTFT is first-token-of-any-kind; TTFC is first *content* token. Conflating them (the
+    original bug) reports a thinking model's time-to-end-of-reasoning as its TTFT."""
+    rows = [
+        {"seq": 1, "ttft_ms": 100.0, "ttfc_ms": 900.0, "total_ms": 2000.0,
+         "completion_tokens": 500, "reasoning_tokens": 300, "decode_tps": 26.3, "error": None},
+        {"seq": 2, "ttft_ms": 120.0, "ttfc_ms": 1100.0, "total_ms": 2200.0,
+         "completion_tokens": 520, "reasoning_tokens": 310, "decode_tps": 25.0, "error": None},
+    ]
+    s = p._bench_summarize(rows)
+    assert s["n_success"] == 2
+    assert s["ttft_ms"]["p50"] == pytest.approx(110.0)
+    assert s["ttfc_ms"]["p50"] == pytest.approx(1000.0)
+    # The reasoning phase is the gap between the two.
+    assert s["reasoning_ms"]["p50"] == pytest.approx(890.0)
+    assert s["reasoning_tokens"]["p50"] == pytest.approx(305.0)
+
+
+def test_summarize_omits_reasoning_block_for_non_thinking_runs():
+    rows = [{"seq": 1, "ttft_ms": 50.0, "ttfc_ms": 50.0, "total_ms": 500.0,
+             "completion_tokens": 100, "reasoning_tokens": None, "decode_tps": 222.0,
+             "error": None}]
+    s = p._bench_summarize(rows)
+    assert "reasoning_tokens" not in s
+    # ttfc == ttft means a zero-length reasoning phase, which is still reported (as 0).
+    assert s["reasoning_ms"]["p50"] == 0
+
+
+def test_summarize_collapses_repeated_errors():
+    rows = [{"seq": i, "ttft_ms": None, "ttfc_ms": None, "total_ms": 10.0,
+             "completion_tokens": 0, "decode_tps": None, "error": "HTTP 500: boom"}
+            for i in range(3)]
+    s = p._bench_summarize(rows)
+    assert s["n_success"] == 0
+    assert s["errors"] == [{"message": "HTTP 500: boom", "count": 3}]
+
+
+# ---- thinking control -------------------------------------------------------------------
+
+def test_thinking_auto_leaves_body_untouched():
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    p._bench_apply_thinking(body, "auto")
+    assert "chat_template_kwargs" not in body
+    assert "reasoning_effort" not in body
+
+
+def test_thinking_off_sets_both_engine_switches():
+    """Qwen-lineage engines read chat_template_kwargs; ds4 reads reasoning_effort. Setting
+    both means one config works across engines."""
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    p._bench_apply_thinking(body, "off")
+    assert body["chat_template_kwargs"]["enable_thinking"] is False
+    assert body["reasoning_effort"] == "none"
+
+
+def test_thinking_off_prefill_appends_spent_think_block():
+    """LM Studio / llama.cpp drops chat_template_kwargs entirely, so the only lever there is
+    putting an already-closed <think> block in the model's mouth."""
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    p._bench_apply_thinking(body, "off_prefill")
+    last = body["messages"][-1]
+    assert last["role"] == "assistant"
+    assert "</think>" in last["content"]
+
+
+def test_thinking_on_requests_reasoning():
+    body = {"model": "m", "messages": []}
+    p._bench_apply_thinking(body, "on")
+    assert body["chat_template_kwargs"]["enable_thinking"] is True
+    assert body["reasoning_effort"] == "high"
+
+
+def test_sampling_only_sets_provided_knobs():
+    body = {}
+    p._bench_apply_sampling(body, {"temperature": 0.2, "top_k": None, "extra_body": {"x": 1}})
+    assert body == {"temperature": 0.2, "x": 1}
+
+
+def test_headers_pin_routing_when_asked():
+    h = p._bench_headers({"bypass_router": True, "upstream": "vllm", "no_nudge": True})
+    assert h["x-client-name"] == "ai-proxy-bench"   # panic-mode whitelist
+    assert h["x-proxy-no-router"] == "1"
+    assert h["x-proxy-upstream"] == "vllm"
+    assert h["x-proxy-no-nudge"] == "1"
+    assert "x-proxy-upstream" not in p._bench_headers({})
+
+
+# ---- matrix -----------------------------------------------------------------------------
+
+def test_matrix_expands_the_cross_product():
+    cells = p._bench_expand_matrix(
+        ["a", "b"], {"prompt_tokens": [0, 32000], "thinking": ["off", "on"]})
+    assert len(cells) == 8
+    assert {c["model"] for c in cells} == {"a", "b"}
+    assert {c["thinking"] for c in cells} == {"off", "on"}
+
+
+def test_matrix_scalars_collapse_to_one_cell():
+    cells = p._bench_expand_matrix(["a"], {"prompt_tokens": 4096, "thinking": "off"})
+    assert cells == [{"model": "a", "prompt_tokens": 4096, "thinking": "off"}]
+
+
+def test_cell_label_is_human_readable():
+    label = p._bench_cell_label(
+        {"model": "ornith", "prompt_tokens": 32000, "thinking": "off", "temperature": 0.2})
+    assert "ornith" in label and "32k" in label and "off" in label and "0.2" in label
+
+
+# ---- grading ----------------------------------------------------------------------------
+
+def _grade(text, task_id="binary_search", timeout=15):
+    task = next(t for t in p._BENCH_SUITES["coding-v1"] if t["id"] == task_id)
+    return asyncio.run(p._bench_grade(text, task, timeout))
+
+
+def test_grader_scores_a_correct_implementation():
+    res = _grade("""Sure:
+```python
+def binary_search(items, target):
+    lo, hi = 0, len(items) - 1
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        if items[mid] == target:
+            return mid
+        if items[mid] < target:
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    return -1
+```
+""")
+    assert res["score"] == 1.0
+    assert res["passed"] == res["total"]
+
+
+def test_grader_catches_a_wrong_implementation():
+    res = _grade("```python\ndef binary_search(items, target):\n    return 0\n```")
+    assert 0 < res["score"] < 1
+
+
+def test_grader_reports_missing_code_as_such():
+    """Prose must not be handed to the compiler — 'SyntaxError' would read as broken code
+    rather than as a model that never answered."""
+    res = _grade("I would rather not.")
+    assert res["score"] == 0.0
+    assert res["error"] == "no code in response"
+
+
+def test_grader_survives_an_infinite_loop():
+    """Model-written code runs in a subprocess with a hard timeout; a runaway loop must not
+    wedge the bench."""
+    res = _grade("```python\ndef binary_search(items, target):\n    while True:\n        pass\n```",
+                 timeout=3)
+    assert res["score"] == 0.0
+    assert "timeout" in res["error"]
+
+
+def test_grader_treats_tuples_and_lists_as_equal():
+    """JSON can't distinguish them, and [('a',1)] vs [['a',1]] is not a correctness issue."""
+    res = _grade("""```python
+def word_freq(text, n):
+    import re
+    from collections import Counter
+    words = re.findall(r"[a-z]+", text.lower())
+    counts = Counter(words)
+    ranked = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+    return ranked[:n]
+```""", task_id="word_freq")
+    assert res["score"] == 1.0
+
+
+def test_code_extraction_prefers_the_longest_block():
+    """Models often emit a short usage example beside the real implementation."""
+    text = "```python\nprint(binary_search([1],1))\n```\nand the impl:\n```python\ndef binary_search(a,b):\n    return -1\n```"
+    assert "def binary_search" in p._bench_extract_code(text)
+
+
+def test_quality_summary_separates_perfect_from_partial():
+    """A model right on 3 of 6 cases everywhere and one perfect on half the tasks can share a
+    case-pass-rate; only the perfect-run rate tells them apart."""
+    suite = p._BENCH_SUITES["coding-v1"][:2]
+    rows = [
+        {"task": suite[0]["id"], "grade": {"passed": 6, "total": 6}},
+        {"task": suite[1]["id"], "grade": {"passed": 2, "total": 4}},
+    ]
+    q = p._bench_quality_summary(rows, suite)
+    assert q["passed_cases"] == 8 and q["total_cases"] == 10
+    assert q["perfect_runs"] == 1 and q["total_runs"] == 2
+    assert q["perfect_rate"] == pytest.approx(0.5)
+
+
+# ---- endpoint validation ----------------------------------------------------------------
+
+def test_submit_rejects_unknown_thinking_mode(client):
+    r = client.post("/__proxy/api/bench/run", json={"model": "m", "thinking": "sideways"})
+    assert r.status_code == 400
+    assert "thinking" in r.json()["error"]
+
+
+def test_submit_rejects_unknown_suite(client):
+    r = client.post("/__proxy/api/bench/run", json={"model": "m", "suite": "nope"})
+    assert r.status_code == 400
+    assert "unknown suite" in r.json()["error"]
+
+
+def test_submit_rejects_unknown_upstream(client):
+    r = client.post("/__proxy/api/bench/run", json={"model": "m", "upstream": "bedrock"})
+    assert r.status_code == 400
+
+
+def test_submit_requires_a_model(client):
+    assert client.post("/__proxy/api/bench/run", json={}).status_code == 400
+
+
+def test_suites_endpoint_lists_tasks(client):
+    r = client.get("/__proxy/api/bench/suites")
+    assert r.status_code == 200
+    body = r.json()
+    names = [s["name"] for s in body["suites"]]
+    assert "coding-v1" in names
+    assert "off_prefill" in body["thinking_modes"]
+
+
+def test_report_requires_ids(client):
+    assert client.get("/__proxy/api/bench/report").status_code == 400
