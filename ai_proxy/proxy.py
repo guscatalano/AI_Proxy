@@ -1918,6 +1918,24 @@ DEFAULT_RULES_CONFIG = {
             # "read_file": {"startLine": 1}
         },
     },
+    "tool_aliases": {
+        # Models call tools by the name they expect rather than the name the client declared —
+        # "run" when the client offers "terminal" is the common one. Without this the call is
+        # either rejected as hallucinated or passed through for the client to fail on, when the
+        # intent was unambiguous and the fix is a rename.
+        #
+        # Each entry is either a plain target name, or an object that also renames arguments:
+        #   "map": {
+        #     "run": "terminal",
+        #     "execute": {"to": "terminal", "args": {"command": "cmd", "script": "cmd"}}
+        #   }
+        "enabled": False,
+        "action": "rewrite",      # "rewrite" applies it; "audit" records what it would do
+        "map": {},
+        # Only rename onto a tool the request actually declared. Off, a typo in the map would
+        # invent a tool the client has never heard of, which is worse than the original problem.
+        "require_declared": True,
+    },
     "hallucinated_tool": {
         "enabled": False,
         "action": "block",
@@ -2682,6 +2700,85 @@ def _build_tool_schemas(request_body) -> dict[str, dict]:
     return out
 
 
+def _alias_target(entry):
+    """An alias is either "to", or {"to": ..., "args": {from: to}}."""
+    if isinstance(entry, str):
+        return entry, {}
+    if isinstance(entry, dict):
+        return str(entry.get("to") or ""), (entry.get("args") or {})
+    return "", {}
+
+
+def _apply_tool_aliases(response_obj: dict, request_body) -> list:
+    """Rename tool calls the model got wrong onto the tool the client actually declared.
+
+    Runs before validation, so a rename-able name is never reported as a hallucination — the
+    point is to fix the call, not to describe it. Returns what changed, for the audit log:
+    silently rewriting a model's tool call is not something to do without a record.
+    """
+    cfg = (load_rules_config().get("tool_aliases") or {})
+    if not cfg.get("enabled"):
+        return []
+    amap = cfg.get("map") or {}
+    if not isinstance(amap, dict) or not amap:
+        return []
+    declared = _build_tool_schemas(request_body)
+    require_declared = bool(cfg.get("require_declared", True))
+    rewrite = (cfg.get("action") or "rewrite") == "rewrite"
+    changes = []
+
+    def fix(tc):
+        if not isinstance(tc, dict):
+            return
+        fn = tc.get("function")
+        if not isinstance(fn, dict):
+            return
+        name = fn.get("name")
+        # Never rename a call that would already have worked.
+        if not isinstance(name, str) or name in declared:
+            return
+        entry = amap.get(name)
+        if entry is None:
+            return
+        target, arg_map = _alias_target(entry)
+        if not target or (require_declared and declared and target not in declared):
+            return
+        change = {"from": name, "to": target, "renamed_args": {}}
+        if rewrite:
+            fn["name"] = target
+        # Argument keys usually differ too: run(command=...) against terminal(cmd=...).
+        if arg_map:
+            raw = fn.get("arguments")
+            parsed = raw
+            if isinstance(raw, str):
+                try:
+                    parsed = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    parsed = None
+            if isinstance(parsed, dict):
+                for src, dst in arg_map.items():
+                    if src in parsed and dst not in parsed:
+                        change["renamed_args"][src] = dst
+                        if rewrite:
+                            parsed[dst] = parsed.pop(src)
+                if rewrite and change["renamed_args"]:
+                    fn["arguments"] = json.dumps(parsed) if isinstance(raw, str) else parsed
+        changes.append(change)
+
+    if not isinstance(response_obj, dict):
+        return changes
+    for choice in (response_obj.get("choices") or []):
+        msg = (choice.get("message") if isinstance(choice, dict) else None) or {}
+        for tc in (msg.get("tool_calls") or []):
+            fix(tc)
+    msg = response_obj.get("message")          # Ollama native /api/chat
+    if isinstance(msg, dict):
+        for tc in (msg.get("tool_calls") or []):
+            fix(tc)
+    return changes
+
+
+
 def _validate_response_tool_calls(response_obj: dict, request_body) -> list[dict]:
     """Inspect a parsed OpenAI-format response (or Ollama native one) for tool_call problems.
     Returns list of {tool_name, arguments, errors:[...], kind:'hallucinated'|'invalid_args'}."""
@@ -2844,7 +2941,12 @@ def _post_flight_active(request_body) -> bool:
     ht = (cfg.get("hallucinated_tool") or {}).get("enabled")
     af = (cfg.get("tool_args_autofix") or {}).get("enabled")
     xa = (cfg.get("xml_autofix") or {}).get("enabled")
-    return bool(sv or ht or af or xa)
+    # Renaming a tool call means rewriting the response, which means having the whole response —
+    # so aliasing has to request buffering the same way the other post-flight rules do. Without
+    # it the rule is silently inert for streaming clients, which is nearly all of them.
+    ta_cfg = cfg.get("tool_aliases") or {}
+    ta = bool(ta_cfg.get("enabled") and (ta_cfg.get("map") or {}))
+    return bool(sv or ht or af or xa or ta)
 
 
 _XML_TAG_RE = re.compile(r"<\s*/?\s*([A-Za-z][\w.\-:]*)\b[^>]*?(/?)>", re.DOTALL)
@@ -5363,7 +5465,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["model_control", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
+    known_extras = ["tool_aliases", "model_control", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -13063,6 +13165,14 @@ async def proxy(full_path: str, request: Request):
             if do_intercept and not err:
                 resp_obj = _assemble_streaming_response(full)
                 fixes = _autofix_tool_calls(resp_obj, body_json)
+                # Rename before validating, so a fixable name is not reported as a hallucination.
+                _alias_changes = _apply_tool_aliases(resp_obj, body_json)
+                if _alias_changes:
+                    _save_gate(req_id, {
+                        "verdict": "rewrite", "rule": "tool_aliases",
+                        "reason": ", ".join(c["from"] + " -> " + c["to"] for c in _alias_changes),
+                        "details": {"changes": _alias_changes},
+                    })
                 findings = _validate_response_tool_calls(resp_obj, body_json)
                 # XML autofix.
                 _xa_cfg = (load_rules_config().get("xml_autofix") or {})
@@ -13254,6 +13364,14 @@ async def proxy(full_path: str, request: Request):
             resp_obj = None
         if isinstance(resp_obj, dict):
             fixes = _autofix_tool_calls(resp_obj, body_json)
+            # Rename before validating, so a fixable name is not reported as a hallucination.
+            _alias_changes = _apply_tool_aliases(resp_obj, body_json)
+            if _alias_changes:
+                _save_gate(req_id, {
+                    "verdict": "rewrite", "rule": "tool_aliases",
+                    "reason": ", ".join(c["from"] + " -> " + c["to"] for c in _alias_changes),
+                    "details": {"changes": _alias_changes},
+                })
             findings = _validate_response_tool_calls(resp_obj, body_json)
             if findings:
                 completion_id = resp_obj.get("id") or f"proxy-{uuid.uuid4().hex[:12]}"
