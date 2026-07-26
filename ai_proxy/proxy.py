@@ -7174,7 +7174,8 @@ _REPORT_CSS = """
              color:var(--ink-faint); font-weight:500; background:var(--panel-2); }
   tbody tr:last-child td, tbody tr:last-child th { border-bottom:none; }
   tbody th { font-weight:600; color:var(--ink-dim); }
-  td.n, th.n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  td.n, th.n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums;
+              white-space:nowrap; }
   td.win { color:var(--accent); font-weight:700; }
   td.slow { color:var(--bad); font-weight:600; }
   td.ok { color:var(--good); } td.bad { color:var(--bad); font-weight:600; }
@@ -7189,6 +7190,19 @@ _REPORT_CSS = """
         letter-spacing:.6px; }
   .cl { font-size:11.5px; fill:var(--ink-dim); }
   .cv { font-size:11.5px; fill:var(--ink); font-weight:600; }
+  /* The one loud element on the page. Everything else stays quiet so this reads first. */
+  .hero { background:linear-gradient(180deg,var(--panel),var(--panel-2));
+          border:1px solid var(--border); border-left:3px solid var(--accent);
+          border-radius:12px; padding:20px 22px; margin:18px 0 4px; }
+  .hero .lede { font-size:clamp(17px,2.2vw,21px); line-height:1.45; color:var(--ink);
+                margin:0; letter-spacing:-.01em; }
+  .hero .lede b { color:var(--accent); font-family:var(--mono); font-weight:600;
+                  font-size:1.06em; letter-spacing:-.02em; }
+  .hero .why { color:var(--ink-faint); font-size:13px; margin:10px 0 0; max-width:74ch; }
+  /* Minor tables sit side by side: full width would give them an authority they haven't earned. */
+  .band { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:0 26px; }
+  .band > section > h2 { margin-top:26px; }
+  section { min-width:0; }
   footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--border);
            color:var(--ink-faint); font-size:11.5px; }
   @media print {
@@ -7547,28 +7561,38 @@ def _stats_report_html(d: dict, env: dict) -> str:
     err_rate = (errors / count) if count else 0
     span = ((o.get("last_ts") or 0) - (o.get("first_ts") or 0)) or 0
 
-    cards = f"""<div class="cards">
+    # The characteristic fact about this traffic is its asymmetry: enormous prompts, small
+    # replies. It explains the rest of the page — why aggregate throughput looks low, why decode
+    # is reported by depth, why prefill dominates latency — so it leads.
+    pt = o.get("prompt_tokens") or 0
+    ct = o.get("completion_tokens") or 0
+    ratio = (pt / ct) if ct else None
+    hero = f"""<div class="hero">
+      <p class="lede">These models read <b>{_fmt_tokens(pt)}</b> tokens and wrote
+        <b>{_fmt_tokens(ct)}</b>{f" — <b>{ratio:,.0f}</b> in for every one out" if ratio and ratio > 2 else ""}.</p>
+      <p class="why">{"That ratio is the shape of agentic traffic: long context, short answers. It is why a single tokens-per-second figure across all requests reads low — most of each request is spent reading, not writing — and why decode rate is reported by prompt depth below." if ratio and ratio > 2 else "Prompt and completion volumes are close, so aggregate throughput and decode rate should track each other."}</p>
+    </div>
+    <div class="cards">
       <div class="card hi"><p class="k">Requests</p><p class="v">{_fmt_tokens(count)}</p>
         <p class="d">{_fmt_n(count / (span / 3600) if span > 3600 else count, 1)} per hour</p></div>
-      <div class="card"><p class="k">Prompt tokens</p><p class="v">{_fmt_tokens(o.get("prompt_tokens"))}</p>
-        <p class="d">{_fmt_n((o.get("prompt_tokens") or 0) / count if count else 0, 0)} per request</p></div>
-      <div class="card"><p class="k">Completion tokens</p><p class="v">{_fmt_tokens(o.get("completion_tokens"))}</p>
-        <p class="d">{_fmt_n((o.get("completion_tokens") or 0) / count if count else 0, 0)} per request</p></div>
       <div class="card"><p class="k">Decode rate</p><p class="v">{_fmt_n(gen.get("p50"), 1)}<small> tok/s</small></p>
         <p class="d">median, prefill excluded</p></div>
+      <div class="card"><p class="k">Reply length</p><p class="v">{_fmt_n(ct / count if count else 0, 0)}<small> tok</small></p>
+        <p class="d">median request wrote this much</p></div>
       <div class="card"><p class="k">Errors</p><p class="v" style="color:{'var(--bad)' if err_rate > 0.02 else 'var(--ink)'}">{err_rate * 100:.1f}<small>%</small></p>
         <p class="d">{_fmt_n(errors)} of {_fmt_n(count)}</p></div>
     </div>"""
+    cards = hero
 
     def table(title, note, headers, rows_html):
         if not rows_html:
             return ""
         head = "".join(f'<th{" class=\"n\"" if h.startswith("#") else ""}>{_h(h.lstrip("#"))}</th>'
                        for h in headers)
-        return (f"<h2>{_h(title)}</h2>"
+        return (f"<section><h2>{_h(title)}</h2>"
                 + (f'<p class="note">{note}</p>' if note else "")
                 + f'<div class="tbl"><table><thead><tr>{head}</tr></thead>'
-                + f"<tbody>{rows_html}</tbody></table></div>")
+                + f"<tbody>{rows_html}</tbody></table></div></section>")
 
     # --- what ran -------------------------------------------------------------------------
     models = sorted(d.get("by_model") or [], key=lambda m: -(m.get("count") or 0))[:12]
@@ -7615,30 +7639,44 @@ def _stats_report_html(d: dict, env: dict) -> str:
         f'<td class="n">{_fmt_n(u.get("avg_ms"), 0, " ms")}</td></tr>'
         for u in ups)
 
-    statuses = sorted(d.get("by_status") or [], key=lambda x: -(x.get("count") or 0))[:8]
+    # None and 0 both mean "never completed"; keeping them apart produced two rows with the
+    # same label and no way to tell why.
+    merged: dict = {}
+    for st in (d.get("by_status") or []):
+        merged[_status_label(st.get("status"))] = merged.get(_status_label(st.get("status")), 0) + (st.get("count") or 0)
+    statuses = sorted(merged.items(), key=lambda kv: -kv[1])[:8]
     status_rows = "".join(
-        f'<tr><th scope="row">{_h(_status_label(st.get("status")))}</th>'
-        f'<td class="n">{_fmt_n(st.get("count"))}</td></tr>'
-        for st in statuses)
+        f'<tr><th scope="row">{_h(label)}</th><td class="n">{_fmt_n(n)}</td></tr>'
+        for label, n in statuses)
 
+    # Minor tables sit side by side; full width would give them an authority they have not
+    # earned next to Models and Clients.
+    minor = "".join([
+        table("Upstreams", "", ["Upstream", "#Requests", "", "#Mean latency"], up_rows),
+        table("Response status", "", ["Status", "#Requests"], status_rows),
+        table("Tool calls",
+              "Tools the models actually invoked — useful for spotting definitions that are "
+              "sent every turn and never used.",
+              ["Tool", "#Calls", ""], tool_rows),
+    ])
+    # The order is the argument: what ran, who asked for it, how fast it went, then small print.
     body = "".join([
         cards,
-        table("Models", "Ranked by request volume.",
-              ["Model", "#Requests", "", "#Prompt", "#Completion", "#Avg latency", "#Errors"],
+        table("Models",
+              "Ranked by request volume. Latency here is a mean over whole requests, so a few "
+              "very long ones drag it upward — read it as a rough scale and use decode rate "
+              "by depth for how fast the model actually generates.",
+              ["Model", "#Requests", "", "#Prompt", "#Completion", "#Mean latency", "#Errors"],
               model_rows),
         table("Clients", "Which applications the traffic came from, by their own fingerprint.",
-              ["Application", "#Requests", "", "#Conversations", "#Tokens", "#Avg latency"],
+              ["Application", "#Requests", "", "#Conversations", "#Tokens", "#Mean latency"],
               app_rows),
         table("Decode rate by prompt depth",
               "Decode slows as the KV cache grows, so a single median across every prompt size "
               "describes no real request. Compare a quoted tok/s figure against the bucket that "
               "matches its prompt size.",
               ["Prompt size", "#Samples", "#p50 tok/s", "#p90", "#max"], depth_rows),
-        table("Upstreams", "", ["Upstream", "#Requests", "", "#Avg latency"], up_rows),
-        table("Tool calls", "Tools the models actually invoked — useful for spotting definitions "
-              "that are sent every turn and never used.",
-              ["Tool", "#Calls", ""], tool_rows),
-        table("Response status", "", ["Status", "#Requests"], status_rows),
+        f'<div class="band">{minor}</div>',
     ])
 
     gpus = env.get("gpus") or []
