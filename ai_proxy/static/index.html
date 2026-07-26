@@ -4595,7 +4595,7 @@ async function loadSystem() {
   const [now, hist, hp] = await Promise.all([
     fetch('/__proxy/api/system/now').then(r => r.json()),
     fetch('/__proxy/api/system/history?minutes=60').then(r => r.json()),
-    fetch('/__proxy/api/health').then(r => r.json()).catch(() => null),
+    fetch('/__proxy/api/health?tables=1').then(r => r.json()).catch(() => null),
   ]);
   systemNowCache = now;
   systemHistoryCache = hist;

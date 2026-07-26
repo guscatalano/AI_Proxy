@@ -4283,8 +4283,33 @@ def _read_proc_self_status() -> dict:
     return out
 
 
+# dbstat walks every page of the database to attribute bytes to tables. On a multi-GB DB that
+# is ~1s of saturated disk I/O, and health is polled — by the restart flow, by the shell, on
+# every System tab load — so it ran constantly and starved every query running beside it.
+# Sizes move slowly; cache them and only compute when someone actually asks.
+_DBSTAT_CACHE: dict = {"ts": 0.0, "value": {}}
+_DBSTAT_TTL_S = 300.0
+
+
+def _table_sizes(conn) -> dict:
+    now = time.time()
+    if _DBSTAT_CACHE["value"] and (now - _DBSTAT_CACHE["ts"]) < _DBSTAT_TTL_S:
+        return _DBSTAT_CACHE["value"]
+    sizes: dict = {}
+    try:
+        for tbl, sz in conn.execute(
+            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC"
+        ).fetchall():
+            sizes[tbl] = sz
+    except sqlite3.OperationalError:
+        # dbstat virtual table not compiled in — row counts are the best we can do.
+        return {}
+    _DBSTAT_CACHE.update({"ts": now, "value": sizes})
+    return sizes
+
+
 @app.get("/__proxy/api/health")
-async def health():
+async def health(tables: bool = False):
     db_size = 0
     try:
         db_size = Path(DB_PATH).stat().st_size
@@ -4297,16 +4322,9 @@ async def health():
     settings_count = conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0]
     oldest = conn.execute("SELECT MIN(ts) FROM requests").fetchone()[0]
     newest = conn.execute("SELECT MAX(ts) FROM requests").fetchone()[0]
-    # Per-table sizes for SQLite (approximate; uses dbstat if compiled in, else best-effort).
-    table_sizes: dict = {}
-    try:
-        for tbl, sz in conn.execute(
-            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC"
-        ).fetchall():
-            table_sizes[tbl] = sz
-    except sqlite3.OperationalError:
-        # dbstat virtual table not available — approximate via row counts only.
-        pass
+    # Opt-in: only the System tab renders these, and it asks with ?tables=1. A liveness poll
+    # has no use for them and shouldn't pay a full-database scan to get them.
+    table_sizes = _table_sizes(conn) if tables else {}
     conn.close()
 
     proc = _read_proc_self_status()

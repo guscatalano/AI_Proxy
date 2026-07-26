@@ -88,3 +88,17 @@ def test_generation_rate_includes_every_streaming_local_upstream():
         assert engine in line, f"{engine} missing from the decode-rate upstreams"
     # Anthropic batches its SSE, so (duration - ttft) is transfer time there, not decode time.
     assert "anthropic" not in line
+
+
+def test_health_skips_the_full_database_scan_by_default(client):
+    """dbstat walks every page of the DB — ~1s on a multi-GB file. health is polled by the
+    restart flow and the shell, so paying that on every call starved every query beside it."""
+    body = client.get("/__proxy/api/health").json()
+    assert body["db"]["table_sizes"] == {}
+
+
+def test_health_reports_table_sizes_when_asked(client):
+    body = client.get("/__proxy/api/health?tables=1").json()
+    # dbstat isn't compiled into every SQLite build; the contract is only that asking is what
+    # triggers the attempt.
+    assert isinstance(body["db"]["table_sizes"], dict)
