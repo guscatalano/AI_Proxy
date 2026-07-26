@@ -3009,7 +3009,8 @@ async function loadStats() {
   const _anyTps = _gen.samples || _proc.samples || _comb.samples;
   const tpSection = `
     <div class="stats-section">
-      <h2>Throughput <span style="color:#666;font-weight:normal;font-size:11px">tokens/sec across requests · percentile spread</span></h2>
+      <h2>Throughput <span style="color:#666;font-weight:normal;font-size:11px">tokens/sec across requests · percentile spread</span>
+        <a href="/__proxy/api/stats/report" target="_blank" rel="noopener" title="Standalone usage report — everything recorded, printable to PDF" style="float:right;color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px;font-weight:normal">Usage report ↗</a></h2>
       <table style="width:100%">
         <thead><tr>
           <th style="text-align:left">Metric</th>

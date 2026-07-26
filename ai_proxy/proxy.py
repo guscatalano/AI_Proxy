@@ -7117,6 +7117,110 @@ def _bench_report_row(run: dict) -> dict:
     }
 
 
+
+# Reports use the dashboard's palette rather than a document look of their own — they're read
+# next to the UI they came from, so a different skin reads as a different tool. Colour lives in
+# CSS variables with a light counterpart, because a dark page printed to PDF wastes a cartridge
+# and reads badly on paper; print forces the light set.
+_REPORT_CSS = """
+  :root {
+    --bg:#0c0f15; --panel:#141922; --panel-2:#10141c; --border:#262d38;
+    --ink:#e9edf4; --ink-dim:#c9d3e1; --ink-faint:#8b97a8;
+    --accent:#57d1e0; --accent-deep:#2f8f9c; --good:#68d391; --warn:#f0c674; --bad:#f07178;
+    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg:#eef1f5; --panel:#fff; --panel-2:#f4f6f9; --border:#d8dee7;
+      --ink:#1a1f28; --ink-dim:#3f4a5a; --ink-faint:#6b7688;
+      --accent:#14707e; --accent-deep:#0f5b66; --good:#0a7d4f; --warn:#8a6d1f; --bad:#b3261e;
+      color-scheme: light;
+    }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
+         line-height:1.6; padding:clamp(18px,4vw,44px) clamp(14px,4vw,34px);
+         -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:1040px; margin:0 auto; }
+  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.18em; text-transform:uppercase;
+             color:var(--accent); margin:0 0 10px; }
+  h1 { font-size:clamp(22px,3.4vw,32px); line-height:1.1; margin:0 0 6px; letter-spacing:-.02em;
+       font-weight:680; }
+  .sub { color:var(--ink-faint); font-size:13px; margin:0 0 20px; }
+  h2 { font-size:12px; font-family:var(--mono); letter-spacing:.14em; text-transform:uppercase;
+       color:var(--ink-faint); margin:34px 0 12px; padding-bottom:9px;
+       border-bottom:1px solid var(--border); font-weight:600; }
+  .meta { display:flex; flex-wrap:wrap; gap:6px 24px; font-family:var(--mono); font-size:12px;
+          color:var(--ink-faint); border-top:1px solid var(--border);
+          border-bottom:1px solid var(--border); padding:10px 0; margin-bottom:6px; }
+  .meta b { color:var(--ink-dim); font-weight:500; }
+  .note { color:var(--ink-faint); font-size:12.5px; margin:0 0 12px; max-width:76ch; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px;
+           margin:16px 0 4px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
+  .card .k { font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase;
+             color:var(--ink-faint); margin:0 0 8px; }
+  .card .v { font-family:var(--mono); font-size:24px; font-weight:600; letter-spacing:-.02em;
+             line-height:1.05; color:var(--ink); }
+  .card .v small { font-size:13px; color:var(--ink-faint); font-weight:400; }
+  .card .d { font-size:12px; color:var(--ink-faint); margin:7px 0 0; }
+  .card.hi { border-color:var(--accent-deep); } .card.hi .v { color:var(--accent); }
+  .tbl { overflow-x:auto; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
+  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  th, td { padding:7px 11px; text-align:left; border-bottom:1px solid var(--border); }
+  thead th { font-family:var(--mono); font-size:10.5px; letter-spacing:.06em; text-transform:uppercase;
+             color:var(--ink-faint); font-weight:500; background:var(--panel-2); }
+  tbody tr:last-child td, tbody tr:last-child th { border-bottom:none; }
+  tbody th { font-weight:600; color:var(--ink-dim); }
+  td.n, th.n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  td.win { color:var(--accent); font-weight:700; }
+  td.slow { color:var(--bad); font-weight:600; }
+  td.ok { color:var(--good); } td.bad { color:var(--bad); font-weight:600; }
+  .unit { color:var(--ink-faint); font-weight:400; font-size:11.5px; }
+  code { font-family:var(--mono); font-size:.88em; background:var(--panel-2);
+         border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--accent); }
+  .bar { display:block; height:8px; background:var(--panel-2); border-radius:4px;
+         overflow:hidden; border:1px solid var(--border); min-width:60px; }
+  .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--accent-deep),var(--accent)); }
+  svg { margin:4px 0 16px; display:block; }
+  .ct { font-size:10.5px; fill:var(--ink-faint); font-weight:600; text-transform:uppercase;
+        letter-spacing:.6px; }
+  .cl { font-size:11.5px; fill:var(--ink-dim); }
+  .cv { font-size:11.5px; fill:var(--ink); font-weight:600; }
+  footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--border);
+           color:var(--ink-faint); font-size:11.5px; }
+  @media print {
+    :root { --bg:#fff; --panel:#fff; --panel-2:#f4f6f9; --border:#d8dee7;
+            --ink:#1a1f28; --ink-dim:#3f4a5a; --ink-faint:#6b7688;
+            --accent:#14707e; --accent-deep:#0f5b66; --good:#0a7d4f; --bad:#b3261e;
+            color-scheme: light; }
+    body { padding:0; }
+    h2 { page-break-after:avoid; }
+    table, svg, .cards { page-break-inside:avoid; }
+  }
+"""
+
+
+def _report_page(title: str, eyebrow: str, sub: str, meta: list, body: str) -> str:
+    """Shared chrome for every generated report."""
+    meta_html = "".join(f"<div>{_h(k)} <b>{_h(v)}</b></div>" for k, v in meta if v is not None)
+    return (
+        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<title>{_h(title)}</title><style>{_REPORT_CSS}</style></head><body><div class=\"wrap\">"
+        f"<p class=\"eyebrow\">{_h(eyebrow)}</p>"
+        f"<h1>{_h(title)}</h1>"
+        f"<p class=\"sub\">{_h(sub)}</p>"
+        f"<div class=\"meta\">{meta_html}</div>"
+        f"{body}"
+        "<footer>Generated by AI Proxy \u00b7 every request behind these numbers passed through the "
+        "proxy and is individually inspectable in the dashboard.</footer>"
+        "</div></body></html>"
+    )
+
+
 def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
     """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
     or printed. Charts here exist to make the ordering obvious at a glance; the table beside
@@ -7284,12 +7388,14 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                     ttrs.append(f'<tr><th scope="row">{_h(names.get(tier, tier))}</th>{tds}</tr>')
                 tier_rows = ('<table><thead><tr><th>Tier</th>' + th + '</tr></thead><tbody>'
                              + "".join(ttrs) + '</tbody></table>')
-            task_html = (
-                "<h2>Correctness by tier</h2>"
-                '<p class="note">The core tier confirms a model is not broken; it saturates for '
-                "anything capable, which is exactly why the hard tier exists. Compare two models "
-                "on the hard row when both score 100% on core.</p>"
-                + tier_rows) + f"""<h2>Per-task correctness</h2>
+            # Runs recorded before the hard tier existed carry no tier data; an empty heading
+            # with a paragraph explaining a table that isn't there is worse than no section.
+            tier_html = ("<h2>Correctness by tier</h2>"
+                         '<p class="note">The core tier confirms a model is not broken; it '
+                         "saturates for anything capable, which is exactly why the hard tier "
+                         "exists. Compare two models on the hard row when both score 100% on "
+                         "core.</p>" + tier_rows) if tier_rows else ""
+            task_html = tier_html + f"""<h2>Per-task correctness</h2>
 <p class="note">Share of responses that passed every case for that task. A model strong
 everywhere except one task and a model mediocre throughout can share an overall average.</p>
 <table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table>"""
@@ -7355,66 +7461,16 @@ ordinary slowness rather than a misconfiguration.</p>
             for r, run in zip(rows, runs)
             if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
 
-    return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Benchmark — {_h(title)}</title>
-<style>
-  :root {{ color-scheme: light; }}
-  * {{ box-sizing: border-box; }}
-  body {{ margin:0; padding:32px; background:#fbfbfa; color:#1b1f24;
-          font:14px/1.55 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif; }}
-  .wrap {{ max-width:1000px; margin:0 auto; }}
-  h1 {{ font-size:23px; margin:0 0 4px; letter-spacing:-0.01em; }}
-  h2 {{ font-size:15px; margin:30px 0 8px; letter-spacing:-0.005em; }}
-  .sub {{ color:#5b6672; font-size:13px; margin:0 0 22px; }}
-  .meta {{ display:flex; flex-wrap:wrap; gap:0 26px; font-size:12px; color:#5b6672;
-           border-top:1px solid #e2e5e9; border-bottom:1px solid #e2e5e9; padding:10px 0; margin-bottom:24px; }}
-  .meta div b {{ color:#1b1f24; font-weight:600; }}
-  table {{ border-collapse:collapse; width:100%; font-size:12.5px; margin-bottom:6px; }}
-  th, td {{ text-align:left; padding:6px 9px; border-bottom:1px solid #e8eaed; }}
-  thead th {{ font-size:10.5px; text-transform:uppercase; letter-spacing:0.6px; color:#6b7684;
-              border-bottom:1.5px solid #c9ced5; font-weight:600; }}
-  tbody th {{ font-weight:600; }}
-  td.n {{ text-align:right; font-variant-numeric:tabular-nums; }}
-  td.win {{ color:#0a7d4f; font-weight:700; }}
-  td.slow {{ color:#b3261e; font-weight:600; }}
-  .unit {{ color:#8b95a1; font-weight:400; font-size:11.5px; }}
-  td.ok {{ color:#0a7d4f; }} td.bad {{ color:#b3261e; font-weight:600; }}
-  code {{ font:12px ui-monospace,SFMono-Regular,Menlo,monospace; background:#eef0f3;
-          padding:1px 5px; border-radius:3px; }}
-  .note {{ color:#5b6672; font-size:12px; margin:0 0 10px; max-width:70ch; }}
-  svg {{ margin:6px 0 18px; display:block; }}
-  .ct {{ font-size:11px; fill:#6b7684; font-weight:600; text-transform:uppercase; letter-spacing:0.6px; }}
-  .cl {{ font-size:11.5px; fill:#3c4450; }}
-  .cv {{ font-size:11.5px; fill:#1b1f24; font-weight:600; }}
-  footer {{ margin-top:34px; padding-top:12px; border-top:1px solid #e2e5e9;
-            color:#8b95a1; font-size:11.5px; }}
-  @media print {{
-    body {{ padding:0; background:#fff; }}
-    h2 {{ page-break-after:avoid; }}
-    table, svg {{ page-break-inside:avoid; }}
-  }}
-</style></head>
-<body><div class="wrap">
-  <h1>Benchmark — {_h(title)}</h1>
-  <p class="sub">{_h(when_txt)} · measured through AI Proxy {_h(env.get("proxy_version") or "")}</p>
-  <div class="meta">
-    <div>GPU <b>{_h(gpu_txt)}</b></div>
-    <div>Configurations <b>{len(rows)}</b></div>
-    <div>Requests <b>{sum(r["n_total"] or 0 for r in rows):,}</b></div>
-    {"<div>Graded suite <b>" + _h(rows[0].get("suite") or "") + "</b></div>" if graded else ""}
-  </div>
-
+    body = f"""
   <h2>Results</h2>
   <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
   the gap between them is time the model spent reasoning. Decode rate is measured from the first
   token onward, so reasoning tokens count as generated work.
   {"" if single else "Best value in each column is highlighted."}</p>
-  <table>
-    <thead><tr>{"".join(f"<th>{_h(h)}</th>" for h in head)}</tr></thead>
+  <div class="tbl"><table>
+    <thead><tr>{"".join(f'<th>{_h(h)}</th>' for h in head)}</tr></thead>
     <tbody>{"".join(body_rows)}</tbody>
-  </table>
+  </table></div>
 
   <h2>{"Consistency" if single else "At a glance"}</h2>
   {charts}
@@ -7426,10 +7482,195 @@ ordinary slowness rather than a misconfiguration.</p>
   {task_html}
 
   {"<h2>Warm-up</h2><p class='note'>Excluded from every measurement above. A large value is the model-load cost for a model that was not resident when the run started.</p><p class='note'>" + _h(" · ".join(warm)) + "</p>" if warm else ""}
+"""
+    return _report_page(
+        title=f"Benchmark — {title}",
+        eyebrow="AI Proxy · benchmark",
+        sub=f"{when_txt} · proxy {env.get('proxy_version') or ''}",
+        meta=[("GPU", gpu_txt), ("Configurations", len(rows)),
+              ("Requests", f"{sum(r['n_total'] or 0 for r in rows):,}"),
+              ("Graded suite", rows[0].get("suite") if graded else None)],
+        body=body,
+    )
 
-  <footer>Generated by AI Proxy. Every request in this report passed through the proxy and is
-  individually inspectable in the dashboard.</footer>
-</div></body></html>"""
+
+
+def _fmt_n(v, digits=0, suffix=""):
+    return "—" if v is None else f"{v:,.{digits}f}{suffix}"
+
+
+def _fmt_tokens(v):
+    """Token counts run to the billions here; full digits are unreadable at a glance."""
+    if not v:
+        return "0"
+    for unit, div in (("B", 1e9), ("M", 1e6), ("k", 1e3)):
+        if v >= div:
+            return f"{v / div:.1f}{unit}"
+    return f"{int(v):,}"
+
+
+def _fmt_dur(seconds):
+    if not seconds:
+        return "—"
+    d, rem = divmod(int(seconds), 86400)
+    h, rem = divmod(rem, 3600)
+    m = rem // 60
+    if d:
+        return f"{d}d {h}h"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _status_label(st):
+    """0 is what a request that never completed records — it is not an HTTP status, and showing
+    it as one sends people looking for a status-0 response that doesn't exist."""
+    if st is None or st == 0:
+        return "no response (aborted or still in flight)"
+    return str(st)
+
+
+def _bar_cell(value, top):
+    pct = 0 if not top else max(1, round((value or 0) / top * 100))
+    return f'<td style="width:120px"><span class="bar"><i style="width:{pct}%"></i></span></td>'
+
+
+def _stats_report_html(d: dict, env: dict) -> str:
+    """Usage over a window. Deliberately not the same shape as the benchmark report: that one
+    compares configurations you chose, this one describes traffic you didn't — so it leads with
+    volume and composition, and treats latency as a property of the mix rather than a score."""
+    o = d.get("overall") or {}
+    gen = o.get("throughput_generation") or {}
+    depth = o.get("throughput_by_depth") or []
+    count = o.get("count") or 0
+    errors = o.get("errors") or 0
+    err_rate = (errors / count) if count else 0
+    span = ((o.get("last_ts") or 0) - (o.get("first_ts") or 0)) or 0
+
+    cards = f"""<div class="cards">
+      <div class="card hi"><p class="k">Requests</p><p class="v">{_fmt_tokens(count)}</p>
+        <p class="d">{_fmt_n(count / (span / 3600) if span > 3600 else count, 1)} per hour</p></div>
+      <div class="card"><p class="k">Prompt tokens</p><p class="v">{_fmt_tokens(o.get("prompt_tokens"))}</p>
+        <p class="d">{_fmt_n((o.get("prompt_tokens") or 0) / count if count else 0, 0)} per request</p></div>
+      <div class="card"><p class="k">Completion tokens</p><p class="v">{_fmt_tokens(o.get("completion_tokens"))}</p>
+        <p class="d">{_fmt_n((o.get("completion_tokens") or 0) / count if count else 0, 0)} per request</p></div>
+      <div class="card"><p class="k">Decode rate</p><p class="v">{_fmt_n(gen.get("p50"), 1)}<small> tok/s</small></p>
+        <p class="d">median, prefill excluded</p></div>
+      <div class="card"><p class="k">Errors</p><p class="v" style="color:{'var(--bad)' if err_rate > 0.02 else 'var(--ink)'}">{err_rate * 100:.1f}<small>%</small></p>
+        <p class="d">{_fmt_n(errors)} of {_fmt_n(count)}</p></div>
+    </div>"""
+
+    def table(title, note, headers, rows_html):
+        if not rows_html:
+            return ""
+        head = "".join(f'<th{" class=\"n\"" if h.startswith("#") else ""}>{_h(h.lstrip("#"))}</th>'
+                       for h in headers)
+        return (f"<h2>{_h(title)}</h2>"
+                + (f'<p class="note">{note}</p>' if note else "")
+                + f'<div class="tbl"><table><thead><tr>{head}</tr></thead>'
+                + f"<tbody>{rows_html}</tbody></table></div>")
+
+    # --- what ran -------------------------------------------------------------------------
+    models = sorted(d.get("by_model") or [], key=lambda m: -(m.get("count") or 0))[:12]
+    top = max((m.get("count") or 0) for m in models) if models else 0
+    model_rows = "".join(
+        f'<tr><th scope="row"><code>{_h(m.get("model") or "—")}</code></th>'
+        f'<td class="n">{_fmt_n(m.get("count"))}</td>{_bar_cell(m.get("count"), top)}'
+        f'<td class="n">{_fmt_tokens(m.get("prompt_tokens"))}</td>'
+        f'<td class="n">{_fmt_tokens(m.get("completion_tokens"))}</td>'
+        f'<td class="n">{_fmt_n(m.get("avg_ms"), 0, " ms")}</td>'
+        f'<td class="n {"bad" if (m.get("errors") or 0) else "ok"}">{_fmt_n(m.get("errors"))}</td></tr>'
+        for m in models)
+
+    apps = sorted(d.get("by_app") or [], key=lambda a: -(a.get("count") or 0))[:12]
+    atop = max((a.get("count") or 0) for a in apps) if apps else 0
+    app_rows = "".join(
+        f'<tr><th scope="row">{_h(a.get("client_app") or "unknown")}</th>'
+        f'<td class="n">{_fmt_n(a.get("count"))}</td>{_bar_cell(a.get("count"), atop)}'
+        f'<td class="n">{_fmt_n(a.get("conversations"))}</td>'
+        f'<td class="n">{_fmt_tokens(a.get("total_tokens"))}</td>'
+        f'<td class="n">{_fmt_n(a.get("avg_ms"), 0, " ms")}</td></tr>'
+        for a in apps)
+
+    tools = sorted(d.get("by_tool") or [], key=lambda t: -(t.get("calls") or 0))[:12]
+    ttop = max((t.get("calls") or 0) for t in tools) if tools else 0
+    tool_rows = "".join(
+        f'<tr><th scope="row"><code>{_h(t.get("name") or "—")}</code></th>'
+        f'<td class="n">{_fmt_n(t.get("calls"))}</td>{_bar_cell(t.get("calls"), ttop)}</tr>'
+        for t in tools)
+
+    depth_rows = "".join(
+        f'<tr><th scope="row">{_h(b.get("bucket"))}</th>'
+        f'<td class="n">{_fmt_n(b.get("samples"))}</td>'
+        f'<td class="n">{_fmt_n(b.get("p50"), 1)}</td>'
+        f'<td class="n">{_fmt_n(b.get("p90"), 1)}</td>'
+        f'<td class="n">{_fmt_n(b.get("max"), 1)}</td></tr>'
+        for b in depth)
+
+    ups = sorted(d.get("by_upstream") or [], key=lambda u: -(u.get("count") or 0))
+    utop = max((u.get("count") or 0) for u in ups) if ups else 0
+    up_rows = "".join(
+        f'<tr><th scope="row">{_h(u.get("upstream") or "—")}</th>'
+        f'<td class="n">{_fmt_n(u.get("count"))}</td>{_bar_cell(u.get("count"), utop)}'
+        f'<td class="n">{_fmt_n(u.get("avg_ms"), 0, " ms")}</td></tr>'
+        for u in ups)
+
+    statuses = sorted(d.get("by_status") or [], key=lambda x: -(x.get("count") or 0))[:8]
+    status_rows = "".join(
+        f'<tr><th scope="row">{_h(_status_label(st.get("status")))}</th>'
+        f'<td class="n">{_fmt_n(st.get("count"))}</td></tr>'
+        for st in statuses)
+
+    body = "".join([
+        cards,
+        table("Models", "Ranked by request volume.",
+              ["Model", "#Requests", "", "#Prompt", "#Completion", "#Avg latency", "#Errors"],
+              model_rows),
+        table("Clients", "Which applications the traffic came from, by their own fingerprint.",
+              ["Application", "#Requests", "", "#Conversations", "#Tokens", "#Avg latency"],
+              app_rows),
+        table("Decode rate by prompt depth",
+              "Decode slows as the KV cache grows, so a single median across every prompt size "
+              "describes no real request. Compare a quoted tok/s figure against the bucket that "
+              "matches its prompt size.",
+              ["Prompt size", "#Samples", "#p50 tok/s", "#p90", "#max"], depth_rows),
+        table("Upstreams", "", ["Upstream", "#Requests", "", "#Avg latency"], up_rows),
+        table("Tool calls", "Tools the models actually invoked — useful for spotting definitions "
+              "that are sent every turn and never used.",
+              ["Tool", "#Calls", ""], tool_rows),
+        table("Response status", "", ["Status", "#Requests"], status_rows),
+    ])
+
+    gpus = env.get("gpus") or []
+    gpu_txt = ", ".join(g.get("name") for g in gpus if isinstance(g, dict) and g.get("name")) or None
+    when = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    return _report_page(
+        title="Usage report",
+        eyebrow="AI Proxy · usage",
+        sub=f"{when} · everything the proxy has recorded",
+        meta=[("Period", _fmt_dur(span)),
+              ("First seen", datetime.datetime.fromtimestamp(o["first_ts"]).strftime("%Y-%m-%d")
+                             if o.get("first_ts") else None),
+              ("Requests", f"{count:,}"),
+              ("Tokens", _fmt_tokens((o.get("prompt_tokens") or 0) + (o.get("completion_tokens") or 0))),
+              ("GPU", gpu_txt),
+              ("Proxy", env.get("proxy_version"))],
+        body=body,
+    )
+
+
+@app.get("/__proxy/api/stats/report")
+async def stats_report(format: str = "html"):
+    """Everything the proxy has recorded, as a standalone page — the long-term counterpart to
+    the benchmark report. The benchmark report compares configurations you chose; this one
+    describes traffic you didn't, so it leads with volume and composition."""
+    # stats() is sync and scans the whole table; keep it off the event loop.
+    data = await asyncio.to_thread(stats)
+    if format != "html":
+        return data
+    env = await _bench_env_snapshot()
+    return Response(content=_stats_report_html(data, env),
+                    media_type="text/html; charset=utf-8")
 
 
 @app.get("/__proxy/api/bench/report")

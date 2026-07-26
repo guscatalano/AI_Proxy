@@ -444,6 +444,7 @@ Everything the dashboard does is a plain HTTP call under `/__proxy/api/`.
 | `/bench/runs`, `/bench/runs/{id}` | GET | Benchmark results and progress |
 | `/bench/suites`, `/bench/models` | GET | Graded task suites; models across all upstreams |
 | `/bench/report` | GET | N-way comparison, `format=json\|markdown\|html` (standalone printable report) |
+| `/stats/report` | GET | Usage report over everything recorded — standalone printable page |
 | `/control/artifacts` | GET / POST | Artifact-capture kill switch (+ optional purge) |
 | `/restart` | POST | Self-restart (requires `X-Confirm: restart-now`) |
 | `/db/reset` | POST | Wipe stored traffic |

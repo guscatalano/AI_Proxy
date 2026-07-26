@@ -534,3 +534,48 @@ def test_startup_fails_runs_left_queued_by_a_restart(tmp_path, monkeypatch):
     assert rows["b_1"] == "failed" and rows["b_2"] == "failed"
     assert rows["b_3"] == "done", "a finished run must be left alone"
     assert "restarted" in (errs["b_1"] or "")
+
+
+# ---- report theming / usage report ---------------------------------------------------------
+
+def test_reports_share_the_dashboard_theme():
+    """Reports are read next to the UI they came from; a different skin reads as a different
+    tool. Both report types render from one shell, dark by default with a light counterpart."""
+    run = {"id": "b", "ts": 1785000000.0, "label": "m", "model": "m", "config": {}, "env": {},
+           "results": {"summary": {"n_total": 1, "n_success": 1}}}
+    bench = p._bench_report_html([run], [p._bench_report_row(run)])
+    usage = p._stats_report_html({"overall": {"count": 0}}, {})
+    for html in (bench, usage):
+        assert "--accent:#57d1e0" in html, "dashboard accent missing"
+        assert "prefers-color-scheme: light" in html, "no light counterpart"
+        assert "@media print" in html, "not printable"
+        # Self-contained: no external fetches of any kind.
+        for external in ('src="http', 'href="http', "@import", "fonts.googleapis"):
+            assert external not in html
+
+
+def test_usage_report_survives_an_empty_database():
+    """A fresh install opening the report must not 500 on divide-by-zero or missing keys."""
+    html = p._stats_report_html({"overall": {"count": 0, "prompt_tokens": 0,
+                                             "completion_tokens": 0, "errors": 0}}, {})
+    assert "Usage report" in html
+
+
+def test_status_zero_is_not_shown_as_an_http_code():
+    """0 is what a request that never completed records. Rendering it as a status sends people
+    looking for a status-0 response that doesn't exist."""
+    assert p._status_label(0) == p._status_label(None)
+    assert "aborted" in p._status_label(0)
+    assert p._status_label(200) == "200"
+
+
+def test_tier_section_is_omitted_when_a_run_predates_tiers():
+    """Older runs carry no tier data; a heading plus a paragraph describing an absent table is
+    worse than no section at all."""
+    run = {"id": "b", "ts": 1785000000.0, "label": "m", "model": "m",
+           "config": {"suite": "coding-v1"}, "env": {},
+           "results": {"summary": {"n_total": 1, "n_success": 1,
+                                   "quality": {"perfect_rate": 1.0, "tasks": [{"task": "x", "perfect_rate": 1.0}]}}}}
+    html = p._bench_report_html([run], [p._bench_report_row(run)])
+    assert "Per-task correctness" in html
+    assert "Correctness by tier" not in html

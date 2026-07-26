@@ -167,6 +167,22 @@ mailed, or archived and still render identically later. It has print styles — 
 
 Same data at `GET /__proxy/api/bench/report?ids=<comma-separated>&format=html`.
 
+Reports use the dashboard's own palette rather than a document look of their own — they're read
+next to the UI they came from. Colour comes from CSS variables with a light counterpart, and
+printing forces the light set, because a dark page printed to PDF wastes a cartridge and reads
+badly on paper.
+
+### Usage report
+
+`GET /__proxy/api/stats/report` (linked from the Stats view) is the long-term counterpart:
+everything the proxy has recorded, as one page. Volume and composition first — requests, tokens,
+models, client applications, tool calls — then decode rate by prompt depth, upstream split and
+response statuses.
+
+The two reports answer different questions and are shaped differently on purpose. The benchmark
+report compares configurations you chose, so it ranks. The usage report describes traffic you
+didn't choose, so it leads with what actually ran and treats latency as a property of the mix.
+
 ## Matrix runs
 
 Any of **models**, **prompt size**, **thinking**, **temperature**, **cache** and **concurrency**
