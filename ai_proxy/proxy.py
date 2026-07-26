@@ -7025,10 +7025,197 @@ def _bench_report_row(run: dict) -> dict:
     }
 
 
+def _bench_bar_svg(rows, key, label, unit, better="high", width=560):
+    """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
+    or printed. Charts here exist to make the ordering obvious at a glance; the table beside
+    them carries the actual numbers."""
+    vals = [(r["label"], r.get(key)) for r in rows if r.get(key) is not None]
+    if not vals:
+        return ""
+    top = max(v for _n, v in vals) or 1
+    best = max(v for _n, v in vals) if better == "high" else min(v for _n, v in vals)
+    bar_h, gap, pad_l = 20, 8, 210
+    height = len(vals) * (bar_h + gap) + 26
+    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+             f'role="img" aria-label="{_h(label)}">',
+             f'<text x="0" y="12" class="ct">{_h(label)} ({_h(unit)})</text>']
+    for i, (name, v) in enumerate(vals):
+        y = 26 + i * (bar_h + gap)
+        w = max(2, int((v / top) * (width - pad_l - 60)))
+        fill = "#57d1e0" if v == best else "#33566b"
+        parts.append(f'<text x="0" y="{y + 14}" class="cl">{_h(name[:34])}</text>')
+        parts.append(f'<rect x="{pad_l}" y="{y}" width="{w}" height="{bar_h}" rx="3" fill="{fill}"/>')
+        parts.append(f'<text x="{pad_l + w + 6}" y="{y + 14}" class="cv">{v:,.1f}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+def _h(v) -> str:
+    """Escape for HTML text/attribute context."""
+    return (str("" if v is None else v).replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
+    """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
+
+    Deliberately one file with inline CSS/SVG and no external requests, so it can be saved,
+    mailed, or printed to PDF and still render exactly the same a month later.
+    """
+    graded = any(r.get("perfect_rate") is not None for r in rows)
+    env = next((r.get("env") for r in runs if r.get("env")), {}) or {}
+    gpus = env.get("gpus") or []
+    gpu_txt = ", ".join(
+        f"{g.get('name') or 'GPU'}"
+        + (f" · {round((g.get('mem_total_mb') or 0) / 1024)} GB" if g.get("mem_total_mb") else "")
+        for g in gpus) or "not reported"
+    when = runs[0].get("ts")
+    when_txt = datetime.datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M") if when else "—"
+    title = rows[0]["label"] if len(rows) == 1 else f"{len(rows)} configurations"
+
+    def fmt(v, digits=0, suffix=""):
+        return "—" if v is None else f"{v:,.{digits}f}{suffix}"
+
+    def pct(v):
+        return "—" if v is None else f"{v * 100:.0f}%"
+
+    # Table -------------------------------------------------------------------------------
+    head = ["Configuration", "Model", "Backend", "Think", "Context",
+            "TTFT p50", "TTFC p50", "Decode p50", "Total p50", "OK"]
+    if graded:
+        head[9:9] = ["Fully correct", "Cases"]
+    best_dec = max((r["decode_p50"] for r in rows if r["decode_p50"] is not None), default=None)
+    best_ttft = min((r["ttft_p50"] for r in rows if r["ttft_p50"] is not None), default=None)
+    best_q = max((r["perfect_rate"] for r in rows if r["perfect_rate"] is not None), default=None)
+
+    body_rows = []
+    for r, run in zip(rows, runs):
+        cfg = run.get("config") or {}
+        cells = [
+            f'<th scope="row">{_h(r["label"])}</th>',
+            f'<td><code>{_h(r["served"] or r["model"])}</code></td>',
+            f'<td>{_h(cfg.get("upstream") or "—")}</td>',
+            f'<td>{_h(r["thinking"] or "auto")}</td>',
+            f'<td class="n">{fmt(r["prompt_tokens"])}</td>',
+            f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
+            f'<td class="n">{fmt(r["ttfc_p50"], 0, " ms")}</td>',
+            f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
+            f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>',
+        ]
+        if graded:
+            cells.append(f'<td class="n{" win" if r["perfect_rate"] == best_q else ""}">{pct(r["perfect_rate"])}</td>')
+            cells.append(f'<td class="n">{pct(r["case_pass_rate"])}</td>')
+        ok = r["n_success"] == r["n_total"]
+        cells.append(f'<td class="n {"ok" if ok else "bad"}">{r["n_success"]}/{r["n_total"]}</td>')
+        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+
+    charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
+    charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
+    if graded:
+        qrows = [dict(r, q=(r["perfect_rate"] or 0) * 100) for r in rows]
+        charts += _bench_bar_svg(qrows, "q", "Fully-correct responses", "%", "high")
+
+    # Per-task quality --------------------------------------------------------------------
+    task_html = ""
+    if graded:
+        tasks = {}
+        for r, run in zip(rows, runs):
+            q = (((run.get("results") or {}).get("summary") or {}).get("quality") or {})
+            for t in (q.get("tasks") or []):
+                tasks.setdefault(t["task"], {})[r["label"]] = t.get("perfect_rate")
+        if tasks:
+            labels = [r["label"] for r in rows]
+            th = "".join(f"<th>{_h(l)}</th>" for l in labels)
+            trs = []
+            for tname, per in sorted(tasks.items()):
+                tds = "".join(
+                    f'<td class="n">{pct(per.get(l))}</td>' for l in labels)
+                trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
+            task_html = f"""<h2>Per-task correctness</h2>
+<p class="note">Share of responses that passed every case for that task. A model strong
+everywhere except one task and a model mediocre throughout can share an overall average.</p>
+<table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table>"""
+
+    warm = [f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}"
+            for r, run in zip(rows, runs)
+            if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
+
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Benchmark — {_h(title)}</title>
+<style>
+  :root {{ color-scheme: light; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; padding:32px; background:#fbfbfa; color:#1b1f24;
+          font:14px/1.55 -apple-system,system-ui,"Segoe UI",Roboto,sans-serif; }}
+  .wrap {{ max-width:1000px; margin:0 auto; }}
+  h1 {{ font-size:23px; margin:0 0 4px; letter-spacing:-0.01em; }}
+  h2 {{ font-size:15px; margin:30px 0 8px; letter-spacing:-0.005em; }}
+  .sub {{ color:#5b6672; font-size:13px; margin:0 0 22px; }}
+  .meta {{ display:flex; flex-wrap:wrap; gap:0 26px; font-size:12px; color:#5b6672;
+           border-top:1px solid #e2e5e9; border-bottom:1px solid #e2e5e9; padding:10px 0; margin-bottom:24px; }}
+  .meta div b {{ color:#1b1f24; font-weight:600; }}
+  table {{ border-collapse:collapse; width:100%; font-size:12.5px; margin-bottom:6px; }}
+  th, td {{ text-align:left; padding:6px 9px; border-bottom:1px solid #e8eaed; }}
+  thead th {{ font-size:10.5px; text-transform:uppercase; letter-spacing:0.6px; color:#6b7684;
+              border-bottom:1.5px solid #c9ced5; font-weight:600; }}
+  tbody th {{ font-weight:600; }}
+  td.n {{ text-align:right; font-variant-numeric:tabular-nums; }}
+  td.win {{ color:#0a7d4f; font-weight:700; }}
+  td.ok {{ color:#0a7d4f; }} td.bad {{ color:#b3261e; font-weight:600; }}
+  code {{ font:12px ui-monospace,SFMono-Regular,Menlo,monospace; background:#eef0f3;
+          padding:1px 5px; border-radius:3px; }}
+  .note {{ color:#5b6672; font-size:12px; margin:0 0 10px; max-width:70ch; }}
+  svg {{ margin:6px 0 18px; display:block; }}
+  .ct {{ font-size:11px; fill:#6b7684; font-weight:600; text-transform:uppercase; letter-spacing:0.6px; }}
+  .cl {{ font-size:11.5px; fill:#3c4450; }}
+  .cv {{ font-size:11.5px; fill:#1b1f24; font-weight:600; }}
+  footer {{ margin-top:34px; padding-top:12px; border-top:1px solid #e2e5e9;
+            color:#8b95a1; font-size:11.5px; }}
+  @media print {{
+    body {{ padding:0; background:#fff; }}
+    h2 {{ page-break-after:avoid; }}
+    table, svg {{ page-break-inside:avoid; }}
+  }}
+</style></head>
+<body><div class="wrap">
+  <h1>Benchmark — {_h(title)}</h1>
+  <p class="sub">{_h(when_txt)} · measured through AI Proxy {_h(env.get("proxy_version") or "")}</p>
+  <div class="meta">
+    <div>GPU <b>{_h(gpu_txt)}</b></div>
+    <div>Configurations <b>{len(rows)}</b></div>
+    <div>Requests <b>{sum(r["n_total"] or 0 for r in rows):,}</b></div>
+    {"<div>Graded suite <b>" + _h(rows[0].get("suite") or "") + "</b></div>" if graded else ""}
+  </div>
+
+  <h2>Results</h2>
+  <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
+  the gap between them is time the model spent reasoning. Decode rate is measured from the first
+  token onward, so reasoning tokens count as generated work. Best value in each column is
+  highlighted.</p>
+  <table>
+    <thead><tr>{"".join(f"<th>{_h(h)}</th>" for h in head)}</tr></thead>
+    <tbody>{"".join(body_rows)}</tbody>
+  </table>
+
+  <h2>At a glance</h2>
+  {charts}
+
+  {task_html}
+
+  {"<h2>Warm-up</h2><p class='note'>Excluded from every measurement above. A large value is the model-load cost for a model that was not resident when the run started.</p><p class='note'>" + _h(" · ".join(warm)) + "</p>" if warm else ""}
+
+  <footer>Generated by AI Proxy. Every request in this report passed through the proxy and is
+  individually inspectable in the dashboard.</footer>
+</div></body></html>"""
+
+
 @app.get("/__proxy/api/bench/report")
 async def bench_report(request: Request, ids: str = "", format: str = "json"):
     """Comparison report over any number of runs. `ids` is comma-separated; a suite parent
-    expands to its cells. format=markdown returns a pasteable table."""
+    expands to its cells. format=json (default), markdown (pasteable table), or html (a
+    standalone, printable page — no external requests, so it survives being saved or mailed)."""
     wanted = [i.strip() for i in (ids or "").split(",") if i.strip()]
     if not wanted:
         return JSONResponse({"error": "'ids' is required (comma-separated bench ids)"},
@@ -7055,6 +7242,9 @@ async def bench_report(request: Request, ids: str = "", format: str = "json"):
     if not runs:
         return JSONResponse({"error": "no visible runs for those ids"}, status_code=404)
     rows = [_bench_report_row(r) for r in runs]
+    if format == "html":
+        return Response(content=_bench_report_html(runs, rows),
+                        media_type="text/html; charset=utf-8")
     if format != "markdown":
         return {"rows": rows, "env": [r.get("env") for r in runs]}
 

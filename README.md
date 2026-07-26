@@ -443,7 +443,7 @@ Everything the dashboard does is a plain HTTP call under `/__proxy/api/`.
 | `/bench/run` | POST | Queue a benchmark or a matrix sweep |
 | `/bench/runs`, `/bench/runs/{id}` | GET | Benchmark results and progress |
 | `/bench/suites`, `/bench/models` | GET | Graded task suites; models across all upstreams |
-| `/bench/report` | GET | N-way comparison, `format=json\|markdown` |
+| `/bench/report` | GET | N-way comparison, `format=json\|markdown\|html` (standalone printable report) |
 | `/control/artifacts` | GET / POST | Artifact-capture kill switch (+ optional purge) |
 | `/restart` | POST | Self-restart (requires `X-Confirm: restart-now`) |
 | `/db/reset` | POST | Wipe stored traffic |

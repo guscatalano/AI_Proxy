@@ -847,6 +847,26 @@
 .bench-list-row .meta { flex:none; color:#5d6775; font-size:10.5px; }
 .bench-list-row.on .meta { color:#4f8894; }
 .bench-list-empty { padding:10px 8px; color:#5d6775; font-size:11.5px; }
+/* Marker legends. Every glyph and ratio in this form is explained in place rather than only in
+   a tooltip — a hover hint is invisible to anyone who doesn't already suspect there's a
+   meaning to find. */
+.bench-modes { display:flex; gap:0; border:1px solid #262d38; border-radius:5px; overflow:hidden; }
+.bench-mode { background:#0f141c; border:none; border-right:1px solid #262d38; color:#8b97a8;
+              padding:4px 14px; font-size:11.5px; cursor:pointer; font-family:inherit; }
+.bench-mode:last-child { border-right:none; }
+.bench-mode[aria-pressed=true] { background:#1c3a44; color:#57d1e0; font-weight:600; }
+.bench-mode:focus-visible { outline:2px solid #2f8f9c; outline-offset:-2px; }
+.bench-preset { font-size:11.5px; color:#8b97a8; line-height:1.55; padding:10px 14px;
+                background:#101720; border-bottom:1px solid #1e242e; }
+.bench-preset b { color:#c9d3e1; font-weight:600; }
+body.bench-simple .bench-adv { display:none; }
+body.bench-simple .bench-groups { grid-template-columns:minmax(280px,440px); }
+body.bench-simple .bench-group { border-right:none; }
+body:not(.bench-simple) .bench-preset { display:none; }
+.bench-hint { color:#5d6775; font-weight:400; font-size:10.5px; }
+.bench-legend { display:flex; flex-wrap:wrap; gap:3px 12px; margin-top:5px;
+                font-size:10.5px; color:#5d6775; line-height:1.45; }
+.bench-legend b { font-weight:600; color:#7c8899; }
 .bench-toggles { display:flex; flex-wrap:wrap; gap:4px; }
 .bench-toggle { background:#0a0d12; border:1px solid #262d38; color:#8b97a8; border-radius:4px;
                 padding:3px 8px; font-size:11px; cursor:pointer; font-family:inherit; }
@@ -6028,52 +6048,66 @@ async function loadBench() {
     el.dataset.bound = '1';
     el.innerHTML = `
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:14px">
-        <h2 style="margin:0;font-size:14px;flex:1">⏱ Benchmark Runner</h2>
-        <button id="bench-refresh" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
+        <h2 style="margin:0;font-size:14px">⏱ Benchmark Runner</h2>
+        <div class="bench-modes" role="group" aria-label="Detail level" style="margin-left:auto">
+          <button type="button" class="bench-mode" data-mode="simple" aria-pressed="true">Simple</button>
+          <button type="button" class="bench-mode" data-mode="advanced" aria-pressed="false">Advanced</button>
+        </div>
       </div>
       <div class="bench-form">
         <div class="bench-lede">
           Compares models on <strong>speed</strong> and, with a graded suite, on <strong>whether the code they return actually works</strong>. Timing separates <strong>TTFT</strong> (first token of any kind) from <strong>TTFC</strong> (first content token) — the gap between them is the model thinking.
-          Selecting more than one model, prompt size, thinking mode or temperature sweeps every combination, one at a time.
+          <span class="bench-adv">Selecting more than one model, prompt size, thinking mode or temperature sweeps every combination, one at a time.</span>
+        </div>
+        <div class="bench-preset">
+          Pick the models, press run. Each one is measured at <b>three context sizes</b> (short, 4K, 32K) and graded on the <b>coding-v1</b> suite, <b>3 runs</b> per combination, with a warm-up and routing pinned — the same shape every time, so two reports are comparable. Switch to <b>Advanced</b> to change any of it.
         </div>
         <div class="bench-groups">
 
           <div class="bench-group">
-            <h4>What to run <span>— each selection multiplies the sweep</span></h4>
+            <h4>What to run <span class="bench-adv">— each selection multiplies the sweep</span></h4>
             <div class="bench-row stack">
-              <label for="bench-upstreams">Backend</label>
-              <div id="bench-upstreams" class="bench-chips"></div>
+              <label id="bench-upstreams-label">Backend <span class="bench-hint">— counts are models loaded / reachable</span></label>
+              <div id="bench-upstreams" class="bench-chips" role="group" aria-labelledby="bench-upstreams-label"></div>
             </div>
             <div class="bench-row stack">
-              <label id="bench-model-label">Models <span style="color:#4d5765">— ● loaded, ○ not</span></label>
+              <label id="bench-model-label">Models</label>
               <div id="bench-model" class="bench-list" role="group" aria-labelledby="bench-model-label"></div>
+              <div class="bench-legend">
+                <span><b style="color:#3f8f5f">●</b> in memory, ready to measure</span>
+                <span><b style="color:#4d5765">○</b> not loaded — loads on first use</span>
+                <span>right-hand text: quantization · context window</span>
+              </div>
             </div>
-            <div class="bench-row stack">
-              <label id="bench-prompt-label">Prompt size</label>
+            <div class="bench-adv bench-row stack">
+              <label id="bench-prompt-label">Prompt size <span class="bench-hint">— how much context to send</span></label>
               <div id="bench-prompt" class="bench-toggles" role="group" aria-labelledby="bench-prompt-label"></div>
             </div>
-            <div class="bench-row stack">
-              <label id="bench-thinking-label">Thinking</label>
+            <div class="bench-adv bench-row stack">
+              <label id="bench-thinking-label">Thinking <span class="bench-hint">— whether the model reasons before answering</span></label>
               <div id="bench-thinking" class="bench-toggles" role="group" aria-labelledby="bench-thinking-label"></div>
+              <div class="bench-legend">
+                <span>engines disagree on the off switch, so <b>off</b> sends both known ones and <b>off (prefill)</b> sends the one LM Studio honors</span>
+              </div>
             </div>
-            <div class="bench-row">
+            <div class="bench-adv bench-row">
               <label for="bench-temp">Temperature</label>
               <input id="bench-temp" type="text" placeholder="engine default, or 0, 0.2">
             </div>
           </div>
 
-          <div class="bench-group">
+          <div class="bench-group bench-adv">
             <h4>How to measure</h4>
-            <div class="bench-row">
-              <label for="bench-runs">Runs / cell</label>
+            <div class="bench-row stack">
+              <label for="bench-runs">Runs / cell <span class="bench-hint">— repeats per combination</span></label>
               <input id="bench-runs" type="number" value="5" min="1" max="50">
             </div>
-            <div class="bench-row">
-              <label for="bench-maxtok">Max tokens</label>
+            <div class="bench-row stack">
+              <label for="bench-maxtok">Max tokens <span class="bench-hint">— cap per response</span></label>
               <input id="bench-maxtok" type="number" value="256" min="16" max="8192">
             </div>
-            <div class="bench-row">
-              <label for="bench-concur">Concurrency</label>
+            <div class="bench-row stack">
+              <label for="bench-concur">Concurrency <span class="bench-hint">— parallel requests per cell</span></label>
               <select id="bench-concur">
                 <option value="1">1 — serial</option><option value="2">2 parallel</option>
                 <option value="4">4 parallel</option><option value="8">8 parallel</option>
@@ -6093,7 +6127,7 @@ async function loadBench() {
             </label>
           </div>
 
-          <div class="bench-group">
+          <div class="bench-group bench-adv">
             <h4>Isolation <span>— keep other traffic out</span></h4>
             <label class="bench-check" title="Sends x-proxy-no-router so routing rules can't substitute a different model or backend behind your back.">
               <input type="checkbox" id="bench-bypass" checked>
@@ -6111,8 +6145,8 @@ async function loadBench() {
               <input type="checkbox" id="bench-quiesce">
               <span>Free the GPU<em>unload Ollama models, restore after</em></span>
             </label>
-            <div class="bench-row" style="margin-top:9px">
-              <label for="bench-drain" title="How long to wait for in-flight requests to finish before the first measurement.">Drain (s)</label>
+            <div class="bench-row stack" style="margin-top:9px">
+              <label for="bench-drain">Drain (s) <span class="bench-hint">— wait for in-flight requests</span></label>
               <input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5">
             </div>
           </div>
@@ -6133,7 +6167,6 @@ async function loadBench() {
       <h3 style="font-size:11px;text-transform:uppercase;color:#888;margin:18px 0 8px;letter-spacing:0.5px">History</h3>
       <div id="bench-history"></div>
     `;
-    $('bench-refresh').onclick = () => loadBench();
     $('bench-go').onclick = _benchSubmit;
     // Keep the "N cells × M requests" preview honest as the axes change — a 4-model ×
     // 3-context × 2-thinking sweep is 24 cells, which is worth seeing before you start it.
@@ -6145,6 +6178,12 @@ async function loadBench() {
     if (tempEl) tempEl.addEventListener('input', _benchUpdatePlan);
     $('bench-compare-btn').onclick = _benchRenderCompare;
     $('bench-compare-clear').onclick = () => { _benchSelected.clear(); _benchUpdateCompareBar(); loadBench(); };
+    for (const b of document.querySelectorAll('.bench-mode')) {
+      b.onclick = () => _benchSetMode(b.dataset.mode);
+    }
+    let _mode = 'simple';
+    try { _mode = localStorage.getItem('ai-proxy-bench-mode') || 'simple'; } catch {}
+    _benchSetMode(_mode);
     _benchRenderAxes();
     await _benchPopulateModels();
   }
@@ -6227,9 +6266,9 @@ function _benchModelCount() {
     ? Array.from(_benchModelSel).filter(k => (_benchModelIndex[k] || {}).upstream !== _benchUpFilter).length
     : 0;
   const legend = total
-    ? `— ${total} selected` + (hidden ? `, ${hidden} on another backend` : '')
-    : '— none selected';
-  lab.innerHTML = `Models <span style="color:${hidden ? '#f0a35a' : '#4d5765'}">${esc(legend)}</span>`;
+    ? `— ${total} selected` + (hidden ? `, ${hidden} on a backend not shown` : '')
+    : '— pick at least one';
+  lab.innerHTML = `Models <span class="bench-hint"${hidden ? ' style="color:#f0a35a"' : ''}>${esc(legend)}</span>`;
 }
 
 function _benchRenderModels() {
@@ -6336,6 +6375,37 @@ function _benchTemps() {
   return vals.length ? vals : null;
 }
 
+// The standard sweep. Fixed on purpose: a report is only worth comparing to another report if
+// both were produced the same way, and picking sizes by hand each time guarantees they weren't.
+const _BENCH_PRESET = {
+  prompt_tokens: [0, 4000, 32000],
+  thinking: 'auto',
+  runs: 3,
+  max_tokens: 512,
+  concurrency: 1,
+  suite: 'coding-v1',
+  warmup: true,
+  bypass_router: true,
+  no_nudge: true,
+  randomize: false,
+  // Left off deliberately: both disrupt other users of the box, which is not a reasonable
+  // default for a button labelled "run".
+  exclusive: false,
+  quiesce: false,
+  drain_seconds: 5,
+};
+
+function _benchSimple() { return document.body.classList.contains('bench-simple'); }
+
+function _benchSetMode(mode) {
+  document.body.classList.toggle('bench-simple', mode !== 'advanced');
+  try { localStorage.setItem('ai-proxy-bench-mode', mode); } catch {}
+  for (const b of document.querySelectorAll('.bench-mode')) {
+    b.setAttribute('aria-pressed', String(b.dataset.mode === mode));
+  }
+  _benchUpdatePlan();
+}
+
 function _benchBody() {
   // Selections are "<upstream>:<model>" keys — sent as explicit pairs so a sweep can span
   // backends and a name served by two of them stays two distinct cells.
@@ -6343,6 +6413,9 @@ function _benchBody() {
     .map(k => _benchModelIndex[k])
     .filter(Boolean)
     .map(m => ({model: m.model, upstream: m.upstream}));
+  // Simple mode ignores the hidden controls entirely rather than reading whatever they happen
+  // to hold — otherwise a value set in Advanced would silently leak into a "standard" run.
+  if (_benchSimple()) return Object.assign({models}, _BENCH_PRESET);
   // Sorted so the sweep runs smallest-context-first and the cell order is predictable.
   const prompts = Array.from(_benchPromptSel).map(v => parseInt(v, 10) || 0).sort((a, b) => a - b);
   const thinking = Array.from(_benchThinkSel);
@@ -6378,7 +6451,12 @@ function _benchUpdatePlan() {
   const cells = Math.max(1, b.models.length) * n(b.prompt_tokens) * n(b.thinking) *
                 (b.temperature === undefined ? 1 : n(b.temperature));
   const suiteSel = $('bench-suite');
-  const suiteTxt = suiteSel.value ? (suiteSel.selectedOptions[0].textContent.match(/(\d+) tasks/) || [])[1] : null;
+  // Task count comes from the option text in advanced mode; in simple mode the suite is fixed,
+  // so fall back to whatever the suites endpoint reported for it.
+  const suiteName = b.suite || '';
+  const suiteOpt = suiteName && suiteSel
+    ? Array.from(suiteSel.options).find(o => o.value === suiteName) : null;
+  const suiteTxt = suiteOpt ? (suiteOpt.textContent.match(/(\d+) tasks/) || [])[1] : null;
   const perCell = b.runs * (suiteTxt ? parseInt(suiteTxt, 10) : 1);
   const scale = cells > 1
     ? `<b>${cells} cells</b> × ${perCell} requests = <b>${cells * perCell} requests</b>, one cell at a time`
@@ -6515,6 +6593,7 @@ function _benchRenderRow(it) {
         <span style="color:#888">${cfg.runs || '?'} runs · prompt=${Array.isArray(cfg.prompt_tokens) ? cfg.prompt_tokens.join('/') : (cfg.prompt_tokens || 'short')} · cc=${cfg.concurrency || 1}${cfg.thinking && cfg.thinking !== 'auto' ? ' · think=' + esc(Array.isArray(cfg.thinking) ? cfg.thinking.join('/') : cfg.thinking) : ''}${cfg.temperature != null ? ' · t=' + esc(String(cfg.temperature)) : ''}${cfg.upstream ? ' · ' + esc(cfg.upstream) : ''}${cfg.randomize ? ' · rand' : ''}${cfg.exclusive ? ' · excl' : ''}${cfg.quiesce ? ' · quiesced' : ''}</span>
         <span style="margin-left:auto;color:#888">${_benchAgo(it.ts)}</span>
         <span>${summaryLine}</span>
+        ${it.status === 'done' ? `<a href="/__proxy/api/bench/report?format=html&ids=${encodeURIComponent(it.id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Standalone HTML report — print it to PDF from the browser" style="color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px">Report ↗</a>` : ''}
         <button data-bench-del style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer" onclick="event.stopPropagation()">🗑</button>
       </div>
       <details style="margin-top:6px" data-bench-detail="${esc(it.id)}">
@@ -6544,12 +6623,15 @@ async function _benchRenderCompare() {
     <div class="stats-section" style="background:#12141b;border:1px solid #57d1e0;padding:12px;border-radius:8px;margin-bottom:18px">
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">
         <h3 style="margin:0;font-size:13px;flex:1">&#8596; Comparison (${runs.length})</h3>
+        <a id="bench-export-html" target="_blank" rel="noopener" style="background:#1c3a44;border:1px solid #2f8f9c;color:#57d1e0;border-radius:4px;padding:4px 10px;font-size:11px;text-decoration:none">Open report ↗</a>
         <button id="bench-export-md" style="background:#262d38;border:1px solid #313a48;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Copy Markdown</button>
       </div>
       ${body}
     </div>`;
   const btn = $('bench-export-md');
   if (btn) btn.onclick = () => _benchExportMarkdown(ids, btn);
+  const rep = $('bench-export-html');
+  if (rep) rep.href = '/__proxy/api/bench/report?format=html&ids=' + encodeURIComponent(ids.join(','));
   view.scrollIntoView({ behavior: 'smooth', block: 'start' });
 }
 

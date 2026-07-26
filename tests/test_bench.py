@@ -331,3 +331,42 @@ def test_upstream_pin_header_does_not_corrupt_the_router_verdict(client):
     # NOT happen is a 500 from the proxy's own audit code.
     assert r.status_code != 500, r.text
     assert r.status_code in (502, 503, 504), r.status_code
+
+
+# ---- report rendering --------------------------------------------------------------------
+
+def test_report_html_is_self_contained(client, monkeypatch):
+    """The report has to survive being saved to a file, mailed, or printed to PDF, so it must
+    not reference anything it doesn't carry."""
+    run = {
+        "id": "b_x", "ts": 1785000000.0, "label": "m · short", "model": "m",
+        "config": {"runs": 3, "suite": "coding-v1", "upstream": "ollama", "thinking": "auto"},
+        "env": {"proxy_version": "0.2.0", "gpus": [{"name": "GB10", "mem_total_mb": 131072}]},
+        "results": {"summary": {
+            "n_total": 3, "n_success": 3, "served_models": ["m"],
+            "ttft_ms": {"p50": 70.0}, "ttfc_ms": {"p50": 240.0},
+            "decode_tps": {"p50": 160.0}, "total_ms": {"p50": 640.0},
+            "warmup_ms": 280.0,
+            "quality": {"perfect_rate": 0.83, "case_pass_rate": 0.81,
+                        "tasks": [{"task": "roman", "perfect_rate": 0.0}]},
+        }},
+    }
+    html = p._bench_report_html([run], [p._bench_report_row(run)])
+    assert html.startswith("<!doctype html>")
+    for external in ("src=\"http", "href=\"http", "@import", "fonts.googleapis"):
+        assert external not in html, f"report pulls in {external}"
+    assert "GB10" in html            # environment captured
+    assert "roman" in html           # per-task breakdown
+    assert "@media print" in html    # printable to PDF
+
+
+def test_report_html_escapes_model_names():
+    """Model names come from upstreams and end up in the page; they are not trusted markup."""
+    run = {
+        "id": "b_y", "ts": 1785000000.0, "label": "<script>alert(1)</script>",
+        "model": "<img onerror=x>", "config": {}, "env": {},
+        "results": {"summary": {"n_total": 1, "n_success": 1}},
+    }
+    html = p._bench_report_html([run], [p._bench_report_row(run)])
+    assert "<script>alert(1)</script>" not in html
+    assert "&lt;script&gt;" in html

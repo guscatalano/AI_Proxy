@@ -58,15 +58,17 @@ from every statistic, but reported separately as `warmup_ms` — if the warm-up 
 measured runs took 2 s, that gap *is* the model-load cost. Turn it off only when cold start is
 what you want to measure.
 
-### The upstream is inferred, not asked for
+### The backend is picked with the model, not separately
 
-There is no separate "which backend" question to keep in sync with your model choice: the proxy
-knows which upstream serves which model and resolves it per run. That's what lets a single sweep
-mix an Ollama model and a vLLM model — each cell routes itself.
+There is no "which backend" field to keep in sync with your model choice. The backend picker is a
+filter over the model list, showing how much of each backend is resident (`ollama 1/14 loaded`),
+and each selected model carries its own backend into the run. That's what lets a single sweep mix
+an Ollama model and a vLLM model — each cell routes itself.
 
-The Upstream field is an override for the unusual case (the same model name served by two
-backends, or forcing traffic somewhere the index doesn't know about). Runs record which upstream
-was used and whether it was inferred or forced.
+Models are identified by the **(backend, model) pair**, so the same name served by two backends is
+two distinct, separately benchmarkable entries. Filtering is a view, not a reset: selections on
+other backends stay in the sweep, and the Models label says how many are selected and how many are
+currently hidden.
 
 ### Routing silently substitutes the model
 
@@ -92,6 +94,35 @@ marked as an error.
 Related trap: prompt sizing is estimated at ~3.5 chars/token, but tokenizer density varies by
 roughly 15% between model families. A prompt that fits one model's window can overflow another's.
 The summary reports the upstream's own `prompt_tokens` so you can see what was really sent.
+
+## Simple mode
+
+The Bench tab opens in **Simple** mode: pick the models, press run. Every model is measured at
+three context sizes (short, 4K, 32K) and graded on `coding-v1`, three runs per combination, with
+a warm-up and routing pinned.
+
+The preset is fixed on purpose. A report is only worth comparing against another report if both
+were produced the same way, and choosing sizes by hand each time guarantees they weren't. It also
+means one press produces the whole comparison rather than you running the benchmark once per
+context size and collating the results afterwards.
+
+Two things it deliberately leaves off: holding other clients, and freeing the GPU. Both disrupt
+everyone else using the box, which is not a reasonable default for a button labelled "run".
+
+**Advanced** exposes every control described below. The choice is remembered.
+
+## Reports
+
+Any finished run has a **Report ↗** link, and a comparison of several runs has **Open report ↗**.
+It renders a standalone HTML page: environment, a per-configuration table with the best value in
+each column highlighted, bar charts for decode rate / TTFT / correctness, and a per-task
+correctness breakdown.
+
+The page carries its own CSS and inline SVG and makes no external requests, so it can be saved,
+mailed, or archived and still render identically later. It has print styles — use the browser's
+**Print → Save as PDF** for a PDF.
+
+Same data at `GET /__proxy/api/bench/report?ids=<comma-separated>&format=html`.
 
 ## Matrix runs
 
@@ -170,7 +201,7 @@ The same data is available at `GET /__proxy/api/bench/report?ids=<comma-separate
 | `/__proxy/api/bench/runs/{id}` | DELETE | Delete (cascades to cells) |
 | `/__proxy/api/bench/suites` | GET | Available graded suites and thinking modes |
 | `/__proxy/api/bench/models` | GET | Models across Ollama, LM Studio and vLLM |
-| `/__proxy/api/bench/report` | GET | Comparison report, `format=json\|markdown` |
+| `/__proxy/api/bench/report` | GET | Comparison report: `format=json` \| `markdown` \| `html` |
 
 Submit body: `{model | models[], runs, max_tokens, prompt_tokens, concurrency, randomize,
 exclusive, drain_seconds, thinking, temperature, top_p, top_k, min_p, seed, extra_body, upstream,
