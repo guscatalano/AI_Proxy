@@ -4623,6 +4623,42 @@ async function restartProxy(btn) {
   }
 }
 
+// Loading a large model takes tens of seconds and unloading frees VRAM someone may be using, so
+// both report what happened rather than silently re-rendering. Delegated, because this view is
+// rebuilt on a timer and per-button handlers would not survive it.
+function _bindModelControls() {
+  const host = $('system');
+  if (!host || host._modelBound) return;
+  host._modelBound = true;
+  host.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-load], [data-unload], [data-unload-all]');
+    if (!btn) return;
+    e.preventDefault();
+    const all = btn.hasAttribute('data-unload-all');
+    const load = btn.hasAttribute('data-load');
+    const model = btn.getAttribute('data-load') || btn.getAttribute('data-unload') || '';
+    const upstream = btn.getAttribute('data-up') || 'ollama';
+    const was = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = load ? 'loading…' : 'unloading…';
+    try {
+      const r = await fetch('/__proxy/api/control/models/' + (load ? 'load' : 'unload'), {
+        method: 'POST', headers: {'content-type': 'application/json'},
+        body: JSON.stringify(all ? {all: true, upstream} : {model, upstream}),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      btn.textContent = load ? `✓ ${Math.round((d.load_ms || 0) / 1000)}s` : '✓';
+      loadSystem();
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = '✕ ' + (err.message || 'failed').slice(0, 40);
+      btn.title = err.message || '';
+      setTimeout(() => { btn.textContent = was; btn.title = ''; }, 4000);
+    }
+  });
+}
+
 async function loadSystem() {
   const [now, hist, hp] = await Promise.all([
     fetch('/__proxy/api/system/now').then(r => r.json()),
@@ -4632,6 +4668,7 @@ async function loadSystem() {
   systemNowCache = now;
   systemHistoryCache = hist;
   systemHealthCache = hp;
+  _bindModelControls();
   renderSystem();
 }
 
@@ -4713,12 +4750,16 @@ function renderSystem() {
         <td class="num">${num(m.size_mb || 0)} MB</td>
         <td class="num">${num(m.size_vram_mb || 0)} MB</td>
         <td>${parBadge(m)}</td>
-        <td>${m.expires_at ? esc(new Date(m.expires_at).toLocaleTimeString()) : ''}</td></tr>
-  `).join('') || '<tr><td colspan="6" class="empty" style="padding:8px">No models loaded</td></tr>';
+        <td>${m.expires_at ? esc(new Date(m.expires_at).toLocaleTimeString()) : ''}</td>
+        <td><button data-unload="${esc(m.name || m.model || '')}" data-up="ollama" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">unload</button></td></tr>
+  `).join('') || '<tr><td colspan="7" class="empty" style="padding:8px">No models loaded</td></tr>';
 
+  const _psNames = new Set((ollama.ps || []).map(m => m.name || m.model));
   const ollamaTags = (ollama.tags || []).slice(0, 25).map(m => `
-    <tr><td><code>${esc(m.name || '')}</code></td><td>${esc(m.parameter_size || '')}</td><td class="num">${num(m.size_mb || 0)} MB</td><td>${parBadge(m)}</td></tr>
-  `).join('') || '<tr><td colspan="4" class="empty" style="padding:8px">No models</td></tr>';
+    <tr><td><code>${esc(m.name || '')}</code></td><td>${esc(m.parameter_size || '')}</td><td class="num">${num(m.size_mb || 0)} MB</td><td>${parBadge(m)}</td>
+        <td>${_psNames.has(m.name) ? '<span style="color:#3f8f5f;font-size:11px">loaded</span>'
+          : `<button data-load="${esc(m.name || '')}" data-up="ollama" style="background:none;border:1px solid #2a4a52;color:#57d1e0;border-radius:3px;padding:1px 8px;font-size:11px;cursor:pointer">load</button>`}</td></tr>
+  `).join('') || '<tr><td colspan="5" class="empty" style="padding:8px">No models</td></tr>';
 
   const lmsLoaded = (lmstudio.loaded || []).map(m => `
     <tr><td><code>${esc(m.id || '')}</code></td>
@@ -4810,9 +4851,10 @@ function renderSystem() {
 
   const ollamaPanel = `
     <div class="stats-section">
-      <h2><span class="reach-dot ${ollama.reachable ? 'ok' : 'bad'}"></span>Ollama Loaded Models</h2>
+      <h2><span class="reach-dot ${ollama.reachable ? 'ok' : 'bad'}"></span>Ollama Loaded Models
+        ${(ollama.ps || []).length ? '<button data-unload-all style="float:right;background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer;font-weight:normal">unload all</button>' : ''}</h2>
       <table style="width:100%">
-        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th class="num">VRAM</th><th>Parallel</th><th>Expires</th></tr></thead>
+        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th class="num">VRAM</th><th>Parallel</th><th>Expires</th><th></th></tr></thead>
         <tbody>${ollamaPs}</tbody>
       </table>
     </div>
@@ -4820,7 +4862,7 @@ function renderSystem() {
     <div class="stats-section">
       <h2>Ollama Available (top 25)</h2>
       <table style="width:100%">
-        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th>Parallel</th></tr></thead>
+        <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th>Parallel</th><th></th></tr></thead>
         <tbody>${ollamaTags}</tbody>
       </table>
     </div>

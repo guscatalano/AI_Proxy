@@ -645,3 +645,76 @@ def test_eviction_reports_what_it_unloaded():
     import inspect
     src = inspect.getsource(p._bench_execute)
     assert "evicted_before_run" in src, "eviction must be recorded in the run environment"
+
+
+# ---- model residency control ---------------------------------------------------------------
+
+def test_lms_control_refuses_a_remote_lm_studio(monkeypatch):
+    """The lms CLI drives the LM Studio on *this* machine. With a remote LMSTUDIO_URL that would
+    load models on the wrong host — quietly, and with the proxy reporting success."""
+    monkeypatch.setattr(p, "LMSTUDIO_URL", "http://192.168.6.50:1234")
+    assert p._lms_is_local() is False
+    ok, why = p._lms_available()
+    assert ok is False and "only controls a local instance" in why
+
+
+def test_lms_control_accepts_a_local_lm_studio(monkeypatch):
+    monkeypatch.setattr(p, "LMSTUDIO_URL", "http://127.0.0.1:1234")
+    assert p._lms_is_local() is True
+
+
+def test_capabilities_report_per_backend(client):
+    """The UI must not offer buttons that cannot work, and must say why when it can't."""
+    caps = client.get("/__proxy/api/control/models/capabilities").json()
+    assert caps["ollama"]["load"] and caps["ollama"]["unload"]
+    # vLLM depends on finding a local container; either way it explains itself.
+    v = caps["vllm"]
+    assert isinstance(v["load"], bool)
+    assert v["reason"] or v["how"], "vLLM must say how it works or why it cannot"
+    assert "one model for the life of the server" in v["note"]
+
+
+def test_vllm_control_refuses_a_remote_server(monkeypatch):
+    """Stopping a *local* container because a remote vLLM is unreachable would be both wrong and
+    destructive — it would kill a different service than the one being asked about."""
+    monkeypatch.setattr(p, "VLLM_URL", "http://192.168.6.50:8001")
+    assert p._upstream_is_local(p.VLLM_URL) is False
+    assert asyncio.run(p._vllm_container()) is None
+
+
+def test_model_control_rejects_vllm_without_a_container(client, monkeypatch):
+    async def no_container():
+        return None
+    monkeypatch.setattr(p, "_vllm_container", no_container)
+    for path in ("load", "unload"):
+        r = client.post(f"/__proxy/api/control/models/{path}",
+                        json={"model": "x", "upstream": "vllm"})
+        assert r.status_code == 501, path
+
+
+def test_model_control_requires_a_name(client):
+    assert client.post("/__proxy/api/control/models/load", json={}).status_code == 400
+    assert client.post("/__proxy/api/control/models/unload", json={}).status_code == 400
+
+
+def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
+    """Starting the vLLM container is the whole operation — the server already knows its model.
+    Requiring a name here made it impossible to start vLLM through the proxy at all, which was
+    only discovered after stopping it."""
+    async def fake_container():
+        return "qwen-vllm"
+    async def fake_run(args, timeout=120.0):
+        return 0, "qwen-vllm"
+    async def fake_ready(t):
+        return True
+    monkeypatch.setattr(p, "_vllm_container", fake_container)
+    monkeypatch.setattr(p, "_run_cmd", fake_run)
+    monkeypatch.setattr(p, "_vllm_ready", fake_ready)
+    monkeypatch.setattr(p, "_docker_bin", lambda: "/usr/bin/docker")
+    r = client.post("/__proxy/api/control/models/load", json={"upstream": "vllm"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["started_container"] == "qwen-vllm" and body["ready"] is True
+    # And a name is still required where one actually means something.
+    assert client.post("/__proxy/api/control/models/load",
+                       json={"upstream": "ollama"}).status_code == 400

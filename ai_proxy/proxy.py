@@ -6400,6 +6400,276 @@ async def control_redact_set(request: Request):
     return {"ok": True, "redact_pii": REDACT_PII_ENABLED}
 
 
+# vLLM holds its weights for the life of the server process, so "unload" means "stop the
+# server". When it runs as a container that is doable, and without it a box whose card is full
+# of vLLM cannot benchmark anything else at all — which is most of the point of the bench.
+#
+# The container is found by the port it publishes rather than by name, so this keeps working when
+# the container is renamed or recreated. Only a local VLLM_URL is eligible: a remote vLLM would
+# be served by a container on another machine, and stopping a local one of the same name would be
+# both wrong and destructive.
+def _docker_bin() -> str | None:
+    return os.environ.get("PROXY_DOCKER_BIN") or shutil.which("docker")
+
+
+def _upstream_is_local(url: str) -> bool:
+    try:
+        host = (httpx.URL(url).host or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1", "")
+
+
+async def _run_cmd(args: list, timeout: float = 120.0) -> tuple[int, str]:
+    """No shell: arguments are passed as a list so a container or model name can never become
+    part of a command."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+    except (OSError, ValueError) as e:
+        return 127, str(e)
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, f"timed out after {timeout:.0f}s"
+    return proc.returncode or 0, (out or b"").decode("utf-8", "replace").strip()[:800]
+
+
+async def _vllm_container() -> str | None:
+    """The container publishing VLLM_URL's port, running or not."""
+    docker = _docker_bin()
+    if not docker or not _upstream_is_local(VLLM_URL):
+        return None
+    try:
+        port = str(httpx.URL(VLLM_URL).port or 8000)
+    except Exception:
+        return None
+    code, out = await _run_cmd([docker, "ps", "-a", "--format", "{{.Names}}	{{.Ports}}"], 20.0)
+    if code != 0:
+        return None
+    for line in out.splitlines():
+        name, _, ports = line.partition("	")
+        if f":{port}->" in ports:
+            return name.strip()
+    return None
+
+
+async def _vllm_ready(timeout_s: float) -> bool:
+    """vLLM takes minutes to become ready — docker start returns long before the server does, so
+    reporting success on the container starting would be reporting a lie."""
+    deadline = time.time() + timeout_s
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+        while time.time() < deadline:
+            try:
+                r = await c.get(f"{VLLM_URL}/v1/models")
+                if r.status_code == 200:
+                    return True
+            except httpx.RequestError:
+                pass
+            await asyncio.sleep(3.0)
+    return False
+
+
+# LM Studio has no load/unload over HTTP — the `lms` CLI is the only way in. That means this
+# works only when the proxy runs on the same machine as LM Studio, which is the common single-box
+# setup but not Docker or a remote LMSTUDIO_URL. Rather than fail confusingly there, the
+# capability reports itself as unavailable with the reason.
+def _lms_bin() -> str | None:
+    for cand in (os.environ.get("PROXY_LMS_BIN"),
+                 str(Path.home() / ".lmstudio" / "bin" / "lms"),
+                 shutil.which("lms")):
+        if cand and Path(cand).exists():
+            return cand
+    return None
+
+
+def _lms_is_local() -> bool:
+    """Only drive the CLI when it would act on the same LM Studio the proxy is proxying.
+    A remote LMSTUDIO_URL with a local CLI would load models on the wrong machine."""
+    try:
+        host = (httpx.URL(LMSTUDIO_URL).host or "").lower()
+    except Exception:
+        return False
+    return host in ("localhost", "127.0.0.1", "::1", "")
+
+
+def _lms_available() -> tuple[bool, str]:
+    if not _lms_is_local():
+        return False, f"LM Studio is at {LMSTUDIO_URL}; the lms CLI only controls a local instance"
+    if not _lms_bin():
+        return False, "the lms CLI was not found (set PROXY_LMS_BIN to its path)"
+    return True, ""
+
+
+async def _lms_run(args: list, timeout: float = 600.0) -> tuple[int, str]:
+    """Run the lms CLI. No shell, so a model name can't become a command; stdin is closed so a
+    missing argument fails instead of dropping into the interactive picker and hanging."""
+    bin_path = _lms_bin()
+    if not bin_path:
+        return 127, "lms CLI not found"
+    proc = await asyncio.create_subprocess_exec(
+        bin_path, *args,
+        stdin=asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return 124, f"timed out after {timeout:.0f}s"
+    return proc.returncode or 0, (out or b"").decode("utf-8", "replace").strip()[:800]
+
+
+@app.get("/__proxy/api/control/models/capabilities")
+async def control_model_capabilities():
+    """What can actually be loaded or unloaded, per backend, and why not when not. The UI needs
+    this to avoid offering buttons that cannot work."""
+    lms_ok, lms_why = _lms_available()
+    container = await _vllm_container()
+    return {
+        "ollama": {"load": True, "unload": True, "how": "HTTP keep_alive"},
+        "lmstudio": {"load": lms_ok, "unload": lms_ok,
+                     "how": "lms CLI" if lms_ok else None, "reason": lms_why or None},
+        "vllm": {"load": bool(container), "unload": bool(container),
+                 "how": f"docker ({container})" if container else None,
+                 "reason": None if container else (
+                     "no container publishing this port was found"
+                     if _upstream_is_local(VLLM_URL)
+                     else f"vLLM is at {VLLM_URL}; only a local container can be controlled"),
+                 "note": "vLLM holds one model for the life of the server, so this stops and "
+                         "starts the container rather than swapping models"},
+    }
+
+
+@app.post("/__proxy/api/control/models/unload")
+async def control_model_unload(request: Request):
+    """Unload a model from Ollama, or all of them. Body: {"model": name} or {"all": true}.
+
+    Ollama is the only backend that can be told this over HTTP: LM Studio exposes no unload
+    endpoint (only its `lms` CLI, which requires being on the same host) and vLLM serves the one
+    model its server was launched with. So this is deliberately Ollama-specific rather than a
+    general abstraction that would be mostly holes.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    upstream = (payload.get("upstream") or "ollama").strip().lower()
+    if upstream == "lmstudio":
+        ok, why = _lms_available()
+        if not ok:
+            return JSONResponse({"error": why}, status_code=501)
+        args = ["unload", "-a"] if payload.get("all") else ["unload", (payload.get("model") or "").strip()]
+        if not payload.get("all") and not args[1]:
+            return JSONResponse({"error": "'model' is required (or 'all': true)"}, status_code=400)
+        code, out = await _lms_run(args, timeout=120.0)
+        if code != 0:
+            return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
+        return {"ok": True, "unloaded": ["all"] if payload.get("all") else [args[1]], "output": out}
+    if upstream == "vllm":
+        container = await _vllm_container()
+        if not container:
+            return JSONResponse(
+                {"error": "no local vLLM container publishing this port was found"},
+                status_code=501)
+        code, out = await _run_cmd([_docker_bin(), "stop", container], 180.0)
+        if code != 0:
+            return JSONResponse({"error": out or f"docker stop exited {code}"}, status_code=502)
+        return {"ok": True, "stopped_container": container, "output": out,
+                "note": "the vLLM server is stopped; start it again to serve that model"}
+    if payload.get("all"):
+        unloaded = await _bench_evict_ollama(keep="")
+        return {"ok": True, "unloaded": unloaded}
+    name = (payload.get("model") or "").strip()
+    if not name:
+        return JSONResponse({"error": "'model' is required (or 'all': true)"}, status_code=400)
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as c:
+            # keep_alive=0 with an empty prompt is Ollama's unload; there is no stop endpoint.
+            r = await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": name, "keep_alive": 0, "prompt": ""})
+            if r.status_code >= 400:
+                return JSONResponse({"error": f"ollama said {r.status_code}: {r.text[:200]}"},
+                                    status_code=502)
+    except httpx.RequestError as e:
+        return JSONResponse({"error": f"ollama unreachable: {e}"}, status_code=502)
+    return {"ok": True, "unloaded": [name]}
+
+
+@app.post("/__proxy/api/control/models/load")
+async def control_model_load(request: Request):
+    """Load a model into Ollama without generating anything.
+    Body: {"model": name, "keep_alive": "30m"}.
+
+    A zero-token generate is how you ask Ollama to make a model resident. Loading a large model
+    takes tens of seconds, so this waits for it rather than returning early — the caller wants to
+    know it is actually resident, not that the request was accepted.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    upstream = (payload.get("upstream") or "ollama").strip().lower()
+    name = (payload.get("model") or "").strip()
+    # vLLM needs no model name: the server was launched with one and starting the container is
+    # the whole operation. Requiring a name here made starting it impossible.
+    if not name and upstream != "vllm":
+        return JSONResponse({"error": "'model' is required"}, status_code=400)
+    if upstream == "lmstudio":
+        ok, why = _lms_available()
+        if not ok:
+            return JSONResponse({"error": why}, status_code=501)
+        args = ["load", name, "--yes"]
+        # These matter for real workloads: a model loaded at the wrong context length or without
+        # parallelism benchmarks as a different thing entirely.
+        if payload.get("context_length"):
+            args += ["--context-length", str(int(payload["context_length"]))]
+        if payload.get("parallel"):
+            args += ["--parallel", str(int(payload["parallel"]))]
+        if payload.get("gpu"):
+            args += ["--gpu", str(payload["gpu"])]
+        if payload.get("ttl_s"):
+            args += ["--ttl", str(int(payload["ttl_s"]))]
+        t0 = time.perf_counter()
+        code, out = await _lms_run(args)
+        if code != 0:
+            return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
+        return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
+                "load_ms": round((time.perf_counter() - t0) * 1000)}
+    if upstream == "vllm":
+        container = await _vllm_container()
+        if not container:
+            return JSONResponse(
+                {"error": "no local vLLM container publishing this port was found"},
+                status_code=501)
+        t0 = time.perf_counter()
+        code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
+        if code != 0:
+            return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
+        # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
+        ready = await _vllm_ready(float(payload.get("wait_s") or 420))
+        return {"ok": ready, "started_container": container, "ready": ready,
+                "load_ms": round((time.perf_counter() - t0) * 1000),
+                "error": None if ready else "container started but the server did not become "
+                                            "ready in time — it may still be loading"}
+    keep = payload.get("keep_alive") or "30m"
+    t0 = time.perf_counter()
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": name, "prompt": "", "keep_alive": keep})
+            if r.status_code >= 400:
+                return JSONResponse({"error": f"ollama said {r.status_code}: {r.text[:200]}"},
+                                    status_code=502)
+    except httpx.RequestError as e:
+        return JSONResponse({"error": f"ollama unreachable: {e}"}, status_code=502)
+    return {"ok": True, "model": name, "keep_alive": keep,
+            "load_ms": round((time.perf_counter() - t0) * 1000)}
+
+
 @app.get("/__proxy/api/control/artifacts")
 async def control_artifacts_status():
     """Whether artifact capture is on, plus how many rows already exist (so the UI can offer to
