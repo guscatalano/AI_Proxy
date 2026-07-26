@@ -1524,6 +1524,34 @@ async def _lmstudio_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+# Quantisation is the first question asked of any benchmark number, and no engine reports it as
+# a field: vLLM has no model_config metric, and LM Studio only labels GGUFs. It is however almost
+# always written into the checkpoint name, because that is how these builds are distributed.
+_QUANT_TOKENS = (
+    "NVFP4", "MXFP4", "FP8", "FP16", "BF16", "AWQ", "GPTQ", "EXL2", "W8A8", "W4A16", "INT8", "INT4",
+    "Q8_0", "Q6_K", "Q5_K_M", "Q5_K_S", "Q4_K_M", "Q4_K_S", "Q4_0", "Q3_K_M", "Q3_K_S", "Q2_K",
+    "IQ4_XS", "IQ3_XXS", "IQ2_XXS",
+)
+
+
+def _infer_quant(*sources) -> str | None:
+    """Recover a quantisation label from a checkpoint path or launch arguments.
+
+    Inferred, not authoritative — a checkpoint named for one quant could contain another. It is
+    reported as-is rather than guessed at, so a wrong name is the publisher's, not ours.
+    """
+    for src in sources:
+        if not src:
+            continue
+        text = " ".join(src) if isinstance(src, (list, tuple)) else str(src)
+        upper = text.upper()
+        # Longest first so Q4_K_M wins over Q4_0's prefix and NVFP4 over FP4.
+        for token in sorted(_QUANT_TOKENS, key=len, reverse=True):
+            if token in upper:
+                return token
+    return None
+
+
 async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
     """vLLM OpenAI-compat: /v1/models lists the served model(s) (always 'loaded' — vLLM serves
     one config at a time); /metrics (Prometheus text) has live running/waiting counts + KV usage."""
@@ -1533,8 +1561,11 @@ async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
         if r.status_code == 200:
             out["reachable"] = True
             for m in (r.json().get("data") or []):
+                # `root` is the checkpoint vLLM was launched with (e.g.
+                # "saricles/Qwen3-Coder-Next-NVFP4-GB10"); the served id is usually an alias.
                 rec = {"id": m.get("id"), "state": "loaded",
-                       "max_context_length": m.get("max_model_len"), "arch": "vllm"}
+                       "max_context_length": m.get("max_model_len"), "arch": "vllm",
+                       "root": m.get("root"), "quant": _infer_quant(m.get("root"), m.get("id"))}
                 out["available"].append(rec)
                 out["loaded"].append(rec)
     except (httpx.RequestError, ValueError):
@@ -6706,10 +6737,18 @@ async def _bench_model_index() -> dict:
                     size_mb=round((m.get("size_bytes") or 0) / 1048576) or None,
                     parallel=m.get("parallel"))
         vll = sysinfo.get("vllm") or {}
+        vcfg = vll.get("config") or {}
+        # A launch flag is authoritative where the checkpoint name is only a convention.
+        v_quant_from_args = _infer_quant(vll.get("launch_args"))
         for m in (vll.get("available") or []):
             if isinstance(m, dict):
                 put(m.get("id"), "vllm", (m.get("state") or "loaded").lower() == "loaded",
-                    max_context=m.get("max_context_length"), arch=m.get("arch"))
+                    max_context=m.get("max_context_length"), arch=m.get("arch"),
+                    quant=m.get("quant") or v_quant_from_args,
+                    checkpoint=m.get("root"),
+                    prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
+                                    if vcfg.get("enable_prefix_caching") is not None else None),
+                    kv_cache_dtype=vcfg.get("cache_dtype"))
     except Exception:
         pass
     if index:
@@ -7106,6 +7145,9 @@ def _bench_report_row(run: dict) -> dict:
         "concurrency": cfg.get("concurrency") or 1,
         "quant": (run.get("env") or {}).get("quant"),
         "size_mb": (run.get("env") or {}).get("size_mb"),
+        "checkpoint": (run.get("env") or {}).get("checkpoint"),
+        "prefix_caching": (run.get("env") or {}).get("prefix_caching"),
+        "kv_cache_dtype": (run.get("env") or {}).get("kv_cache_dtype"),
         "warmup_ms": s.get("warmup_ms"),
         "warmup_ttft_ms": s.get("warmup_ttft_ms"),
         "tiers": q.get("tiers") or {},
@@ -7528,6 +7570,8 @@ ordinary slowness rather than a misconfiguration.</p>
     <div><p class="k">Prompt cache</p><p class="v">{_h(r0.get("cache") or "—")}</p></div>
     <div><p class="k">Temperature</p><p class="v">{"—" if r0.get("temperature") is None else _h(str(r0["temperature"]))}</p></div>
     <div><p class="k">Quantisation</p><p class="v">{_h(r0.get("quant") or "not reported")}</p></div>
+    <div><p class="k">Prefix caching</p><p class="v">{"on" if r0.get("prefix_caching") else ("off" if r0.get("prefix_caching") is False else "—")}</p></div>
+    <div><p class="k">KV cache dtype</p><p class="v">{_h(r0.get("kv_cache_dtype") or "—")}</p></div>
     <div><p class="k">Decode rate</p><p class="v big">{_fmt_n(r0["decode_p50"], 1)}</p></div>
     <div><p class="k">Time to first token</p><p class="v big">{_fmt_n(r0["ttft_p50"], 0)} ms</p></div>
     <div><p class="k">Reply length</p><p class="v">{_fmt_n(r0.get("mean_tokens"), 0)} tok</p></div>
@@ -9283,7 +9327,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             cfg["upstream_inferred"] = True
         env["model_loaded_at_start"] = model_meta.get("loaded")
         env["resolved_upstream"] = cfg.get("upstream")
-        for k in ("quant", "size_mb", "max_context", "loaded_context"):
+        for k in ("quant", "size_mb", "max_context", "loaded_context", "checkpoint",
+                  "prefix_caching", "kv_cache_dtype"):
             if model_meta.get(k) is not None:
                 env[k] = model_meta[k]
         conn = db()

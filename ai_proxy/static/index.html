@@ -6594,11 +6594,9 @@ async function _benchSubmit() {
   errEl.textContent = '';
   const body = _benchBody();
   if (!body.models.length) { errEl.textContent = 'pick at least one model'; return; }
-  // Only one thing here still warrants interrupting: unloading models other people may be
-  // mid-conversation with. Size and grading are stated on the button and in the run bar, and a
-  // dialog that fires on every single run is one people learn to dismiss without reading —
-  // which costs you the warning that actually matters.
-  if (body.quiesce && !confirm('This unloads every model currently loaded in Ollama — including any someone else is using — and restores them when the benchmark finishes.\n\nContinue?')) return;
+  // No dialogs in this flow at all. Everything they used to say is stated on the button and in
+  // the run bar, and a suppressed confirm() returns false — which would make Run silently do
+  // nothing, the exact failure the delete button hit.
   try {
     const r = await fetch('/__proxy/api/bench/run', {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -6677,17 +6675,57 @@ function _benchRenderRow(it) {
     </div>`;
 }
 
+// Return every delete button to rest, optionally sparing the one being armed, so only one
+// delete is ever live at a time.
+function _benchDisarmDeletes(except) {
+  for (const b of document.querySelectorAll('#bench-history [data-bench-del]')) {
+    if (b === except) continue;
+    if (b._t) { clearTimeout(b._t); b._t = null; }
+    b.dataset.armed = '';
+    b.textContent = '🗑';
+    b.style.background = 'none';
+    b.style.color = '#e08080';
+    b.title = '';
+  }
+}
+
 // Wired once per row when it's created — not on every poll, which is what the old rebuild forced.
 function _benchWireRow(node) {
   const id = node.dataset.benchId;
   const del = node.querySelector('[data-bench-del]');
   if (del) del.onclick = (e) => {
     e.stopPropagation();
-    if (!confirm('Delete this bench run?')) return;
+    // confirm() is not a dependable control: Chrome offers "prevent this page from creating
+    // additional dialogs" once a page fires a few, and after that every confirm() returns false
+    // instantly — the button goes dead for the session with nothing on screen to say why. An
+    // inline two-step arms on the button itself, so it can't be suppressed and you can see it.
+    if (del.dataset.armed !== '1') {
+      _benchDisarmDeletes(del);
+      del.dataset.armed = '1';
+      del.textContent = 'Delete?';
+      del.style.background = '#4a2020';
+      del.style.color = '#ffb4b4';
+      // Disarms itself, so a stray click never leaves a live delete under the cursor.
+      del._t = setTimeout(() => _benchDisarmDeletes(), 4000);
+      return;
+    }
+    _benchDisarmDeletes();
+    del.textContent = '…';
     _benchOpenDetails.delete(id);
     _benchSelected.delete(id);
     fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id), { method: 'DELETE' })
-      .then(() => _benchRefreshHistory());
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        node.remove();                       // immediate, not on the next poll
+        _benchUpdateCompareBar();
+        _benchRefreshHistory();
+      })
+      .catch(err => {
+        // Failure has to be visible — a silently dead button is what sent us here.
+        del.textContent = '✕ failed';
+        del.title = err.message;
+        setTimeout(() => _benchDisarmDeletes(), 3000);
+      });
   };
   const cb = node.querySelector('[data-bench-cmp]');
   if (cb) {
