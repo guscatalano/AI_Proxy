@@ -238,3 +238,32 @@ def test_suites_endpoint_lists_tasks(client):
 
 def test_report_requires_ids(client):
     assert client.get("/__proxy/api/bench/report").status_code == 400
+
+
+def test_models_endpoint_reports_upstream_and_load_state(client):
+    """The upstream is derivable from the model, which is why the bench form doesn't ask for
+    both. `loaded` drives the cold-model warning and the warm-up."""
+    r = client.get("/__proxy/api/bench/models")
+    assert r.status_code == 200
+    body = r.json()
+    assert "items" in body
+    for item in body["items"]:
+        assert item["upstream"] in ("ollama", "lmstudio", "vllm")
+        assert isinstance(item["loaded"], bool)
+
+
+def test_upstream_pin_header_does_not_corrupt_the_router_verdict(client):
+    """Regression: x-proxy-upstream used to be folded into the model_router `rewrite` dict,
+    producing a partial dict with no from/to/via. The audit path reads those keys unguarded, so
+    any pinned request 500'd as soon as another transform fired and triggered an audit write —
+    which is every bench request, since the bench pins its upstream."""
+    r = client.post(
+        "/v1/chat/completions",
+        json={"model": "nonexistent-test-model", "messages": [{"role": "user", "content": "hi"}]},
+        headers={"x-proxy-upstream": "vllm", "x-proxy-no-router": "1",
+                 "x-client-name": "ai-proxy-bench"},
+    )
+    # No upstream is running in tests, so 502 (unreachable) is the expected outcome. What must
+    # NOT happen is a 500 from the proxy's own audit code.
+    assert r.status_code != 500, r.text
+    assert r.status_code in (502, 503, 504), r.status_code

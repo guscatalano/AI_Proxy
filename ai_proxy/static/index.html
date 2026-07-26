@@ -5961,7 +5961,10 @@ async function loadBench() {
         <button id="bench-refresh" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
       </div>
       <div style="background:#141922;border:1px solid #262d38;border-radius:8px;padding:14px;margin-bottom:18px">
-        <div style="font-size:12px;color:#aaa;margin-bottom:10px">Queue a workload against one or more models. Each request reports TTFT (first token of any kind), TTFC (first <em>content</em> token) and decode rate. Pick several models, prompt sizes, thinking modes or temperatures and it runs the whole matrix, one cell at a time.</div>
+        <div style="font-size:12px;color:#aaa;margin-bottom:10px;line-height:1.55">
+          Sends real requests through the proxy to the models you pick, and times them: <strong>TTFT</strong> (first token of any kind), <strong>TTFC</strong> (first <em>content</em> token — the gap between the two is the model thinking), and decode rate. Add a graded suite and it also scores whether the code that came back actually works.<br>
+          <span style="color:#8b97a8">Models are listed by the backend that serves them — ● loaded, ○ not. Picking one doesn't load it: Ollama loads on first use (the warm-up absorbs that), while LM Studio and vLLM only serve what's already resident. Select several models, prompt sizes, thinking modes or temperatures to sweep the whole matrix, one cell at a time.</span>
+        </div>
         <div style="display:grid;grid-template-columns:auto 1fr auto 1fr;gap:8px 12px;align-items:center;font-size:12px;margin-bottom:10px">
           <label>Models</label><select id="bench-model" multiple size="5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"></select>
           <label>Prompt size</label><select id="bench-prompt" multiple size="5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="0" selected>short (~80 tok)</option><option value="2000">2K</option><option value="4000">4K</option><option value="8000">8K</option><option value="16000">16K</option><option value="32000">32K</option><option value="65536">64K</option><option value="131072">128K</option><option value="262144">256K</option></select>
@@ -5970,11 +5973,12 @@ async function loadBench() {
           <label>Thinking</label><select id="bench-thinking" multiple size="4" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="auto" selected>auto (proxy quirks apply)</option><option value="off">off (kwarg + reasoning_effort)</option><option value="off_prefill">off via &lt;think&gt; prefill (LM Studio)</option><option value="on">on</option></select>
           <label>Temperature</label><input id="bench-temp" placeholder="engine default — or 0, 0.2" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px">
           <label>Concurrency</label><select id="bench-concur" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="1">1 (serial)</option><option value="2">2 parallel</option><option value="4">4 parallel</option><option value="8">8 parallel</option></select>
-          <label>Upstream</label><select id="bench-upstream" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="">(path default)</option><option value="ollama">ollama</option><option value="lmstudio">lmstudio</option><option value="vllm">vllm</option></select>
+          <label title="Normally inferred from the model you picked — the proxy knows which backend serves it. Override only to force a specific one.">Upstream</label><select id="bench-upstream" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="">auto — from the model</option><option value="ollama">force ollama</option><option value="lmstudio">force lmstudio</option><option value="vllm">force vllm</option></select>
           <label>Graded suite</label><select id="bench-suite" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="">none (perf only)</option></select>
           <label>Drain (s)</label><input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
         </div>
         <div style="display:flex;gap:14px;align-items:center;font-size:12px;margin-bottom:8px;flex-wrap:wrap">
+          <label><input type="checkbox" id="bench-warmup" checked> Warm up first <span style="color:#666">(one unmeasured request, so model-load time stays out of the results)</span></label>
           <label><input type="checkbox" id="bench-randomize"> Randomize prompt <span style="color:#666">(defeats prompt cache)</span></label>
           <label><input type="checkbox" id="bench-bypass" checked> Pin model <span style="color:#666">(ignore routing rules)</span></label>
           <label><input type="checkbox" id="bench-nonudge" checked> No system nudge <span style="color:#666">(drop quirk prompt injection)</span></label>
@@ -6000,7 +6004,8 @@ async function loadBench() {
     $('bench-go').onclick = _benchSubmit;
     // Keep the "N cells × M requests" preview honest as the axes change — a 4-model ×
     // 3-context × 2-thinking sweep is 24 cells, which is worth seeing before you start it.
-    ['bench-model', 'bench-prompt', 'bench-thinking', 'bench-temp', 'bench-runs', 'bench-suite']
+    ['bench-model', 'bench-prompt', 'bench-thinking', 'bench-temp', 'bench-runs', 'bench-suite',
+     'bench-upstream', 'bench-warmup']
       .forEach(id => { const el = $(id); if (el) el.addEventListener('change', _benchUpdatePlan); });
     const tempEl = $('bench-temp');
     if (tempEl) tempEl.addEventListener('input', _benchUpdatePlan);
@@ -6023,16 +6028,24 @@ async function _benchPopulateModels() {
     // /api/bench/models unions every upstream the proxy can reach — benching LM Studio or
     // vLLM shouldn't require the model to also exist in Ollama.
     const d = await (await fetch('/__proxy/api/bench/models')).json();
-    const groups = [];
-    const opt = n => `<option value="${esc(n)}">${esc(n)}</option>`;
-    const oll = d.ollama || {};
-    if ((oll.loaded || []).length) groups.push(`<optgroup label="✓ Ollama (loaded)">${oll.loaded.map(opt).join('')}</optgroup>`);
-    if ((oll.available || []).length) groups.push(`<optgroup label="Ollama (available)">${oll.available.map(opt).join('')}</optgroup>`);
-    if ((d.lmstudio || []).length) groups.push(`<optgroup label="LM Studio">${d.lmstudio.map(opt).join('')}</optgroup>`);
-    if ((d.vllm || []).length) groups.push(`<optgroup label="vLLM">${d.vllm.map(opt).join('')}</optgroup>`);
-    sel.innerHTML = groups.join('') || '<option disabled>(no models)</option>';
-    const first = sel.querySelector('option:not([disabled])');
-    if (first) first.selected = true;
+    _benchModelIndex = {};
+    const items = d.items || [];
+    for (const it of items) _benchModelIndex[it.model] = it;
+    // Grouped by the upstream that serves them, with load state on the option itself — an
+    // unloaded model costs a load on first use, which is what the warm-up exists to absorb.
+    const byUp = {};
+    for (const it of items) (byUp[it.upstream] = byUp[it.upstream] || []).push(it);
+    const label = {ollama: 'Ollama', lmstudio: 'LM Studio', vllm: 'vLLM'};
+    const groups = Object.keys(byUp).sort().map(up =>
+      `<optgroup label="${esc(label[up] || up)}">` + byUp[up].map(it =>
+        `<option value="${esc(it.model)}">${it.loaded ? '● ' : '○ '}${esc(it.model)}${it.loaded ? '' : '  (not loaded)'}</option>`
+      ).join('') + '</optgroup>').join('');
+    sel.innerHTML = groups || '<option disabled>(no models)</option>';
+    // Default to something already resident, so the obvious first click measures a warm model.
+    const loadedOpt = items.find(i => i.loaded);
+    const pick = loadedOpt ? sel.querySelector(`option[value="${CSS.escape(loadedOpt.model)}"]`)
+                           : sel.querySelector('option:not([disabled])');
+    if (pick) pick.selected = true;
   } catch {
     sel.innerHTML = '<option disabled>(failed to fetch models)</option>';
   }
@@ -6044,6 +6057,8 @@ async function _benchPopulateModels() {
   } catch { /* suites are optional */ }
   _benchUpdatePlan();
 }
+
+let _benchModelIndex = {};
 
 function _benchMulti(id) {
   const el = $(id);
@@ -6077,6 +6092,7 @@ function _benchBody() {
     quiesce: $('bench-quiesce').checked,
     bypass_router: $('bench-bypass').checked,
     no_nudge: $('bench-nonudge').checked,
+    warmup: $('bench-warmup').checked,
   };
   if (temps) body.temperature = temps.length > 1 ? temps : temps[0];
   const up = $('bench-upstream').value;
@@ -6096,9 +6112,25 @@ function _benchUpdatePlan() {
   const suiteSel = $('bench-suite');
   const suiteTxt = suiteSel.value ? (suiteSel.selectedOptions[0].textContent.match(/(\d+) tasks/) || [])[1] : null;
   const perCell = b.runs * (suiteTxt ? parseInt(suiteTxt, 10) : 1);
-  el.textContent = cells > 1
-    ? `${cells} cells × ${perCell} requests = ${cells * perCell} requests, run one cell at a time`
+  const scale = cells > 1
+    ? `${cells} cells × ${perCell} requests = ${cells * perCell} requests, one cell at a time`
     : `${perCell} request${perCell === 1 ? '' : 's'}`;
+
+  // Spell out where the traffic is actually going and what has to be loaded first — those are
+  // the two things you can't tell by looking at the form.
+  const metas = b.models.map(m => _benchModelIndex[m]).filter(Boolean);
+  const forced = $('bench-upstream').value;
+  const ups = forced ? [forced] : [...new Set(metas.map(m => m.upstream))];
+  let route = ups.length ? ` → ${ups.join(' + ')}${forced ? ' (forced)' : ''}` : '';
+  const cold = metas.filter(m => !m.loaded).map(m => m.model);
+  let warn = '';
+  if (cold.length) {
+    warn = b.warmup
+      ? ` · ${cold.length === 1 ? cold[0] + ' is' : cold.length + ' models are'} not loaded — the warm-up absorbs the load`
+      : ` · ⚠ ${cold.length === 1 ? cold[0] + ' is' : cold.length + ' models are'} not loaded and warm-up is off — load time will land in the first measurement`;
+  }
+  el.innerHTML = esc(scale + route) + (warn
+    ? `<span style="color:${b.warmup ? '#888' : '#f0a35a'}">${esc(warn)}</span>` : '');
 }
 
 async function _benchSubmit() {
@@ -6393,6 +6425,12 @@ async function _benchLoadDetail(id) {
         <tr><td style="color:#888">Errors</td><td style="color:#e08080;font-size:11px">${res.errors.map(e => `${e.count}× ${esc(e.message)}`).join('<br>')}</td></tr>` : '';
     const served = (res.served_models || []).length ? `
         <tr><td style="color:#888">Served by</td><td><code style="color:#57d1e0">${esc(res.served_models.join(', '))}</code></td></tr>` : '';
+    const routed = cfg.upstream ? `
+        <tr><td style="color:#888">Upstream</td><td>${esc(cfg.upstream)}${cfg.upstream_inferred ? ' <span style="color:#667">(inferred from model)</span>' : ' <span style="color:#667">(forced)</span>'}</td></tr>` : '';
+    // The warm-up time is the model-load cost when the model was cold. Showing it explains an
+    // otherwise baffling gap between wall-clock and the reported per-request numbers.
+    const warmRow = res.warmup_ms != null ? `
+        <tr><td style="color:#888">Warm-up</td><td>${_benchFmtMs(res.warmup_ms)} <span style="color:#667">(not counted${(d.env && d.env.model_loaded_at_start === false) ? ' — model was cold' : ''})</span>${res.warmup_error ? ` <span style="color:#e08080">${esc(res.warmup_error)}</span>` : ''}</td></tr>` : '';
     // A sweep parent has children instead of its own rows.
     const kids = (d.children || []).length ? `
       <div style="margin-top:8px">
@@ -6417,6 +6455,8 @@ async function _benchLoadDetail(id) {
       <table style="width:auto"><tbody>
         <tr><td style="color:#888">Config</td><td><code style="font-size:11px">${esc(JSON.stringify(cfg))}</code></td></tr>
         ${served}
+        ${routed}
+        ${warmRow}
         <tr><td style="color:#888">TTFT (first token)</td><td>min ${_benchFmtMs(tt.min)} · p50 ${_benchFmtMs(tt.p50)} · p90 ${_benchFmtMs(tt.p90)} · max ${_benchFmtMs(tt.max)}</td></tr>
         ${reasoningRows}
         <tr><td style="color:#888">Decode tok/s</td><td>min ${_benchFmtTps(dec.min)} · p50 ${_benchFmtTps(dec.p50)} · mean ${_benchFmtTps(dec.mean)} · max ${_benchFmtTps(dec.max)}</td></tr>

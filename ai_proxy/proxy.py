@@ -6550,28 +6550,93 @@ async def bench_suites():
     }
 
 
-@app.get("/__proxy/api/bench/models")
-async def bench_models():
-    """Every model the proxy can reach, grouped by upstream, so a bench can target LM Studio or
-    vLLM and not just Ollama."""
-    out: dict = {"ollama": {"loaded": [], "available": []}, "lmstudio": [], "vllm": []}
+async def _bench_model_index() -> dict:
+    """Map model name → {upstream, loaded}. This is what makes the upstream field unnecessary:
+    the proxy already knows which backend serves which model, so a bench can infer it instead of
+    asking the user to state it (and to keep it consistent with their model choice)."""
+    index: dict[str, dict] = {}
     try:
         sysinfo = await system_now()
         ollama = sysinfo.get("ollama") or {}
-        loaded = [m.get("name") or m.get("model") for m in (ollama.get("ps") or [])
-                  if isinstance(m, dict)]
-        out["ollama"]["loaded"] = [m for m in loaded if m]
-        tags = [t.get("name") for t in (ollama.get("tags") or []) if isinstance(t, dict)]
-        loaded_set = set(out["ollama"]["loaded"])
-        out["ollama"]["available"] = sorted(t for t in tags if t and t not in loaded_set)
-        out["lmstudio"] = sorted(m.get("id") for m in
-                                 ((sysinfo.get("lmstudio") or {}).get("models") or [])
-                                 if isinstance(m, dict) and m.get("id"))
-        out["vllm"] = sorted(m.get("id") for m in
-                             ((sysinfo.get("vllm") or {}).get("models") or [])
-                             if isinstance(m, dict) and m.get("id"))
-    except Exception as e:
-        out["error"] = f"{type(e).__name__}: {e}"
+        for m in (ollama.get("ps") or []):
+            if isinstance(m, dict) and (m.get("name") or m.get("model")):
+                index[m.get("name") or m.get("model")] = {"upstream": "ollama", "loaded": True}
+        for t in (ollama.get("tags") or []):
+            if isinstance(t, dict) and t.get("name") and t["name"] not in index:
+                index[t["name"]] = {"upstream": "ollama", "loaded": False}
+        # LM Studio and vLLM only list what's actually resident — nothing auto-loads there, so
+        # anything they report is by definition already loaded.
+        for m in ((sysinfo.get("lmstudio") or {}).get("models") or []):
+            if isinstance(m, dict) and m.get("id"):
+                index[m["id"]] = {"upstream": "lmstudio", "loaded": True}
+        for m in ((sysinfo.get("vllm") or {}).get("models") or []):
+            if isinstance(m, dict) and m.get("id"):
+                index[m["id"]] = {"upstream": "vllm", "loaded": True}
+    except Exception:
+        pass
+    if index:
+        return index
+    # The snapshot comes from the background metrics collector, which hasn't necessarily run
+    # yet on a freshly-started proxy — and a bench submitted in that window would silently get
+    # no upstream inference. Probe the upstreams directly rather than depend on that timing.
+    async def _probe(client, url, parse):
+        try:
+            r = await client.get(url)
+            if r.status_code == 200:
+                parse(r.json())
+        except Exception:
+            pass
+
+    def _ollama_tags(j):
+        for m in (j.get("models") or []):
+            if isinstance(m, dict) and m.get("name"):
+                index.setdefault(m["name"], {"upstream": "ollama", "loaded": False})
+
+    def _ollama_ps(j):
+        for m in (j.get("models") or []):
+            if isinstance(m, dict) and (m.get("name") or m.get("model")):
+                index[m.get("name") or m.get("model")] = {"upstream": "ollama", "loaded": True}
+
+    def _openai_models(label):
+        def parse(j):
+            for m in (j.get("data") or []):
+                if isinstance(m, dict) and m.get("id"):
+                    index[m["id"]] = {"upstream": label, "loaded": True}
+        return parse
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(4.0)) as c:
+            await asyncio.gather(
+                _probe(c, f"{OLLAMA_URL}/api/tags", _ollama_tags),
+                _probe(c, f"{LMSTUDIO_URL}/v1/models", _openai_models("lmstudio")),
+                _probe(c, f"{VLLM_URL}/v1/models", _openai_models("vllm")),
+            )
+            # After tags, so a loaded model's entry wins over its catalogue entry.
+            await _probe(c, f"{OLLAMA_URL}/api/ps", _ollama_ps)
+    except Exception:
+        pass
+    return index
+
+
+@app.get("/__proxy/api/bench/models")
+async def bench_models():
+    """Every model the proxy can reach, with the upstream that serves it and whether it's
+    currently loaded. `loaded` matters for benchmarking: an unloaded Ollama model is pulled into
+    VRAM by the first request, so without a warm-up that load time lands inside the first
+    measurement."""
+    index = await _bench_model_index()
+    items = [{"model": name, **meta} for name, meta in index.items()]
+    items.sort(key=lambda i: (i["upstream"], not i["loaded"], i["model"]))
+    out: dict = {
+        "items": items,
+        # Kept for older clients / convenience.
+        "ollama": {
+            "loaded": [i["model"] for i in items if i["upstream"] == "ollama" and i["loaded"]],
+            "available": [i["model"] for i in items if i["upstream"] == "ollama" and not i["loaded"]],
+        },
+        "lmstudio": [i["model"] for i in items if i["upstream"] == "lmstudio"],
+        "vllm": [i["model"] for i in items if i["upstream"] == "vllm"],
+    }
     return out
 
 
@@ -6636,8 +6701,13 @@ async def bench_run(request: Request):
         "bypass_router": bool(payload.get("bypass_router", False)),
         "no_nudge": bool(payload.get("no_nudge", False)),
         "quiesce": bool(payload.get("quiesce", False)),
+        # On by default: an unloaded model's load time would otherwise land in the first
+        # measured request. Turn it off only when cold-start IS what you're measuring.
+        "warmup": bool(payload.get("warmup", True)),
     }
     if upstream:
+        # Explicit pin. Left unset, each cell resolves its own backend from the model, which is
+        # what makes a mixed-model sweep (Ollama + vLLM in one submission) work.
         config["upstream"] = upstream
     if suite:
         config["suite"] = suite
@@ -8018,6 +8088,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         suite_name = str(cfg.get("suite") or "").strip()
         suite = _BENCH_SUITES.get(suite_name) if suite_name else None
         grade_timeout = max(1.0, min(float(cfg.get("grade_timeout", 10.0)), 60.0))
+        warmup = bool(cfg.get("warmup", True))
         total_units = (len(suite) * runs) if suite else runs
         conn.execute(
             "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=? WHERE id=?",
@@ -8026,8 +8097,18 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         conn.commit()
         conn.close()
         env = await _bench_env_snapshot()
+        # Resolve the backend from the model unless the user pinned one explicitly. Asking the
+        # user to state both invites contradictions (an Ollama model aimed at vLLM just errors),
+        # and the proxy already knows the answer.
+        model_meta = (await _bench_model_index()).get(model) or {}
+        if not cfg.get("upstream") and model_meta.get("upstream"):
+            cfg["upstream"] = model_meta["upstream"]
+            cfg["upstream_inferred"] = True
+        env["model_loaded_at_start"] = model_meta.get("loaded")
+        env["resolved_upstream"] = cfg.get("upstream")
         conn = db()
-        conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?", (json.dumps(env), bench_id))
+        conn.execute("UPDATE bench_runs SET env_json=?, config_json=? WHERE id=?",
+                     (json.dumps(env), json.dumps(cfg), bench_id))
         conn.commit()
         conn.close()
         # Exclusive mode: clear the gate, optionally drain in-flight requests, run, then re-set.
@@ -8047,6 +8128,20 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
             try:
                 rows: list[dict] = []
+                # Warm-up: Ollama pulls an unloaded model into VRAM on first use, so without
+                # this the first measured request carries the load time (tens of seconds for a
+                # large model) and the run's min/max are nonsense. The warm-up result is
+                # discarded, never scored, and never counted in the summary.
+                if warmup:
+                    warm = await _bench_run_one(client, base, model, 16,
+                                                _bench_build_prompt(0, True, 0), 0, cfg=cfg)
+                    conn = db()
+                    conn.execute("UPDATE bench_runs SET results_json=? WHERE id=?",
+                                 (json.dumps({"rows": [], "warmup": warm}), bench_id))
+                    conn.commit()
+                    conn.close()
+                else:
+                    warm = None
                 # Each unit is one request. Without a suite that's the synthetic prompt N times;
                 # with one it's every task × N repeats, so each task gets its own percentiles
                 # and a repeatable score.
@@ -8098,7 +8193,13 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 summary = _bench_summarize(rows)
                 if suite:
                     summary["quality"] = _bench_quality_summary(rows, suite)
-                final = {"rows": rows, "summary": summary, "config_used": cfg, "env": env}
+                if warm:
+                    # Surfaced, not hidden: if the warm-up took 40s and the measured runs took
+                    # 2s, that gap IS the model-load cost and is worth seeing.
+                    summary["warmup_ms"] = warm.get("total_ms")
+                    summary["warmup_error"] = warm.get("error")
+                final = {"rows": rows, "summary": summary, "config_used": cfg, "env": env,
+                         "warmup": warm}
                 conn = db()
                 conn.execute(
                     "UPDATE bench_runs SET status='done', results_json=?, finished_ts=? WHERE id=?",
@@ -10556,13 +10657,15 @@ async def proxy(full_path: str, request: Request):
     _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL}
     # x-proxy-upstream forces the backend directly, without needing a routing rule. Same
     # motivation as x-proxy-no-router: benchmark the engine you meant to benchmark.
+    # Kept OUT of `rewrite`: that dict is the model_router verdict and downstream audit code
+    # requires its from/to/via keys. Synthesizing a partial one here to carry the upstream
+    # made every pinned request 500 on the audit path.
     _pin_upstream = (request.headers.get("x-proxy-upstream") or "").strip().lower()
-    if _pin_upstream in _UPSTREAM_BASES and upstream_label != "anthropic":
-        rewrite = dict(rewrite or {})
-        rewrite["upstream"] = _pin_upstream
-    if (rewrite and rewrite.get("upstream")
-            and upstream_label != "anthropic"):
-        _new_label = str(rewrite["upstream"]).lower()
+    if _pin_upstream not in _UPSTREAM_BASES:
+        _pin_upstream = ""
+    _want_upstream = _pin_upstream or ((rewrite or {}).get("upstream") or "")
+    if _want_upstream and upstream_label != "anthropic":
+        _new_label = str(_want_upstream).lower()
         _new_base = _UPSTREAM_BASES.get(_new_label)
         if _new_base and _new_label != upstream_label:
             upstream_label = _new_label

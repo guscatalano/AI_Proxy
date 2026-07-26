@@ -41,6 +41,33 @@ The `thinking` setting maps onto these:
 - `off_prefill` — as `off`, plus the pre-closed `<think>` block. Use for LM Studio.
 - `on` — `enable_thinking: true` and `reasoning_effort: "high"`.
 
+### Picking a model does not load it
+
+The picker lists every model the proxy can reach, grouped by the backend that serves it and
+marked ● loaded / ○ not loaded. Selecting one only names it in the request — what happens next
+depends on the backend:
+
+- **Ollama** pulls an unloaded model into VRAM on first use. Without a warm-up, that load time —
+  tens of seconds for a large model — lands inside the first measured request while the rest run
+  warm, which makes the run's min/max meaningless.
+- **LM Studio and vLLM** don't auto-load. They only serve what is already resident, so an
+  unlisted model simply errors.
+
+**Warm up first** (on by default) sends one throwaway request before measuring. It is excluded
+from every statistic, but reported separately as `warmup_ms` — if the warm-up took 40 s and the
+measured runs took 2 s, that gap *is* the model-load cost. Turn it off only when cold start is
+what you want to measure.
+
+### The upstream is inferred, not asked for
+
+There is no separate "which backend" question to keep in sync with your model choice: the proxy
+knows which upstream serves which model and resolves it per run. That's what lets a single sweep
+mix an Ollama model and a vLLM model — each cell routes itself.
+
+The Upstream field is an override for the unusual case (the same model name served by two
+backends, or forcing traffic somewhere the index doesn't know about). Runs record which upstream
+was used and whether it was inferred or forced.
+
 ### Routing silently substitutes the model
 
 A `model_router` rule can rewrite the model *and* the upstream. Benchmark `qwen` with a rule in
