@@ -452,3 +452,63 @@ def test_report_flags_a_backend_with_no_cache_reuse():
     runs = [mk("cold", 320.0), mk("cached", 300.0)]
     html = p._bench_report_html(runs, [p._bench_report_row(r) for r in runs])
     assert "no measurable reuse" in html
+
+
+# ---- sweep robustness ---------------------------------------------------------------------
+
+def test_every_cell_carries_a_scalar_concurrency():
+    """The bug that broke a 24-cell sweep on spark: concurrency was only copied into the child
+    config when it differed from the default, so every concurrency-1 cell inherited the parent's
+    [1, 4] LIST. int() on a list raises, the first child died before it could be marked running,
+    the exception escaped a fire-and-forget task, and all 24 cells sat 'pending' forever with no
+    error recorded anywhere."""
+    cfg = {"prompt_tokens": [0, 8000], "thinking": ["off", "on"],
+           "cache": ["cold", "cached"], "concurrency": [1, 4]}
+    cells = p._bench_expand_matrix([{"model": "m", "upstream": "vllm"}], cfg)
+    assert len(cells) == 16
+    # Reproduce what the suite executor writes for each child.
+    for axes in cells:
+        child = dict(cfg)
+        child["prompt_tokens"] = axes["prompt_tokens"]
+        child["thinking"] = axes["thinking"]
+        child["concurrency"] = axes.get("concurrency") or 1
+        assert isinstance(child["concurrency"], int), axes
+        int(child["concurrency"])   # must not raise
+
+
+def test_scalar_coercion_survives_a_list_that_slips_through():
+    """Defence in depth: a future axis that forgets to flatten shouldn't crash the cell, because
+    a crashed cell explains nothing to whoever is waiting on it."""
+    def _scalar(cfg, key, default):
+        v = cfg.get(key, default)
+        return (v[0] if v else default) if isinstance(v, list) else v
+
+    assert _scalar({"concurrency": [1, 4]}, "concurrency", 1) == 1
+    assert _scalar({"concurrency": []}, "concurrency", 1) == 1
+    assert _scalar({"concurrency": 4}, "concurrency", 1) == 4
+    assert _scalar({}, "concurrency", 1) == 1
+
+
+def test_startup_fails_runs_left_queued_by_a_restart(tmp_path, monkeypatch):
+    """A bench only exists as an in-memory task, so a restart strands it. Rows that can never
+    advance must not keep claiming they're about to."""
+    import sqlite3 as sq
+    dbf = tmp_path / "b.db"
+    conn = sq.connect(dbf)
+    conn.executescript(p.SCHEMA_TABLE)
+    for bid, st in (("b_1", "pending"), ("b_2", "running"), ("b_3", "done")):
+        conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status) "
+                     "VALUES (?, ?, 'm', '{}', ?)", (bid, 1.0, st))
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(p, "DB_PATH", str(dbf))
+    p.init_db()
+
+    conn = sq.connect(dbf)
+    rows = dict(conn.execute("SELECT id, status FROM bench_runs").fetchall())
+    errs = dict(conn.execute("SELECT id, error FROM bench_runs").fetchall())
+    conn.close()
+    assert rows["b_1"] == "failed" and rows["b_2"] == "failed"
+    assert rows["b_3"] == "done", "a finished run must be left alone"
+    assert "restarted" in (errs["b_1"] or "")

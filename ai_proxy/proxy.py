@@ -830,6 +830,18 @@ def init_db():
         )
     except sqlite3.OperationalError:
         pass
+    # Benches live in an in-memory asyncio task, so a restart (or a crash) strands whatever was
+    # queued: the rows stay 'pending'/'running' forever with nothing left to advance them, and
+    # the UI shows a sweep that will never move. Nothing can resume them, so say so plainly.
+    try:
+        conn.execute(
+            "UPDATE bench_runs SET status='failed', finished_ts=?, "
+            "error=COALESCE(error, 'interrupted — the proxy restarted while this was queued') "
+            "WHERE status IN ('pending','running')",
+            (time.time(),),
+        )
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     if _did_blob_split:
@@ -8592,8 +8604,9 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
             # the mechanism, so a result column reads "cold / cached" not "randomize true/false".
             child_cfg["cache"] = axes["cache"]
             child_cfg["randomize"] = (axes["cache"] == "cold")
-        if axes.get("concurrency"):
-            child_cfg["concurrency"] = axes["concurrency"]
+        # Always write the scalar, including the default. Copying it only when it differed left
+        # every concurrency-1 cell holding the parent's [1, 4] list, and int() on a list raises.
+        child_cfg["concurrency"] = axes.get("concurrency") or 1
         # The suite owns quiescing for the whole sweep; children must not toggle it per cell.
         child_cfg["quiesce"] = False
         conn.execute(
@@ -8616,12 +8629,34 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     if cfg.get("quiesce"):
         quiesce_state = await _bench_quiesce(True)
     try:
+      try:
         for i, cid in enumerate(child_ids, start=1):
-            await _bench_execute(cid, app)
+            # One bad cell must not abandon the other 23. Before this, an exception here
+            # propagated out of a fire-and-forget task, which dies silently — leaving the
+            # parent 'running' and every child 'pending' with nothing to explain why.
+            try:
+                await _bench_execute(cid, app)
+            except Exception as e:
+                conn = db()
+                conn.execute(
+                    "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                    (f"{type(e).__name__}: {e}", time.time(), cid))
+                conn.commit()
+                conn.close()
             conn = db()
             conn.execute("UPDATE bench_runs SET progress=? WHERE id=?", (i, parent_id))
             conn.commit()
             conn.close()
+      except Exception as e:
+        # A fire-and-forget task that raises disappears without trace. Record it on the parent,
+        # or the sweep looks like it is still running for the rest of the process's life.
+        conn = db()
+        conn.execute(
+            "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+            (f"{type(e).__name__}: {e}", time.time(), parent_id))
+        conn.commit()
+        conn.close()
+        return
     finally:
         if quiesce_state is not None:
             await _bench_quiesce(False, quiesce_state)
@@ -8652,10 +8687,16 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             conn.commit()
             conn.close()
             return
-        runs = max(1, min(int(cfg.get("runs", 5)), 50))
-        max_tokens = max(16, min(int(cfg.get("max_tokens", 256)), 8192))
-        prompt_tokens = max(0, min(int(cfg.get("prompt_tokens", 0)), 262144))
-        concurrency = max(1, min(int(cfg.get("concurrency", 1)), 8))
+        def _scalar(key, default):
+            # Defence in depth for the bug above: a sweep axis that reaches a child unflattened
+            # would otherwise crash it, and a crashed child explains nothing to the user.
+            v = cfg.get(key, default)
+            return (v[0] if v else default) if isinstance(v, list) else v
+
+        runs = max(1, min(int(_scalar("runs", 5)), 50))
+        max_tokens = max(16, min(int(_scalar("max_tokens", 256)), 8192))
+        prompt_tokens = max(0, min(int(_scalar("prompt_tokens", 0)), 262144))
+        concurrency = max(1, min(int(_scalar("concurrency", 1)), 8))
         randomize = bool(cfg.get("randomize", False))
         exclusive = bool(cfg.get("exclusive", False))
         drain_seconds = max(0.0, min(float(cfg.get("drain_seconds", 5.0)), 30.0))

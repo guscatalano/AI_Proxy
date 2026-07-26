@@ -6072,8 +6072,8 @@ async function loadBench() {
         </div>
         <div class="bench-preset">
           <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:9px">
-            <button type="button" class="bench-preset-opt" data-preset="quick" aria-pressed="true">Quick</button>
-            <button type="button" class="bench-preset-opt" data-preset="full" aria-pressed="false">Full report</button>
+            <button type="button" class="bench-preset-opt" data-preset="quick" aria-pressed="true">Quick <span style="opacity:.7">· 36 requests / model</span></button>
+            <button type="button" class="bench-preset-opt" data-preset="full" aria-pressed="false">Full report <span style="opacity:.7">· 864 requests / model</span></button>
           </div>
           <div id="bench-preset-desc"></div>
           <label class="bench-check" style="margin-top:9px" title="Other clients keep their connections and resume as soon as the benchmark finishes — they wait, they don't fail. Without this, whatever else is using the model gets measured along with it.">
@@ -6506,23 +6506,26 @@ function _benchBody() {
   return body;
 }
 
+// One place computes the size of a submission, so the plan line and the pre-flight guard can
+// never disagree about how big it is.
+function _benchPlanCounts(b) {
+  const n = a => (Array.isArray(a) ? a.length : 1);
+  const cells = Math.max(1, (b.models || []).length) * n(b.prompt_tokens) * n(b.thinking) *
+                (b.temperature === undefined ? 1 : n(b.temperature)) *
+                (b.cache === undefined ? 1 : n(b.cache)) *
+                (b.concurrency === undefined ? 1 : n(b.concurrency));
+  const sel = $('bench-suite');
+  const opt = b.suite && sel ? Array.from(sel.options).find(o => o.value === b.suite) : null;
+  const tasks = opt ? (parseInt((opt.textContent.match(/(\d+) tasks/) || [])[1], 10) || 1) : 1;
+  const perCell = (b.runs || 1) * tasks;
+  return {cells, perCell, total: cells * perCell};
+}
+
 function _benchUpdatePlan() {
   const el = $('bench-plan');
   if (!el) return;
   const b = _benchBody();
-  const n = arr => (Array.isArray(arr) ? arr.length : 1);
-  const cells = Math.max(1, b.models.length) * n(b.prompt_tokens) * n(b.thinking) *
-                (b.temperature === undefined ? 1 : n(b.temperature)) *
-                (b.cache === undefined ? 1 : n(b.cache)) *
-                (b.concurrency === undefined ? 1 : n(b.concurrency));
-  const suiteSel = $('bench-suite');
-  // Task count comes from the option text in advanced mode; in simple mode the suite is fixed,
-  // so fall back to whatever the suites endpoint reported for it.
-  const suiteName = b.suite || '';
-  const suiteOpt = suiteName && suiteSel
-    ? Array.from(suiteSel.options).find(o => o.value === suiteName) : null;
-  const suiteTxt = suiteOpt ? (suiteOpt.textContent.match(/(\d+) tasks/) || [])[1] : null;
-  const perCell = b.runs * (suiteTxt ? parseInt(suiteTxt, 10) : 1);
+  const {cells, perCell} = _benchPlanCounts(b);
   const scale = cells > 1
     ? `<b>${cells} cells</b> × ${perCell} requests = <b>${cells * perCell} requests</b>, one cell at a time`
     : `<b>${perCell} request${perCell === 1 ? '' : 's'}</b>`;
@@ -6578,6 +6581,13 @@ async function _benchSubmit() {
   if (!body.models.length) { errEl.textContent = 'pick at least one model'; return; }
   if (body.quiesce && !confirm('Quiesce will enable panic mode and unload every loaded Ollama model, then restore them when the bench finishes. Continue?')) return;
   if (body.suite && !confirm('The graded suite executes the model\'s generated Python in a subprocess to score it. Only run it against models you trust. Continue?')) return;
+  // Scale check. The plan line already states the size, but a large sweep also ties up the box
+  // for a long time — "I pressed run and it queued 864 requests" should not happen by accident.
+  const _plan = _benchPlanCounts(body);
+  if (_plan.total > 120 && !confirm(
+        `This runs ${_plan.cells} configuration${_plan.cells === 1 ? '' : 's'} — ${_plan.total} requests in total`
+        + (body.exclusive ? ', holding other proxy clients until it finishes' : '')
+        + '.\n\nStart it?')) return;
   try {
     const r = await fetch('/__proxy/api/bench/run', {
       method: 'POST', headers: { 'content-type': 'application/json' },
