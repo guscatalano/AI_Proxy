@@ -808,6 +808,60 @@
   .cc-mode.shadow { background: rgba(122,162,247,.16); color: #7aa2f7; }
   .cc-mode.off { background: #20262f; color: #5f6b7e; }
   @media (max-width: 760px) { .s2-kpis { grid-template-columns: repeat(3, 1fr); } }
+/* ---- Benchmark runner form -------------------------------------------------------------
+   Three fieldsets matching the three questions the form answers — what to run, how to measure,
+   what to isolate — instead of one grid mixing all three. The run bar is pinned at the bottom
+   with the plan readout, because "what is this about to do" is the thing you check last. */
+.bench-form { background:#141922; border:1px solid #262d38; border-radius:8px; margin-bottom:18px; }
+.bench-lede { font-size:12px; color:#8b97a8; line-height:1.5; padding:12px 14px; border-bottom:1px solid #1e242e; }
+.bench-lede strong { color:#c9d3e1; font-weight:600; }
+.bench-groups { display:grid; grid-template-columns:minmax(260px,1.15fr) minmax(210px,0.95fr) minmax(190px,0.9fr); gap:0; }
+.bench-group { padding:12px 14px; border-right:1px solid #1e242e; min-width:0; }
+.bench-group:last-child { border-right:none; }
+.bench-group > h4 { margin:0 0 10px; font-size:10px; text-transform:uppercase; letter-spacing:0.9px;
+                    color:#6b7787; font-weight:600; display:flex; align-items:baseline; gap:6px; }
+.bench-group > h4 span { text-transform:none; letter-spacing:0; color:#4d5765; font-weight:400; font-size:10px; }
+.bench-row { display:grid; grid-template-columns:82px 1fr; gap:6px 10px; align-items:center;
+             margin-bottom:7px; font-size:12px; }
+.bench-row > label:first-child { color:#8b97a8; }
+.bench-row.stack { grid-template-columns:1fr; }
+.bench-row.stack > label:first-child { margin-bottom:1px; }
+.bench-form select, .bench-form input[type=number], .bench-form input[type=text] {
+  background:#0a0d12; border:1px solid #262d38; color:#c9d3e1; border-radius:4px;
+  padding:4px 6px; font-size:12px; font-family:inherit; width:100%; min-width:0; }
+.bench-form select[multiple] { padding:2px; }
+/* Selected options drive the sweep, so they have to be unmistakable. Browsers grey out the
+   native selection once the list loses focus; the gradient is the reliable way to override an
+   <option> background in Chrome. */
+.bench-form select[multiple] option { padding:2px 5px; border-radius:3px; }
+.bench-form select[multiple] option:checked {
+  background:#1c3a44 linear-gradient(0deg,#1c3a44 0%,#1c3a44 100%); color:#57d1e0; font-weight:600; }
+.bench-form select:focus, .bench-form input:focus { outline:2px solid #2f8f9c; outline-offset:-1px; }
+.bench-form input[type=number] { width:76px; }
+/* Checkboxes read as a list of statements, one per line, with the rationale as a tooltip
+   rather than a parenthetical — six inline parentheticals were most of the visual noise. */
+.bench-check { display:flex; align-items:flex-start; gap:7px; font-size:12px; color:#c9d3e1;
+               margin-bottom:6px; cursor:pointer; line-height:1.35; }
+.bench-check input { margin:2px 0 0; flex:none; cursor:pointer; }
+.bench-check em { color:#667; font-style:normal; font-size:11px; display:block; }
+.bench-chips { display:flex; gap:5px; flex-wrap:wrap; }
+.bench-chip { background:#161b24; border:1px solid #262d38; color:#9aa4b2; border-radius:5px;
+              padding:3px 9px; font-size:11px; cursor:pointer; font-family:inherit; }
+.bench-chip[aria-pressed=true] { background:#1c3a44; border-color:#2f8f9c; color:#57d1e0; }
+.bench-chip:disabled { color:#4a5260; cursor:default; }
+.bench-chip:focus-visible { outline:2px solid #2f8f9c; outline-offset:1px; }
+.bench-run { display:flex; align-items:center; gap:14px; padding:11px 14px;
+             border-top:1px solid #1e242e; background:#12161e; border-radius:0 0 8px 8px; flex-wrap:wrap; }
+.bench-plan { flex:1; min-width:220px; font-size:11.5px; color:#8b97a8; line-height:1.5; }
+.bench-plan b { color:#c9d3e1; font-weight:600; }
+.bench-go { background:#1c3a44; border:1px solid #2f8f9c; color:#57d1e0; border-radius:5px;
+            padding:7px 20px; font-size:13px; cursor:pointer; font-family:inherit; white-space:nowrap; }
+.bench-go:hover { background:#224652; }
+.bench-go:focus-visible { outline:2px solid #57d1e0; outline-offset:2px; }
+@media (max-width: 900px) {
+  .bench-groups { grid-template-columns:1fr; }
+  .bench-group { border-right:none; border-bottom:1px solid #1e242e; }
+}
 </style>
 </head>
 <body class="shell-console">
@@ -5960,36 +6014,109 @@ async function loadBench() {
         <h2 style="margin:0;font-size:14px;flex:1">⏱ Benchmark Runner</h2>
         <button id="bench-refresh" style="background:#262d38;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 10px;font-size:12px;cursor:pointer">Refresh</button>
       </div>
-      <div style="background:#141922;border:1px solid #262d38;border-radius:8px;padding:14px;margin-bottom:18px">
-        <div style="font-size:12px;color:#aaa;margin-bottom:10px;line-height:1.55">
-          Sends real requests through the proxy to the models you pick, and times them: <strong>TTFT</strong> (first token of any kind), <strong>TTFC</strong> (first <em>content</em> token — the gap between the two is the model thinking), and decode rate. Add a graded suite and it also scores whether the code that came back actually works.<br>
-          <span style="color:#8b97a8">Models are listed by the backend that serves them — ● loaded, ○ not. Picking one doesn't load it: Ollama loads on first use (the warm-up absorbs that), while LM Studio and vLLM only serve what's already resident. Select several models, prompt sizes, thinking modes or temperatures to sweep the whole matrix, one cell at a time.</span>
+      <div class="bench-form">
+        <div class="bench-lede">
+          Compares models on <strong>speed</strong> and, with a graded suite, on <strong>whether the code they return actually works</strong>. Timing separates <strong>TTFT</strong> (first token of any kind) from <strong>TTFC</strong> (first content token) — the gap between them is the model thinking.
+          Selecting more than one model, prompt size, thinking mode or temperature sweeps every combination, one at a time.
         </div>
-        <div style="display:grid;grid-template-columns:auto 1fr auto 1fr;gap:8px 12px;align-items:center;font-size:12px;margin-bottom:10px">
-          <label>Backend</label><div id="bench-upstreams" style="display:flex;gap:6px;flex-wrap:wrap"></div>
-          <label>Models</label><select id="bench-model" multiple size="6" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"></select>
-          <label>Prompt size</label><select id="bench-prompt" multiple size="5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="0" selected>short (~80 tok)</option><option value="2000">2K</option><option value="4000">4K</option><option value="8000">8K</option><option value="16000">16K</option><option value="32000">32K</option><option value="65536">64K</option><option value="131072">128K</option><option value="262144">256K</option></select>
-          <label>Runs / cell</label><input id="bench-runs" type="number" value="5" min="1" max="50" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
-          <label>Max tokens</label><input id="bench-maxtok" type="number" value="256" min="16" max="8192" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
-          <label>Thinking</label><select id="bench-thinking" multiple size="4" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="auto" selected>auto (proxy quirks apply)</option><option value="off">off (kwarg + reasoning_effort)</option><option value="off_prefill">off via &lt;think&gt; prefill (LM Studio)</option><option value="on">on</option></select>
-          <label>Temperature</label><input id="bench-temp" placeholder="engine default — or 0, 0.2" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px">
-          <label>Concurrency</label><select id="bench-concur" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="1">1 (serial)</option><option value="2">2 parallel</option><option value="4">4 parallel</option><option value="8">8 parallel</option></select>
-          <label>Graded suite</label><select id="bench-suite" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="">none (perf only)</option></select>
-          <label>Drain (s)</label><input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
+        <div class="bench-groups">
+
+          <div class="bench-group">
+            <h4>What to run <span>— each selection multiplies the sweep</span></h4>
+            <div class="bench-row stack">
+              <label for="bench-upstreams">Backend</label>
+              <div id="bench-upstreams" class="bench-chips"></div>
+            </div>
+            <div class="bench-row stack">
+              <label for="bench-model">Models <span style="color:#4d5765">— ● loaded, ○ not</span></label>
+              <select id="bench-model" multiple size="6"></select>
+            </div>
+            <div class="bench-row stack">
+              <label for="bench-prompt">Prompt size</label>
+              <select id="bench-prompt" multiple size="4">
+                <option value="0" selected>short (~80 tok)</option>
+                <option value="2000">2K</option><option value="4000">4K</option>
+                <option value="8000">8K</option><option value="16000">16K</option>
+                <option value="32000">32K</option><option value="65536">64K</option>
+                <option value="131072">128K</option><option value="262144">256K</option>
+              </select>
+            </div>
+            <div class="bench-row stack">
+              <label for="bench-thinking">Thinking</label>
+              <select id="bench-thinking" multiple size="4">
+                <option value="auto" selected>auto — leave the proxy's quirks in place</option>
+                <option value="off">off — enable_thinking + reasoning_effort</option>
+                <option value="off_prefill">off — via &lt;think&gt; prefill, for LM Studio</option>
+                <option value="on">on</option>
+              </select>
+            </div>
+            <div class="bench-row">
+              <label for="bench-temp">Temperature</label>
+              <input id="bench-temp" type="text" placeholder="engine default, or 0, 0.2">
+            </div>
+          </div>
+
+          <div class="bench-group">
+            <h4>How to measure</h4>
+            <div class="bench-row">
+              <label for="bench-runs">Runs / cell</label>
+              <input id="bench-runs" type="number" value="5" min="1" max="50">
+            </div>
+            <div class="bench-row">
+              <label for="bench-maxtok">Max tokens</label>
+              <input id="bench-maxtok" type="number" value="256" min="16" max="8192">
+            </div>
+            <div class="bench-row">
+              <label for="bench-concur">Concurrency</label>
+              <select id="bench-concur">
+                <option value="1">1 — serial</option><option value="2">2 parallel</option>
+                <option value="4">4 parallel</option><option value="8">8 parallel</option>
+              </select>
+            </div>
+            <div class="bench-row stack">
+              <label for="bench-suite">Graded suite</label>
+              <select id="bench-suite"><option value="">none — measure speed only</option></select>
+            </div>
+            <label class="bench-check" title="Sends one request that isn't measured, so an unloaded model's load time stays out of the results. Its duration is still reported separately.">
+              <input type="checkbox" id="bench-warmup" checked>
+              <span>Warm up first<em>keeps model-load time out of the numbers</em></span>
+            </label>
+            <label class="bench-check" title="Salts each prompt so repeated runs can't be served from the prompt cache, which would report a prefill time no real request would see.">
+              <input type="checkbox" id="bench-randomize">
+              <span>Randomize prompt<em>defeats the prompt cache</em></span>
+            </label>
+          </div>
+
+          <div class="bench-group">
+            <h4>Isolation <span>— keep other traffic out</span></h4>
+            <label class="bench-check" title="Sends x-proxy-no-router so routing rules can't substitute a different model or backend behind your back.">
+              <input type="checkbox" id="bench-bypass" checked>
+              <span>Pin the model<em>ignore routing rules</em></span>
+            </label>
+            <label class="bench-check" title="Suppresses quirk-injected system prompt text, which is an extra instruction the model wouldn't otherwise see.">
+              <input type="checkbox" id="bench-nonudge" checked>
+              <span>No system nudge<em>drop quirk prompt injection</em></span>
+            </label>
+            <label class="bench-check" title="Other proxy clients queue until the benchmark finishes. Only gates traffic through the proxy — anything talking to Ollama directly is unaffected.">
+              <input type="checkbox" id="bench-exclusive">
+              <span>Hold other clients<em>they queue until it finishes</em></span>
+            </label>
+            <label class="bench-check" title="Enables panic mode and unloads every loaded Ollama model, then restores them afterwards. Use when you need the GPU entirely to yourself.">
+              <input type="checkbox" id="bench-quiesce">
+              <span>Free the GPU<em>unload Ollama models, restore after</em></span>
+            </label>
+            <div class="bench-row" style="margin-top:9px">
+              <label for="bench-drain" title="How long to wait for in-flight requests to finish before the first measurement.">Drain (s)</label>
+              <input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5">
+            </div>
+          </div>
+
         </div>
-        <div style="display:flex;gap:14px;align-items:center;font-size:12px;margin-bottom:8px;flex-wrap:wrap">
-          <label><input type="checkbox" id="bench-warmup" checked> Warm up first <span style="color:#666">(one unmeasured request, so model-load time stays out of the results)</span></label>
-          <label><input type="checkbox" id="bench-randomize"> Randomize prompt <span style="color:#666">(defeats prompt cache)</span></label>
-          <label><input type="checkbox" id="bench-bypass" checked> Pin model <span style="color:#666">(ignore routing rules)</span></label>
-          <label><input type="checkbox" id="bench-nonudge" checked> No system nudge <span style="color:#666">(drop quirk prompt injection)</span></label>
+        <div class="bench-run">
+          <div id="bench-plan" class="bench-plan"></div>
+          <div id="bench-go-err" style="color:#e08080;font-size:11.5px"></div>
+          <button id="bench-go" class="bench-go">Run benchmark</button>
         </div>
-        <div style="display:flex;gap:14px;align-items:center;font-size:12px;margin-bottom:10px;flex-wrap:wrap">
-          <label><input type="checkbox" id="bench-exclusive"> Exclusive mode <span style="color:#666">(queue all other proxy clients)</span></label>
-          <label><input type="checkbox" id="bench-quiesce"> Quiesce GPU <span style="color:#666">(panic mode + unload Ollama models, restored after)</span></label>
-          <button id="bench-go" style="margin-left:auto;background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 18px;font-size:13px;cursor:pointer">▶ Run benchmark</button>
-        </div>
-        <div id="bench-plan" style="color:#888;font-size:11px;margin-bottom:4px"></div>
-        <div id="bench-go-err" style="color:#e08080;font-size:11px"></div>
       </div>
       <div id="bench-compare-bar" style="display:none;background:#12141b;border:1px solid #2a3e5a;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;align-items:center;gap:8px">
         <span style="flex:1" id="bench-compare-label"></span>
@@ -6042,7 +6169,9 @@ async function _benchPopulateModels() {
   try {
     const s = await (await fetch('/__proxy/api/bench/suites')).json();
     const sel2 = $('bench-suite');
-    if (sel2) sel2.innerHTML = '<option value="">none (perf only)</option>' +
+    // Copy matches the static markup it replaces — the two drifting apart is how a control ends
+    // up describing itself two different ways depending on whether a fetch succeeded.
+    if (sel2) sel2.innerHTML = '<option value="">none — measure speed only</option>' +
       (s.suites || []).map(x => `<option value="${esc(x.name)}">${esc(x.name)} — ${x.task_count} tasks / ${x.case_count} cases</option>`).join('');
   } catch { /* suites are optional */ }
   _benchUpdatePlan();
@@ -6057,14 +6186,16 @@ function _benchRenderUpstreams() {
   const note = {'on-demand': 'loads on demand', 'jit': 'JIT-loads on demand',
                 'fixed': 'fixed at server launch'};
   const chip = (id, label, sub, on, dim) =>
-    `<button data-up="${esc(id)}" title="${esc(sub)}" ${dim ? 'disabled' : ''} style="background:${on ? '#1c3a44' : '#161b24'};border:1px solid ${on ? '#2f8f9c' : '#262d38'};color:${dim ? '#4a5260' : (on ? '#57d1e0' : '#9aa4b2')};border-radius:6px;padding:4px 10px;font-size:11px;cursor:${dim ? 'default' : 'pointer'}">${esc(label)}</button>`;
+    `<button type="button" class="bench-chip" data-up="${esc(id)}" title="${esc(sub)}" aria-pressed="${on}" ${dim ? 'disabled' : ''}>${esc(label)}</button>`;
+  // Count is "loaded of reachable" — the number that tells you whether picking from this
+  // backend means measuring straight away or waiting on a load.
   const total = _benchModels.length;
   const totalLoaded = _benchModels.filter(m => m.loaded).length;
-  let html = chip('', `All · ${totalLoaded}/${total} loaded`, 'Every reachable backend', _benchUpFilter === '', false);
+  let html = chip('', `All ${totalLoaded}/${total}`, 'Every reachable backend', _benchUpFilter === '', false);
   for (const u of _benchUpstreams) {
     html += chip(u.upstream,
-      `${u.upstream} · ${u.loaded}/${u.total} loaded`,
-      u.reachable ? note[u.load_mode] || '' : 'not reachable',
+      u.reachable ? `${u.upstream} ${u.loaded}/${u.total}` : `${u.upstream} —`,
+      u.reachable ? `${u.loaded} of ${u.total} loaded · ${note[u.load_mode] || ''}` : 'Not reachable',
       _benchUpFilter === u.upstream, !u.reachable);
   }
   host.innerHTML = html;
@@ -6183,8 +6314,8 @@ function _benchUpdatePlan() {
   const suiteTxt = suiteSel.value ? (suiteSel.selectedOptions[0].textContent.match(/(\d+) tasks/) || [])[1] : null;
   const perCell = b.runs * (suiteTxt ? parseInt(suiteTxt, 10) : 1);
   const scale = cells > 1
-    ? `${cells} cells × ${perCell} requests = ${cells * perCell} requests, one cell at a time`
-    : `${perCell} request${perCell === 1 ? '' : 's'}`;
+    ? `<b>${cells} cells</b> × ${perCell} requests = <b>${cells * perCell} requests</b>, one cell at a time`
+    : `<b>${perCell} request${perCell === 1 ? '' : 's'}</b>`;
 
   // Spell out where the traffic is actually going and what has to be loaded first — those are
   // the two things you can't tell by looking at the form.
@@ -6213,8 +6344,10 @@ function _benchUpdatePlan() {
   if (tooSmall.length) {
     warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${tooSmall.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — expect empty completions`});
   }
-  el.innerHTML = esc(scale + route) + warns.map(w =>
-    `<span style="color:${w.level === 'bad' ? '#f0a35a' : '#888'}"> · ${esc(w.text)}</span>`).join('');
+  // Warnings go on their own line: inline they read as part of the sentence, and the ones that
+  // matter ("this will fail") deserve to be seen before the button is pressed, not skimmed past.
+  el.innerHTML = scale + esc(route) + warns.map(w =>
+    `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('');
 }
 
 async function _benchSubmit() {
