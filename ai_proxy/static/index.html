@@ -6029,6 +6029,12 @@ function _taskBadge(s) {
 
 // ---------- Bench tab ----------
 let _benchTimer = null;
+// Self-managed pollers each grew their own loop and none consulted the auto-refresh switch, so
+// turning it off quietened the main loop and left these running regardless.
+function _mayPoll() {
+  const t = $('autoref');
+  return !document.hidden && (!t || t.checked);
+}
 let _benchSelected = new Set();  // ids selected for compare
 let _benchOpenDetails = new Set();  // ids whose detail panel is expanded
 let _benchDetailCache = new Map();  // id → rendered detail HTML (survives auto-refresh)
@@ -6221,8 +6227,8 @@ async function loadBench() {
   await _benchRefreshHistory();
   if (_benchTimer) clearInterval(_benchTimer);
   if (view === 'bench') _benchTimer = setInterval(() => {
-    if (view === 'bench') _benchRefreshHistory();
-    else { clearInterval(_benchTimer); _benchTimer = null; }
+    if (view !== 'bench') { clearInterval(_benchTimer); _benchTimer = null; return; }
+    if (_mayPoll()) _benchRefreshHistory();
   }, 3000);
 }
 
@@ -6612,54 +6618,26 @@ async function _benchRefreshHistory() {
     const r = await fetch('/__proxy/api/bench/runs?limit=50');
     const d = await r.json();
     const items = d.items || [];
-    if (!items.length) { wrap.innerHTML = '<div class="empty" style="padding:20px">No bench runs yet.</div>'; return; }
-    wrap.innerHTML = items.map(it => _benchRenderRow(it)).join('');
-    // Wire delete buttons and compare checkboxes only — let the native <details> handle
-    // expansion (no row-level click handler).
-    wrap.querySelectorAll('[data-bench-del]').forEach(btn => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const id = btn.closest('[data-bench-id]').dataset.benchId;
-        if (!confirm('Delete this bench run?')) return;
-        _benchOpenDetails.delete(id);
-        _benchSelected.delete(id);
-        fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id), { method: 'DELETE' }).then(() => _benchRefreshHistory());
-      };
-    });
-    wrap.querySelectorAll('[data-bench-cmp]').forEach(cb => {
-      cb.onclick = (e) => e.stopPropagation();
-      cb.onchange = () => {
-        const id = cb.closest('[data-bench-id]').dataset.benchId;
-        if (cb.checked && _benchSelected.size < 2) _benchSelected.add(id);
-        else _benchSelected.delete(id);
-        _benchUpdateCompareBar();
-      };
-    });
-    // Track which detail panels are open and survive auto-refresh by re-applying state.
-    wrap.querySelectorAll('details[data-bench-detail]').forEach(dt => {
-      const id = dt.dataset.benchDetail;
-      // Re-apply cached detail HTML on re-render (auto-refresh wipes the DOM).
-      const inner = document.getElementById('bench-detail-' + id);
-      if (inner && _benchDetailCache.has(id)) {
-        inner.innerHTML = _benchDetailCache.get(id);
-        _benchApplyInnerState(id);
+    if (!items.length) {
+      if (!wrap.querySelector('[data-bench-empty]')) {
+        wrap.innerHTML = '<div data-bench-empty class="empty" style="padding:20px">No bench runs yet.</div>';
       }
-      if (_benchOpenDetails.has(id)) dt.open = true;
-      dt.addEventListener('toggle', async () => {
-        if (dt.open) {
-          _benchOpenDetails.add(id);
-          if (!_benchDetailCache.has(id)) await _benchLoadDetail(id);
-        } else {
-          _benchOpenDetails.delete(id);
-        }
-      });
-    });
+      return;
+    }
+    const empty = wrap.querySelector('[data-bench-empty]');
+    if (empty) empty.remove();
+    _benchSyncRows(wrap, items);
   } catch (e) {
     wrap.innerHTML = `<div style="color:#f07178">${esc(e.message)}</div>`;
   }
 }
 
-function _benchRenderRow(it) {
+function _benchRowSig(it) {
+  return [it.status, it.progress, it.progress_total, it.error || '',
+          _benchSelected.has(it.id) ? 1 : 0].join('|');
+}
+
+function _benchRowHead(it) {
   const cfg = it.config || {};
   const isSelected = _benchSelected.has(it.id);
   let summaryLine = '';
@@ -6673,7 +6651,6 @@ function _benchRenderRow(it) {
     summaryLine = `<span style="color:#5a5">✓ done</span>`;
   }
   return `
-    <div data-bench-id="${esc(it.id)}" style="background:#141922;border:1px solid ${isSelected ? '#57d1e0' : '#262d38'};border-radius:6px;padding:10px 12px;margin-bottom:6px;cursor:pointer">
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">
         <input type="checkbox" data-bench-cmp ${isSelected ? 'checked' : ''} title="Select for comparison" onclick="event.stopPropagation()">
         <code style="color:#57d1e0">${esc(it.label || it.model)}</code>
@@ -6684,12 +6661,100 @@ function _benchRenderRow(it) {
         <span>${summaryLine}</span>
         ${it.status === 'done' ? `<a href="/__proxy/api/bench/report?format=html&ids=${encodeURIComponent(it.id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Standalone HTML report — print it to PDF from the browser" style="color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px">Report ↗</a>` : ''}
         <button data-bench-del style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer" onclick="event.stopPropagation()">🗑</button>
-      </div>
+      </div>`;
+}
+
+function _benchRenderRow(it) {
+  const isSelected = _benchSelected.has(it.id);
+  return `
+    <div data-bench-id="${esc(it.id)}" data-sig="${esc(_benchRowSig(it))}" style="background:#141922;border:1px solid ${isSelected ? '#57d1e0' : '#262d38'};border-radius:6px;padding:10px 12px;margin-bottom:6px;cursor:pointer">
+      <div data-bench-head>${_benchRowHead(it)}</div>
       <details style="margin-top:6px" data-bench-detail="${esc(it.id)}">
         <summary style="cursor:pointer;color:#888;font-size:11px;list-style:none">▸ details</summary>
         <div style="margin-top:8px;font-size:12px" id="bench-detail-${esc(it.id)}">loading…</div>
       </details>
     </div>`;
+}
+
+// Wired once per row when it's created — not on every poll, which is what the old rebuild forced.
+function _benchWireRow(node) {
+  const id = node.dataset.benchId;
+  const del = node.querySelector('[data-bench-del]');
+  if (del) del.onclick = (e) => {
+    e.stopPropagation();
+    if (!confirm('Delete this bench run?')) return;
+    _benchOpenDetails.delete(id);
+    _benchSelected.delete(id);
+    fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id), { method: 'DELETE' })
+      .then(() => _benchRefreshHistory());
+  };
+  const cb = node.querySelector('[data-bench-cmp]');
+  if (cb) {
+    cb.onclick = (e) => e.stopPropagation();
+    cb.onchange = () => {
+      // No cap: the comparison view takes any number of runs. It used to stop at 2, left over
+      // from when the compare table only handled a pair.
+      if (cb.checked) _benchSelected.add(id); else _benchSelected.delete(id);
+      node.style.borderColor = cb.checked ? '#57d1e0' : '#262d38';
+      _benchUpdateCompareBar();
+    };
+  }
+  const dt = node.querySelector('details[data-bench-detail]');
+  if (dt) {
+    if (_benchDetailCache.has(id)) {
+      const innerEl = node.querySelector('[id^="bench-detail-"]');
+      if (innerEl) { innerEl.innerHTML = _benchDetailCache.get(id); _benchApplyInnerState(id); }
+    }
+    if (_benchOpenDetails.has(id)) dt.open = true;
+    dt.addEventListener('toggle', async () => {
+      if (dt.open) {
+        _benchOpenDetails.add(id);
+        if (!_benchDetailCache.has(id)) await _benchLoadDetail(id);
+      } else {
+        _benchOpenDetails.delete(id);
+      }
+    });
+  }
+}
+
+// Reconcile the list against the DOM instead of rewriting it. Rewriting destroyed every row on a
+// 3s beat: text selection vanished mid-drag, open panels were recreated, and the scroll position
+// jumped — which is why this code used to carry caches purely to undo its own damage.
+function _benchSyncRows(wrap, items) {
+  const existing = new Map();
+  for (const n of Array.from(wrap.children)) {
+    if (n.dataset && n.dataset.benchId) existing.set(n.dataset.benchId, n);
+  }
+  const tpl = document.createElement('template');
+  let anchor = null;
+  for (const it of items) {
+    let node = existing.get(it.id);
+    if (!node) {
+      tpl.innerHTML = _benchRenderRow(it).trim();
+      node = tpl.content.firstElementChild;
+      _benchWireRow(node);
+    } else {
+      existing.delete(it.id);
+      const sig = _benchRowSig(it);
+      if (node.dataset.sig !== sig) {
+        // Only the head changes; the <details> keeps its open state and rendered contents.
+        const head = node.querySelector('[data-bench-head]');
+        if (head) head.innerHTML = _benchRowHead(it);
+        node.dataset.sig = sig;
+        node.style.borderColor = _benchSelected.has(it.id) ? '#57d1e0' : '#262d38';
+        _benchWireRow(node);
+      }
+      // A run still in flight needs its open detail panel refreshed; a finished one never changes.
+      if ((it.status === 'running' || it.status === 'pending') && _benchOpenDetails.has(it.id)) {
+        _benchDetailCache.delete(it.id);
+        _benchLoadDetail(it.id);
+      }
+    }
+    // insertBefore moves an existing node without recreating it, so ordering is free.
+    wrap.insertBefore(node, anchor ? anchor.nextSibling : wrap.firstChild);
+    anchor = node;
+  }
+  for (const stale of existing.values()) stale.remove();
 }
 
 function _benchUpdateCompareBar() {
@@ -7026,7 +7091,10 @@ async function loadTasks() {
     $('t2-recurring').innerHTML = `<div style="color:#e08080;font-size:12px">${esc(e.message)}</div>`;
   }
   if (_tasksTimer) clearInterval(_tasksTimer);
-  if (view === 'tasks') _tasksTimer = setInterval(() => { if (view === 'tasks') loadTasks(); else { clearInterval(_tasksTimer); _tasksTimer = null; } }, 4000);
+  if (view === 'tasks') _tasksTimer = setInterval(() => {
+    if (view !== 'tasks') { clearInterval(_tasksTimer); _tasksTimer = null; return; }
+    if (_mayPoll()) loadTasks();
+  }, 4000);
 }
 
 async function _t2PopulateModels() {
