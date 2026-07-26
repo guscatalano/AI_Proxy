@@ -6561,6 +6561,13 @@ function _benchUpdatePlan() {
   // matter ("this will fail") deserve to be seen before the button is pressed, not skimmed past.
   // Isolation is disclosed here rather than in a dialog: it is on for every run, and a confirm
   // that always fires is noise people click through without reading.
+  // Grading runs model-written code. That's worth stating on every run, but it's a standing
+  // property of the configuration, not a decision to re-make each time — so it lives here
+  // rather than in a dialog.
+  let grading = '';
+  if (b.suite) {
+    grading = `<div style="color:#667;margin-top:2px">grades by executing the returned code in an isolated subprocess with a timeout</div>`;
+  }
   let iso = '';
   if (b.exclusive || b.quiesce) {
     const bits = [];
@@ -6571,7 +6578,8 @@ function _benchUpdatePlan() {
     iso = `<div style="color:#f0a35a;margin-top:2px">⚠ other traffic keeps running — it will be measured along with the model</div>`;
   }
   el.innerHTML = scale + esc(route) + warns.map(w =>
-    `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('') + iso;
+    `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('')
+    + iso + grading;
 }
 
 async function _benchSubmit() {
@@ -6579,15 +6587,11 @@ async function _benchSubmit() {
   errEl.textContent = '';
   const body = _benchBody();
   if (!body.models.length) { errEl.textContent = 'pick at least one model'; return; }
-  if (body.quiesce && !confirm('Quiesce will enable panic mode and unload every loaded Ollama model, then restore them when the bench finishes. Continue?')) return;
-  if (body.suite && !confirm('The graded suite executes the model\'s generated Python in a subprocess to score it. Only run it against models you trust. Continue?')) return;
-  // Scale check. The plan line already states the size, but a large sweep also ties up the box
-  // for a long time — "I pressed run and it queued 864 requests" should not happen by accident.
-  const _plan = _benchPlanCounts(body);
-  if (_plan.total > 120 && !confirm(
-        `This runs ${_plan.cells} configuration${_plan.cells === 1 ? '' : 's'} — ${_plan.total} requests in total`
-        + (body.exclusive ? ', holding other proxy clients until it finishes' : '')
-        + '.\n\nStart it?')) return;
+  // Only one thing here still warrants interrupting: unloading models other people may be
+  // mid-conversation with. Size and grading are stated on the button and in the run bar, and a
+  // dialog that fires on every single run is one people learn to dismiss without reading —
+  // which costs you the warning that actually matters.
+  if (body.quiesce && !confirm('This unloads every model currently loaded in Ollama — including any someone else is using — and restores them when the benchmark finishes.\n\nContinue?')) return;
   try {
     const r = await fetch('/__proxy/api/bench/run', {
       method: 'POST', headers: { 'content-type': 'application/json' },
