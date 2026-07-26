@@ -3451,7 +3451,11 @@ function _artHead(backOnclick, backLabel, titleHtml, subHtml) {
     </div></div>`;
 }
 async function loadArtifacts() {
-  _artRefreshCaptureBanner();
+  // Awaited on first load only: the chip is rendered as part of the header markup, so the
+  // state has to be known before the view paints. After that the cached value is reused and
+  // the refresh happens in the background.
+  if (_artCapture === null) await _artRefreshCaptureBanner();
+  else _artRefreshCaptureBanner();
   if (_artNav.level === 'file') return renderArtFile();
   if (_artNav.level === 'files') return renderArtFiles();
   return renderArtConvs();
@@ -3463,29 +3467,33 @@ async function loadArtifacts() {
 // nothing is extracted and no rows are written.
 let _artCapture = null;
 async function _artRefreshCaptureBanner() {
-  const host = $('artifacts');
-  if (!host) return;
-  let d;
-  try { d = await (await fetch('/__proxy/api/control/artifacts')).json(); }
-  catch { return; }
-  _artCapture = d;
-  let bar = document.getElementById('art-capture-bar');
-  if (!bar) {
-    bar = document.createElement('div');
-    bar.id = 'art-capture-bar';
-    bar.style.cssText = 'margin:0 4px 12px;padding:8px 12px;border-radius:8px;font-size:12px;display:flex;align-items:center;gap:10px';
-    host.parentNode.insertBefore(bar, host);
-  }
+  // Just refreshes the cached state — the indicator itself renders inline in the view
+  // header (see _artCaptureChip), so it sits with the title rather than as its own strip.
+  try { _artCapture = await (await fetch('/__proxy/api/control/artifacts')).json(); }
+  catch { _artCapture = null; }
+  const chip = document.getElementById('art-capture-chip');
+  if (chip) chip.outerHTML = _artCaptureChip();
+}
+
+// Compact inline state chip. When capture is ON this is deliberately quiet — a small dot and
+// a link-ish control — because the normal state doesn't warrant attention. It only turns loud
+// when capture is OFF, which is the state you'd otherwise forget you left it in.
+function _artCaptureChip() {
+  const d = _artCapture;
+  if (!d) return '<span id="art-capture-chip"></span>';
   const on = d.artifacts;
-  bar.style.background = on ? '#141922' : '#241a1a';
-  bar.style.border = '1px solid ' + (on ? '#262d38' : '#5a2828');
-  bar.innerHTML = `
-    <span style="color:${on ? '#68d391' : '#f0a35a'};font-weight:600">${on ? '● Capture on' : '⛔ Capture off'}</span>
-    <span style="color:#8b97a8;flex:1">${on
-      ? 'Files, URLs and directories touched via tool calls are being recorded.'
-      : 'Nothing new is being recorded. ' + (d.stored_rows ? d.stored_rows.toLocaleString() + ' rows remain from before it was switched off.' : 'No rows stored.')}</span>
-    <button onclick="_artToggleCapture(${!on})" style="background:#1c222c;border:1px solid ${on ? '#5a2828' : '#3a6a4a'};color:${on ? '#e08080' : '#68d391'};border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer">${on ? 'Turn off' : 'Turn on'}</button>
-    ${(!on && d.stored_rows) ? `<button onclick="_artPurge()" style="background:#1c222c;border:1px solid #5a2828;color:#e08080;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer">Purge stored</button>` : ''}`;
+  if (on) {
+    return `<span id="art-capture-chip" style="display:inline-flex;align-items:center;gap:6px;font-size:11px;color:#667">
+      <span style="color:#3f8f5f">●</span>capture on
+      <a onclick="_artToggleCapture(false)" style="color:#667;text-decoration:underline;cursor:pointer" title="Stop recording files, URLs and directories touched via tool calls">turn off</a>
+    </span>`;
+  }
+  return `<span id="art-capture-chip" style="display:inline-flex;align-items:center;gap:7px;font-size:11px;background:#241a1a;border:1px solid #5a2828;border-radius:5px;padding:2px 8px">
+    <span style="color:#f0a35a;font-weight:600">⛔ capture off</span>
+    <span style="color:#8b97a8">${d.stored_rows ? d.stored_rows.toLocaleString() + ' rows kept' : 'nothing stored'}</span>
+    <a onclick="_artToggleCapture(true)" style="color:#68d391;text-decoration:underline;cursor:pointer">turn on</a>
+    ${d.stored_rows ? `<a onclick="_artPurge()" style="color:#e08080;text-decoration:underline;cursor:pointer">purge</a>` : ''}
+  </span>`;
 }
 
 async function _artToggleCapture(on) {
@@ -3519,7 +3527,7 @@ function _artLandingToggle() {
 async function renderArtTop() {
   const el = $('artifacts');
   const toggle = _artLandingToggle();
-  const wrap = body => `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px">Artifacts</h2>${toggle}${body}</div>`;
+  const wrap = body => `<div style="padding:6px 4px"><h2 style="margin:0 0 14px;font-size:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— most active</span>${_artCaptureChip()}</h2>${toggle}${body}</div>`;
   el.innerHTML = wrap('<div class="empty">loading…</div>');
   let d;
   try { d = await (await fetch('/__proxy/api/artifacts/top?limit=40')).json(); }
@@ -3565,7 +3573,7 @@ async function renderArtConvs() {
     </tr>`;
   }).join('') || '<tr><td colspan="9" class="empty" style="padding:30px">No conversations have touched files or URLs yet.</td></tr>';
   el.innerHTML = `<div style="padding:6px 4px">
-    <h2 style="margin:0 0 14px;font-size:16px">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— by conversation (${items.length})</span></h2>
+    <h2 style="margin:0 0 14px;font-size:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap">Artifacts <span style="color:#8b97a8;font-size:12px;font-weight:normal">— by conversation (${items.length})</span>${_artCaptureChip()}</h2>
     ${_artLandingToggle()}
     <div class="tbl-wrap" style="overflow-x:auto"><table style="width:100%;font-size:13px">
       <thead><tr>
