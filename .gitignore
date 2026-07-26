@@ -69,3 +69,6 @@ htmlcov/
 
 # npm (UI smoke test deps)
 node_modules/
+# The smoke harness pins playwright exactly in package.json and CI uses `npm install`,
+# so the lockfile adds churn without buying reproducibility.
+tests/ui/package-lock.json
