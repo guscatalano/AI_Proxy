@@ -1154,6 +1154,28 @@ function setRailCollapsed(collapsed, animate) {
 }
 function toggleRailCollapse() { setRailCollapsed(!document.body.classList.contains('shell-collapsed'), true); }
 let _shellTick = 0, _shellErr = null, _shellVer = null, _bootMs = null;
+let _uiBuild = null;
+// A dashboard tab stays open for days. When the server starts serving a different build, the
+// page in front of you is running code that no longer matches it — which reads as a bug rather
+// than as staleness. Say so, and offer the one-click fix.
+function _showStaleBuild() {
+  if (document.getElementById('stale-build')) return;
+  const el = document.createElement('div');
+  el.id = 'stale-build';
+  el.style.cssText = 'position:fixed;bottom:16px;right:16px;z-index:9999;background:#1c3a44;' +
+    'border:1px solid #2f8f9c;color:#c9f3fa;border-radius:8px;padding:10px 14px;font-size:12.5px;' +
+    'box-shadow:0 6px 24px rgba(0,0,0,.45);display:flex;align-items:center;gap:12px';
+  el.innerHTML = '<span>The dashboard was updated on the server. This tab is running the older ' +
+    'version.</span>' +
+    '<button style="background:#57d1e0;border:none;color:#08222a;border-radius:5px;padding:4px 12px;' +
+    'font-size:12px;font-weight:600;cursor:pointer">Reload</button>' +
+    '<button aria-label="Dismiss" style="background:none;border:none;color:#8fbfc8;font-size:15px;' +
+    'cursor:pointer;line-height:1">×</button>';
+  const [reload, dismiss] = el.querySelectorAll('button');
+  reload.onclick = () => location.reload();
+  dismiss.onclick = () => el.remove();
+  document.body.appendChild(el);
+}
 function fmtUptime(s) { s = Math.max(0, Math.floor(s)); const d = Math.floor(s / 86400), h = Math.floor(s % 86400 / 3600), m = Math.floor(s % 3600 / 60); if (d > 0) return d + 'd ' + String(h).padStart(2, '0') + 'h'; if (h > 0) return h + 'h ' + String(m).padStart(2, '0') + 'm'; return m + 'm'; }
 function fmtCompact(n) { return n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + 'k' : String(n); }
 // Admin-only: flip PII redaction at runtime (POST /control/redact-pii). `on`=redaction enabled.
@@ -1192,7 +1214,16 @@ async function shellVitals() {
     } catch {}
   }
   // version once; error-rate (last 1h) refreshed every ~20s (perf is server-cached)
-  if (_shellVer == null) { try { const inf = await (await fetch('/__proxy/api/info')).json(); _shellVer = inf.version || '—'; } catch { _shellVer = '—'; } }
+  // Re-checked on every vitals tick, not just once: the point is to notice a deploy that
+  // happens while this tab is sitting open.
+  try {
+    const inf = await (await fetch('/__proxy/api/info')).json();
+    if (_shellVer == null) _shellVer = inf.version || '—';
+    if (inf.ui) {
+      if (_uiBuild == null) _uiBuild = inf.ui;
+      else if (inf.ui !== _uiBuild) _showStaleBuild();
+    }
+  } catch { if (_shellVer == null) _shellVer = '—'; }
   // Boot time once (uptime lives at /health under process.uptime_s); tick it client-side after.
   if (_bootMs == null) { try { const hz = await (await fetch('/__proxy/api/health')).json(); const us = hz && hz.process && hz.process.uptime_s; if (us != null) _bootMs = Date.now() - us * 1000; } catch {} }
   // Access badge + admin PII-redaction toggle. Refreshed each tick so a global OFF state stays
@@ -6659,7 +6690,7 @@ function _benchRowHead(it) {
         <span style="margin-left:auto;color:#888">${_benchAgo(it.ts)}</span>
         <span>${summaryLine}</span>
         ${it.status === 'done' ? `<a href="/__proxy/api/bench/report?format=html&ids=${encodeURIComponent(it.id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Standalone HTML report — print it to PDF from the browser" style="color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px">Report ↗</a>` : ''}
-        <button data-bench-del style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer" onclick="event.stopPropagation()">🗑</button>
+        <button type="button" data-bench-del title="Delete this run" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer">🗑</button>
       </div>`;
 }
 
@@ -6673,6 +6704,64 @@ function _benchRenderRow(it) {
         <div style="margin-top:8px;font-size:12px" id="bench-detail-${esc(it.id)}">loading…</div>
       </details>
     </div>`;
+}
+
+// One listener on the container, bound once. Rows can be created, replaced or reordered by any
+// code path and these keep working — a delegated handler cannot be "forgotten" for a row the way
+// a per-node one can, and a control that silently does nothing is the worst failure this UI has.
+function _benchBindHistory(wrap) {
+  if (wrap._bound) return;
+  wrap._bound = true;
+
+  wrap.addEventListener('click', (e) => {
+    const del = e.target.closest('[data-bench-del]');
+    if (!del) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const row = del.closest('[data-bench-id]');
+    if (!row) return;
+    const id = row.dataset.benchId;
+    // Two-step on the button rather than confirm(): Chrome's "prevent this page from creating
+    // additional dialogs" makes every confirm() return false for the rest of the session, which
+    // leaves the button dead with nothing on screen to explain it.
+    if (del.dataset.armed !== '1') {
+      _benchDisarmDeletes(del);
+      del.dataset.armed = '1';
+      del.textContent = 'Delete?';
+      del.style.background = '#4a2020';
+      del.style.color = '#ffb4b4';
+      del._t = setTimeout(() => _benchDisarmDeletes(), 4000);
+      return;
+    }
+    _benchDisarmDeletes();
+    del.textContent = '…';
+    _benchOpenDetails.delete(id);
+    _benchSelected.delete(id);
+    fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id), { method: 'DELETE' })
+      .then(r => {
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        row.remove();
+        _benchUpdateCompareBar();
+        _benchRefreshHistory();
+      })
+      .catch(err => {
+        del.textContent = '✕ failed';
+        del.title = err.message;
+        setTimeout(() => _benchDisarmDeletes(), 3000);
+      });
+  });
+
+  wrap.addEventListener('change', (e) => {
+    const cb = e.target.closest('[data-bench-cmp]');
+    if (!cb) return;
+    const row = cb.closest('[data-bench-id]');
+    if (!row) return;
+    // No cap: the comparison view takes any number of runs.
+    if (cb.checked) _benchSelected.add(row.dataset.benchId);
+    else _benchSelected.delete(row.dataset.benchId);
+    row.style.borderColor = cb.checked ? '#57d1e0' : '#262d38';
+    _benchUpdateCompareBar();
+  });
 }
 
 // Return every delete button to rest, optionally sparing the one being armed, so only one
@@ -6692,52 +6781,6 @@ function _benchDisarmDeletes(except) {
 // Wired once per row when it's created — not on every poll, which is what the old rebuild forced.
 function _benchWireRow(node) {
   const id = node.dataset.benchId;
-  const del = node.querySelector('[data-bench-del]');
-  if (del) del.onclick = (e) => {
-    e.stopPropagation();
-    // confirm() is not a dependable control: Chrome offers "prevent this page from creating
-    // additional dialogs" once a page fires a few, and after that every confirm() returns false
-    // instantly — the button goes dead for the session with nothing on screen to say why. An
-    // inline two-step arms on the button itself, so it can't be suppressed and you can see it.
-    if (del.dataset.armed !== '1') {
-      _benchDisarmDeletes(del);
-      del.dataset.armed = '1';
-      del.textContent = 'Delete?';
-      del.style.background = '#4a2020';
-      del.style.color = '#ffb4b4';
-      // Disarms itself, so a stray click never leaves a live delete under the cursor.
-      del._t = setTimeout(() => _benchDisarmDeletes(), 4000);
-      return;
-    }
-    _benchDisarmDeletes();
-    del.textContent = '…';
-    _benchOpenDetails.delete(id);
-    _benchSelected.delete(id);
-    fetch('/__proxy/api/bench/runs/' + encodeURIComponent(id), { method: 'DELETE' })
-      .then(r => {
-        if (!r.ok) throw new Error('HTTP ' + r.status);
-        node.remove();                       // immediate, not on the next poll
-        _benchUpdateCompareBar();
-        _benchRefreshHistory();
-      })
-      .catch(err => {
-        // Failure has to be visible — a silently dead button is what sent us here.
-        del.textContent = '✕ failed';
-        del.title = err.message;
-        setTimeout(() => _benchDisarmDeletes(), 3000);
-      });
-  };
-  const cb = node.querySelector('[data-bench-cmp]');
-  if (cb) {
-    cb.onclick = (e) => e.stopPropagation();
-    cb.onchange = () => {
-      // No cap: the comparison view takes any number of runs. It used to stop at 2, left over
-      // from when the compare table only handled a pair.
-      if (cb.checked) _benchSelected.add(id); else _benchSelected.delete(id);
-      node.style.borderColor = cb.checked ? '#57d1e0' : '#262d38';
-      _benchUpdateCompareBar();
-    };
-  }
   const dt = node.querySelector('details[data-bench-detail]');
   if (dt) {
     if (_benchDetailCache.has(id)) {
@@ -6760,6 +6803,7 @@ function _benchWireRow(node) {
 // 3s beat: text selection vanished mid-drag, open panels were recreated, and the scroll position
 // jumped — which is why this code used to carry caches purely to undo its own damage.
 function _benchSyncRows(wrap, items) {
+  _benchBindHistory(wrap);
   const existing = new Map();
   for (const n of Array.from(wrap.children)) {
     if (n.dataset && n.dataset.benchId) existing.set(n.dataset.benchId, n);

@@ -4257,7 +4257,17 @@ def _save_gate(req_id: str, gate: dict):
 
 @app.get("/__proxy/api/info")
 async def info():
-    return {"version": __version__, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL, "port": PROXY_PORT}
+    # `ui` fingerprints the served dashboard so a long-lived tab can notice it is running code
+    # older than the server. A dashboard is left open for days; without this, every deploy is
+    # invisible to it and old behaviour looks like a bug in the new build.
+    ui = None
+    try:
+        st = (STATIC_DIR / "index.html").stat()
+        ui = f"{int(st.st_mtime)}-{st.st_size}"
+    except OSError:
+        pass
+    return {"version": __version__, "ui": ui, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL,
+            "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL, "port": PROXY_PORT}
 
 
 @app.get("/__proxy/api/whoami")
@@ -8211,7 +8221,11 @@ async def generated_image(fname: str):
 @app.get("/__proxy")
 @app.get("/__proxy/")
 async def ui_index():
-    return FileResponse(STATIC_DIR / "index.html")
+    # no-cache means "revalidate before reusing", not "don't store": the browser still gets a
+    # 304 when nothing changed, but a tab can never come back holding a stale dashboard after a
+    # deploy. Debugging an old UI against a new server is a bad use of anyone's evening.
+    return FileResponse(STATIC_DIR / "index.html",
+                        headers={"cache-control": "no-cache, must-revalidate"})
 
 
 # The proxy's logo: two arrows (request out / response back). Same SVG the UI uses for its
