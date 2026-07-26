@@ -412,13 +412,35 @@ def test_submit_rejects_an_unknown_cache_value(client):
     assert "cache" in r.json()["error"]
 
 
-def test_suite_has_twelve_tasks():
-    """The original study graded 12 tasks; a 6-task suite is a weaker signal for the same cost
-    in wall-clock, since latency dominates."""
+def test_suite_has_a_core_and_a_hard_tier():
+    """The core tier matches the original study's 12 tasks and saturates for any capable model —
+    it can confirm a model works but cannot rank two that both do. The hard tier exists to
+    separate them; without it a report reads 100% for everything and decides nothing."""
     suite = p._BENCH_SUITES["coding-v1"]
-    assert len(suite) == 12
-    assert len({t["id"] for t in suite}) == 12
+    core = [t for t in suite if t.get("tier", "core") == "core"]
+    hard = [t for t in suite if t.get("tier") == "hard"]
+    assert len(core) == 12
+    assert len(hard) >= 6
+    assert len({t["id"] for t in suite}) == len(suite), "task ids must be unique"
     assert all(t["cases"] and t["entry"] for t in suite)
+
+
+def test_quality_summary_scores_each_tier_separately():
+    """A blended rate hides the thing you want: two models at 100% core are indistinguishable
+    until you look at hard."""
+    suite = [
+        {"id": "easy", "tier": "core", "entry": "e", "cases": [1, 2]},
+        {"id": "tough", "tier": "hard", "entry": "t", "cases": [1, 2]},
+    ]
+    rows = [
+        {"task": "easy", "grade": {"passed": 2, "total": 2}},
+        {"task": "tough", "grade": {"passed": 1, "total": 2}},
+    ]
+    q = p._bench_quality_summary(rows, suite)
+    assert q["tiers"]["core"]["perfect_rate"] == 1.0
+    assert q["tiers"]["hard"]["perfect_rate"] == 0.0
+    # The blended number sits between them and tells you neither.
+    assert 0 < q["perfect_rate"] < 1
 
 
 def test_chart_labels_elide_the_middle_not_the_tail():

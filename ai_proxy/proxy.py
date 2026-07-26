@@ -7107,6 +7107,13 @@ def _bench_report_row(run: dict) -> dict:
         "quant": (run.get("env") or {}).get("quant"),
         "size_mb": (run.get("env") or {}).get("size_mb"),
         "warmup_ms": s.get("warmup_ms"),
+        "warmup_ttft_ms": s.get("warmup_ttft_ms"),
+        "tiers": q.get("tiers") or {},
+        # Full distributions, used when there is a single configuration and a comparison table
+        # would have nothing to compare against.
+        "ttft": s.get("ttft_ms") or {},
+        "decode": s.get("decode_tps") or {},
+        "total": s.get("total_ms") or {},
     }
 
 
@@ -7179,6 +7186,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             "TTFT p50", "Decode p50", "Tokens", "Total p50", "vs best", "OK"]
     if graded:
         head[12:12] = ["Fully correct", "Cases"]
+    if len(rows) == 1:
+        head.remove("vs best")
     # Slowdown against the fastest configuration in the set. A raw latency column doesn't make
     # "16x slower for no quality gain" jump out; a ratio does.
     fastest = min((r["total_p50"] for r in rows if r["total_p50"]), default=None)
@@ -7203,8 +7212,11 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
             f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>',
             f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>',
-            f'<td class="n{" slow" if (slow or 0) >= 2 else ""}">{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>',
         ]
+        if len(rows) > 1:
+            cells.append(
+                f'<td class="n{" slow" if (slow or 0) >= 2 else ""}">'
+                f'{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>')
         if graded:
             cells.append(f'<td class="n{" win" if r["perfect_rate"] == best_q else ""}">{pct(r["perfect_rate"])}</td>')
             cells.append(f'<td class="n">{pct(r["case_pass_rate"])}</td>')
@@ -7212,11 +7224,35 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         cells.append(f'<td class="n {"ok" if ok else "bad"}">{r["n_success"]}/{r["n_total"]}</td>')
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
 
-    charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
-    charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
-    if graded:
-        qrows = [dict(r, q=(r["perfect_rate"] or 0) * 100) for r in rows]
-        charts += _bench_bar_svg(qrows, "q", "Fully-correct responses", "%", "high")
+    # One configuration has nothing to compare against: a chart with a single full-width bar
+    # conveys no scale, "best in column" marks everything, and "vs best" is always 1.0x. The
+    # only real variation in a single cell is run-to-run spread, so show that instead.
+    single = len(rows) == 1
+    if single:
+        r0 = rows[0]
+
+        def spread(label, dist, unit, digits=0):
+            if not dist or dist.get("p50") is None:
+                return ""
+            cells = "".join(f'<td class="n">{fmt(dist.get(k), digits)}</td>'
+                            for k in ("min", "p50", "p90", "max"))
+            return f'<tr><th scope="row">{_h(label)} <span class="unit">{_h(unit)}</span></th>{cells}</tr>'
+
+        charts = (
+            f'<p class="note">A single configuration, so there is nothing to rank \u2014 what matters '
+            f'here is consistency across the {r0["n_total"]} requests. A wide gap between p50 and max '
+            f'means the number is not repeatable.</p>'
+            '<table><thead><tr><th>Metric</th><th>min</th><th>p50</th><th>p90</th><th>max</th></tr></thead><tbody>'
+            + spread("Time to first token", r0.get("ttft"), "ms")
+            + spread("Decode rate", r0.get("decode"), "tokens/sec", 1)
+            + spread("Total", r0.get("total"), "ms")
+            + '</tbody></table>')
+    else:
+        charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
+        charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
+        if graded:
+            qrows = [dict(r, q=(r["perfect_rate"] or 0) * 100) for r in rows]
+            charts += _bench_bar_svg(qrows, "q", "Fully-correct responses", "%", "high")
 
     # Per-task quality --------------------------------------------------------------------
     task_html = ""
@@ -7234,7 +7270,26 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 tds = "".join(
                     f'<td class="n">{pct(per.get(l))}</td>' for l in labels)
                 trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
-            task_html = f"""<h2>Per-task correctness</h2>
+            tier_rows = ""
+            if any(r.get("tiers") for r in rows):
+                names = {"core": "Core \u2014 any usable coding model clears these",
+                         "hard": "Hard \u2014 separates models that both pass the core tier"}
+                ttrs = []
+                for tier in ("core", "hard"):
+                    if not any((r.get("tiers") or {}).get(tier) for r in rows):
+                        continue
+                    tds = "".join(
+                        f'<td class="n">{pct(((r.get("tiers") or {}).get(tier) or {}).get("perfect_rate"))}</td>'
+                        for r in rows)
+                    ttrs.append(f'<tr><th scope="row">{_h(names.get(tier, tier))}</th>{tds}</tr>')
+                tier_rows = ('<table><thead><tr><th>Tier</th>' + th + '</tr></thead><tbody>'
+                             + "".join(ttrs) + '</tbody></table>')
+            task_html = (
+                "<h2>Correctness by tier</h2>"
+                '<p class="note">The core tier confirms a model is not broken; it saturates for '
+                "anything capable, which is exactly why the hard tier exists. Compare two models "
+                "on the hard row when both score 100% on core.</p>"
+                + tier_rows) + f"""<h2>Per-task correctness</h2>
 <p class="note">Share of responses that passed every case for that task. A model strong
 everywhere except one task and a model mediocre throughout can share an overall average.</p>
 <table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table>"""
@@ -7271,6 +7326,31 @@ ordinary slowness rather than a misconfiguration.</p>
 <table><thead><tr><th>Model</th><th>Context</th><th>Think</th><th>Cold TTFT</th>
 <th>Cached TTFT</th><th>Speed-up</th><th></th></tr></thead><tbody>{"".join(trs)}</tbody></table>"""
 
+    # The warm-up in cached mode sends the prompt the measured runs will send, so its TTFT is
+    # the cold prefill of that exact prompt. Against the measured (cached) TTFT that is a direct
+    # read on whether the prefix cache is working, and it costs nothing extra to report.
+    cold_html = ""
+    cold_rows = []
+    for r in rows:
+        cold_t, warm_t = r.get("warmup_ttft_ms"), r.get("ttft_p50")
+        if r.get("cache") == "cached" and cold_t and warm_t and cold_t > warm_t * 1.5:
+            cold_rows.append((r, cold_t, warm_t, cold_t / warm_t))
+    if cold_rows:
+        trs = "".join(
+            f'<tr><th scope="row">{_h(r["label"])}</th>'
+            f'<td class="n">{fmt(r["prompt_tokens"])}</td>'
+            f'<td class="n">{fmt(c, 0, " ms")}</td><td class="n">{fmt(w, 0, " ms")}</td>'
+            f'<td class="n win">{fmt(ratio, 0, "x")}</td></tr>'
+            for r, c, w, ratio in cold_rows)
+        cold_html = (
+            "<h2>Prompt cache</h2>"
+            '<p class="note">The warm-up sends the same prompt the measured runs use, so its '
+            "first-token time is that prompt\u2019s <em>cold</em> prefill; everything after it is "
+            "served warm. A backend whose prefix caching is off or unsupported shows no gap "
+            "between these two columns.</p>"
+            "<table><thead><tr><th>Configuration</th><th>Prompt</th><th>Cold TTFT</th>"
+            "<th>Cached TTFT</th><th>Faster by</th></tr></thead><tbody>" + trs + "</tbody></table>")
+
     warm = [f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}"
             for r, run in zip(rows, runs)
             if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
@@ -7299,6 +7379,7 @@ ordinary slowness rather than a misconfiguration.</p>
   td.n {{ text-align:right; font-variant-numeric:tabular-nums; }}
   td.win {{ color:#0a7d4f; font-weight:700; }}
   td.slow {{ color:#b3261e; font-weight:600; }}
+  .unit {{ color:#8b95a1; font-weight:400; font-size:11.5px; }}
   td.ok {{ color:#0a7d4f; }} td.bad {{ color:#b3261e; font-weight:600; }}
   code {{ font:12px ui-monospace,SFMono-Regular,Menlo,monospace; background:#eef0f3;
           padding:1px 5px; border-radius:3px; }}
@@ -7328,17 +7409,19 @@ ordinary slowness rather than a misconfiguration.</p>
   <h2>Results</h2>
   <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
   the gap between them is time the model spent reasoning. Decode rate is measured from the first
-  token onward, so reasoning tokens count as generated work. Best value in each column is
-  highlighted.</p>
+  token onward, so reasoning tokens count as generated work.
+  {"" if single else "Best value in each column is highlighted."}</p>
   <table>
     <thead><tr>{"".join(f"<th>{_h(h)}</th>" for h in head)}</tr></thead>
     <tbody>{"".join(body_rows)}</tbody>
   </table>
 
-  <h2>At a glance</h2>
+  <h2>{"Consistency" if single else "At a glance"}</h2>
   {charts}
 
   {cache_html}
+
+  {cold_html}
 
   {task_html}
 
@@ -7863,6 +7946,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             "prompt": ("Write a Python function `binary_search(items: list[int], target: int) -> int` "
                        "that returns the index of target in the sorted list items, or -1 if absent. "
                        "Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "binary_search",
             "cases": [
                 {"args": [[1, 3, 5, 7, 9], 7], "expect": 3},
@@ -7879,6 +7963,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                        "that merges all overlapping intervals and returns them sorted by start. "
                        "Touching intervals like [1,2] and [2,3] count as overlapping. "
                        "Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "merge_intervals",
             "cases": [
                 {"args": [[[1, 3], [2, 6], [8, 10], [15, 18]]], "expect": [[1, 6], [8, 10], [15, 18]]},
@@ -7893,6 +7978,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                        "returning the n most common lowercase words in text, as (word, count) tuples "
                        "sorted by count descending then word ascending. Words are runs of letters; "
                        "ignore case and punctuation. Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "word_freq",
             "cases": [
                 {"args": ["the cat the dog THE bird", 2], "expect": [["the", 3], ["bird", 1]]},
@@ -7905,6 +7991,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             "prompt": ("Write a Python function `to_roman(n: int) -> str` converting an integer "
                        "between 1 and 3999 into a Roman numeral. Return only the function in a "
                        "single ```python code block."),
+            "tier": "core",
             "entry": "to_roman",
             "cases": [
                 {"args": [1], "expect": "I"},
@@ -7920,6 +8007,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             "prompt": ("Write a Python function `is_balanced(s: str) -> bool` returning True when "
                        "every (), [] and {} in s is correctly matched and nested. Ignore all other "
                        "characters. Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "is_balanced",
             "cases": [
                 {"args": ["({[]})"], "expect": True},
@@ -7934,6 +8022,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             "prompt": ("Write a Python function `flatten(nested: list) -> list` that fully flattens "
                        "an arbitrarily nested list of lists into a single flat list, preserving order. "
                        "Non-list values pass through. Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "flatten",
             "cases": [
                 {"args": [[1, [2, [3, [4]]], 5]], "expect": [1, 2, 3, 4, 5]},
@@ -7947,6 +8036,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                        "returning the indices of the two numbers that add to target, as a list of two "
                        "ascending indices. Exactly one solution exists and an element can't be reused. "
                        "Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "two_sum",
             "cases": [
                 {"args": [[2, 7, 11, 15], 9], "expect": [0, 1]},
@@ -7961,6 +8051,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                        "LRU cache. ops is a list of ['put', key, value] or ['get', key]. Return the list "
                        "of results of every 'get', using -1 for a miss. A get or put counts as a use. "
                        "Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "lru",
             "cases": [
                 {"args": [2, [["put", 1, 1], ["put", 2, 2], ["get", 1], ["put", 3, 3], ["get", 2], ["get", 3]]],
@@ -7974,6 +8065,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                        "grouping words that are anagrams. Each group is sorted alphabetically, and the "
                        "groups are sorted by their first word. Return only the function in a single "
                        "```python code block."),
+            "tier": "core",
             "entry": "group_anagrams",
             "cases": [
                 {"args": [["eat", "tea", "tan", "ate", "nat", "bat"]],
@@ -7987,6 +8079,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             "prompt": ("Write a Python function `rle(s: str) -> str` performing run-length encoding: "
                        "each run becomes the character followed by its count, including runs of length 1 "
                        "(so 'aab' becomes 'a2b1'). Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "rle",
             "cases": [
                 {"args": ["aab"], "expect": "a2b1"},
@@ -8001,6 +8094,7 @@ _BENCH_SUITES: dict[str, list[dict]] = {
                        "dotted version strings. Return -1 if a < b, 1 if a > b, 0 if equal. Segments "
                        "are integers, missing segments count as 0, and leading zeros are ignored "
                        "('1.02' equals '1.2'). Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "compare_versions",
             "cases": [
                 {"args": ["1.2", "1.10"], "expect": -1},
@@ -8015,12 +8109,117 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             "prompt": ("Write a Python function `spiral(matrix: list[list[int]]) -> list[int]` returning "
                        "the elements of the matrix in clockwise spiral order starting at the top-left. "
                        "Return only the function in a single ```python code block."),
+            "tier": "core",
             "entry": "spiral",
             "cases": [
                 {"args": [[[1, 2, 3], [4, 5, 6], [7, 8, 9]]], "expect": [1, 2, 3, 6, 9, 8, 7, 4, 5]},
                 {"args": [[[1, 2], [3, 4]]], "expect": [1, 2, 4, 3]},
                 {"args": [[]], "expect": []},
                 {"args": [[[1]]], "expect": [1]},
+            ],
+        },
+        # ---- hard tier ---------------------------------------------------------------------
+        # The core tier is a smoke test: any usable coding model clears it, which means it can
+        # confirm a model works but cannot rank two that both do. These are chosen to fail
+        # partially — each has an edge case that a plausible-looking implementation gets wrong.
+        {
+            "id": "edit_distance",
+            "tier": "hard",
+            "prompt": ("Write a Python function `edit_distance(a: str, b: str) -> int` returning the "
+                       "Levenshtein distance between a and b: the minimum number of single-character "
+                       "insertions, deletions or substitutions to turn a into b. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "edit_distance",
+            "cases": [
+                {"args": ["kitten", "sitting"], "expect": 3},
+                {"args": ["flaw", "lawn"], "expect": 2},
+                {"args": ["", "abc"], "expect": 3},
+                {"args": ["same", "same"], "expect": 0},
+                {"args": ["a", ""], "expect": 1},
+                {"args": ["intention", "execution"], "expect": 5},
+            ],
+        },
+        {
+            "id": "lis_length",
+            "tier": "hard",
+            "prompt": ("Write a Python function `lis_length(nums: list[int]) -> int` returning the "
+                       "length of the longest STRICTLY increasing subsequence (elements need not be "
+                       "contiguous). Return only the function in a single ```python code block."),
+            "entry": "lis_length",
+            "cases": [
+                {"args": [[10, 9, 2, 5, 3, 7, 101, 18]], "expect": 4},
+                {"args": [[0, 1, 0, 3, 2, 3]], "expect": 4},
+                {"args": [[7, 7, 7, 7]], "expect": 1},
+                {"args": [[]], "expect": 0},
+                {"args": [[3, 1, 2]], "expect": 2},
+            ],
+        },
+        {
+            "id": "simplify_path",
+            "tier": "hard",
+            "prompt": ("Write a Python function `simplify_path(path: str) -> str` that canonicalises "
+                       "an absolute Unix path: collapse repeated slashes, resolve '.' and '..', and "
+                       "return a path with no trailing slash (except the root, which is '/'). "
+                       "'..' at the root stays at the root. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "simplify_path",
+            "cases": [
+                {"args": ["/home/"], "expect": "/home"},
+                {"args": ["/../"], "expect": "/"},
+                {"args": ["/home//foo/"], "expect": "/home/foo"},
+                {"args": ["/a/./b/../../c/"], "expect": "/c"},
+                {"args": ["/"], "expect": "/"},
+                {"args": ["/a/../../b/../c//.//"], "expect": "/c"},
+            ],
+        },
+        {
+            "id": "calculator",
+            "tier": "hard",
+            "prompt": ("Write a Python function `calculate(expr: str) -> int` evaluating an arithmetic "
+                       "expression containing non-negative integers and the operators + - * / with "
+                       "normal precedence and optional spaces. There are no parentheses. Division is "
+                       "INTEGER division that truncates toward zero (so 7/-2 would be -3, and 3/2 is 1). "
+                       "Return only the function in a single ```python code block."),
+            "entry": "calculate",
+            "cases": [
+                {"args": ["3+2*2"], "expect": 7},
+                {"args": [" 3/2 "], "expect": 1},
+                {"args": [" 3+5 / 2 "], "expect": 5},
+                {"args": ["2*3+4*5"], "expect": 26},
+                {"args": ["14-3/2"], "expect": 13},
+                {"args": ["100"], "expect": 100},
+            ],
+        },
+        {
+            "id": "word_break",
+            "tier": "hard",
+            "prompt": ("Write a Python function `word_break(s: str, words: list[str]) -> bool` "
+                       "returning True when s can be segmented into a sequence of one or more words "
+                       "from the list. Words may be reused. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "word_break",
+            "cases": [
+                {"args": ["leetcode", ["leet", "code"]], "expect": True},
+                {"args": ["applepenapple", ["apple", "pen"]], "expect": True},
+                {"args": ["catsandog", ["cats", "dog", "sand", "and", "cat"]], "expect": False},
+                {"args": ["aaaaaaa", ["aaaa", "aaa"]], "expect": True},
+                {"args": ["", ["a"]], "expect": True},
+            ],
+        },
+        {
+            "id": "topo_sort",
+            "tier": "hard",
+            "prompt": ("Write a Python function `topo_sort(n: int, edges: list[list[int]]) -> list[int]` "
+                       "returning a topological ordering of nodes 0..n-1, where each edge [a, b] means a "
+                       "must come before b. When several orderings are valid, return the "
+                       "lexicographically smallest. Return an empty list if a cycle makes it impossible. "
+                       "Return only the function in a single ```python code block."),
+            "entry": "topo_sort",
+            "cases": [
+                {"args": [4, [[0, 1], [0, 2], [1, 3], [2, 3]]], "expect": [0, 1, 2, 3]},
+                {"args": [3, [[2, 0], [2, 1]]], "expect": [2, 0, 1]},
+                {"args": [2, [[0, 1], [1, 0]]], "expect": []},
+                {"args": [3, []], "expect": [0, 1, 2]},
             ],
         },
     ],
@@ -8412,6 +8611,21 @@ def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
         slot["case_pass_rate"] = (slot["passed_cases"] / slot["total_cases"]
                                   if slot["total_cases"] else None)
         slot["perfect_rate"] = (slot["perfect_runs"] / slot["runs"] if slot["runs"] else None)
+    tier_of = {t["id"]: t.get("tier", "core") for t in suite}
+    for tid, slot in per_task.items():
+        slot["tier"] = tier_of.get(tid, "core")
+    tiers = {}
+    for tier in sorted({t.get("tier", "core") for t in suite}):
+        mine = [v for v in per_task.values() if v["tier"] == tier]
+        runs = sum(v["runs"] for v in mine)
+        perfect = sum(v["perfect_runs"] for v in mine)
+        cases = sum(v["total_cases"] for v in mine)
+        passed = sum(v["passed_cases"] for v in mine)
+        tiers[tier] = {
+            "tasks": len(mine), "runs": runs, "perfect_runs": perfect,
+            "perfect_rate": (perfect / runs) if runs else None,
+            "case_pass_rate": (passed / cases) if cases else None,
+        }
     total_cases = sum(s["total_cases"] for s in per_task.values())
     passed_cases = sum(s["passed_cases"] for s in per_task.values())
     total_runs = sum(s["runs"] for s in per_task.values())
@@ -8426,6 +8640,7 @@ def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
         "perfect_rate": (perfect_runs / total_runs) if total_runs else None,
         "perfect_runs": perfect_runs,
         "total_runs": total_runs,
+        "tiers": tiers,
         "tasks": list(per_task.values()),
     }
 
@@ -8826,6 +9041,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     # Surfaced, not hidden: if the warm-up took 40s and the measured runs took
                     # 2s, that gap IS the model-load cost and is worth seeing.
                     summary["warmup_ms"] = warm.get("total_ms")
+                    summary["warmup_ttft_ms"] = warm.get("ttft_ms")
                     summary["warmup_error"] = warm.get("error")
                 final = {"rows": rows, "summary": summary, "config_used": cfg, "env": env,
                          "warmup": warm}

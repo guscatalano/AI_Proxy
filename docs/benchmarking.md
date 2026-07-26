@@ -146,6 +146,16 @@ confound the axis exists to expose.
 
 ## Reports
 
+A report with **one configuration** drops the comparison furniture — no charts (a single bar
+conveys no scale), no "best in column" highlighting, no "vs best" ratio — and shows the
+min/p50/p90/max spread instead, since run-to-run consistency is the only real variation a single
+cell contains.
+
+When a cached run has a warm-up, the report also derives **cold vs cached** from it for free: the
+warm-up sends the prompt the measured runs will send, so its first-token time is that prompt's
+cold prefill. On spark that reads 14,200 ms cold against 134 ms cached — a 106× gap, and direct
+evidence the prefix cache is working.
+
 Any finished run has a **Report ↗** link, and a comparison of several runs has **Open report ↗**.
 It renders a standalone HTML page: environment, a per-configuration table with the best value in
 each column highlighted, bar charts for decode rate / TTFT / correctness, and a per-task
@@ -187,7 +197,20 @@ and a model that is mediocre throughout can share an identical average.
 > environment. That contains accidents and runaway loops — it is **not** a sandbox against
 > deliberately hostile code. Grading is opt-in per run, and the UI confirms before starting.
 
-`coding-v1` ships with 12 tasks / 49 cases: binary search, interval merging, word frequency,
+### Tiers
+
+`coding-v1` has two tiers, both graded in the same run:
+
+- **core** (12 tasks) — any usable coding model clears these. It confirms a model isn't broken,
+  and saturates at 100% for anything capable, so it cannot rank two models that both pass.
+- **hard** (6 tasks) — edit distance, longest increasing subsequence, Unix path canonicalisation,
+  an expression evaluator with integer division truncating toward zero, word break, and a
+  topological sort with a lexicographic tie-break. Each has an edge case a plausible-looking
+  implementation gets wrong, so this is the tier that separates models.
+
+Read the hard row when comparing two models that both score 100% on core.
+
+`coding-v1` ships with 12 core tasks / 49 cases: binary search, interval merging, word frequency,
 Roman numerals, bracket balancing, list flattening, two-sum, an LRU cache simulation, anagram
 grouping, run-length encoding, version comparison, and spiral matrix traversal. Every task is
 verified solvable by a reference implementation — a task its own reference can't pass would cap
