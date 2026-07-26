@@ -11,6 +11,8 @@ release workflow (publishes to PyPI and npm, and creates a `vX.Y.Z` GitHub Relea
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-25
+
 The dashboard is rebuilt around a console shell, and the proxy grows three new
 observability surfaces — Live View, Artifacts, and Bench — plus per-model quirk
 handling and a deterministic context compressor.
@@ -150,5 +152,6 @@ Initial packaged release.
   installed, overridable via `PROXY_STATE_DIR` / `PROXY_DB` / `PROXY_RULES_FILE`.
 - `version` field in `GET /__proxy/api/info`.
 
-[Unreleased]: https://github.com/guscatalano/AI_Proxy/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/guscatalano/AI_Proxy/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/guscatalano/AI_Proxy/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/guscatalano/AI_Proxy/releases/tag/v0.1.0

@@ -1,7 +1,7 @@
 {
   "name": "guscatalano-ai-proxy",
-  "version": "0.1.0",
-  "description": "A transparent inspector and rule engine that sits between AI clients (Claude Code, Copilot, Cursor) and their upstreams (Anthropic, Ollama, OpenAI-compatible). Ships as a self-contained binary — no Python required.",
+  "version": "0.2.0",
+  "description": "A transparent inspector and rule engine that sits between AI clients (Claude Code, Copilot, Cursor) and their upstreams (Anthropic, Ollama, OpenAI-compatible). Ships as a self-contained binary \u2014 no Python required.",
   "keywords": [
     "llm",
     "proxy",
@@ -31,9 +31,9 @@
     "node": ">=16"
   },
   "optionalDependencies": {
-    "guscatalano-ai-proxy-win32-x64": "0.1.0",
-    "guscatalano-ai-proxy-darwin-arm64": "0.1.0",
-    "guscatalano-ai-proxy-linux-x64": "0.1.0",
-    "guscatalano-ai-proxy-linux-arm64": "0.1.0"
+    "guscatalano-ai-proxy-win32-x64": "0.2.0",
+    "guscatalano-ai-proxy-darwin-arm64": "0.2.0",
+    "guscatalano-ai-proxy-linux-x64": "0.2.0",
+    "guscatalano-ai-proxy-linux-arm64": "0.2.0"
   }
 }
