@@ -6523,6 +6523,93 @@ async def _lms_run(args: list, timeout: float = 600.0) -> tuple[int, str]:
     return proc.returncode or 0, (out or b"").decode("utf-8", "replace").strip()[:800]
 
 
+VLLM_ARG_SUMMARY = ("--served-model-name", "--model", "--max-model-len",
+                    "--gpu-memory-utilization", "--kv-cache-dtype", "--quantization")
+
+
+async def _vllm_configs() -> list:
+    """Every vLLM container on this host, running or not, with what it would serve.
+
+    Configuration is expressed as containers rather than as launch arguments the proxy templates
+    into `docker run`. Defining how a server starts is Docker's job and people already do it that
+    way — spark had a stopped `ornith-vllm` beside the running `qwen-vllm` before any of this
+    existed. The proxy only decides which one is up, which is the part a benchmark needs.
+    """
+    docker = _docker_bin()
+    if not docker or not _upstream_is_local(VLLM_URL):
+        return []
+    code, out = await _run_cmd(
+        [docker, "ps", "-a", "--format", "{{.Names}}	{{.Image}}	{{.State}}	{{.Ports}}"], 20.0)
+    if code != 0:
+        return []
+    try:
+        want_port = str(httpx.URL(VLLM_URL).port or 8000)
+    except Exception:
+        want_port = "8000"
+    out_list = []
+    for line in out.splitlines():
+        parts = line.split("	")
+        if len(parts) < 3:
+            continue
+        name, image, state = parts[0].strip(), parts[1].strip(), parts[2].strip()
+        if "vllm" not in image.lower() and "vllm" not in name.lower():
+            continue
+        rc, cmd_json = await _run_cmd([docker, "inspect", name, "--format", "{{json .Config.Cmd}}"], 15.0)
+        args = []
+        if rc == 0:
+            try:
+                args = json.loads(cmd_json) or []
+            except (json.JSONDecodeError, TypeError):
+                args = []
+        flags = {}
+        for i, a in enumerate(args):
+            if a in VLLM_ARG_SUMMARY and i + 1 < len(args):
+                flags[a.lstrip("-")] = args[i + 1]
+        # Does it publish the port this proxy talks to? One that doesn't would start without
+        # ever becoming reachable, which is worse than refusing.
+        rc, ports_json = await _run_cmd(
+            [docker, "inspect", name, "--format", "{{json .HostConfig.PortBindings}}"], 15.0)
+        serves_port = False
+        try:
+            for binds in (json.loads(ports_json) or {}).values():
+                for b in (binds or []):
+                    if str(b.get("HostPort")) == want_port:
+                        serves_port = True
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+        mounts = []
+        rc, mounts_json = await _run_cmd(
+            [docker, "inspect", name, "--format", "{{json .Mounts}}"], 15.0)
+        if rc == 0:
+            try:
+                mounts = [m.get("Source") for m in (json.loads(mounts_json) or []) if m.get("Source")]
+            except (json.JSONDecodeError, TypeError):
+                mounts = []
+        out_list.append({
+            "container": name, "image": image, "running": state.lower() == "running",
+            "serves_port": serves_port,
+            "model": flags.get("served-model-name") or flags.get("model"),
+            "checkpoint": flags.get("model"),
+            "mounts": mounts,
+            # A bind mount makes --model "/model", which names nothing — fall back to the served
+            # name and then to the host path that was mounted.
+            "quant": _infer_quant(flags.get("model"), flags.get("served-model-name"),
+                                  name, mounts),
+            "max_model_len": flags.get("max-model-len"),
+            "kv_cache_dtype": flags.get("kv-cache-dtype"),
+            "prefix_caching": "--enable-prefix-caching" in args,
+            "args": " ".join(args),
+        })
+    return out_list
+
+
+@app.get("/__proxy/api/control/models/vllm")
+async def control_vllm_configs():
+    """The vLLM configurations available to switch between. They contend for one port, so at
+    most one can be up — which is exactly what makes them a menu."""
+    return {"configs": await _vllm_configs(), "url": VLLM_URL}
+
+
 @app.get("/__proxy/api/control/models/capabilities")
 async def control_model_capabilities():
     """What can actually be loaded or unloaded, per backend, and why not when not. The UI needs
@@ -6640,19 +6727,40 @@ async def control_model_load(request: Request):
         return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
                 "load_ms": round((time.perf_counter() - t0) * 1000)}
     if upstream == "vllm":
-        container = await _vllm_container()
+        wanted = (payload.get("container") or "").strip()
+        configs = await _vllm_configs()
+        if wanted:
+            match = next((c for c in configs if c["container"] == wanted), None)
+            if not match:
+                return JSONResponse(
+                    {"error": f"no vLLM container named {wanted!r}",
+                     "available": [c["container"] for c in configs]}, status_code=404)
+            if not match["serves_port"]:
+                return JSONResponse(
+                    {"error": f"{wanted!r} does not publish {VLLM_URL} — starting it would not "
+                              f"make it reachable through this proxy"}, status_code=409)
+            container = wanted
+        else:
+            container = await _vllm_container()
         if not container:
             return JSONResponse(
-                {"error": "no local vLLM container publishing this port was found"},
-                status_code=501)
+                {"error": "no local vLLM container publishing this port was found",
+                 "available": [c["container"] for c in configs]}, status_code=501)
         t0 = time.perf_counter()
+        # They contend for one port, so anything else running must come down first — otherwise
+        # docker start fails on the binding and the error looks unrelated.
+        stopped = []
+        for c in configs:
+            if c["running"] and c["container"] != container:
+                await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
+                stopped.append(c["container"])
         code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
         if code != 0:
             return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
         # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
         ready = await _vllm_ready(float(payload.get("wait_s") or 420))
-        return {"ok": ready, "started_container": container, "ready": ready,
-                "load_ms": round((time.perf_counter() - t0) * 1000),
+        return {"ok": ready, "started_container": container, "stopped_containers": stopped,
+                "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
                 "error": None if ready else "container started but the server did not become "
                                             "ready in time — it may still be loading"}
     keep = payload.get("keep_alive") or "30m"

@@ -718,3 +718,39 @@ def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
     # And a name is still required where one actually means something.
     assert client.post("/__proxy/api/control/models/load",
                        json={"upstream": "ollama"}).status_code == 400
+
+
+def test_vllm_switch_refuses_a_container_that_does_not_publish_our_port(client, monkeypatch):
+    """Starting a container that binds a different port would succeed at the Docker level and
+    then never be reachable — a success message for a server the proxy cannot talk to."""
+    async def configs():
+        return [{"container": "other-vllm", "running": False, "serves_port": False,
+                 "model": "x", "checkpoint": "x", "quant": None, "max_model_len": None,
+                 "kv_cache_dtype": None, "prefix_caching": False, "args": ""}]
+    monkeypatch.setattr(p, "_vllm_configs", configs)
+    monkeypatch.setattr(p, "_docker_bin", lambda: "/usr/bin/docker")
+    r = client.post("/__proxy/api/control/models/load",
+                    json={"upstream": "vllm", "container": "other-vllm"})
+    assert r.status_code == 409
+    assert "would not make it reachable" in r.json()["error"]
+
+
+def test_vllm_switch_reports_unknown_containers_with_the_alternatives(client, monkeypatch):
+    async def configs():
+        return [{"container": "qwen-vllm", "running": True, "serves_port": True, "model": "q",
+                 "checkpoint": "q", "quant": None, "max_model_len": None, "kv_cache_dtype": None,
+                 "prefix_caching": False, "args": ""}]
+    monkeypatch.setattr(p, "_vllm_configs", configs)
+    monkeypatch.setattr(p, "_docker_bin", lambda: "/usr/bin/docker")
+    r = client.post("/__proxy/api/control/models/load",
+                    json={"upstream": "vllm", "container": "nope"})
+    assert r.status_code == 404
+    assert r.json()["available"] == ["qwen-vllm"]
+
+
+def test_quant_falls_back_when_the_checkpoint_is_a_bind_mount():
+    """--model /model names nothing. The quant is still recoverable from the served name, the
+    container name, or the host path that was mounted."""
+    assert p._infer_quant("/model", "ornith-nvfp4", "ornith-vllm", []) == "NVFP4"
+    assert p._infer_quant("/model", None, "x", ["/home/u/models/ornith-nvfp4"]) == "NVFP4"
+    assert p._infer_quant("/model", "plain", "plain", ["/data/plain"]) is None
