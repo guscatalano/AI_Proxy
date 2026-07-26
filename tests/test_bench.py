@@ -252,6 +252,70 @@ def test_models_endpoint_reports_upstream_and_load_state(client):
         assert isinstance(item["loaded"], bool)
 
 
+def test_model_index_reads_the_snapshot_keys_the_snapshots_actually_emit(monkeypatch):
+    """Regression: the index read `lmstudio.models` / `vllm.models`, but both snapshots emit
+    `loaded` / `available`. The result was that LM Studio and vLLM models never appeared in the
+    bench picker at all — silently, since an empty list looks like 'nothing is running'."""
+    async def fake_system_now():
+        return {
+            "ollama": {"tags": [{"name": "llama3:8b"}], "ps": [{"name": "llama3:8b"}]},
+            "lmstudio": {
+                "reachable": True,
+                "available": [
+                    {"id": "qwen/qwen3-coder-next", "state": "not-loaded",
+                     "quant": "Q4_K_M", "max_context_length": 262144},
+                    {"id": "ornith-35b", "state": "loaded", "quant": "Q8_0",
+                     "max_context_length": 32768},
+                ],
+                "loaded": [{"id": "ornith-35b", "state": "loaded"}],
+            },
+            "vllm": {
+                "reachable": True,
+                "available": [{"id": "ornith-nvfp4", "state": "loaded",
+                               "max_context_length": 40960}],
+                "loaded": [{"id": "ornith-nvfp4", "state": "loaded"}],
+            },
+        }
+
+    monkeypatch.setattr(p, "system_now", fake_system_now)
+    index = asyncio.run(p._bench_model_index())
+
+    assert index["qwen/qwen3-coder-next"]["upstream"] == "lmstudio"
+    assert index["qwen/qwen3-coder-next"]["loaded"] is False
+    assert index["qwen/qwen3-coder-next"]["quant"] == "Q4_K_M"
+    assert index["ornith-35b"]["loaded"] is True
+    assert index["ornith-nvfp4"]["upstream"] == "vllm"
+    assert index["llama3:8b"]["loaded"] is True
+
+
+def test_model_index_records_per_backend_load_semantics(monkeypatch):
+    """vLLM can't load on demand, so an unloaded model there is a guaranteed failure rather
+    than a slow first request. The UI needs that distinction to warn correctly."""
+    async def fake_system_now():
+        return {
+            "ollama": {"tags": [{"name": "m1"}], "ps": []},
+            "lmstudio": {"available": [{"id": "m2", "state": "not-loaded"}]},
+            "vllm": {"available": [{"id": "m3", "state": "loaded"}]},
+        }
+
+    monkeypatch.setattr(p, "system_now", fake_system_now)
+    index = asyncio.run(p._bench_model_index())
+    assert index["m1"]["load_mode"] == "on-demand"
+    assert index["m2"]["load_mode"] == "jit"
+    assert index["m3"]["load_mode"] == "fixed"
+
+
+def test_loaded_entry_wins_over_catalogue_entry(monkeypatch):
+    """Ollama lists a model in both /api/tags and /api/ps; the running one must not be
+    overwritten by the catalogue entry and reported as cold."""
+    async def fake_system_now():
+        return {"ollama": {"tags": [{"name": "dup"}], "ps": [{"name": "dup"}]},
+                "lmstudio": {}, "vllm": {}}
+
+    monkeypatch.setattr(p, "system_now", fake_system_now)
+    assert asyncio.run(p._bench_model_index())["dup"]["loaded"] is True
+
+
 def test_upstream_pin_header_does_not_corrupt_the_router_verdict(client):
     """Regression: x-proxy-upstream used to be folded into the model_router `rewrite` dict,
     producing a partial dict with no from/to/via. The audit path reads those keys unguarded, so

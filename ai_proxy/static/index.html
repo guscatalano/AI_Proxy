@@ -6035,11 +6035,20 @@ async function _benchPopulateModels() {
     // unloaded model costs a load on first use, which is what the warm-up exists to absorb.
     const byUp = {};
     for (const it of items) (byUp[it.upstream] = byUp[it.upstream] || []).push(it);
-    const label = {ollama: 'Ollama', lmstudio: 'LM Studio', vllm: 'vLLM'};
+    // Each backend gets its load semantics in the group label, since that's what decides
+    // whether picking an unloaded model is fine or futile.
+    const label = {
+      ollama: 'Ollama — loads on demand',
+      lmstudio: 'LM Studio — JIT-loads on demand',
+      vllm: 'vLLM — fixed, serves only what it was launched with',
+    };
+    const ctx = n => n == null ? '' : (n >= 1000 ? Math.round(n / 1024) + 'K' : String(n));
     const groups = Object.keys(byUp).sort().map(up =>
-      `<optgroup label="${esc(label[up] || up)}">` + byUp[up].map(it =>
-        `<option value="${esc(it.model)}">${it.loaded ? '● ' : '○ '}${esc(it.model)}${it.loaded ? '' : '  (not loaded)'}</option>`
-      ).join('') + '</optgroup>').join('');
+      `<optgroup label="${esc(label[up] || up)}">` + byUp[up].map(it => {
+        // Quant and window are the two facts you need beside a benchmark number.
+        const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(', ');
+        return `<option value="${esc(it.model)}">${it.loaded ? '● ' : '○ '}${esc(it.model)}${meta ? '  [' + esc(meta) + ']' : ''}${it.loaded ? '' : '  (not loaded)'}</option>`;
+      }).join('') + '</optgroup>').join('');
     sel.innerHTML = groups || '<option disabled>(no models)</option>';
     // Default to something already resident, so the obvious first click measures a warm model.
     const loadedOpt = items.find(i => i.loaded);
@@ -6122,15 +6131,30 @@ function _benchUpdatePlan() {
   const forced = $('bench-upstream').value;
   const ups = forced ? [forced] : [...new Set(metas.map(m => m.upstream))];
   let route = ups.length ? ` → ${ups.join(' + ')}${forced ? ' (forced)' : ''}` : '';
-  const cold = metas.filter(m => !m.loaded).map(m => m.model);
-  let warn = '';
-  if (cold.length) {
-    warn = b.warmup
-      ? ` · ${cold.length === 1 ? cold[0] + ' is' : cold.length + ' models are'} not loaded — the warm-up absorbs the load`
-      : ` · ⚠ ${cold.length === 1 ? cold[0] + ' is' : cold.length + ' models are'} not loaded and warm-up is off — load time will land in the first measurement`;
+  const warns = [];
+  const cold = metas.filter(m => !m.loaded);
+  // vLLM can't load anything on demand — the server serves what it was launched with, so an
+  // unloaded model there isn't a slow start, it's a guaranteed failure.
+  const impossible = cold.filter(m => m.load_mode === 'fixed').map(m => m.model);
+  const loadable = cold.filter(m => m.load_mode !== 'fixed').map(m => m.model);
+  if (impossible.length) {
+    warns.push({level: 'bad', text: `${impossible.join(', ')} not loaded on vLLM — it only serves what its server was launched with, so this will fail`});
   }
-  el.innerHTML = esc(scale + route) + (warn
-    ? `<span style="color:${b.warmup ? '#888' : '#f0a35a'}">${esc(warn)}</span>` : '');
+  if (loadable.length) {
+    warns.push(b.warmup
+      ? {level: 'info', text: `${loadable.join(', ')} not loaded — will be loaded on first use; the warm-up absorbs it`}
+      : {level: 'bad', text: `⚠ ${loadable.join(', ')} not loaded and warm-up is off — load time will land in the first measurement`});
+  }
+  // A prompt bigger than the model's window returns an empty completion, not an error — worth
+  // catching before you spend a sweep discovering it.
+  const ctxSizes = Array.isArray(b.prompt_tokens) ? b.prompt_tokens : [b.prompt_tokens];
+  const biggest = Math.max(...ctxSizes.map(Number), 0);
+  const tooSmall = metas.filter(m => (m.max_context || 0) > 0 && biggest > m.max_context * 0.9);
+  if (tooSmall.length) {
+    warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${tooSmall.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — expect empty completions`});
+  }
+  el.innerHTML = esc(scale + route) + warns.map(w =>
+    `<span style="color:${w.level === 'bad' ? '#f0a35a' : '#888'}"> · ${esc(w.text)}</span>`).join('');
 }
 
 async function _benchSubmit() {

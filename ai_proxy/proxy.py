@@ -6550,28 +6550,63 @@ async def bench_suites():
     }
 
 
+# How each backend behaves when you ask for a model that isn't currently resident. This is the
+# difference the bench has to expose, because it decides whether picking a model is enough:
+#   ollama    — pulls it into VRAM on demand; the warm-up absorbs the load
+#   lmstudio  — JIT-loads a downloaded model on demand (when JIT loading is enabled); the
+#               catalogue lists everything downloaded, with per-model state
+#   vllm      — serves exactly the model(s) the server process was launched with. Nothing else
+#               is reachable without restarting that server, so an unlisted model is unbenchable
+_BENCH_LOAD_MODES = {"ollama": "on-demand", "lmstudio": "jit", "vllm": "fixed"}
+
+
 async def _bench_model_index() -> dict:
-    """Map model name → {upstream, loaded}. This is what makes the upstream field unnecessary:
-    the proxy already knows which backend serves which model, so a bench can infer it instead of
-    asking the user to state it (and to keep it consistent with their model choice)."""
+    """Map model name → {upstream, loaded, ...}. This is what makes the upstream field
+    unnecessary: the proxy already knows which backend serves which model, so a bench can infer
+    it instead of asking the user to state it (and to keep it consistent with their choice).
+
+    Carries the metadata a benchmark actually needs — quantization and context window — because
+    'which quant was this?' is the first question asked of any result, and a prompt larger than
+    the model's window silently produces an empty completion.
+    """
     index: dict[str, dict] = {}
+
+    def put(name, upstream, loaded, **extra):
+        if not name:
+            return
+        rec = {"upstream": upstream, "loaded": bool(loaded),
+               "load_mode": _BENCH_LOAD_MODES.get(upstream, "unknown")}
+        rec.update({k: v for k, v in extra.items() if v is not None})
+        # A loaded entry always wins over a catalogue entry for the same name.
+        if name in index and index[name].get("loaded") and not loaded:
+            return
+        index[name] = rec
+
     try:
         sysinfo = await system_now()
         ollama = sysinfo.get("ollama") or {}
-        for m in (ollama.get("ps") or []):
-            if isinstance(m, dict) and (m.get("name") or m.get("model")):
-                index[m.get("name") or m.get("model")] = {"upstream": "ollama", "loaded": True}
         for t in (ollama.get("tags") or []):
-            if isinstance(t, dict) and t.get("name") and t["name"] not in index:
-                index[t["name"]] = {"upstream": "ollama", "loaded": False}
-        # LM Studio and vLLM only list what's actually resident — nothing auto-loads there, so
-        # anything they report is by definition already loaded.
-        for m in ((sysinfo.get("lmstudio") or {}).get("models") or []):
-            if isinstance(m, dict) and m.get("id"):
-                index[m["id"]] = {"upstream": "lmstudio", "loaded": True}
-        for m in ((sysinfo.get("vllm") or {}).get("models") or []):
-            if isinstance(m, dict) and m.get("id"):
-                index[m["id"]] = {"upstream": "vllm", "loaded": True}
+            if isinstance(t, dict):
+                put(t.get("name"), "ollama", False)
+        for m in (ollama.get("ps") or []):
+            if isinstance(m, dict):
+                put(m.get("name") or m.get("model"), "ollama", True)
+        # NOTE: both snapshots expose `loaded` / `available`, NOT `models`. Reading the wrong
+        # key here is why LM Studio and vLLM models never showed up in the bench picker.
+        lms = sysinfo.get("lmstudio") or {}
+        for m in (lms.get("available") or []):
+            if isinstance(m, dict):
+                put(m.get("id"), "lmstudio",
+                    (m.get("state") or "").lower() in ("loaded", "ready"),
+                    quant=m.get("quant"), arch=m.get("arch"),
+                    max_context=m.get("max_context_length"),
+                    loaded_context=m.get("loaded_context_length"),
+                    parallel=m.get("parallel"))
+        vll = sysinfo.get("vllm") or {}
+        for m in (vll.get("available") or []):
+            if isinstance(m, dict):
+                put(m.get("id"), "vllm", (m.get("state") or "loaded").lower() == "loaded",
+                    max_context=m.get("max_context_length"), arch=m.get("arch"))
     except Exception:
         pass
     if index:
@@ -6589,30 +6624,45 @@ async def _bench_model_index() -> dict:
 
     def _ollama_tags(j):
         for m in (j.get("models") or []):
-            if isinstance(m, dict) and m.get("name"):
-                index.setdefault(m["name"], {"upstream": "ollama", "loaded": False})
+            if isinstance(m, dict):
+                put(m.get("name"), "ollama", False)
 
     def _ollama_ps(j):
         for m in (j.get("models") or []):
-            if isinstance(m, dict) and (m.get("name") or m.get("model")):
-                index[m.get("name") or m.get("model")] = {"upstream": "ollama", "loaded": True}
+            if isinstance(m, dict):
+                put(m.get("name") or m.get("model"), "ollama", True)
+
+    def _lms_native(j):
+        # LM Studio's own API reports every downloaded model plus its state; the OpenAI-compat
+        # /v1/models can't distinguish loaded from merely present.
+        entries = j.get("data") if isinstance(j, dict) else j
+        for m in (entries or []):
+            if isinstance(m, dict):
+                put(m.get("id"), "lmstudio",
+                    (m.get("state") or "").lower() in ("loaded", "ready"),
+                    quant=m.get("quantization"), arch=m.get("arch"),
+                    max_context=m.get("max_context_length"),
+                    loaded_context=m.get("loaded_context_length"))
 
     def _openai_models(label):
         def parse(j):
             for m in (j.get("data") or []):
-                if isinstance(m, dict) and m.get("id"):
-                    index[m["id"]] = {"upstream": label, "loaded": True}
+                if isinstance(m, dict):
+                    put(m.get("id"), label, True, max_context=m.get("max_model_len"))
         return parse
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(4.0)) as c:
             await asyncio.gather(
                 _probe(c, f"{OLLAMA_URL}/api/tags", _ollama_tags),
-                _probe(c, f"{LMSTUDIO_URL}/v1/models", _openai_models("lmstudio")),
+                _probe(c, f"{LMSTUDIO_URL}/api/v0/models", _lms_native),
                 _probe(c, f"{VLLM_URL}/v1/models", _openai_models("vllm")),
             )
             # After tags, so a loaded model's entry wins over its catalogue entry.
             await _probe(c, f"{OLLAMA_URL}/api/ps", _ollama_ps)
+            if not any(v["upstream"] == "lmstudio" for v in index.values()):
+                # Older LM Studio builds predate /api/v0 — fall back, losing load state.
+                await _probe(c, f"{LMSTUDIO_URL}/v1/models", _openai_models("lmstudio"))
     except Exception:
         pass
     return index
@@ -6627,8 +6677,12 @@ async def bench_models():
     index = await _bench_model_index()
     items = [{"model": name, **meta} for name, meta in index.items()]
     items.sort(key=lambda i: (i["upstream"], not i["loaded"], i["model"]))
+    # Per-backend load semantics, so the UI can say what will happen rather than making the
+    # user know that Ollama auto-loads, LM Studio JIT-loads, and vLLM can't load anything.
+    out_modes = {u: _BENCH_LOAD_MODES[u] for u in _BENCH_LOAD_MODES}
     out: dict = {
         "items": items,
+        "load_modes": out_modes,
         # Kept for older clients / convenience.
         "ollama": {
             "loaded": [i["model"] for i in items if i["upstream"] == "ollama" and i["loaded"]],
