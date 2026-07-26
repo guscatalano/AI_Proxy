@@ -5539,10 +5539,13 @@ def stats():  # sync → threadpool
     combined_values: list[float] = []
     generation_values: list[float] = []
     processing_values: list[float] = []
-    # Anthropic batches its SSE output, so (duration − ttft) is transfer time, not
-    # decoding time. Exclude it from the generation-rate distribution to keep that metric
-    # meaningful. Processing-rate (prefill) and combined-throughput are still valid.
-    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio"}
+    # Anthropic batches its SSE output, so (duration − ttft) is transfer time, not decoding
+    # time. Exclude it from the generation-rate distribution to keep that metric meaningful.
+    # Processing-rate (prefill) and combined-throughput are still valid.
+    # vLLM streams token-by-token like the other local engines and belongs here — it was
+    # missing until 2026-07, which silently emptied the decode metric on any box that had
+    # moved its daily driver to vLLM.
+    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio", "vllm"}
     for r in tps_rows:
         ct = r["completion_tokens"] or 0
         pt = r["prompt_tokens"] or 0
@@ -5551,7 +5554,11 @@ def stats():  # sync → threadpool
         ups = r["upstream"]
         if dur > 0 and ct > 0:
             combined_values.append(ct / (dur / 1000.0))
-        if (ttft is not None and ttft > 0 and dur > ttft and ct > 0
+        # A decode rate needs a decode window worth dividing by. When a reply arrives in
+        # essentially one chunk, (dur - ttft) can be a fraction of a millisecond and the rate
+        # explodes into six figures — real rows, meaningless numbers, and they wreck p90/max
+        # even though the median shrugs them off.
+        if (ttft is not None and ttft > 0 and dur - ttft >= 100 and ct >= 8
                 and (ups in GENERATION_RATE_UPSTREAMS or ups is None)):
             # Older rows pre-backfill have ups=None; let those through so we don't lose data.
             generation_values.append(ct / ((dur - ttft) / 1000.0))
@@ -5587,6 +5594,28 @@ def stats():  # sync → threadpool
     overall["throughput"] = _dist(combined_values)            # legacy / combined
     overall["throughput_generation"] = _dist(generation_values)  # decode rate
     overall["throughput_processing"] = _dist(processing_values)  # prefill rate
+    # Decode rate by prompt depth. A single median blends 80-token prompts with 67k-token ones,
+    # and decode slows markedly as the KV cache grows — so the blended figure describes no real
+    # request, and can't be compared against a number someone quotes from a short prompt.
+    depth_buckets = [(0, 4000, "< 4K"), (4000, 16000, "4–16K"), (16000, 64000, "16–64K"),
+                     (64000, 1 << 30, "> 64K")]
+    by_depth = {label: [] for _lo, _hi, label in depth_buckets}
+    for r in tps_rows:
+        ct, dur, ttft, pt = (r["completion_tokens"] or 0), (r["duration_ms"] or 0), r["ttft_ms"], (r["prompt_tokens"] or 0)
+        ups = r["upstream"]
+        # Same guards as the overall generation rate, so the buckets can't disagree with it.
+        if not (ttft and ttft > 0 and dur - ttft >= 100 and ct >= 8 and pt > 0):
+            continue
+        if ups not in GENERATION_RATE_UPSTREAMS and ups is not None:
+            continue
+        for lo, hi, label in depth_buckets:
+            if lo <= pt < hi:
+                by_depth[label].append(ct / ((dur - ttft) / 1000.0))
+                break
+    overall["throughput_by_depth"] = [
+        {"bucket": label, **_dist(sorted(v))} for _lo, _hi, label in depth_buckets
+        for v in [by_depth[label]] if v
+    ]
 
     conn.close()
     result = {

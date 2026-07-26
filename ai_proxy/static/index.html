@@ -1243,7 +1243,7 @@ async function shellVitals() {
     + cell('Active', `<span class="sv-v">${active} <small>reqs</small></span>`)
     + cell('GPU', `<span class="sv-v">${gpuN == null ? '—' : gpuN}<small>%</small></span>`, `<span class="sv-bar"><i style="width:${gpuBar}%;background:${gpuCol}"></i></span>`)
     + cell('Mem', `<span class="sv-v">${memU == null ? '—' : Math.round(memU)}<small>/${memT == null ? '—' : Math.round(memT)} GB</small></span>`, `<span class="sv-bar"><i style="width:${memPct}%;background:#f0c674"></i></span>`)
-    + cell('Throughput', `<span class="sv-v">${tps}<small> tok/s</small></span>`)
+    + cell('Streaming now', `<span class="sv-v">${tps}<small> tok/s</small></span>`)
     + cell('Errors 1h', `<span class="sv-v" style="color:${errCol}">${errTxt}</span>`);
   // rail footer meta
   const su = $('sm-uptime'); if (su && _bootMs != null) su.textContent = fmtUptime((Date.now() - _bootMs) / 1000);
@@ -3002,6 +3002,10 @@ async function loadStats() {
     </tr>`;
   }
   const _gen = o.throughput_generation || {}, _proc = o.throughput_processing || {}, _comb = o.throughput || {};
+  // Headline is the decode median: it's what "N tok/s" means everywhere else, so it's the only
+  // version of this number that can be compared against someone else's.
+  const _decodeP50 = _gen.p50 != null ? _gen.p50.toFixed(1)
+                   : (_comb.p50 != null ? _comb.p50.toFixed(1) : '—');
   const _anyTps = _gen.samples || _proc.samples || _comb.samples;
   const tpSection = `
     <div class="stats-section">
@@ -3013,16 +3017,19 @@ async function loadStats() {
           <th class="num">p75</th><th class="num">p90</th><th class="num">max</th><th class="num">n</th>
         </tr></thead>
         <tbody>
-          ${_renderTpsMetricRow('Processing rate', 'prompt tokens ÷ prefill time (TTFT) — how fast it reads the prompt', '#68d391', _proc)}
-          ${_renderTpsMetricRow('Generation rate', 'completion tokens ÷ decode time — how fast it writes the reply', '#57d1e0', _gen)}
+          ${_renderTpsMetricRow('Processing rate', 'prompt tokens ÷ prefill time (TTFT) — inflated when the prompt cache hits, since the whole prompt counts but almost none of it was read', '#68d391', _proc)}
+          ${_renderTpsMetricRow('Generation rate', 'completion tokens ÷ decode time — how fast it writes the reply. This is the number people quote.', '#57d1e0', _gen)}
           ${_renderTpsMetricRow('Combined throughput', 'completion tokens ÷ TOTAL time (prefill + decode)', '#b48ead', _comb)}
+          ${(o.throughput_by_depth || []).length > 1 ? `<tr><td colspan="8" style="padding-top:12px;color:#8b97a8;font-size:11px">Generation rate by prompt depth — decode slows as the KV cache grows, so a blended median describes no real request</td></tr>` : ''}
+          ${(o.throughput_by_depth || []).length > 1 ? (o.throughput_by_depth || []).map(b =>
+              _renderTpsMetricRow('&nbsp;&nbsp;' + b.bucket + ' prompt', 'decode rate for requests with a prompt this size', '#3f7c88', b)).join('') : ''}
         </tbody>
       </table>
       ${_anyTps ? `<div style="margin-top:10px;padding:10px 12px;background:#20242e;border-left:3px solid #b48ead;border-radius:4px;font-size:12px;color:#bbb;line-height:1.5">
         <strong style="color:#d8c3e0">Why is “Combined” so much lower than the other two?</strong><br>
         They measure different things. <span style="color:#68d391">Processing</span> times only the <em>prefill</em> phase (reading the prompt); <span style="color:#57d1e0">Generation</span> times only the <em>decode</em> phase (writing the reply). Both can be fast.
         <span style="color:#b48ead">Combined</span> divides <strong>only the completion tokens</strong> by the <strong>entire</strong> request time — prefill <em>and</em> decode.
-        So when the prompt is far larger than the reply (e.g. an 85k-token prompt that produces a 200-token answer), the model spends most of its time prefilling — counted under Processing — while emitting few completion tokens, which drags the completion-per-second figure down. It's not a slowdown; it's a big-prompt / small-reply ratio. A prompt-cache <em>hit</em> skips prefill and pulls Combined back up toward Generation.
+        So when the prompt is far larger than the reply (e.g. an 85k-token prompt that produces a 200-token answer), the model spends most of its time prefilling — counted under Processing — while emitting few completion tokens, which drags the completion-per-second figure down. It's not a slowdown; it's a big-prompt / small-reply ratio. A prompt-cache <em>hit</em> skips prefill and pulls Combined back up toward Generation.<br><br>When someone quotes “this model does N tok/s”, they mean <span style="color:#57d1e0">Generation</span> on a short prompt — compare against that row, at the depth bucket that matches theirs.
       </div>` : ''}
     </div>`;
 
@@ -3072,7 +3079,7 @@ async function loadStats() {
   const kpiStrip = `<div class="s2-kpis">
     ${_kpi('Requests', num(o.count || 0), '', `${num(o.streams || 0)} streamed`)}
     ${_kpi('Total tokens', num(o.total_tokens || 0), '', `p ${num(o.prompt_tokens || 0)} · c ${num(o.completion_tokens || 0)}`)}
-    ${_kpi('Throughput', overallTokSec, 'tok/s', 'completion / decode')}
+    ${_kpi('Decode rate', _decodeP50, 'tok/s', 'median, prefill excluded')}
     ${_kpi('Avg latency', num(Math.round(o.avg_ms || 0)), 'ms', `${(((o.total_ms || 0) / 1000)).toFixed(0)}s upstream`)}
     ${_kpi('Errors', num(o.errors || 0), '', `${_errRate.toFixed(1)}% of reqs`, _errRate > 1 ? 's2-bad' : '')}
     ${_kpi('Cache hit', _cacheHit, '', 'prefill reuse')}
