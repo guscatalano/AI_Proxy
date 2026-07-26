@@ -360,16 +360,21 @@ def test_report_html_is_self_contained(client, monkeypatch):
     assert "@media print" in html    # printable to PDF
 
 
-def test_report_html_escapes_model_names():
-    """Model names come from upstreams and end up in the page; they are not trusted markup."""
-    run = {
-        "id": "b_y", "ts": 1785000000.0, "label": "<script>alert(1)</script>",
-        "model": "<img onerror=x>", "config": {}, "env": {},
-        "results": {"summary": {"n_total": 1, "n_success": 1}},
-    }
-    html = p._bench_report_html([run], [p._bench_report_row(run)])
-    assert "<script>alert(1)</script>" not in html
-    assert "&lt;script&gt;" in html
+def test_report_html_escapes_untrusted_names():
+    """Model names, labels and upstreams come from outside and land in the page. None of them is
+    trusted markup, in either the single-configuration or the comparison layout."""
+    def mk(i):
+        return {
+            "id": f"b_{i}", "ts": 1785000000.0, "label": "<script>alert(1)</script>",
+            "model": "<img onerror=x>", "config": {"upstream": "<b>x</b>"}, "env": {},
+            "results": {"summary": {"n_total": 1, "n_success": 1,
+                                    "served_models": ["<svg onload=y>"]}},
+        }
+    for runs in ([mk(1)], [mk(1), mk(2)]):          # single-cell and comparison paths
+        html = p._bench_report_html(runs, [p._bench_report_row(r) for r in runs])
+        for raw in ("<script>alert(1)</script>", "<img onerror=x>", "<svg onload=y>"):
+            assert raw not in html, raw
+        assert "&lt;" in html, "nothing was escaped at all"
 
 
 # ---- cache / concurrency axes -------------------------------------------------------------

@@ -7200,6 +7200,16 @@ _REPORT_CSS = """
                   font-size:1.06em; letter-spacing:-.02em; }
   .hero .why { color:var(--ink-faint); font-size:13px; margin:10px 0 0; max-width:74ch; }
   /* Minor tables sit side by side: full width would give them an authority they haven't earned. */
+  /* A single run is a record: read down a list of properties, not across a 14-column row. */
+  .spec { display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:1px;
+          background:var(--border); border:1px solid var(--border); border-radius:10px;
+          overflow:hidden; margin:16px 0 4px; }
+  .spec div { background:var(--panel); padding:11px 14px; }
+  .spec .k { font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase;
+             color:var(--ink-faint); margin:0 0 5px; }
+  .spec .v { font-family:var(--mono); font-size:14px; color:var(--ink); margin:0;
+             overflow-wrap:anywhere; }
+  .spec .v.big { font-size:19px; font-weight:600; color:var(--accent); letter-spacing:-.02em; }
   .band { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:0 26px; }
   .band > section > h2 { margin-top:26px; }
   section { min-width:0; }
@@ -7291,7 +7301,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         for g in gpus) or "not reported"
     when = runs[0].get("ts")
     when_txt = datetime.datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M") if when else "—"
-    title = rows[0]["label"] if len(rows) == 1 else f"{len(rows)} configurations"
+    title = ((rows[0].get("served") or rows[0]["model"]) if len(rows) == 1
+             else f"{len(rows)} configurations")
 
     def fmt(v, digits=0, suffix=""):
         return "—" if v is None else f"{v:,.{digits}f}{suffix}"
@@ -7383,11 +7394,29 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         if tasks:
             labels = [r["label"] for r in rows]
             th = "".join(f"<th>{_h(l)}</th>" for l in labels)
-            trs = []
-            for tname, per in sorted(tasks.items()):
-                tds = "".join(
-                    f'<td class="n">{pct(per.get(l))}</td>' for l in labels)
-                trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
+            # With one configuration, a row per task is a column of identical 100%s. Only the
+            # tasks that lost a case carry information, so list those and count the rest.
+            items = sorted(tasks.items())
+            if len(rows) == 1:
+                lab = labels[0]
+                imperfect = [(t, per) for t, per in items if (per.get(lab) or 0) < 1]
+                clean = len(items) - len(imperfect)
+                if not imperfect:
+                    task_summary = (f'<p class="note">All <b>{clean}</b> tasks fully correct on '
+                                    "every run — nothing to single out.</p>")
+                    trs = []
+                else:
+                    task_summary = (f'<p class="note"><b>{clean}</b> of {len(items)} tasks were '
+                                    "fully correct on every run; the ones that were not are "
+                                    "listed below.</p>")
+                    trs = [f'<tr><th scope="row"><code>{_h(t)}</code></th>'
+                           f'<td class="n">{pct(per.get(lab))}</td></tr>' for t, per in imperfect]
+            else:
+                task_summary = ""
+                trs = []
+                for tname, per in items:
+                    tds = "".join(f'<td class="n">{pct(per.get(l))}</td>' for l in labels)
+                    trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
             tier_rows = ""
             if any(r.get("tiers") for r in rows):
                 names = {"core": "Core \u2014 any usable coding model clears these",
@@ -7412,7 +7441,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             task_html = tier_html + f"""<h2>Per-task correctness</h2>
 <p class="note">Share of responses that passed every case for that task. A model strong
 everywhere except one task and a model mediocre throughout can share an overall average.</p>
-<table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table>"""
+{task_summary}
+{f'<div class="tbl"><table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>' if trs else ""}"""
 
     # Cold vs cached, paired by everything except the cache axis. This is the comparison that
     # exposes a backend serving every repeated prompt as a fresh prefill.
@@ -7471,20 +7501,54 @@ ordinary slowness rather than a misconfiguration.</p>
             "<table><thead><tr><th>Configuration</th><th>Prompt</th><th>Cold TTFT</th>"
             "<th>Cached TTFT</th><th>Faster by</th></tr></thead><tbody>" + trs + "</tbody></table>")
 
-    warm = [f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}"
+    warm = [(fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')
+             if len(rows) == 1 else
+             f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}")
             for r, run in zip(rows, runs)
             if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
 
-    body = f"""
+    if single:
+        r0 = rows[0]
+        cfg0 = (runs[0].get("config") or {})
+        q0 = r0.get("perfect_rate")
+        # The verdict first. A wide table asks you to reconstruct it from fifteen cells.
+        verdict = (f"scored <b>{q0 * 100:.0f}%</b> fully correct" if q0 is not None
+                   else f"completed <b>{r0['n_success']}</b> of {r0['n_total']} requests")
+        results = f"""
+  <div class="hero">
+    <p class="lede"><b>{_h(r0["served"] or r0["model"])}</b> {verdict} at
+      <b>{_fmt_n(r0["decode_p50"], 1)}</b> tok/s, first token in <b>{_fmt_n(r0["ttft_p50"], 0)}</b> ms.</p>
+    <p class="why">{r0["n_success"]} of {r0["n_total"]} requests succeeded.</p>
+  </div>
+  <h2>Configuration</h2>
+  <div class="spec">
+    <div><p class="k">Backend</p><p class="v">{_h(cfg0.get("upstream") or "—")}</p></div>
+    <div><p class="k">Context</p><p class="v">{_fmt_n(r0["prompt_tokens"]) if r0["prompt_tokens"] else "short"}</p></div>
+    <div><p class="k">Thinking</p><p class="v">{_h(r0["thinking"] or "auto")}</p></div>
+    <div><p class="k">Prompt cache</p><p class="v">{_h(r0.get("cache") or "—")}</p></div>
+    <div><p class="k">Temperature</p><p class="v">{"—" if r0.get("temperature") is None else _h(str(r0["temperature"]))}</p></div>
+    <div><p class="k">Quantisation</p><p class="v">{_h(r0.get("quant") or "not reported")}</p></div>
+    <div><p class="k">Decode rate</p><p class="v big">{_fmt_n(r0["decode_p50"], 1)}</p></div>
+    <div><p class="k">Time to first token</p><p class="v big">{_fmt_n(r0["ttft_p50"], 0)} ms</p></div>
+    <div><p class="k">Reply length</p><p class="v">{_fmt_n(r0.get("mean_tokens"), 0)} tok</p></div>
+    <div><p class="k">Total per request</p><p class="v">{_fmt_n(r0["total_p50"], 0)} ms</p></div>
+  </div>
+"""
+    else:
+        results = f"""
   <h2>Results</h2>
   <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
   the gap between them is time the model spent reasoning. Decode rate is measured from the first
-  token onward, so reasoning tokens count as generated work.
-  {"" if single else "Best value in each column is highlighted."}</p>
+  token onward, so reasoning tokens count as generated work. Best value in each column is
+  highlighted.</p>
   <div class="tbl"><table>
     <thead><tr>{"".join(f'<th>{_h(h)}</th>' for h in head)}</tr></thead>
     <tbody>{"".join(body_rows)}</tbody>
   </table></div>
+"""
+
+    body = f"""
+  {results}
 
   <h2>{"Consistency" if single else "At a glance"}</h2>
   {charts}
