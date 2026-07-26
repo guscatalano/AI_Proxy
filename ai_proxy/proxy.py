@@ -2098,6 +2098,28 @@ DEFAULT_RULES_CONFIG = {
             "ai-proxy-chat": "system_reminder_plain",
         },
     },
+    "model_control": {
+        # Loading and unloading models, and switching which vLLM server is up. Not a request
+        # transform like the rest of this file, but this is the config surface that is editable
+        # live and survives restarts, so it lives here rather than in a second mechanism.
+        #
+        # vllm_containers: the containers that represent your vLLM configurations. Leave empty to
+        # auto-discover anything whose name or image mentions vllm — fine for the common case,
+        # but list them explicitly when a container is named something else, or when you want the
+        # proxy to leave the others alone. They must publish the port VLLM_URL points at, since
+        # they contend for it and only one can be up.
+        #   "vllm_containers": ["qwen-vllm", "ornith-vllm"]
+        "vllm_containers": [],
+        # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
+        # /v1/models to answer before reporting that it started but is not ready.
+        "vllm_ready_timeout_s": 420,
+        # Applied when loading an LM Studio model, unless the request overrides them. A model
+        # loaded at the wrong context length or without parallelism benchmarks as a different
+        # thing, so these are worth pinning per box.
+        "lmstudio_context_length": None,
+        "lmstudio_parallel": None,
+        "lmstudio_gpu": None,
+    },
     "tool_injector": {
         # Adds proxy-owned tools to outgoing requests and executes them server-side. The model
         # sees them in tools[] like any other tool; when it calls one, the proxy intercepts
@@ -5341,7 +5363,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
+    known_extras = ["model_control", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -6546,13 +6568,20 @@ async def _vllm_configs() -> list:
         want_port = str(httpx.URL(VLLM_URL).port or 8000)
     except Exception:
         want_port = "8000"
+    named = [str(n) for n in ((load_rules_config().get("model_control") or {})
+                              .get("vllm_containers") or []) if n]
     out_list = []
     for line in out.splitlines():
         parts = line.split("	")
         if len(parts) < 3:
             continue
         name, image, state = parts[0].strip(), parts[1].strip(), parts[2].strip()
-        if "vllm" not in image.lower() and "vllm" not in name.lower():
+        if named:
+            # An explicit list means exactly these, so a container the proxy should not touch
+            # cannot be swept up by a name that happens to contain "vllm".
+            if name not in named:
+                continue
+        elif "vllm" not in image.lower() and "vllm" not in name.lower():
             continue
         rc, cmd_json = await _run_cmd([docker, "inspect", name, "--format", "{{json .Config.Cmd}}"], 15.0)
         args = []
@@ -6711,13 +6740,18 @@ async def control_model_load(request: Request):
             return JSONResponse({"error": why}, status_code=501)
         args = ["load", name, "--yes"]
         # These matter for real workloads: a model loaded at the wrong context length or without
-        # parallelism benchmarks as a different thing entirely.
-        if payload.get("context_length"):
-            args += ["--context-length", str(int(payload["context_length"]))]
-        if payload.get("parallel"):
-            args += ["--parallel", str(int(payload["parallel"]))]
-        if payload.get("gpu"):
-            args += ["--gpu", str(payload["gpu"])]
+        # parallelism benchmarks as a different thing entirely. The request wins over the
+        # per-box defaults in model_control.
+        mc = load_rules_config().get("model_control") or {}
+        ctx = payload.get("context_length") or mc.get("lmstudio_context_length")
+        par = payload.get("parallel") or mc.get("lmstudio_parallel")
+        gpu = payload.get("gpu") or mc.get("lmstudio_gpu")
+        if ctx:
+            args += ["--context-length", str(int(ctx))]
+        if par:
+            args += ["--parallel", str(int(par))]
+        if gpu:
+            args += ["--gpu", str(gpu)]
         if payload.get("ttl_s"):
             args += ["--ttl", str(int(payload["ttl_s"]))]
         t0 = time.perf_counter()
@@ -6758,7 +6792,9 @@ async def control_model_load(request: Request):
         if code != 0:
             return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
         # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
-        ready = await _vllm_ready(float(payload.get("wait_s") or 420))
+        cfg_mc = load_rules_config().get("model_control") or {}
+        ready = await _vllm_ready(float(payload.get("wait_s")
+                                        or cfg_mc.get("vllm_ready_timeout_s") or 420))
         return {"ok": ready, "started_container": container, "stopped_containers": stopped,
                 "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
                 "error": None if ready else "container started but the server did not become "

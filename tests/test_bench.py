@@ -754,3 +754,29 @@ def test_quant_falls_back_when_the_checkpoint_is_a_bind_mount():
     assert p._infer_quant("/model", "ornith-nvfp4", "ornith-vllm", []) == "NVFP4"
     assert p._infer_quant("/model", None, "x", ["/home/u/models/ornith-nvfp4"]) == "NVFP4"
     assert p._infer_quant("/model", "plain", "plain", ["/data/plain"]) is None
+
+
+def test_explicit_container_list_excludes_everything_else(monkeypatch):
+    """Auto-discovery matches on the name or image containing "vllm", which could sweep up a
+    container the proxy has no business stopping. An explicit list means exactly those."""
+    async def fake_run(args, timeout=120.0):
+        if "ps" in args:
+            return 0, ("qwen-vllm\tvllm/vllm-openai\trunning\t0.0.0.0:8001->8000/tcp\n"
+                       "ornith-vllm\tvllm/vllm-openai\texited\t\n"
+                       "someone-elses-vllm\tvllm/vllm-openai\trunning\t0.0.0.0:9999->8000/tcp")
+        if "Config.Cmd" in args[-1]:
+            return 0, '["--served-model-name","m"]'
+        if "PortBindings" in args[-1]:
+            return 0, '{"8000/tcp":[{"HostPort":"8001"}]}'
+        return 0, "[]"
+    monkeypatch.setattr(p, "_run_cmd", fake_run)
+    monkeypatch.setattr(p, "_docker_bin", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(p, "VLLM_URL", "http://localhost:8001")
+
+    monkeypatch.setattr(p, "load_rules_config", lambda: {})
+    assert {c["container"] for c in asyncio.run(p._vllm_configs())} == {
+        "qwen-vllm", "ornith-vllm", "someone-elses-vllm"}, "auto-discovery takes all of them"
+
+    monkeypatch.setattr(p, "load_rules_config",
+                        lambda: {"model_control": {"vllm_containers": ["qwen-vllm", "ornith-vllm"]}})
+    assert {c["container"] for c in asyncio.run(p._vllm_configs())} == {"qwen-vllm", "ornith-vllm"}

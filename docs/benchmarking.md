@@ -130,6 +130,55 @@ everyone else using the box, which is not a reasonable default for a button labe
 
 **Advanced** exposes every control described below. The choice is remembered.
 
+## Model residency
+
+Comparing models means controlling which one is on the card, and each backend offers a different
+mechanism — so the proxy uses each one rather than pretending to a uniform abstraction:
+
+| Backend | Load | Unload | Mechanism |
+|---|---|---|---|
+| Ollama | ✅ | ✅ | `keep_alive` over HTTP |
+| LM Studio | ✅ | ✅ | the `lms` CLI — no HTTP endpoints exist |
+| vLLM | ✅ | ✅ | `docker start` / `stop` of the container publishing its port |
+
+Only **local** upstreams are eligible. A remote `LMSTUDIO_URL` or `VLLM_URL` combined with a
+local CLI or container would act on a different machine and report success, so it's refused with
+the reason.
+
+### vLLM configurations
+
+vLLM holds one model for the life of the server, so "switch model" means "run a different
+server". Each configuration is a **container you define** — the proxy doesn't template
+`docker run`, because defining how a server starts is Docker's job and you are almost certainly
+doing it that way already:
+
+```bash
+docker create --name ornith-vllm --gpus all -p 8001:8000   -v ~/models/ornith-nvfp4:/model vllm/vllm-openai:latest   --model /model --served-model-name ornith-nvfp4 --enable-prefix-caching --kv-cache-dtype fp8
+```
+
+They contend for one published port, which is what makes them a menu: activating one stops
+whatever else is running first. `GET /__proxy/api/control/models/vllm` lists them with the served
+model, checkpoint, quantisation, context length, KV dtype and whether prefix caching is on — all
+read back from the container, so the report describes what actually ran.
+
+By default any container whose name or image mentions `vllm` is discovered. To be explicit —
+because a container named `coder-server` would be missed, and one you don't want touched could be
+swept up — list them in the rules editor:
+
+```json
+"model_control": {
+  "vllm_containers": ["qwen-vllm", "ornith-vllm"],
+  "vllm_ready_timeout_s": 420,
+  "lmstudio_context_length": 262144,
+  "lmstudio_parallel": 4
+}
+```
+
+`vllm_ready_timeout_s` matters because `docker start` returns in milliseconds while vLLM takes
+minutes: the load waits for `/v1/models` to answer before claiming success. The LM Studio values
+are per-box defaults for `lms load`, since a model loaded at the wrong context length benchmarks
+as a different thing entirely.
+
 ## The cache axis
 
 `cold` salts every prompt so nothing can be served from the prefix cache; `cached` repeats one
