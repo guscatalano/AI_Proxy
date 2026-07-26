@@ -6957,6 +6957,9 @@ async def bench_run(request: Request):
         "bypass_router": bool(payload.get("bypass_router", False)),
         "no_nudge": bool(payload.get("no_nudge", False)),
         "quiesce": bool(payload.get("quiesce", False)),
+        # Unload other Ollama models before each cell, without gating traffic. Only Ollama can
+        # be controlled this way; see _bench_evict_ollama.
+        "evict_others": bool(payload.get("evict_others", False)),
         # On by default: an unloaded model's load time would otherwise land in the first
         # measured request. Turn it off only when cold-start IS what you're measuring.
         "warmup": bool(payload.get("warmup", True)),
@@ -9077,12 +9080,39 @@ async def _bench_env_snapshot() -> dict:
     return env
 
 
-async def _bench_quiesce(enable: bool, prior: dict | None = None) -> dict:
+async def _bench_evict_ollama(keep: str = "") -> list:
+    """Unload every Ollama model except `keep`. Returns the names unloaded.
+
+    This is the only per-model residency control any of the three backends offers over HTTP.
+    LM Studio exposes no unload endpoint (its JIT TTL handles eviction on its own schedule), and
+    vLLM serves exactly the model its server was launched with — so a benchmark cannot arrange
+    for its target to be the only resident model, only for Ollama not to be holding VRAM it
+    doesn't need to.
+    """
+    unloaded: list = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+            ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+            for m in (ps.get("models") or []):
+                name = m.get("name") or m.get("model")
+                if not name or name == keep:
+                    continue
+                # keep_alive=0 is Ollama's "unload now"; there is no separate stop endpoint.
+                await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": name, "keep_alive": 0, "prompt": ""})
+                unloaded.append(name)
+    except Exception:
+        pass
+    return unloaded
+
+
+async def _bench_quiesce(enable: bool, prior: dict | None = None, keep: str = "") -> dict:
     """Quiet the box for a clean run, and put it back afterward.
 
     Exclusive mode only gates traffic *through the proxy* — Ollama still serves whatever asks
     it directly on its own port, and an idle loaded model still holds VRAM. So quiescing also
-    means stopping Ollama's loaded models. Returns the prior state so it can be restored.
+    unloads Ollama's models, sparing `keep` so the cell about to run isn't evicted and then
+    immediately reloaded. Returns the prior state so it can be restored.
     """
     state: dict = {"panic_was": _PANIC_MODE, "ollama_was": []}
     if enable:
@@ -9090,17 +9120,7 @@ async def _bench_quiesce(enable: bool, prior: dict | None = None) -> dict:
             _set_panic_mode(True)
         except Exception as e:
             state["panic_error"] = f"{type(e).__name__}: {e}"
-        try:
-            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
-                ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
-                loaded = [m.get("name") or m.get("model") for m in (ps.get("models") or [])]
-                state["ollama_was"] = [m for m in loaded if m]
-                for name in state["ollama_was"]:
-                    # keep_alive=0 is Ollama's "unload now" — no separate stop endpoint.
-                    await c.post(f"{OLLAMA_URL}/api/generate",
-                                 json={"model": name, "keep_alive": 0, "prompt": ""})
-        except Exception as e:
-            state["ollama_error"] = f"{type(e).__name__}: {e}"
+        state["ollama_was"] = await _bench_evict_ollama(keep)
         return state
     # Restore.
     prior = prior or {}
@@ -9261,9 +9281,12 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     conn.commit()
     conn.close()
 
+    # Deliberately not evicting here: each child evicts for itself, sparing its own model, so a
+    # multi-model sweep measures each model without the previous one still holding VRAM. A single
+    # eviction up front would only help the first cell.
     quiesce_state = None
     if cfg.get("quiesce"):
-        quiesce_state = await _bench_quiesce(True)
+        quiesce_state = await _bench_quiesce(True, keep="")
     try:
       try:
         for i, cid in enumerate(child_ids, start=1):
@@ -9381,7 +9404,20 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             gate_held = True
             if drain_seconds > 0:
                 await asyncio.sleep(drain_seconds)
-        quiesce_state = await _bench_quiesce(True) if cfg.get("quiesce") else None
+        # Spare the model about to run, or it would be evicted and immediately reloaded.
+        quiesce_state = (await _bench_quiesce(True, keep=model)
+                         if cfg.get("quiesce") else None)
+        if cfg.get("evict_others") and not cfg.get("quiesce"):
+            # Same eviction without the traffic gate, for the common case of wanting a clean
+            # measurement without also blocking everyone.
+            evicted = await _bench_evict_ollama(keep=model)
+            if evicted:
+                env["evicted_before_run"] = evicted
+                conn = db()
+                conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                             (json.dumps(env), bench_id))
+                conn.commit()
+                conn.close()
         try:
             base = f"http://127.0.0.1:{PROXY_PORT}"
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))

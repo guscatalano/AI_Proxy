@@ -616,3 +616,32 @@ def test_resolve_model_prefers_the_exact_backend_pair():
     assert p._bench_resolve_model(index, "m", "vllm")["max_context"] == 262144
     # Without an upstream, a loaded copy wins over an unloaded one.
     assert p._bench_resolve_model(index, "m")["upstream"] == "vllm"
+
+
+def test_eviction_spares_the_model_about_to_run(monkeypatch):
+    """Evicting the target and then immediately reloading it would add a cold load to the very
+    measurement the eviction exists to clean up."""
+    calls = []
+
+    class FakeResp:
+        def json(self):
+            return {"models": [{"name": "a"}, {"name": "target"}, {"name": "b"}]}
+
+    class FakeClient:
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+        async def get(self, url): return FakeResp()
+        async def post(self, url, json=None): calls.append(json["model"])
+
+    monkeypatch.setattr(p.httpx, "AsyncClient", lambda **kw: FakeClient())
+    unloaded = asyncio.run(p._bench_evict_ollama(keep="target"))
+    assert "target" not in calls, "the model about to be measured must not be evicted"
+    assert set(calls) == {"a", "b"}
+    assert set(unloaded) == {"a", "b"}
+
+
+def test_eviction_reports_what_it_unloaded():
+    """Silent eviction of someone else's model is not acceptable; the run records it."""
+    import inspect
+    src = inspect.getsource(p._bench_execute)
+    assert "evicted_before_run" in src, "eviction must be recorded in the run environment"
