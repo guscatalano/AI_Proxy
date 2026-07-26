@@ -280,12 +280,12 @@ def test_model_index_reads_the_snapshot_keys_the_snapshots_actually_emit(monkeyp
     monkeypatch.setattr(p, "system_now", fake_system_now)
     index = asyncio.run(p._bench_model_index())
 
-    assert index["qwen/qwen3-coder-next"]["upstream"] == "lmstudio"
-    assert index["qwen/qwen3-coder-next"]["loaded"] is False
-    assert index["qwen/qwen3-coder-next"]["quant"] == "Q4_K_M"
-    assert index["ornith-35b"]["loaded"] is True
-    assert index["ornith-nvfp4"]["upstream"] == "vllm"
-    assert index["llama3:8b"]["loaded"] is True
+    assert index["lmstudio:qwen/qwen3-coder-next"]["upstream"] == "lmstudio"
+    assert index["lmstudio:qwen/qwen3-coder-next"]["loaded"] is False
+    assert index["lmstudio:qwen/qwen3-coder-next"]["quant"] == "Q4_K_M"
+    assert index["lmstudio:ornith-35b"]["loaded"] is True
+    assert index["vllm:ornith-nvfp4"]["upstream"] == "vllm"
+    assert index["ollama:llama3:8b"]["loaded"] is True
 
 
 def test_model_index_records_per_backend_load_semantics(monkeypatch):
@@ -300,9 +300,9 @@ def test_model_index_records_per_backend_load_semantics(monkeypatch):
 
     monkeypatch.setattr(p, "system_now", fake_system_now)
     index = asyncio.run(p._bench_model_index())
-    assert index["m1"]["load_mode"] == "on-demand"
-    assert index["m2"]["load_mode"] == "jit"
-    assert index["m3"]["load_mode"] == "fixed"
+    assert index["ollama:m1"]["load_mode"] == "on-demand"
+    assert index["lmstudio:m2"]["load_mode"] == "jit"
+    assert index["vllm:m3"]["load_mode"] == "fixed"
 
 
 def test_loaded_entry_wins_over_catalogue_entry(monkeypatch):
@@ -313,7 +313,7 @@ def test_loaded_entry_wins_over_catalogue_entry(monkeypatch):
                 "lmstudio": {}, "vllm": {}}
 
     monkeypatch.setattr(p, "system_now", fake_system_now)
-    assert asyncio.run(p._bench_model_index())["dup"]["loaded"] is True
+    assert asyncio.run(p._bench_model_index())["ollama:dup"]["loaded"] is True
 
 
 def test_upstream_pin_header_does_not_corrupt_the_router_verdict(client):

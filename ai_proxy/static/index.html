@@ -5966,14 +5966,14 @@ async function loadBench() {
           <span style="color:#8b97a8">Models are listed by the backend that serves them — ● loaded, ○ not. Picking one doesn't load it: Ollama loads on first use (the warm-up absorbs that), while LM Studio and vLLM only serve what's already resident. Select several models, prompt sizes, thinking modes or temperatures to sweep the whole matrix, one cell at a time.</span>
         </div>
         <div style="display:grid;grid-template-columns:auto 1fr auto 1fr;gap:8px 12px;align-items:center;font-size:12px;margin-bottom:10px">
-          <label>Models</label><select id="bench-model" multiple size="5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"></select>
+          <label>Backend</label><div id="bench-upstreams" style="display:flex;gap:6px;flex-wrap:wrap"></div>
+          <label>Models</label><select id="bench-model" multiple size="6" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"></select>
           <label>Prompt size</label><select id="bench-prompt" multiple size="5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="0" selected>short (~80 tok)</option><option value="2000">2K</option><option value="4000">4K</option><option value="8000">8K</option><option value="16000">16K</option><option value="32000">32K</option><option value="65536">64K</option><option value="131072">128K</option><option value="262144">256K</option></select>
           <label>Runs / cell</label><input id="bench-runs" type="number" value="5" min="1" max="50" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
           <label>Max tokens</label><input id="bench-maxtok" type="number" value="256" min="16" max="8192" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
           <label>Thinking</label><select id="bench-thinking" multiple size="4" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="auto" selected>auto (proxy quirks apply)</option><option value="off">off (kwarg + reasoning_effort)</option><option value="off_prefill">off via &lt;think&gt; prefill (LM Studio)</option><option value="on">on</option></select>
           <label>Temperature</label><input id="bench-temp" placeholder="engine default — or 0, 0.2" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px">
           <label>Concurrency</label><select id="bench-concur" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="1">1 (serial)</option><option value="2">2 parallel</option><option value="4">4 parallel</option><option value="8">8 parallel</option></select>
-          <label title="Normally inferred from the model you picked — the proxy knows which backend serves it. Override only to force a specific one.">Upstream</label><select id="bench-upstream" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="">auto — from the model</option><option value="ollama">force ollama</option><option value="lmstudio">force lmstudio</option><option value="vllm">force vllm</option></select>
           <label>Graded suite</label><select id="bench-suite" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px"><option value="">none (perf only)</option></select>
           <label>Drain (s)</label><input id="bench-drain" type="number" value="5" min="0" max="30" step="0.5" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:4px;width:80px">
         </div>
@@ -6028,35 +6028,16 @@ async function _benchPopulateModels() {
     // /api/bench/models unions every upstream the proxy can reach — benching LM Studio or
     // vLLM shouldn't require the model to also exist in Ollama.
     const d = await (await fetch('/__proxy/api/bench/models')).json();
+    _benchModels = d.items || [];
+    _benchUpstreams = d.upstreams || [];
     _benchModelIndex = {};
-    const items = d.items || [];
-    for (const it of items) _benchModelIndex[it.model] = it;
-    // Grouped by the upstream that serves them, with load state on the option itself — an
-    // unloaded model costs a load on first use, which is what the warm-up exists to absorb.
-    const byUp = {};
-    for (const it of items) (byUp[it.upstream] = byUp[it.upstream] || []).push(it);
-    // Each backend gets its load semantics in the group label, since that's what decides
-    // whether picking an unloaded model is fine or futile.
-    const label = {
-      ollama: 'Ollama — loads on demand',
-      lmstudio: 'LM Studio — JIT-loads on demand',
-      vllm: 'vLLM — fixed, serves only what it was launched with',
-    };
-    const ctx = n => n == null ? '' : (n >= 1000 ? Math.round(n / 1024) + 'K' : String(n));
-    const groups = Object.keys(byUp).sort().map(up =>
-      `<optgroup label="${esc(label[up] || up)}">` + byUp[up].map(it => {
-        // Quant and window are the two facts you need beside a benchmark number.
-        const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(', ');
-        return `<option value="${esc(it.model)}">${it.loaded ? '● ' : '○ '}${esc(it.model)}${meta ? '  [' + esc(meta) + ']' : ''}${it.loaded ? '' : '  (not loaded)'}</option>`;
-      }).join('') + '</optgroup>').join('');
-    sel.innerHTML = groups || '<option disabled>(no models)</option>';
-    // Default to something already resident, so the obvious first click measures a warm model.
-    const loadedOpt = items.find(i => i.loaded);
-    const pick = loadedOpt ? sel.querySelector(`option[value="${CSS.escape(loadedOpt.model)}"]`)
-                           : sel.querySelector('option:not([disabled])');
-    if (pick) pick.selected = true;
-  } catch {
-    sel.innerHTML = '<option disabled>(failed to fetch models)</option>';
+    for (const it of _benchModels) _benchModelIndex[it.key] = it;
+    _benchRenderUpstreams();
+    _benchRenderModels();
+  } catch (e) {
+    // Surface the reason: swallowing it made a render bug look like an unreachable backend.
+    console.error('bench: model list failed', e);
+    sel.innerHTML = `<option disabled>(failed to load models: ${esc(e.message || e)})</option>`;
   }
   try {
     const s = await (await fetch('/__proxy/api/bench/suites')).json();
@@ -6067,6 +6048,81 @@ async function _benchPopulateModels() {
   _benchUpdatePlan();
 }
 
+// The backend picker doubles as the model filter — the model list is grouped by upstream
+// anyway, so a separate "which upstream" field was asking for information already implied by
+// the model choice (and letting the two contradict each other).
+function _benchRenderUpstreams() {
+  const host = $('bench-upstreams');
+  if (!host) return;
+  const note = {'on-demand': 'loads on demand', 'jit': 'JIT-loads on demand',
+                'fixed': 'fixed at server launch'};
+  const chip = (id, label, sub, on, dim) =>
+    `<button data-up="${esc(id)}" title="${esc(sub)}" ${dim ? 'disabled' : ''} style="background:${on ? '#1c3a44' : '#161b24'};border:1px solid ${on ? '#2f8f9c' : '#262d38'};color:${dim ? '#4a5260' : (on ? '#57d1e0' : '#9aa4b2')};border-radius:6px;padding:4px 10px;font-size:11px;cursor:${dim ? 'default' : 'pointer'}">${esc(label)}</button>`;
+  const total = _benchModels.length;
+  const totalLoaded = _benchModels.filter(m => m.loaded).length;
+  let html = chip('', `All · ${totalLoaded}/${total} loaded`, 'Every reachable backend', _benchUpFilter === '', false);
+  for (const u of _benchUpstreams) {
+    html += chip(u.upstream,
+      `${u.upstream} · ${u.loaded}/${u.total} loaded`,
+      u.reachable ? note[u.load_mode] || '' : 'not reachable',
+      _benchUpFilter === u.upstream, !u.reachable);
+  }
+  host.innerHTML = html;
+  for (const b of host.querySelectorAll('button[data-up]')) {
+    b.onclick = () => {
+      _benchUpFilter = b.dataset.up;
+      _benchRenderUpstreams();
+      _benchRenderModels();
+      _benchUpdatePlan();
+    };
+  }
+}
+
+function _benchRenderModels() {
+  const sel = $('bench-model');
+  if (!sel) return;
+  const prev = new Set(Array.from(sel.selectedOptions).map(o => o.value));
+  const items = _benchUpFilter
+    ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels;
+  if (!items.length) {
+    sel.innerHTML = '<option disabled>(no models on this backend)</option>';
+    return;
+  }
+  // Option values are the "<upstream>:<model>" key, not the bare name: the same model can be
+  // served by two backends, and selecting by name alone couldn't tell them apart.
+  const byUp = {};
+  for (const it of items) (byUp[it.upstream] = byUp[it.upstream] || []).push(it);
+  const label = {
+    ollama: 'Ollama — loads on demand',
+    lmstudio: 'LM Studio — JIT-loads on demand',
+    vllm: 'vLLM — fixed, serves only what it was launched with',
+  };
+  const ctx = n => n == null ? '' : (n >= 1024 ? Math.round(n / 1024) + 'K' : String(n));
+  // Only group when more than one backend is in view; filtered to one, the group header is noise.
+  const ups = Object.keys(byUp).sort();
+  const optFor = it => {
+    // Quant and window are the two facts you need beside a benchmark number.
+    const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(', ');
+    return `<option value="${esc(it.key)}">${it.loaded ? '● ' : '○ '}${esc(it.model)}${meta ? '  [' + esc(meta) + ']' : ''}${it.loaded ? '' : '  (not loaded)'}</option>`;
+  };
+  sel.innerHTML = ups.length > 1
+    ? ups.map(up => `<optgroup label="${esc(label[up] || up)}">${byUp[up].map(optFor).join('')}</optgroup>`).join('')
+    : byUp[ups[0]].map(optFor).join('');
+
+  // Keep whatever was already selected and still visible; otherwise default to something
+  // already resident, so the obvious first click measures a warm model.
+  let kept = 0;
+  for (const o of sel.options) {
+    if (prev.has(o.value)) { o.selected = true; kept++; }
+  }
+  if (!kept) {
+    const first = items.find(i => i.loaded) || items[0];
+    const opt = first && sel.querySelector(`option[value="${CSS.escape(first.key)}"]`);
+    if (opt) opt.selected = true;
+  }
+}
+
+let _benchModels = [], _benchUpstreams = [], _benchUpFilter = '';
 let _benchModelIndex = {};
 
 function _benchMulti(id) {
@@ -6084,7 +6140,12 @@ function _benchTemps() {
 }
 
 function _benchBody() {
-  const models = _benchMulti('bench-model');
+  // Selected values are "<upstream>:<model>" keys — send them as explicit pairs so a sweep can
+  // span backends and a name served by two of them stays two distinct cells.
+  const models = _benchMulti('bench-model')
+    .map(k => _benchModelIndex[k])
+    .filter(Boolean)
+    .map(m => ({model: m.model, upstream: m.upstream}));
   const prompts = _benchMulti('bench-prompt').map(v => parseInt(v, 10) || 0);
   const thinking = _benchMulti('bench-thinking');
   const temps = _benchTemps();
@@ -6104,8 +6165,8 @@ function _benchBody() {
     warmup: $('bench-warmup').checked,
   };
   if (temps) body.temperature = temps.length > 1 ? temps : temps[0];
-  const up = $('bench-upstream').value;
-  if (up) body.upstream = up;
+  // No top-level `upstream`: each selected model already carries its own, which is what makes
+  // a mixed-backend sweep possible.
   const suite = $('bench-suite').value;
   if (suite) body.suite = suite;
   return body;
@@ -6127,10 +6188,9 @@ function _benchUpdatePlan() {
 
   // Spell out where the traffic is actually going and what has to be loaded first — those are
   // the two things you can't tell by looking at the form.
-  const metas = b.models.map(m => _benchModelIndex[m]).filter(Boolean);
-  const forced = $('bench-upstream').value;
-  const ups = forced ? [forced] : [...new Set(metas.map(m => m.upstream))];
-  let route = ups.length ? ` → ${ups.join(' + ')}${forced ? ' (forced)' : ''}` : '';
+  const metas = b.models.map(m => _benchModelIndex[`${m.upstream}:${m.model}`]).filter(Boolean);
+  const ups = [...new Set(metas.map(m => m.upstream))];
+  const route = ups.length ? ` → ${ups.join(' + ')}` : '';
   const warns = [];
   const cold = metas.filter(m => !m.loaded);
   // vLLM can't load anything on demand — the server serves what it was launched with, so an

@@ -3110,6 +3110,44 @@ def _embedded_b64_images(s):
         yield ("image/png" if blob[0] == "i" else "image/jpeg", blob)
 
 
+# Magic bytes for the formats we claim to surface. Anything else isn't an image we can render.
+_IMAGE_MAGIC = (
+    b"\x89PNG\r\n\x1a\n",     # PNG
+    b"\xff\xd8\xff",           # JPEG
+    b"GIF87a", b"GIF89a",      # GIF
+    b"RIFF",                   # WEBP (RIFF....WEBP)
+    b"BM",                     # BMP
+)
+
+
+def _decode_b64_image(payload) -> bytes | None:
+    """Decode a base64 image payload, returning the bytes only if they really are an image.
+
+    Pattern-matching a base64 prefix is not enough to conclude a request contains an image: the
+    JPEG marker '/9j/' is four base64 characters and turns up by chance inside unrelated blobs and
+    text, and a truncated data URL yields a run that looks right but decodes to nothing usable.
+    Both produce a request flagged as having an image whose image can never be displayed — so the
+    test is 'does it decode to something with an image header', not 'does it look like one'.
+    """
+    if not isinstance(payload, str):
+        return None
+    b = "".join(payload.split())          # data URLs are sometimes wrapped across lines
+    if len(b) < 64:
+        return None
+    try:
+        # validate=True matters: with it off, base64 silently DISCARDS non-alphabet characters,
+        # so "/9j/" followed by arbitrary prose still decodes to the three JPEG magic bytes and
+        # would be accepted as an image.
+        raw = base64.b64decode(b + "=" * (-len(b) % 4), validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    # Magic bytes alone aren't enough either — they're only 2-8 bytes, and no real image is that
+    # small. Anything under a few hundred bytes is a coincidence, not a picture.
+    if len(raw) < 128 or not raw.startswith(_IMAGE_MAGIC):
+        return None
+    return raw
+
+
 def _iter_request_images(body: dict):
     """Yield (index, media_type, kind, payload) for each image in a chat request, in order.
     kind='data' → payload is base64 (from a data: URL or Anthropic source); kind='url' →
@@ -6561,9 +6599,12 @@ _BENCH_LOAD_MODES = {"ollama": "on-demand", "lmstudio": "jit", "vllm": "fixed"}
 
 
 async def _bench_model_index() -> dict:
-    """Map model name → {upstream, loaded, ...}. This is what makes the upstream field
-    unnecessary: the proxy already knows which backend serves which model, so a bench can infer
-    it instead of asking the user to state it (and to keep it consistent with their choice).
+    """Map "<upstream>:<model>" → {model, upstream, loaded, ...}.
+
+    Keyed by the PAIR, not the model name: the same name can be served by more than one backend
+    (a GGUF in LM Studio and the same weights in vLLM), and keying by name alone let one silently
+    overwrite the other, making it unbenchable. The pair is also what the UI selects, so there is
+    no separate "which upstream" question to keep in sync.
 
     Carries the metadata a benchmark actually needs — quantization and context window — because
     'which quant was this?' is the first question asked of any result, and a prompt larger than
@@ -6574,13 +6615,14 @@ async def _bench_model_index() -> dict:
     def put(name, upstream, loaded, **extra):
         if not name:
             return
-        rec = {"upstream": upstream, "loaded": bool(loaded),
+        key = f"{upstream}:{name}"
+        rec = {"model": name, "upstream": upstream, "loaded": bool(loaded),
                "load_mode": _BENCH_LOAD_MODES.get(upstream, "unknown")}
         rec.update({k: v for k, v in extra.items() if v is not None})
-        # A loaded entry always wins over a catalogue entry for the same name.
-        if name in index and index[name].get("loaded") and not loaded:
+        # A loaded entry always wins over a catalogue entry for the same pair.
+        if key in index and index[key].get("loaded") and not loaded:
             return
-        index[name] = rec
+        index[key] = rec
 
     try:
         sysinfo = await system_now()
@@ -6652,7 +6694,10 @@ async def _bench_model_index() -> dict:
         return parse
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(4.0)) as c:
+        # Short: this path runs when the metrics snapshot is empty, and it gates the bench model
+        # picker. An unconfigured upstream is usually an instant connection refusal, but a
+        # firewalled host would hang — and the picker sitting on "loading…" reads as broken.
+        async with httpx.AsyncClient(timeout=httpx.Timeout(1.5)) as c:
             await asyncio.gather(
                 _probe(c, f"{OLLAMA_URL}/api/tags", _ollama_tags),
                 _probe(c, f"{LMSTUDIO_URL}/api/v0/models", _lms_native),
@@ -6668,6 +6713,18 @@ async def _bench_model_index() -> dict:
     return index
 
 
+def _bench_resolve_model(index: dict, model: str, upstream: str = "") -> dict:
+    """Find a model's entry. With an upstream, matches that exact pair; without one, falls back
+    to the first backend serving that name (preferring a loaded copy) so an old-style submission
+    that names only a model still resolves."""
+    if upstream:
+        return index.get(f"{upstream}:{model}") or {}
+    matches = [v for v in index.values() if v.get("model") == model]
+    if not matches:
+        return {}
+    return next((m for m in matches if m.get("loaded")), matches[0])
+
+
 @app.get("/__proxy/api/bench/models")
 async def bench_models():
     """Every model the proxy can reach, with the upstream that serves it and whether it's
@@ -6675,14 +6732,24 @@ async def bench_models():
     VRAM by the first request, so without a warm-up that load time lands inside the first
     measurement."""
     index = await _bench_model_index()
-    items = [{"model": name, **meta} for name, meta in index.items()]
+    items = [dict(meta, key=key) for key, meta in index.items()]
     items.sort(key=lambda i: (i["upstream"], not i["loaded"], i["model"]))
-    # Per-backend load semantics, so the UI can say what will happen rather than making the
-    # user know that Ollama auto-loads, LM Studio JIT-loads, and vLLM can't load anything.
-    out_modes = {u: _BENCH_LOAD_MODES[u] for u in _BENCH_LOAD_MODES}
+    # Per-backend rollup: what's reachable, how much of it is resident, and whether unloaded
+    # models there can be used at all. This is what the upstream picker is built from.
+    upstreams = []
+    for name, mode in _BENCH_LOAD_MODES.items():
+        mine = [i for i in items if i["upstream"] == name]
+        upstreams.append({
+            "upstream": name,
+            "load_mode": mode,
+            "total": len(mine),
+            "loaded": sum(1 for i in mine if i["loaded"]),
+            "reachable": bool(mine),
+        })
     out: dict = {
         "items": items,
-        "load_modes": out_modes,
+        "upstreams": upstreams,
+        "load_modes": dict(_BENCH_LOAD_MODES),
         # Kept for older clients / convenience.
         "ollama": {
             "loaded": [i["model"] for i in items if i["upstream"] == "ollama" and i["loaded"]],
@@ -6710,14 +6777,34 @@ async def bench_run(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
 
-    models = payload.get("models")
-    if isinstance(models, list):
-        models = [str(m).strip() for m in models if str(m or "").strip()]
-    else:
-        models = []
-    single = (payload.get("model") or "").strip()
-    if single and not models:
-        models = [single]
+    # A model is identified by (name, upstream). Accepted forms, in order of preference:
+    #   [{"model": "x", "upstream": "vllm"}]   explicit — what the UI sends
+    #   ["vllm:x"]                              the index key
+    #   ["x"]                                   name only; the upstream is inferred later
+    def _parse_model(entry) -> dict | None:
+        if isinstance(entry, dict):
+            name = str(entry.get("model") or "").strip()
+            up = str(entry.get("upstream") or "").strip().lower()
+        else:
+            raw = str(entry or "").strip()
+            name, up = raw, ""
+            head = raw.split(":", 1)[0].lower()
+            if head in _BENCH_LOAD_MODES and ":" in raw:
+                up, name = head, raw.split(":", 1)[1]
+        if not name:
+            return None
+        if up and up not in _BENCH_LOAD_MODES:
+            return None
+        return {"model": name, "upstream": up}
+
+    raw_models = payload.get("models")
+    models = []
+    if isinstance(raw_models, list):
+        models = [m for m in (_parse_model(e) for e in raw_models) if m]
+    if not models and payload.get("model"):
+        one = _parse_model(payload.get("model"))
+        if one:
+            models = [one]
     if not models:
         return JSONResponse({"error": "'model' or 'models' is required"}, status_code=400)
 
@@ -6787,7 +6874,7 @@ async def bench_run(request: Request):
         conn.execute(
             """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip, label)
                VALUES (?, ?, ?, ?, 'pending', ?, ?)""",
-            (bench_id, time.time(), models[0], json.dumps(config), creator_ip, label),
+            (bench_id, time.time(), models[0]["model"], json.dumps(config), creator_ip, label),
         )
     else:
         # Flatten the single cell so the child config carries scalars, not one-element lists.
@@ -6796,6 +6883,8 @@ async def bench_run(request: Request):
         config["thinking"] = only["thinking"]
         if only.get("temperature") is not None:
             config["temperature"] = only["temperature"]
+        if only.get("upstream"):
+            config["upstream"] = only["upstream"]
         config.pop("models", None)
         conn.execute(
             """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip, axes_json, label)
@@ -6809,7 +6898,7 @@ async def bench_run(request: Request):
         asyncio.create_task(_bench_execute_suite(bench_id, request.app))
     else:
         asyncio.create_task(_bench_execute(bench_id, request.app))
-    return {"id": bench_id, "model": models[0], "config": config,
+    return {"id": bench_id, "model": models[0]["model"], "config": config,
             "matrix": is_matrix, "cells": len(cells)}
 
 
@@ -8020,10 +8109,17 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
     temps = as_list(cfg.get("temperature"), None)
     cells = []
     for m in model_axis:
+        # Entries may be bare names (older callers) or {model, upstream} pairs, so a sweep can
+        # span backends — the same weights on LM Studio and on vLLM are two different cells.
+        name = m.get("model") if isinstance(m, dict) else m
+        up = (m.get("upstream") or "") if isinstance(m, dict) else ""
         for pt in prompts:
             for th in thinks:
                 for tp in temps:
-                    axes = {"model": m, "prompt_tokens": int(pt or 0), "thinking": str(th or "auto")}
+                    axes = {"model": name, "prompt_tokens": int(pt or 0),
+                            "thinking": str(th or "auto")}
+                    if up:
+                        axes["upstream"] = up
                     if tp is not None:
                         axes["temperature"] = float(tp)
                     cells.append(axes)
@@ -8032,6 +8128,8 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
 
 def _bench_cell_label(axes: dict) -> str:
     bits = [str(axes.get("model") or "?")]
+    if axes.get("upstream"):
+        bits.append(f"@{axes['upstream']}")
     pt = axes.get("prompt_tokens") or 0
     bits.append(f"{int(pt) // 1000}k ctx" if pt >= 1000 else (f"{pt} ctx" if pt else "short"))
     if axes.get("thinking") and axes["thinking"] != "auto":
@@ -8071,6 +8169,10 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         child_cfg["thinking"] = axes["thinking"]
         if axes.get("temperature") is not None:
             child_cfg["temperature"] = axes["temperature"]
+        # Per-cell upstream — this is what lets one sweep compare the same model across two
+        # backends without them collapsing into each other.
+        if axes.get("upstream"):
+            child_cfg["upstream"] = axes["upstream"]
         # The suite owns quiescing for the whole sweep; children must not toggle it per cell.
         child_cfg["quiesce"] = False
         conn.execute(
@@ -8154,7 +8256,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Resolve the backend from the model unless the user pinned one explicitly. Asking the
         # user to state both invites contradictions (an Ollama model aimed at vLLM just errors),
         # and the proxy already knows the answer.
-        model_meta = (await _bench_model_index()).get(model) or {}
+        model_meta = _bench_resolve_model(await _bench_model_index(), model,
+                                          str(cfg.get("upstream") or ""))
         if not cfg.get("upstream") and model_meta.get("upstream"):
             cfg["upstream"] = model_meta["upstream"]
             cfg["upstream_inferred"] = True
@@ -8941,21 +9044,32 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     # embedded in tool-output text (e.g. screenshot_png_b64). The router keys off _body_has_images()
     # directly (standard parts only), so flagging an embedded blob here surfaces it in the dashboard
     # viewer WITHOUT routing a text request to the vision model (which couldn't consume it anyway).
-    _embedded_imgs = isinstance(body_text, str) and ("iVBORw0KGgo" in body_text or "/9j/" in body_text)
-    has_imgs = 1 if (_body_has_images(body_json) or _embedded_imgs) else None
+    # An embedded blob only counts once it decodes to something with an image header. A bare
+    # substring test (the previous approach) flagged any body merely containing the 4-character
+    # sequence "/9j/", so text-only agents were reported as vision requests en masse and every
+    # such badge led to an image that couldn't be rendered.
+    _embedded_imgs = any(_decode_b64_image(b64) for _mt, b64 in _embedded_b64_images(body_text or ""))
     # Pull inline base64 images into their own column at full size, then store the text body
-    # with them stripped — so the 256KB body cap can't truncate (and corrupt the JSON of) a
-    # ~700KB screenshot. The image bytes stay reconstructable from images_data.
+    # with them stripped — so the body cap can't truncate (and corrupt the JSON of) a ~700KB
+    # screenshot. The image bytes stay reconstructable from images_data.
     images_data = None
     store_body_text = body_text
-    if isinstance(body_json, dict) and has_imgs:
+    imgs: list = []
+    if isinstance(body_json, dict):
+        # Standard vision parts get the same validation: a truncated data URL is not an image.
         imgs = [{"media_type": mt, "data": payload}
-                for (_i, mt, _k, payload) in _iter_request_images(body_json) if _k == "data"]
+                for (_i, mt, _k, payload) in _iter_request_images(body_json)
+                if _k == "data" and _decode_b64_image(payload)]
         if imgs:
             images_data = json.dumps(imgs)
             body_copy = json.loads(json.dumps(body_json))   # don't mutate the body we forward
             _strip_image_data(body_copy)
             store_body_text = json.dumps(body_copy)
+    # Flag only what a viewer could actually open: a decodable inline image, a decodable embedded
+    # blob, or an image referenced by URL (nothing to decode, but it is genuinely an image part).
+    _url_imgs = any(k == "url" for (_i, _mt, k, _p) in _iter_request_images(body_json)) \
+        if isinstance(body_json, dict) else False
+    has_imgs = 1 if (imgs or _embedded_imgs or _url_imgs) else None
     conn = db()
     conn.execute(
         """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images)
