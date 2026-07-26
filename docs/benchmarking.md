@@ -104,7 +104,17 @@ The Bench tab opens in **Simple** mode: pick the models, choose a preset, press 
 | **Quick** | 32K context, reasoning off, cache warm | 12 tasks × 3 runs = **36 requests** |
 | **Full report** | 3 contexts (short/8K/32K) × reasoning off·on × cold·cached × 1·4 parallel | 24 cells × 36 = **864 requests** |
 
-Both grade on `coding-v1` at temperature 0, with a warm-up and routing pinned.
+Both grade on `coding-v1` at temperature 0, with a warm-up, routing pinned, and **other proxy
+clients held** for the duration.
+
+Holding is on by default because a benchmark sharing the model with live traffic measures the
+traffic as much as the model. Other clients keep their connections and resume as soon as the run
+finishes — they wait, they don't fail — and the gate is released between cells of a sweep, so a
+long run leaves gaps rather than blocking solid for hours. Uncheck **Hold other proxy clients**
+if you'd rather not delay anyone; the run bar says which mode you're in either way.
+
+Freeing the GPU (unloading Ollama models) stays opt-in: it evicts models other people may be
+mid-conversation with, which is a bigger imposition than waiting.
 
 Quick ranks models on speed and correctness. **Full report** is the shape of a real
 investigation — it answers what context depth costs, what reasoning costs, whether the prompt

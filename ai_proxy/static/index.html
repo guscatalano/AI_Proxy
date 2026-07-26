@@ -6069,6 +6069,10 @@ async function loadBench() {
             <button type="button" class="bench-preset-opt" data-preset="full" aria-pressed="false">Full report</button>
           </div>
           <div id="bench-preset-desc"></div>
+          <label class="bench-check" style="margin-top:9px" title="Other clients keep their connections and resume as soon as the benchmark finishes — they wait, they don't fail. Without this, whatever else is using the model gets measured along with it.">
+            <input type="checkbox" id="bench-hold" checked>
+            <span>Hold other proxy clients while it runs<em>they queue until it finishes — required for numbers that mean anything</em></span>
+          </label>
         </div>
         <div class="bench-groups">
 
@@ -6146,7 +6150,7 @@ async function loadBench() {
               <span>No system nudge<em>drop quirk prompt injection</em></span>
             </label>
             <label class="bench-check" title="Other proxy clients queue until the benchmark finishes. Only gates traffic through the proxy — anything talking to Ollama directly is unaffected.">
-              <input type="checkbox" id="bench-exclusive">
+              <input type="checkbox" id="bench-exclusive" checked>
               <span>Hold other clients<em>they queue until it finishes</em></span>
             </label>
             <label class="bench-check" title="Enables panic mode and unloads every loaded Ollama model, then restores them afterwards. Use when you need the GPU entirely to yourself.">
@@ -6199,6 +6203,8 @@ async function loadBench() {
       };
     }
     _benchRenderPreset();
+    const _hold = $('bench-hold');
+    if (_hold) _hold.addEventListener('change', _benchUpdatePlan);
     let _mode = 'simple';
     try { _mode = localStorage.getItem('ai-proxy-bench-mode') || 'simple'; } catch {}
     _benchSetMode(_mode);
@@ -6403,9 +6409,10 @@ const _BENCH_COMMON = {
   bypass_router: true,
   no_nudge: true,
   temperature: 0,
-  // Left off deliberately: both disrupt other users of the box, which is not a reasonable
-  // default for a button labelled "run".
-  exclusive: false,
+  // Freeing the GPU entirely (unloading Ollama models) stays opt-in — it evicts models other
+  // people may be mid-conversation with. Holding proxy traffic is different: it delays other
+  // clients rather than disrupting them, and without it the numbers measure whatever else
+  // happened to be running.
   quiesce: false,
   drain_seconds: 5,
 };
@@ -6425,7 +6432,9 @@ const _BENCH_PRESETS = {
 };
 function _benchPreset() {
   const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
-  return _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
+  const base = _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
+  const hold = $('bench-hold');
+  return Object.assign({}, base, {exclusive: !hold || hold.checked});
 }
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
@@ -6540,8 +6549,19 @@ function _benchUpdatePlan() {
   }
   // Warnings go on their own line: inline they read as part of the sentence, and the ones that
   // matter ("this will fail") deserve to be seen before the button is pressed, not skimmed past.
+  // Isolation is disclosed here rather than in a dialog: it is on for every run, and a confirm
+  // that always fires is noise people click through without reading.
+  let iso = '';
+  if (b.exclusive || b.quiesce) {
+    const bits = [];
+    if (b.exclusive) bits.push('other proxy clients queue until this finishes');
+    if (b.quiesce) bits.push('loaded Ollama models are unloaded and restored afterwards');
+    iso = `<div style="color:#d9c37a;margin-top:2px">⏸ ${esc(bits.join(' · '))}</div>`;
+  } else {
+    iso = `<div style="color:#f0a35a;margin-top:2px">⚠ other traffic keeps running — it will be measured along with the model</div>`;
+  }
   el.innerHTML = scale + esc(route) + warns.map(w =>
-    `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('');
+    `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('') + iso;
 }
 
 async function _benchSubmit() {
@@ -6549,7 +6569,6 @@ async function _benchSubmit() {
   errEl.textContent = '';
   const body = _benchBody();
   if (!body.models.length) { errEl.textContent = 'pick at least one model'; return; }
-  if (body.exclusive && !confirm('Exclusive mode will pause all other clients during this bench. Continue?')) return;
   if (body.quiesce && !confirm('Quiesce will enable panic mode and unload every loaded Ollama model, then restore them when the bench finishes. Continue?')) return;
   if (body.suite && !confirm('The graded suite executes the model\'s generated Python in a subprocess to score it. Only run it against models you trust. Continue?')) return;
   try {
