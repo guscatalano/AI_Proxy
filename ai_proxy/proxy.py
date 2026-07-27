@@ -2138,6 +2138,25 @@ DEFAULT_RULES_CONFIG = {
         "lmstudio_parallel": None,
         "lmstudio_gpu": None,
     },
+    "pricing": {
+        # Reference rates for the usage report's daily ledger. Local models produce no invoice,
+        # so this is not a bill — it is what the same traffic would have cost had it gone to a
+        # commercial API, which is the only way to put a number on what the hardware returns.
+        #
+        # Rates are US dollars per million tokens. `cached_input` matters more than either of
+        # the others here: agentic traffic re-sends the whole conversation every turn, so most
+        # prompt tokens are a re-read of a prefix the server already has, and every commercial
+        # API discounts them roughly tenfold. Charging them at full rate overstates the total
+        # by an order of magnitude.
+        #
+        # `models` maps a substring of the model name to its own rates, first match wins —
+        # use it when a small local model shouldn't be priced like a frontier one:
+        #   "models": {"27b": {"input": 0.30, "cached_input": 0.03, "output": 1.20}}
+        "enabled": True,
+        "reference": "Claude Sonnet 4.5 API rates",
+        "default": {"input": 3.0, "cached_input": 0.30, "output": 15.0},
+        "models": {},
+    },
     "tool_injector": {
         # Adds proxy-owned tools to outgoing requests and executes them server-side. The model
         # sees them in tools[] like any other tool; when it calls one, the proxy intercepts
@@ -5465,7 +5484,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["tool_aliases", "model_control", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
+    known_extras = ["tool_aliases", "model_control", "pricing", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -7747,6 +7766,9 @@ _REPORT_CSS = """
   tbody th { font-weight:600; color:var(--ink-dim); }
   td.n, th.n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums;
               white-space:nowrap; }
+  /* A ledger's total is a different kind of row from the days above it, and has to read as one. */
+  tbody tr.sum th, tbody tr.sum td { border-top:2px solid var(--border); background:var(--panel-2);
+                                     font-weight:600; color:var(--ink); }
   td.win { color:var(--accent); font-weight:700; }
   td.slow { color:var(--bad); font-weight:600; }
   td.ok { color:var(--good); } td.bad { color:var(--bad); font-weight:600; }
@@ -8192,6 +8214,98 @@ _TURN_BUCKETS = ((0, 5, "1–4"), (5, 15, "5–14"), (15, 40, "15–39"),
                  (40, 100, "40–99"), (100, 1 << 30, "100+"))
 
 
+def _price_rates(model, cfg) -> dict:
+    """First substring match wins, so the more specific fragment goes first in the map."""
+    base = cfg.get("default") or {}
+    m = (model or "").lower()
+    for frag, over in (cfg.get("models") or {}).items():
+        if frag and str(frag).lower() in m:
+            return {**base, **(over or {})}
+    return base
+
+
+def _usage_by_day(days: int = 30) -> dict:
+    """A daily ledger of tokens and what they would have cost on a commercial API.
+
+    Local models produce no invoice, so a cost column has to be honest about what it is: the
+    price the same traffic would have carried elsewhere, which is the only way to put a figure
+    on what the hardware returns.
+
+    The number lives or dies on the cached share, and that is worked out per conversation rather
+    than per request. An agentic client re-sends the whole conversation every turn, so turn N's
+    prompt is turn N-1's prompt plus whatever is new; only the difference is a token any API
+    would charge at the full input rate, and the shared prefix is a cache read at roughly a
+    tenth of it. That is how the commercial APIs actually bill, and it needs nothing but the
+    conversation id and the prompt sizes.
+
+    The earlier approach — reading the proxy's own cache verdict — was worse for this: it is a
+    prefill-speed heuristic that can say nothing at all about a request that was not streamed,
+    and a fifth of this traffic isn't, which left the largest term in the total resting on
+    "unknown, assume uncached".
+    """
+    cfg = load_rules_config().get("pricing") or {}
+    priced = bool(cfg.get("enabled", True)) and bool(cfg.get("default"))
+    out: dict = {"days": days, "priced": priced,
+                 "reference": cfg.get("reference") if priced else None}
+    conn = db()
+    try:
+        rows = conn.execute(
+            """SELECT date(ts, 'unixepoch', 'localtime') d, model, conversation_id,
+                      prompt_tokens, est_prompt_tokens, completion_tokens
+               FROM requests
+               WHERE ts > ? AND shadow_of IS NULL
+               ORDER BY conversation_id, ts""",
+            (time.time() - days * 86400,)).fetchall()
+    except sqlite3.Error as e:
+        conn.close()
+        return {**out, "error": str(e), "by_day": []}
+    conn.close()
+
+    per_day: dict = {}
+    conv, prev_prompt = object(), 0
+    for r in rows:
+        # Rows arrive grouped by conversation, so one running total is enough. A request with no
+        # conversation is a one-shot: nothing preceded it, so all of it is new.
+        cid = r["conversation_id"]
+        if cid is None or cid != conv:
+            conv, prev_prompt = (cid if cid is not None else object()), 0
+        full = r["prompt_tokens"] or r["est_prompt_tokens"] or 0
+        # Compaction and context trimming can shrink a prompt; the reusable prefix is then at
+        # most what is left, never what the longer previous turn held.
+        cached = min(prev_prompt, full)
+        uncached = full - cached
+        prev_prompt = full
+        completion = r["completion_tokens"] or 0
+
+        day = per_day.setdefault(r["d"], {"date": r["d"], "n": 0, "input": 0,
+                                          "cached_input": 0, "output": 0, "cost": 0.0})
+        day["n"] += 1
+        day["input"] += uncached
+        day["cached_input"] += cached
+        day["output"] += completion
+        if priced:
+            rt = _price_rates(r["model"], cfg)
+            day["cost"] += (uncached / 1e6) * (rt.get("input") or 0)
+            day["cost"] += (cached / 1e6) * (rt.get("cached_input") or 0)
+            day["cost"] += (completion / 1e6) * (rt.get("output") or 0)
+
+    by_day = sorted(per_day.values(), key=lambda d: d["date"])
+    for d in by_day:
+        d["total"] = d["input"] + d["cached_input"] + d["output"]
+    out["by_day"] = by_day
+    out["total"] = {
+        k: sum(d[k] for d in by_day)
+        for k in ("n", "input", "cached_input", "output", "total", "cost")
+    } if by_day else None
+    # Days with no traffic at all are absent rather than zero — worth saying, since a reader
+    # counting rows would otherwise take the ledger for a continuous record.
+    if by_day:
+        first = datetime.date.fromisoformat(by_day[0]["date"])
+        last = datetime.date.fromisoformat(by_day[-1]["date"])
+        out["missing_days"] = (last - first).days + 1 - len(by_day)
+    return out
+
+
 def _usage_extras(window_s: float = 86400.0, hygiene_limit: int = 800) -> dict:
     """Views the stats endpoint doesn't compute, because they only make sense over a window and
     the last one is too costly to poll."""
@@ -8296,6 +8410,8 @@ def _usage_extras(window_s: float = 86400.0, hygiene_limit: int = 800) -> dict:
         out["error"] = str(e)
     finally:
         conn.close()
+    # Its own window: a day-by-day ledger over 24 hours would be one row.
+    out["daily"] = _usage_by_day()
     return out
 
 
@@ -8454,6 +8570,61 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
                if ab.get("n") else "")
             + "</div>")
 
+    # --- the daily ledger, last thing on the page --------------------------------------------
+    daily = ex.get("daily") or {}
+    by_day = daily.get("by_day") or []
+    tot = daily.get("total") or {}
+    priced = daily.get("priced") and tot.get("cost")
+    day_html = ""
+    if by_day:
+        def day_row(d, is_total=False):
+            label = ("Total" if is_total else
+                     datetime.date.fromisoformat(d["date"]).strftime("%b %d"))
+            cost = (f'<td class="n">${d["cost"]:,.2f}</td>' if priced else "")
+            tr = '<tr class="sum">' if is_total else "<tr>"
+            return (tr + f'<th scope="row">{_h(label)}</th>'
+                    f'<td class="n">{_fmt_n(d["n"])}</td>'
+                    f'<td class="n">{_fmt_tokens(d["input"])}</td>'
+                    f'<td class="n">{_fmt_tokens(d["cached_input"])}</td>'
+                    f'<td class="n">{_fmt_tokens(d["output"])}</td>'
+                    f'<td class="n">{_fmt_tokens(d["total"])}</td>{cost}</tr>')
+
+        cached_share = (100 * tot["cached_input"] / tot["total"]) if tot.get("total") else 0
+        gap = daily.get("missing_days") or 0
+        lede = ""
+        if priced:
+            # The point of the column. Not a bill — nobody invoiced any of this — but the price
+            # the same work carries elsewhere, which is what the hardware is actually returning.
+            lede = (f'<div class="hero"><p class="lede">At <b>{_h(daily.get("reference") or "")}</b>, '
+                    f'this traffic would have cost <b>${tot["cost"]:,.0f}</b> — '
+                    f'<b>${tot["cost"] / max(1, len(by_day)):,.0f}</b> a day.</p>'
+                    f'<p class="why">Nothing here was billed — these models run on your own '
+                    f'hardware. The figure is what the same tokens would have carried on a '
+                    f'commercial API, and it rests on the cached share: {cached_share:.0f}% of '
+                    f'all tokens are a prefix an earlier turn already sent, which every API '
+                    f'discounts roughly tenfold. Charge those at the full input rate instead '
+                    f'and the same traffic reads as several times more.</p></div>')
+        day_html = (
+            "<h2>Day by day</h2>" + lede
+            + '<p class="note">Prompt tokens are split per conversation: each turn re-sends '
+            "everything before it, so only the growth since the previous turn counts as input "
+            "and the rest is a cache read. A conversation already running when this range "
+            "opened has its first turn here counted in full, and a real API's cache expires "
+            "between turns where this one doesn't — both push the estimate low."
+            + (f" No traffic at all on {gap} day{'s' if gap != 1 else ''} in this range; those "
+               "are absent rather than shown as zero." if gap else "")
+            + (f' Rates are editable under <code>pricing</code> in the rules config.'
+               if priced else "")
+            + "</p>"
+            + "<div class=\"tbl\"><table><thead><tr><th>Date</th><th class=\"n\">Requests</th>"
+            "<th class=\"n\">Input</th><th class=\"n\">Cached</th><th class=\"n\">Output</th>"
+            "<th class=\"n\">Total</th>"
+            + ('<th class="n">Cost</th>' if priced else "")
+            + "</tr></thead><tbody>"
+            + "".join(day_row(d) for d in by_day)
+            + (day_row({**tot, "date": by_day[-1]["date"]}, True) if tot else "")
+            + "</tbody></table></div>")
+
     und = ex.get("undeclared_tools") or []
     tool_html = ""
     if und:
@@ -8498,6 +8669,7 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
         time_html,
         tool_html,
         f'<div class="band">{minor}</div>',
+        day_html,
     ])
 
     gpus = env.get("gpus") or []

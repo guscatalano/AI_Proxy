@@ -1,7 +1,10 @@
-"""The three report-only views: conversation depth, prefill/decode split, tool-call hygiene.
+"""The report-only views: conversation depth, prefill/decode split, tool-call hygiene, and the
+daily token/cost ledger.
 
-These don't run on the dashboard poll, so nothing else exercises them — and the hygiene pass in
-particular walks untrusted request bodies, where one malformed blob must not take the report down.
+None of these run on the dashboard poll, so nothing else exercises them. Two need care: the
+hygiene pass walks untrusted request bodies, where one malformed blob must not take the report
+down, and the ledger puts a dollar figure on the page, where an arithmetic slip is a lie rather
+than a glitch.
 """
 import json
 import time
@@ -15,12 +18,14 @@ def _seed(rows, blobs=(), stream=()):
     conn = P.db()
     conn.executemany(
         """INSERT INTO requests (id, ts, method, path, upstream_url, client_app, status,
-                                 turn_index, prompt_tokens, est_prompt_tokens, duration_ms, ttft_ms)
+                                 turn_index, prompt_tokens, est_prompt_tokens, duration_ms,
+                                 ttft_ms, conversation_id)
            VALUES (:id, :ts, 'POST', '/v1/messages', 'http://x', :app, :status,
-                   :turn, :ptok, :est, :dur, :ttft)""",
+                   :turn, :ptok, :est, :dur, :ttft, :conv)""",
         [{"id": r["id"], "ts": r.get("ts", time.time()), "app": r.get("app", "test-app"),
           "status": r.get("status", 200), "turn": r.get("turn"), "ptok": r.get("ptok"),
-          "est": r.get("est"), "dur": r.get("dur"), "ttft": r.get("ttft")} for r in rows])
+          "est": r.get("est"), "dur": r.get("dur"), "ttft": r.get("ttft"),
+          "conv": r.get("conv")} for r in rows])
     if blobs:
         conn.executemany(
             "INSERT INTO request_blobs (id, request_body, response_body) VALUES (?, ?, ?)", blobs)
@@ -207,6 +212,128 @@ def test_extras_respect_the_window(_clean):
     _seed([{"id": "old", "ts": old, "turn": 1, "ptok": 10, "dur": 100, "ttft": 10}])
     assert P._usage_extras(window_s=3600)["by_turn"] == []
     assert P._usage_extras(window_s=172800)["by_turn"] != []
+
+
+def _price(monkeypatch, **over):
+    cfg = dict(P.load_rules_config())
+    cfg["pricing"] = {"enabled": True, "reference": "test rates",
+                      "default": {"input": 3.0, "cached_input": 0.30, "output": 15.0},
+                      "models": {}, **over}
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    return cfg
+
+
+def test_daily_ledger_groups_and_totals(_clean, monkeypatch):
+    _price(monkeypatch)
+    day = 86400
+    now = time.time()
+    # No conversation id, so each is a one-shot and its whole prompt is new.
+    _seed([{"id": "d1", "ts": now, "turn": 1, "ptok": 1_000_000},
+           {"id": "d2", "ts": now, "turn": 2, "ptok": 1_000_000},
+           {"id": "d3", "ts": now - day, "turn": 1, "ptok": 500_000}])
+    conn = P.db()
+    conn.executemany("UPDATE requests SET completion_tokens = ? WHERE id = ?",
+                     [(1000, "d1"), (1000, "d2"), (2000, "d3")])
+    conn.commit()
+    conn.close()
+
+    daily = P._usage_by_day()
+    assert len(daily["by_day"]) == 2
+    assert daily["by_day"][-1]["n"] == 2                     # today, sorted last
+    assert daily["total"]["input"] == 2_500_000
+    assert daily["total"]["output"] == 4000
+    # 2.5M uncached input at $3/M + 4k output at $15/M
+    assert daily["total"]["cost"] == pytest.approx(7.5 + 0.06)
+
+
+def test_daily_ledger_charges_only_what_a_turn_added(_clean, monkeypatch):
+    # The whole point: turn 2 re-sends turn 1's prompt, and only its growth is a new token.
+    _price(monkeypatch)
+    now = time.time()
+    _seed([{"id": "c1", "ts": now - 10, "turn": 1, "ptok": 100_000, "conv": "x"},
+           {"id": "c2", "ts": now, "turn": 2, "ptok": 1_000_000, "conv": "x"}])
+    tot = P._usage_by_day()["total"]
+    assert tot["input"] == 1_000_000 and tot["cached_input"] == 100_000
+    # Charging both prompts in full would read $3.30 instead.
+    assert tot["cost"] == pytest.approx(3.0 + 0.03)
+
+
+def test_daily_ledger_handles_a_prompt_that_shrank(_clean, monkeypatch):
+    # Compaction cuts the prompt; the reusable prefix is what is left, not the longer old one.
+    _price(monkeypatch)
+    now = time.time()
+    _seed([{"id": "s1", "ts": now - 10, "turn": 1, "ptok": 1_000_000, "conv": "y"},
+           {"id": "s2", "ts": now, "turn": 2, "ptok": 200_000, "conv": "y"}])
+    tot = P._usage_by_day()["total"]
+    assert tot["input"] == 1_000_000 and tot["cached_input"] == 200_000
+
+
+def test_daily_ledger_keeps_conversations_apart(_clean, monkeypatch):
+    # Two conversations interleaved in time: one's prompt must never discount the other's.
+    _price(monkeypatch)
+    now = time.time()
+    _seed([{"id": "a1", "ts": now - 30, "turn": 1, "ptok": 500_000, "conv": "a"},
+           {"id": "b1", "ts": now - 20, "turn": 1, "ptok": 500_000, "conv": "b"},
+           {"id": "a2", "ts": now - 10, "turn": 2, "ptok": 600_000, "conv": "a"}])
+    tot = P._usage_by_day()["total"]
+    assert tot["input"] == 1_100_000 and tot["cached_input"] == 500_000
+
+
+def test_daily_ledger_applies_per_model_rates(_clean, monkeypatch):
+    _price(monkeypatch, models={"27b": {"input": 0.30, "cached_input": 0.03, "output": 1.20}})
+    _seed([{"id": "m1", "turn": 1, "ptok": 1_000_000},
+           {"id": "m2", "turn": 1, "ptok": 1_000_000}])
+    conn = P.db()
+    conn.execute("UPDATE requests SET model = 'gemma3:27b', completion_tokens = 0 WHERE id = 'm1'")
+    conn.execute("UPDATE requests SET model = 'big-frontier', completion_tokens = 0 WHERE id = 'm2'")
+    conn.commit()
+    conn.close()
+    assert P._usage_by_day()["total"]["cost"] == pytest.approx(0.30 + 3.0)
+
+
+def test_daily_ledger_can_be_turned_off(_clean, monkeypatch):
+    _price(monkeypatch, enabled=False)
+    _seed([{"id": "p1", "turn": 1, "ptok": 1_000_000}])
+    daily = P._usage_by_day()
+    assert daily["priced"] is False
+    assert daily["total"]["cost"] == 0          # tokens still counted, money not claimed
+    assert daily["total"]["input"] == 1_000_000
+
+
+def test_daily_ledger_excludes_shadow_traffic(_clean, monkeypatch):
+    # Shadow requests are the proxy's own duplicate of a real one. Counting them would inflate
+    # both the token total and the cost by whatever share of traffic is being shadowed.
+    _price(monkeypatch)
+    _seed([{"id": "real", "turn": 1, "ptok": 1_000_000},
+           {"id": "shadow", "turn": 1, "ptok": 1_000_000}])
+    conn = P.db()
+    conn.execute("UPDATE requests SET shadow_of = 'real', completion_tokens = 0 WHERE id = 'shadow'")
+    conn.execute("UPDATE requests SET completion_tokens = 0 WHERE id = 'real'")
+    conn.commit()
+    conn.close()
+    assert P._usage_by_day()["total"]["n"] == 1
+
+
+def test_daily_ledger_counts_days_with_no_traffic(_clean, monkeypatch):
+    _price(monkeypatch)
+    now = time.time()
+    _seed([{"id": "g1", "ts": now, "turn": 1, "ptok": 10, "dur": 10, "ttft": 5},
+           {"id": "g2", "ts": now - 3 * 86400, "turn": 1, "ptok": 10, "dur": 10, "ttft": 5}])
+    assert P._usage_by_day()["missing_days"] == 2
+
+
+def test_report_renders_the_daily_ledger(_clean, monkeypatch):
+    _price(monkeypatch)
+    _seed([{"id": "rr", "turn": 1, "ptok": 2_000_000}])
+    conn = P.db()
+    conn.execute("UPDATE requests SET completion_tokens = 0 WHERE id = 'rr'")
+    conn.commit()
+    conn.close()
+    html = _clean.get("/__proxy/api/stats/report?format=html").text
+    assert "Day by day" in html
+    assert "would have cost" in html and "test rates" in html
+    assert "$6.00" in html            # 2M uncached input at $3/M
+    assert 'class="sum"' in html      # the total row reads as a total
 
 
 def test_report_renders_the_new_sections(_clean):

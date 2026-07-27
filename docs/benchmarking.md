@@ -249,6 +249,43 @@ because they scan stored bodies and are far too expensive to sit behind the dash
   are of what the model *emitted*, so a name the `tool_aliases` rule already rewrites still
   appears, marked as handled — the rewrite fixes the call, it doesn't stop the model making it.
 
+### Day by day, and what it would have cost
+
+The last section is a ledger: requests, input, cached input, output and total tokens per day over
+the last 30 days, with a cost column.
+
+Nothing the proxy serves is billed — the models run on your hardware — so the column is not an
+invoice. It's what the same tokens would have carried on a commercial API, which is the only way
+to put a figure on what the hardware returns.
+
+The whole number rests on the cached share, and that's worked out **per conversation** rather
+than per request. An agentic client re-sends the entire conversation every turn, so turn *N*'s
+prompt is turn *N-1*'s prompt plus whatever is new; only the growth is a token an API would
+charge at the full input rate, and the shared prefix is a cache read at roughly a tenth of it.
+That's how the commercial APIs actually bill, and it needs nothing but `conversation_id` and the
+prompt sizes. On a real agentic workload this lands around 97% cached — the same ballpark
+`ccusage` reports for Claude Code, which is the closest thing to an independent check.
+
+Two things push the estimate **low**: a conversation already running when the range opened has
+its first turn counted in full, and a real API's cache expires between turns where this model's
+never does.
+
+Rates live under `pricing` in the rules config:
+
+```jsonc
+"pricing": {
+  "enabled": true,                       // false drops the cost column, keeps the tokens
+  "reference": "Claude Sonnet 4.5 API rates",   // named on the page, so change it with the rates
+  "default": { "input": 3.0, "cached_input": 0.30, "output": 15.0 },   // USD per million tokens
+  "models": {                            // optional, first substring match wins
+    "27b": { "input": 0.30, "cached_input": 0.03, "output": 1.20 }
+  }
+}
+```
+
+`cached_input` is the rate that matters. Set it equal to `input` and the same traffic reads as
+roughly seven times more expensive — which is the mistake worth avoiding, not a stricter reading.
+
 ## Matrix runs
 
 Any of **models**, **prompt size**, **thinking**, **temperature**, **cache** and **concurrency**
