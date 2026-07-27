@@ -3040,8 +3040,7 @@ async function loadStats() {
   const _anyTps = _gen.samples || _proc.samples || _comb.samples;
   const tpSection = `
     <div class="stats-section">
-      <h2>Throughput <span style="color:#666;font-weight:normal;font-size:11px">tokens/sec across requests · percentile spread</span>
-        <a href="/__proxy/api/stats/report" target="_blank" rel="noopener" title="Standalone usage report — everything recorded, printable to PDF" style="float:right;color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px;font-weight:normal">Usage report ↗</a></h2>
+      <h2>Throughput <span style="color:#666;font-weight:normal;font-size:11px">tokens/sec across requests · percentile spread</span></h2>
       <table style="width:100%">
         <thead><tr>
           <th style="text-align:left">Metric</th>
@@ -3108,6 +3107,13 @@ async function loadStats() {
   let _cacheHit = '—';
   if (perfData && perfData.series) { const cp = perfData.series.map(b => b.cache_pct).filter(v => v != null); if (cp.length) _cacheHit = Math.round(cp.reduce((a, b) => a + b, 0) / cp.length) + '%'; }
   const _kpi = (l, v, unit, sub, cls) => `<div class="s2-kpi"><div class="l">${l}</div><div class="v tnum">${v}${unit ? `<small> ${unit}</small>` : ''}</div><div class="s ${cls || ''}">${sub}</div></div>`;
+  // Sits above the KPI strip, where a page-level action belongs.
+  const reportBar = `<div style="display:flex;align-items:center;gap:10px;margin:0 0 10px">
+    <span style="color:#8b97a8;font-size:12px;flex:1">Everything recorded${o.first_ts ? ' since ' + new Date(o.first_ts * 1000).toLocaleDateString() : ''} — ${num(o.count || 0)} requests</span>
+    <a href="/__proxy/api/stats/report" target="_blank" rel="noopener"
+       title="Standalone page: volume, models, clients, decode rate by prompt depth. Self-contained, and printable to PDF from the browser."
+       style="background:#1c3a44;border:1px solid #2f8f9c;color:#57d1e0;border-radius:5px;padding:5px 13px;font-size:12px;text-decoration:none;white-space:nowrap">Usage report ↗</a>
+  </div>`;
   const kpiStrip = `<div class="s2-kpis">
     ${_kpi('Requests', num(o.count || 0), '', `${num(o.streams || 0)} streamed`)}
     ${_kpi('Total tokens', num(o.total_tokens || 0), '', `p ${num(o.prompt_tokens || 0)} · c ${num(o.completion_tokens || 0)}`)}
@@ -3198,7 +3204,7 @@ async function loadStats() {
   }
 
   $('stats').innerHTML = `
-    ${kpiStrip}
+    ${reportBar}${kpiStrip}
     ${compHtml}
     <div class="s2-detail"><div class="s2-tabs">${tabBar}</div><div class="s2-panes">${tabPanes}</div></div>
   `;
