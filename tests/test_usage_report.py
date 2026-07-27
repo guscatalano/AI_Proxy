@@ -216,9 +216,12 @@ def test_extras_respect_the_window(_clean):
 
 def _price(monkeypatch, **over):
     cfg = dict(P.load_rules_config())
-    cfg["pricing"] = {"enabled": True, "reference": "test rates",
-                      "default": {"input": 3.0, "cached_input": 0.30, "output": 15.0},
-                      "models": {}, **over}
+    cfg["pricing"] = {
+        "enabled": True,
+        "tiers": [{"name": "premium tier", "input": 3.0, "cached_input": 0.30, "output": 15.0},
+                  {"name": "budget tier", "input": 0.30, "cached_input": 0.03, "output": 0.60}],
+        "electricity": {"usd_per_kwh": 0.0, "watts": None},
+        **over}
     monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
     return cfg
 
@@ -243,7 +246,8 @@ def test_daily_ledger_groups_and_totals(_clean, monkeypatch):
     assert daily["total"]["input"] == 2_500_000
     assert daily["total"]["output"] == 4000
     # 2.5M uncached input at $3/M + 4k output at $15/M
-    assert daily["total"]["cost"] == pytest.approx(7.5 + 0.06)
+    assert daily["total"]["costs"] == [pytest.approx(7.5 + 0.06),
+                                      pytest.approx(0.75 + 0.0024)]
 
 
 def test_daily_ledger_charges_only_what_a_turn_added(_clean, monkeypatch):
@@ -255,7 +259,7 @@ def test_daily_ledger_charges_only_what_a_turn_added(_clean, monkeypatch):
     tot = P._usage_by_day()["total"]
     assert tot["input"] == 1_000_000 and tot["cached_input"] == 100_000
     # Charging both prompts in full would read $3.30 instead.
-    assert tot["cost"] == pytest.approx(3.0 + 0.03)
+    assert tot["costs"][0] == pytest.approx(3.0 + 0.03)
 
 
 def test_daily_ledger_handles_a_prompt_that_shrank(_clean, monkeypatch):
@@ -279,16 +283,17 @@ def test_daily_ledger_keeps_conversations_apart(_clean, monkeypatch):
     assert tot["input"] == 1_100_000 and tot["cached_input"] == 500_000
 
 
-def test_daily_ledger_applies_per_model_rates(_clean, monkeypatch):
-    _price(monkeypatch, models={"27b": {"input": 0.30, "cached_input": 0.03, "output": 1.20}})
-    _seed([{"id": "m1", "turn": 1, "ptok": 1_000_000},
-           {"id": "m2", "turn": 1, "ptok": 1_000_000}])
+def test_daily_ledger_prices_every_tier(_clean, monkeypatch):
+    # One rate is an argument about what a local model is worth; a bracket is a measurement.
+    _price(monkeypatch)
+    _seed([{"id": "m1", "turn": 1, "ptok": 1_000_000}])
     conn = P.db()
-    conn.execute("UPDATE requests SET model = 'gemma3:27b', completion_tokens = 0 WHERE id = 'm1'")
-    conn.execute("UPDATE requests SET model = 'big-frontier', completion_tokens = 0 WHERE id = 'm2'")
+    conn.execute("UPDATE requests SET completion_tokens = 0 WHERE id = 'm1'")
     conn.commit()
     conn.close()
-    assert P._usage_by_day()["total"]["cost"] == pytest.approx(0.30 + 3.0)
+    daily = P._usage_by_day()
+    assert daily["tiers"] == ["premium tier", "budget tier"]
+    assert daily["total"]["costs"] == [pytest.approx(3.0), pytest.approx(0.30)]
 
 
 def test_daily_ledger_can_be_turned_off(_clean, monkeypatch):
@@ -296,7 +301,7 @@ def test_daily_ledger_can_be_turned_off(_clean, monkeypatch):
     _seed([{"id": "p1", "turn": 1, "ptok": 1_000_000}])
     daily = P._usage_by_day()
     assert daily["priced"] is False
-    assert daily["total"]["cost"] == 0          # tokens still counted, money not claimed
+    assert daily["total"]["costs"] == []        # tokens still counted, money not claimed
     assert daily["total"]["input"] == 1_000_000
 
 
@@ -322,6 +327,69 @@ def test_daily_ledger_counts_days_with_no_traffic(_clean, monkeypatch):
     assert P._usage_by_day()["missing_days"] == 2
 
 
+def test_busy_time_merges_concurrent_requests(_clean):
+    # Summing durations is the obvious mistake and it overstates busy time severalfold: four
+    # requests served at once occupy the GPU for the length of the longest, not their sum.
+    base = time.mktime(time.strptime("2026-03-05 12:00:00", "%Y-%m-%d %H:%M:%S"))
+    rows = [{"ts": base, "duration_ms": 10_000},
+            {"ts": base + 2, "duration_ms": 4_000},      # wholly inside the first
+            {"ts": base + 8, "duration_ms": 10_000},     # overlaps, extends to +18
+            {"ts": base + 30, "duration_ms": 5_000}]     # separate
+    busy = P._busy_seconds_by_day(rows)
+    assert sum(busy.values()) == pytest.approx(18 + 5)   # not 10 + 4 + 10 + 5
+
+
+def test_busy_time_splits_at_midnight(_clean):
+    # A generation running over midnight belongs to both days, or one day's energy lands on the
+    # wrong bill.
+    midnight = time.mktime(time.strptime("2026-03-06 00:00:00", "%Y-%m-%d %H:%M:%S"))
+    busy = P._busy_seconds_by_day([{"ts": midnight - 60, "duration_ms": 120_000}])
+    assert busy["2026-03-05"] == pytest.approx(60)
+    assert busy["2026-03-06"] == pytest.approx(60)
+
+
+def test_busy_time_ignores_requests_that_never_finished(_clean):
+    assert P._busy_seconds_by_day([{"ts": time.time(), "duration_ms": None},
+                                   {"ts": time.time(), "duration_ms": 0}]) == {}
+
+
+def test_electricity_costs_the_clock_not_the_requests(_clean, monkeypatch):
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500})
+    now = time.time()
+    # Two hours of wall-clock work, served two-at-a-time. At 500W that is 1 kWh, not 2.
+    _seed([{"id": "e1", "ts": now - 7200, "turn": 1, "ptok": 10, "dur": 7_200_000},
+           {"id": "e2", "ts": now - 7200, "turn": 1, "ptok": 10, "dur": 7_200_000}])
+    daily = P._usage_by_day()
+    assert daily["power"] == {"watts": 500, "usd_per_kwh": 0.20, "source": "configured"}
+    assert daily["total"]["kwh"] == pytest.approx(1.0, rel=0.01)
+    assert daily["total"]["power_cost"] == pytest.approx(0.20, rel=0.01)
+
+
+def test_electricity_is_omitted_without_a_wattage(_clean, monkeypatch):
+    # No configured watts and no GPU to ask: say nothing rather than invent a number.
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.17, "watts": None})
+    monkeypatch.setattr(P, "_gpu_watts", lambda: None)
+    _seed([{"id": "n1", "turn": 1, "ptok": 10, "dur": 1000}])
+    daily = P._usage_by_day()
+    assert "power" not in daily
+    assert daily["total"]["power_cost"] == 0
+
+
+def test_report_renders_electricity_against_the_tiers(_clean, monkeypatch):
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500})
+    now = time.time()
+    _seed([{"id": "w1", "ts": now - 3600, "turn": 1, "ptok": 2_000_000, "dur": 3_600_000}])
+    conn = P.db()
+    conn.execute("UPDATE requests SET completion_tokens = 0 WHERE id = 'w1'")
+    conn.commit()
+    conn.close()
+    html = _clean.get("/__proxy/api/stats/report?format=html").text
+    assert "GPU hours" in html and "Electricity" in html
+    assert "$0.10" in html               # 1h at 500W = 0.5 kWh at $0.20
+    assert "of electricity to produce" in html
+    assert "500 W (configured)" in html  # the page says where the wattage came from
+
+
 def test_report_renders_the_daily_ledger(_clean, monkeypatch):
     _price(monkeypatch)
     _seed([{"id": "rr", "turn": 1, "ptok": 2_000_000}])
@@ -331,9 +399,10 @@ def test_report_renders_the_daily_ledger(_clean, monkeypatch):
     conn.close()
     html = _clean.get("/__proxy/api/stats/report?format=html").text
     assert "Day by day" in html
-    assert "would have cost" in html and "test rates" in html
-    assert "$6.00" in html            # 2M uncached input at $3/M
-    assert 'class="sum"' in html      # the total row reads as a total
+    assert "would have cost" in html
+    assert "premium tier" in html and "budget tier" in html
+    assert "$6.00" in html and "$0.60" in html   # 2M uncached input at $3/M and at $0.30/M
+    assert 'class="sum"' in html                 # the total row reads as a total
 
 
 def test_report_renders_the_new_sections(_clean):

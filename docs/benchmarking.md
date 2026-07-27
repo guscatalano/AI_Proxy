@@ -252,11 +252,17 @@ because they scan stored bodies and are far too expensive to sit behind the dash
 ### Day by day, and what it would have cost
 
 The last section is a ledger: requests, input, cached input, output and total tokens per day over
-the last 30 days, with a cost column.
+the last 30 days, then GPU hours and electricity, then one column per pricing tier.
 
-Nothing the proxy serves is billed — the models run on your hardware — so the column is not an
-invoice. It's what the same tokens would have carried on a commercial API, which is the only way
+Nothing the proxy serves is billed — the models run on your hardware — so those last columns are
+not an invoice. They're what the same tokens would have carried elsewhere, which is the only way
 to put a figure on what the hardware returns.
+
+**Two tiers, not one.** A frontier rate flatters a local 30B that isn't frontier quality; an
+open-weights rate ignores that some of this work would have gone to a better model if it hadn't
+run here. Neither single number is honest, so the default config brackets it — Claude Sonnet 4.5
+at the top, hosted open-weights at the bottom — and the page reports the range. Add, remove or
+re-rate tiers freely; every one gets its own column.
 
 The whole number rests on the cached share, and that's worked out **per conversation** rather
 than per request. An agentic client re-sends the entire conversation every turn, so turn *N*'s
@@ -270,21 +276,42 @@ Two things push the estimate **low**: a conversation already running when the ra
 its first turn counted in full, and a real API's cache expires between turns where this model's
 never does.
 
-Rates live under `pricing` in the rules config:
+### What it cost to produce
+
+Against those columns sits the electricity. **GPU hours are wall-clock with concurrent requests
+merged, not the sum of durations** — four requests served at once occupy the GPU for the length
+of the longest, and energy is billed by the clock. Summing durations overstates busy time
+severalfold. Intervals are split at midnight, so a generation running over the boundary is
+charged to both days.
+
+Only time spent working counts. The machine's idle draw is excluded, as is everything in it that
+isn't the GPU, so this is the floor rather than your power bill.
+
+Rates and wattage live under `pricing` in the rules config:
 
 ```jsonc
 "pricing": {
-  "enabled": true,                       // false drops the cost column, keeps the tokens
-  "reference": "Claude Sonnet 4.5 API rates",   // named on the page, so change it with the rates
-  "default": { "input": 3.0, "cached_input": 0.30, "output": 15.0 },   // USD per million tokens
-  "models": {                            // optional, first substring match wins
-    "27b": { "input": 0.30, "cached_input": 0.03, "output": 1.20 }
+  "enabled": true,                  // false drops the cost columns, keeps the tokens
+  "tiers": [                        // one column each; USD per million tokens
+    { "name": "Claude Sonnet 4.5", "input": 3.0, "cached_input": 0.30, "output": 15.0 },
+    { "name": "Hosted open-weights, 30B class",
+      "input": 0.30, "cached_input": 0.03, "output": 0.60 }
+  ],
+  "electricity": {
+    "usd_per_kwh": 0.17,            // US residential average; set your own
+    "watts": null                   // null = ask the GPU. See the warning below.
   }
 }
 ```
 
 `cached_input` is the rate that matters. Set it equal to `input` and the same traffic reads as
 roughly seven times more expensive — which is the mistake worth avoiding, not a stricter reading.
+
+> **Set `watts` explicitly on unified-memory hardware.** `nvidia-smi` reports one power domain,
+> which on a DGX Spark / GB10 is a fraction of what the module pulls: 35 W at 96% utilisation,
+> against a machine rated well over a hundred. Left on `null` the report will happily print an
+> electricity cost an order of magnitude too low, and say where the number came from but not
+> that it's wrong. Ten seconds with a watt meter under load settles it.
 
 ## Matrix runs
 

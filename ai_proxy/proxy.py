@@ -2140,22 +2140,31 @@ DEFAULT_RULES_CONFIG = {
     },
     "pricing": {
         # Reference rates for the usage report's daily ledger. Local models produce no invoice,
-        # so this is not a bill — it is what the same traffic would have cost had it gone to a
-        # commercial API, which is the only way to put a number on what the hardware returns.
+        # so this is not a bill — it is what the same traffic would have cost had it gone
+        # somewhere else, which is the only way to put a number on what the hardware returns.
+        #
+        # Two tiers by default, because one is misleading in either direction. A frontier rate
+        # flatters a local 30B that is not frontier quality; an open-weights rate ignores that
+        # some of this work would have gone to a better model if it hadn't run here. The pair
+        # brackets the honest answer. Add or replace tiers freely — every one gets a column.
         #
         # Rates are US dollars per million tokens. `cached_input` matters more than either of
-        # the others here: agentic traffic re-sends the whole conversation every turn, so most
-        # prompt tokens are a re-read of a prefix the server already has, and every commercial
-        # API discounts them roughly tenfold. Charging them at full rate overstates the total
-        # by an order of magnitude.
-        #
-        # `models` maps a substring of the model name to its own rates, first match wins —
-        # use it when a small local model shouldn't be priced like a frontier one:
-        #   "models": {"27b": {"input": 0.30, "cached_input": 0.03, "output": 1.20}}
+        # the others: agentic traffic re-sends the whole conversation every turn, so nearly all
+        # prompt tokens are a prefix the server already holds, and every provider discounts
+        # them roughly tenfold. Charging them at full rate overstates the total several times.
         "enabled": True,
-        "reference": "Claude Sonnet 4.5 API rates",
-        "default": {"input": 3.0, "cached_input": 0.30, "output": 15.0},
-        "models": {},
+        "tiers": [
+            {"name": "Claude Sonnet 4.5", "input": 3.0, "cached_input": 0.30, "output": 15.0},
+            {"name": "Hosted open-weights, 30B class",
+             "input": 0.30, "cached_input": 0.03, "output": 0.60},
+        ],
+        # What the work actually cost to produce, for the other side of the comparison.
+        # usd_per_kwh defaults to the US residential average; set it to your own rate.
+        # watts: leave null to use the GPU's own reported draw. Worth setting explicitly on
+        # unified-memory boards (DGX Spark / GB10 and friends), where nvidia-smi reports only
+        # part of the module and the figure comes out far below what the machine draws at the
+        # wall — a watt meter for ten seconds under load beats any guess here.
+        "electricity": {"usd_per_kwh": 0.17, "watts": None},
     },
     "tool_injector": {
         # Adds proxy-owned tools to outgoing requests and executes them server-side. The model
@@ -8214,22 +8223,71 @@ _TURN_BUCKETS = ((0, 5, "1–4"), (5, 15, "5–14"), (15, 40, "15–39"),
                  (40, 100, "40–99"), (100, 1 << 30, "100+"))
 
 
-def _price_rates(model, cfg) -> dict:
-    """First substring match wins, so the more specific fragment goes first in the map."""
-    base = cfg.get("default") or {}
-    m = (model or "").lower()
-    for frag, over in (cfg.get("models") or {}).items():
-        if frag and str(frag).lower() in m:
-            return {**base, **(over or {})}
-    return base
+def _gpu_watts():
+    """Current total GPU draw, or None. A spot reading, not a per-request measurement.
+
+    Worth distrusting on unified-memory parts: a GB10 at 96% utilisation reports ~34W, which is
+    a fraction of what the module pulls at the wall, because the field covers only one domain.
+    That's why the config can override it — a measured number beats a reported one here."""
+    if not _NVIDIA_SMI:
+        return None
+    try:
+        r = subprocess.run([_NVIDIA_SMI, "--query-gpu=power.draw",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=3)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    total = 0.0
+    for line in r.stdout.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("["):
+            continue
+        try:
+            total += float(line)
+        except ValueError:
+            pass
+    return total or None
+
+
+def _busy_seconds_by_day(rows) -> dict:
+    """Wall-clock seconds the upstreams were working, per local day.
+
+    Summing durations would double-count everything served concurrently — on this traffic that
+    overstates busy time severalfold, and energy is billed by the clock, not by the request. So
+    overlapping requests are merged into intervals first, then split at midnight so a generation
+    running over the boundary is charged to the days it actually spanned."""
+    spans = sorted((r["ts"], r["ts"] + (r["duration_ms"] or 0) / 1000.0)
+                   for r in rows if r["ts"] and (r["duration_ms"] or 0) > 0)
+    merged: list = []
+    for start, end in spans:
+        if merged and start <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], end)
+        else:
+            merged.append([start, end])
+
+    out: dict = {}
+    for start, end in merged:
+        cursor = start
+        while cursor < end:
+            day = datetime.datetime.fromtimestamp(cursor)
+            midnight = datetime.datetime.combine(
+                day.date() + datetime.timedelta(days=1), datetime.time.min).timestamp()
+            stop = min(end, midnight)
+            out[day.date().isoformat()] = out.get(day.date().isoformat(), 0.0) + (stop - cursor)
+            cursor = stop
+    return out
 
 
 def _usage_by_day(days: int = 30) -> dict:
-    """A daily ledger of tokens and what they would have cost on a commercial API.
+    """A daily ledger of tokens, what they would have cost elsewhere, and what they cost here.
 
     Local models produce no invoice, so a cost column has to be honest about what it is: the
     price the same traffic would have carried elsewhere, which is the only way to put a figure
-    on what the hardware returns.
+    on what the hardware returns. Two tiers by default rather than one, because a frontier rate
+    flatters a local 30B and an open-weights rate undersells it; the pair brackets the answer.
+    Against them sits the electricity actually spent producing the same tokens.
 
     The number lives or dies on the cached share, and that is worked out per conversation rather
     than per request. An agentic client re-sends the whole conversation every turn, so turn N's
@@ -8244,13 +8302,16 @@ def _usage_by_day(days: int = 30) -> dict:
     "unknown, assume uncached".
     """
     cfg = load_rules_config().get("pricing") or {}
-    priced = bool(cfg.get("enabled", True)) and bool(cfg.get("default"))
+    tiers = [t for t in (cfg.get("tiers") or []) if isinstance(t, dict)]
+    priced = bool(cfg.get("enabled", True)) and bool(tiers)
+    if not priced:
+        tiers = []
     out: dict = {"days": days, "priced": priced,
-                 "reference": cfg.get("reference") if priced else None}
+                 "tiers": [t.get("name") or "unnamed" for t in tiers]}
     conn = db()
     try:
         rows = conn.execute(
-            """SELECT date(ts, 'unixepoch', 'localtime') d, model, conversation_id,
+            """SELECT ts, date(ts, 'unixepoch', 'localtime') d, conversation_id, duration_ms,
                       prompt_tokens, est_prompt_tokens, completion_tokens
                FROM requests
                WHERE ts > ? AND shadow_of IS NULL
@@ -8277,26 +8338,47 @@ def _usage_by_day(days: int = 30) -> dict:
         prev_prompt = full
         completion = r["completion_tokens"] or 0
 
-        day = per_day.setdefault(r["d"], {"date": r["d"], "n": 0, "input": 0,
-                                          "cached_input": 0, "output": 0, "cost": 0.0})
+        day = per_day.setdefault(r["d"], {"date": r["d"], "n": 0, "input": 0, "cached_input": 0,
+                                          "output": 0, "costs": [0.0] * len(tiers),
+                                          "busy_s": 0.0, "kwh": 0.0, "power_cost": 0.0})
         day["n"] += 1
         day["input"] += uncached
         day["cached_input"] += cached
         day["output"] += completion
-        if priced:
-            rt = _price_rates(r["model"], cfg)
-            day["cost"] += (uncached / 1e6) * (rt.get("input") or 0)
-            day["cost"] += (cached / 1e6) * (rt.get("cached_input") or 0)
-            day["cost"] += (completion / 1e6) * (rt.get("output") or 0)
+        for i, t in enumerate(tiers):
+            day["costs"][i] += ((uncached / 1e6) * (t.get("input") or 0)
+                                + (cached / 1e6) * (t.get("cached_input") or 0)
+                                + (completion / 1e6) * (t.get("output") or 0))
+
+    # --- what producing it actually drew ---------------------------------------------------
+    elec = cfg.get("electricity") or {}
+    watts, source = elec.get("watts"), "configured"
+    if not watts:
+        watts, source = _gpu_watts(), "reported by the GPU"
+    rate = elec.get("usd_per_kwh")
+    if watts and rate:
+        out["power"] = {"watts": watts, "usd_per_kwh": rate, "source": source}
+        for date, secs in _busy_seconds_by_day(rows).items():
+            day = per_day.get(date)
+            if day is None:
+                continue
+            day["busy_s"] = secs
+            day["kwh"] = (secs / 3600.0) * (watts / 1000.0)
+            day["power_cost"] = day["kwh"] * rate
 
     by_day = sorted(per_day.values(), key=lambda d: d["date"])
     for d in by_day:
         d["total"] = d["input"] + d["cached_input"] + d["output"]
     out["by_day"] = by_day
-    out["total"] = {
-        k: sum(d[k] for d in by_day)
-        for k in ("n", "input", "cached_input", "output", "total", "cost")
-    } if by_day else None
+    if by_day:
+        out["total"] = {
+            k: sum(d[k] for d in by_day)
+            for k in ("n", "input", "cached_input", "output", "total",
+                      "busy_s", "kwh", "power_cost")
+        }
+        out["total"]["costs"] = [sum(d["costs"][i] for d in by_day) for i in range(len(tiers))]
+    else:
+        out["total"] = None
     # Days with no traffic at all are absent rather than zero — worth saying, since a reader
     # counting rows would otherwise take the ledger for a continuous record.
     if by_day:
@@ -8574,52 +8656,86 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
     daily = ex.get("daily") or {}
     by_day = daily.get("by_day") or []
     tot = daily.get("total") or {}
-    priced = daily.get("priced") and tot.get("cost")
+    tiers = daily.get("tiers") or []
+    priced = bool(daily.get("priced") and tiers)
+    power = daily.get("power") or {}
     day_html = ""
     if by_day:
         def day_row(d, is_total=False):
             label = ("Total" if is_total else
                      datetime.date.fromisoformat(d["date"]).strftime("%b %d"))
-            cost = (f'<td class="n">${d["cost"]:,.2f}</td>' if priced else "")
+            cells = "".join(f'<td class="n">${c:,.2f}</td>' for c in (d.get("costs") or []))
+            if power:
+                # Read left to right, the row ends on what it cost against what it would have.
+                cells = (f'<td class="n">{d["busy_s"] / 3600:,.1f} h</td>'
+                         f'<td class="n">${d["power_cost"]:,.2f}</td>' + cells)
             tr = '<tr class="sum">' if is_total else "<tr>"
             return (tr + f'<th scope="row">{_h(label)}</th>'
                     f'<td class="n">{_fmt_n(d["n"])}</td>'
                     f'<td class="n">{_fmt_tokens(d["input"])}</td>'
                     f'<td class="n">{_fmt_tokens(d["cached_input"])}</td>'
                     f'<td class="n">{_fmt_tokens(d["output"])}</td>'
-                    f'<td class="n">{_fmt_tokens(d["total"])}</td>{cost}</tr>')
+                    f'<td class="n">{_fmt_tokens(d["total"])}</td>{cells}</tr>')
 
         cached_share = (100 * tot["cached_input"] / tot["total"]) if tot.get("total") else 0
         gap = daily.get("missing_days") or 0
+        costs = tot.get("costs") or []
         lede = ""
-        if priced:
-            # The point of the column. Not a bill — nobody invoiced any of this — but the price
-            # the same work carries elsewhere, which is what the hardware is actually returning.
-            lede = (f'<div class="hero"><p class="lede">At <b>{_h(daily.get("reference") or "")}</b>, '
-                    f'this traffic would have cost <b>${tot["cost"]:,.0f}</b> — '
-                    f'<b>${tot["cost"] / max(1, len(by_day)):,.0f}</b> a day.</p>'
-                    f'<p class="why">Nothing here was billed — these models run on your own '
-                    f'hardware. The figure is what the same tokens would have carried on a '
-                    f'commercial API, and it rests on the cached share: {cached_share:.0f}% of '
-                    f'all tokens are a prefix an earlier turn already sent, which every API '
-                    f'discounts roughly tenfold. Charge those at the full input rate instead '
-                    f'and the same traffic reads as several times more.</p></div>')
+        if priced and costs:
+            # The comparison the whole section exists for: the same work, bought two ways,
+            # against what it drew to make it here. One reference rate would be an argument;
+            # a bracket is a measurement.
+            hi, lo = max(costs), min(costs)
+            hi_name = tiers[costs.index(hi)]
+            lo_name = tiers[costs.index(lo)]
+            bracket = (f'between <b>${lo:,.0f}</b> and <b>${hi:,.0f}</b>'
+                       if hi != lo else f'<b>${hi:,.0f}</b>')
+            versus = ""
+            if power and tot.get("power_cost"):
+                ratio = lo / tot["power_cost"] if tot["power_cost"] else 0
+                versus = (f' It drew <b>${tot["power_cost"]:,.2f}</b> of electricity to produce '
+                          f'here — {ratio:,.0f}× less than the cheaper of the two.'
+                          if ratio >= 2 else
+                          f' It drew <b>${tot["power_cost"]:,.2f}</b> of electricity to produce '
+                          f'here.')
+            lede = (f'<div class="hero"><p class="lede">Bought elsewhere, this traffic would '
+                    f'have cost {bracket} — {_h(lo_name)} at the low end, {_h(hi_name)} at '
+                    f'the high.{versus}</p>'
+                    f'<p class="why">Nothing here was billed: these models run on your own '
+                    f'hardware. Two reference rates rather than one because a frontier price '
+                    f'flatters a local model that is not frontier quality, and an open-weights '
+                    f'price ignores that some of this work would have gone to a better model if '
+                    f'it had not run here — the truth is inside the bracket. All of it rests on '
+                    f'the cached share: {cached_share:.0f}% of tokens are a prefix an earlier '
+                    f'turn already sent, which every provider discounts roughly tenfold.</p>'
+                    f'</div>')
+        power_note = ""
+        if power:
+            src = power.get("source") or ""
+            power_note = (
+                f" GPU hours are wall-clock with concurrent requests merged, not the sum of "
+                f"durations, since energy is billed by the clock. Drawn at "
+                f"{power['watts']:,.0f} W ({_h(src)}) and {power['usd_per_kwh']:.3f} $/kWh, "
+                f"counting only time spent working — the machine's idle draw is excluded, as "
+                f"is everything in it that is not the GPU.")
         day_html = (
             "<h2>Day by day</h2>" + lede
             + '<p class="note">Prompt tokens are split per conversation: each turn re-sends '
             "everything before it, so only the growth since the previous turn counts as input "
             "and the rest is a cache read. A conversation already running when this range "
-            "opened has its first turn here counted in full, and a real API's cache expires "
-            "between turns where this one doesn't — both push the estimate low."
+            "opened has its first turn here counted in full, and a real provider's cache "
+            "expires between turns where this one doesn't — both push the estimate low."
             + (f" No traffic at all on {gap} day{'s' if gap != 1 else ''} in this range; those "
                "are absent rather than shown as zero." if gap else "")
-            + (f' Rates are editable under <code>pricing</code> in the rules config.'
-               if priced else "")
+            + power_note
+            + (' Rates, tiers and the wattage are editable under <code>pricing</code> in the '
+               'rules config.' if priced else "")
             + "</p>"
             + "<div class=\"tbl\"><table><thead><tr><th>Date</th><th class=\"n\">Requests</th>"
             "<th class=\"n\">Input</th><th class=\"n\">Cached</th><th class=\"n\">Output</th>"
             "<th class=\"n\">Total</th>"
-            + ('<th class="n">Cost</th>' if priced else "")
+            + ('<th class="n">GPU hours</th><th class="n">Electricity</th>' if power else "")
+            + "".join(f'<th class="n">{_h(name)}</th>' for name in tiers)
             + "</tr></thead><tbody>"
             + "".join(day_row(d) for d in by_day)
             + (day_row({**tot, "date": by_day[-1]["date"]}, True) if tot else "")
