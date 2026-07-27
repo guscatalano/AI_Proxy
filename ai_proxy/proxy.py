@@ -118,6 +118,7 @@ ANALYTICS_CACHE_TTL_S = float(os.environ.get("PROXY_ANALYTICS_CACHE_TTL", "5") o
 # or an in-flight stream) can't hang a `systemctl restart` forever. 0 = wait indefinitely.
 GRACEFUL_SHUTDOWN_S = int(float(os.environ.get("PROXY_GRACEFUL_SHUTDOWN", "10") or 0))
 _last_request_prune = 0.0
+_last_archive_sweep = 0.0
 _ANALYTICS_CACHE: dict = {}
 
 
@@ -465,11 +466,100 @@ MIGRATIONS = [
 ]
 
 
+# Cold request bodies live in a second file. It is ALWAYS attached and the requests_v view
+# always spans both, whether or not anything has been moved yet — a view that references
+# `arch` only sometimes would fail on every connection that happened not to attach it, and
+# the failure would be a query error rather than a missing row. An empty archive costs ~12 KB.
+#
+# The trade this makes: `requests_v` is unusable from a plain `sqlite3 proxy.db` shell, since
+# nothing is attached there. Query `requests` and `request_blobs` directly for that.
+ARCHIVE_DB_PATH = os.environ.get("PROXY_ARCHIVE_DB") or (str(DB_PATH) + ".archive")
+_ARCHIVE_READY = False
+# Attaching the archive and building the spanning view costs ~1.3ms per connection (measured),
+# and db() is called on every save and every poll. Nobody who has never archived anything
+# should pay it, so connections only do the work once there is something to read: set when a
+# sweep moves rows, and re-checked at startup so a restart doesn't forget.
+_ARCHIVE_ACTIVE = False
+
+
+def _refresh_archive_active() -> bool:
+    """True when the archive holds rows, or archiving is on and will soon."""
+    global _ARCHIVE_ACTIVE
+    active = False
+    try:
+        if _archive_settings().get("enabled"):
+            active = True
+        elif Path(ARCHIVE_DB_PATH).exists():
+            # Through an attached connection, not a direct one — see _ensure_archive_file.
+            _ARCHIVE_ACTIVE = True
+            conn = db()
+            try:
+                active = bool(conn.execute(
+                    "SELECT 1 FROM arch.request_blobs LIMIT 1").fetchone())
+            except sqlite3.Error:
+                active = False
+            finally:
+                conn.close()
+    except Exception:
+        active = False
+    _ARCHIVE_ACTIVE = active
+    return active
+
+
+def _ensure_archive_file():
+    """Create the archive with the same blob schema, once.
+
+    Deliberately the ONLY place that opens the archive directly. Everything else reaches it
+    through ATTACH on a main connection: mixing the two access paths meant a direct writer and
+    an attached writer contending for the same file, which showed up as `database is locked`
+    and ten-second timeouts rather than as anything obviously wrong.
+    """
+    global _ARCHIVE_READY
+    if _ARCHIVE_READY and Path(ARCHIVE_DB_PATH).exists():
+        return
+    a = sqlite3.connect(ARCHIVE_DB_PATH, timeout=10.0)
+    try:
+        a.execute("PRAGMA journal_mode=WAL")
+        a.execute("""CREATE TABLE IF NOT EXISTS request_blobs (
+                        id TEXT PRIMARY KEY, request_body TEXT, response_body TEXT,
+                        stream_chunks TEXT, images_data TEXT)""")
+        a.commit()
+        _ARCHIVE_READY = True
+    finally:
+        a.close()
+
+
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
+    attached = False
+    if _ARCHIVE_ACTIVE:
+        try:
+            _ensure_archive_file()
+            conn.execute("ATTACH DATABASE ? AS arch", (ARCHIVE_DB_PATH,))
+            attached = True
+        except sqlite3.Error:
+            pass  # Main-only view rather than failing to open the database at all.
+    # requests_v has to be a TEMP view: SQLite refuses to let a stored view reference an
+    # attached database ("cannot reference objects in database arch"). Temp views are
+    # per-connection, which is the same scope the attach has, so the two agree by construction
+    # — and every existing caller keeps querying requests_v without knowing any of this.
+    try:
+        conn.execute(
+            "CREATE TEMP VIEW requests_v AS SELECT r.*, "
+            + ("COALESCE(b.request_body,  ab.request_body)  AS request_body, "
+               "COALESCE(b.response_body, ab.response_body) AS response_body, "
+               "COALESCE(b.stream_chunks, ab.stream_chunks) AS stream_chunks, "
+               "COALESCE(b.images_data,   ab.images_data)   AS images_data "
+               "FROM requests r LEFT JOIN request_blobs b ON b.id = r.id "
+               "LEFT JOIN arch.request_blobs ab ON ab.id = r.id"
+               if attached else
+               "b.request_body, b.response_body, b.stream_chunks, b.images_data "
+               "FROM requests r LEFT JOIN request_blobs b ON b.id = r.id"))
+    except sqlite3.Error:
+        pass
     return conn
 
 
@@ -829,12 +919,11 @@ def init_db():
     # (few) blob-reading queries use `requests_v` unchanged while fast scans stay on the lean
     # `requests`. Recreated every startup (cheap); r.* is clean because the blob columns were
     # dropped above. Needs SQLite >= 3.35 (DROP COLUMN) — confirmed before deploy.
+    # requests_v is now created per connection as a TEMP view (see db()), because it has to
+    # span the attached archive and SQLite won't let a stored view do that. Drop any stored
+    # copy left by an older build so the two can never disagree about what a body is.
     try:
         conn.execute("DROP VIEW IF EXISTS requests_v")
-        conn.execute(
-            "CREATE VIEW requests_v AS SELECT r.*, b.request_body, b.response_body, "
-            "b.stream_chunks, b.images_data FROM requests r LEFT JOIN request_blobs b ON b.id = r.id"
-        )
     except sqlite3.OperationalError:
         pass
     # Benches live in an in-memory asyncio task, so a restart (or a crash) strands whatever was
@@ -1103,6 +1192,9 @@ def _pick_upstream(full_path: str) -> tuple[str, str]:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Decide once whether connections need to attach the archive, so a restart doesn't forget
+    # that there is something out there to read.
+    _refresh_archive_active()
     _load_panic_mode()
     app.state.started_at = time.time()
     app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
@@ -1892,12 +1984,171 @@ async def _collect_once(app: FastAPI):
     if REQUEST_RETENTION_DAYS > 0 and (ts - _last_request_prune) > 600:
         _last_request_prune = ts
         conn.execute("DELETE FROM requests WHERE ts < ?", (ts - REQUEST_RETENTION_DAYS * 86400,))
+        # Archived bodies outlive their rows otherwise: nothing else references them, and the
+        # archive would grow forever holding blobs for requests that no longer exist.
+        try:
+            conn.execute("DELETE FROM arch.request_blobs WHERE id NOT IN "
+                         "(SELECT id FROM requests)")
+        except sqlite3.Error:
+            pass
     conn.commit()
     conn.close()
+    _maybe_sweep_archive(ts)
     # Artifact sweep: extract file/url/image touches from recent requests (off-thread so the
     # metrics loop never blocks on DB work). Dedup makes it idempotent.
     try:
         await asyncio.to_thread(_artifact_sweep)
+    except Exception:
+        pass
+
+
+_ARCHIVE_JOB: dict = {"state": "idle"}
+_ARCHIVE_LOCK = threading.Lock()
+
+
+def _archive_settings() -> dict:
+    cfg = {}
+    try:
+        cfg = load_rules_config().get("archive") or {}
+    except Exception:
+        pass
+
+    def num(key, default, lo, hi):
+        try:
+            v = float(cfg.get(key, default))
+        except (TypeError, ValueError):
+            return default
+        return min(hi, max(lo, v))
+
+    return {"enabled": bool(cfg.get("enabled")),
+            "after_days": num("after_days", 7, 0.04, 3650),
+            "chunk": int(num("chunk", 200, 1, 5000)),
+            "pause_s": num("pause_s", 0.1, 0.0, 5.0)}
+
+
+def _archive_status() -> dict:
+    """Sizes and how much is waiting to move — the numbers worth seeing before pressing go."""
+    s = _archive_settings()
+    out = {**s, "main_db_bytes": 0, "archive_db_bytes": 0,
+           "pending_rows": 0, "pending_bytes": 0, "archived_rows": 0,
+           "job": dict(_ARCHIVE_JOB)}
+    for key, path in (("main_db_bytes", DB_PATH), ("archive_db_bytes", ARCHIVE_DB_PATH)):
+        try:
+            out[key] = Path(path).stat().st_size
+        except OSError:
+            pass
+    conn = db()
+    try:
+        cutoff = time.time() - s["after_days"] * 86400
+        r = conn.execute(
+            """SELECT COUNT(*) n, COALESCE(SUM(
+                   LENGTH(COALESCE(b.request_body,'')) + LENGTH(COALESCE(b.response_body,'')) +
+                   LENGTH(COALESCE(b.stream_chunks,'')) + LENGTH(COALESCE(b.images_data,''))), 0) sz
+               FROM requests r JOIN request_blobs b ON b.id = r.id
+               WHERE r.ts < ?""", (cutoff,)).fetchone()
+        out["pending_rows"], out["pending_bytes"] = r["n"], r["sz"]
+    except sqlite3.Error as e:
+        out["error"] = str(e)
+    finally:
+        conn.close()
+    # Via ATTACH like everything else; force it on for this connection so the count is
+    # available even before the first sweep has made archiving active.
+    global _ARCHIVE_ACTIVE
+    if Path(ARCHIVE_DB_PATH).exists():
+        was, _ARCHIVE_ACTIVE = _ARCHIVE_ACTIVE, True
+        conn = db()
+        try:
+            out["archived_rows"] = conn.execute(
+                "SELECT COUNT(*) FROM arch.request_blobs").fetchone()[0]
+        except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+            _ARCHIVE_ACTIVE = was or bool(out["archived_rows"])
+    return out
+
+
+def _archive_sweep(force: bool = False) -> dict:
+    """Move cold blobs into the archive file, a chunk per transaction.
+
+    Insert-then-delete inside one transaction per chunk, so a crash mid-sweep can duplicate a
+    row into the archive but can never drop one from both. Interrupted work is simply picked up
+    on the next sweep.
+    """
+    s = _archive_settings()
+    if not (s["enabled"] or force):
+        return {"ok": False, "reason": "archiving is disabled"}
+    if not _ARCHIVE_LOCK.acquire(blocking=False):
+        return {"ok": False, "reason": "a sweep is already running", "job": dict(_ARCHIVE_JOB)}
+    # From here on connections must attach the archive — this sweep is about to put rows in it,
+    # and every later read has to be able to see them.
+    global _ARCHIVE_ACTIVE
+    _ensure_archive_file()
+    _ARCHIVE_ACTIVE = True
+    started, moved, freed = time.time(), 0, 0
+    _ARCHIVE_JOB.update({"state": "running", "started": started, "moved": 0, "error": None})
+    try:
+        cutoff = started - s["after_days"] * 86400
+        while True:
+            conn = db()
+            try:
+                rows = conn.execute(
+                    """SELECT b.id, LENGTH(COALESCE(b.request_body,'')) +
+                              LENGTH(COALESCE(b.response_body,'')) +
+                              LENGTH(COALESCE(b.stream_chunks,'')) +
+                              LENGTH(COALESCE(b.images_data,'')) sz
+                       FROM requests r JOIN request_blobs b ON b.id = r.id
+                       WHERE r.ts < ? ORDER BY r.ts LIMIT ?""",
+                    (cutoff, s["chunk"])).fetchall()
+                if not rows:
+                    break
+                ids = [r["id"] for r in rows]
+                marks = ",".join("?" for _ in ids)
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    f"""INSERT OR REPLACE INTO arch.request_blobs
+                        (id, request_body, response_body, stream_chunks, images_data)
+                        SELECT id, request_body, response_body, stream_chunks, images_data
+                        FROM main.request_blobs WHERE id IN ({marks})""", ids)
+                conn.execute(f"DELETE FROM main.request_blobs WHERE id IN ({marks})", ids)
+                conn.commit()
+                moved += len(ids)
+                freed += sum(r["sz"] or 0 for r in rows)
+                _ARCHIVE_JOB["moved"] = moved
+            except sqlite3.Error as e:
+                _ARCHIVE_JOB["error"] = str(e)
+                try:
+                    conn.rollback()
+                except sqlite3.Error:
+                    pass
+                break
+            finally:
+                conn.close()
+            if s["pause_s"]:
+                time.sleep(s["pause_s"])
+        _ARCHIVE_JOB.update({"state": "done", "finished": time.time()})
+        if moved:
+            try:
+                print(f"[archive] moved {moved} blob row(s), {freed / 1e9:.2f} GB, "
+                      f"in {time.time() - started:.0f}s")
+            except Exception:
+                pass
+        return {"ok": True, "moved": moved, "freed_bytes": freed,
+                "elapsed_s": round(time.time() - started, 1)}
+    finally:
+        _ARCHIVE_LOCK.release()
+
+
+def _maybe_sweep_archive(ts: float) -> None:
+    """Hourly at most, and only when switched on. In a thread: it moves gigabytes, and the
+    metrics loop it is called from must not wait on that."""
+    global _last_archive_sweep
+    if (ts - _last_archive_sweep) <= 3600:
+        return
+    _last_archive_sweep = ts
+    try:
+        if _archive_settings().get("enabled"):
+            threading.Thread(target=_archive_sweep, daemon=True, name="archive-sweep").start()
     except Exception:
         pass
 
@@ -2245,6 +2496,20 @@ DEFAULT_RULES_CONFIG = {
         "lmstudio_context_length": None,
         "lmstudio_parallel": None,
         "lmstudio_gpu": None,
+    },
+    "archive": {
+        # Request bodies are ~340 KB each and arrive at ~3 GB/day, while the row describing
+        # them is ~1.4 KB. Nothing analytical reads a body any more — stats, the reports and
+        # the tool counts all run off metadata — so cold bodies are pure archival weight in a
+        # file that has to be backed up, vacuumed and kept in page cache.
+        #
+        # Moving them to a second file keeps them readable (the requests_v view spans both, so
+        # opening an old request works exactly as before) while the working database stays
+        # small. Off by default: it relocates data, which is the caller's decision to make.
+        "enabled": False,
+        "after_days": 7,          # bodies older than this move on the next sweep
+        "chunk": 200,             # rows per transaction — insert and delete together
+        "pause_s": 0.1,           # breathing room between chunks so it never floods the disk
     },
     "pricing": {
         # Reference rates for the usage report's daily ledger. Local models produce no invoice,
@@ -4751,6 +5016,11 @@ def health(tables: bool = False):
             "oldest_ts": oldest,
             "newest_ts": newest,
             "table_sizes": table_sizes,
+            # The archive is a second file; a size that ignores it would understate what the
+            # proxy is actually keeping on disk.
+            "archive_path": ARCHIVE_DB_PATH,
+            "archive_bytes": (Path(ARCHIVE_DB_PATH).stat().st_size
+                              if Path(ARCHIVE_DB_PATH).exists() else 0),
             # So the UI can say "measuring" instead of silently showing nothing on the first
             # load after a restart.
             "table_sizes_pending": bool(tables and not table_sizes
@@ -4822,6 +5092,12 @@ def _db_reset_job(targets: list, vacuum: bool) -> dict:
             if "requests" in targets:
                 step("deleting request bodies")
                 conn.execute("DELETE FROM request_blobs")
+                # Including the ones that were moved out — otherwise "wipe requests" leaves
+                # gigabytes of bodies behind in the archive file.
+                try:
+                    conn.execute("DELETE FROM arch.request_blobs")
+                except sqlite3.Error:
+                    pass
             conn.commit()
         finally:
             conn.close()
@@ -5752,7 +6028,7 @@ async def get_rules():
     src, raw = _rules_source()
     setting = get_setting("rules")
     # Show every known rule/transform — pre-flight (registry), transforms, and post-flight.
-    known_extras = ["tool_aliases", "model_control", "pricing", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
+    known_extras = ["tool_aliases", "model_control", "pricing", "archive", "model_router", "ollama_options", "context_overflow_guard", "tool_pruner", "context_compressor", "protocol_bridge", "shadow_router", "tool_injector", "compaction_nudge", "request_priority", "request_dedup", "schema_validator", "hallucinated_tool", "tool_args_autofix", "xml_autofix", "tool_call_xml_retry"]
     seen: set = set()
     registered: list[str] = []
     for n in list(RULES_REGISTRY.keys()) + known_extras:
@@ -5782,6 +6058,24 @@ async def update_rules(request: Request):
     set_setting("rules", json.dumps(payload, indent=2))
     cfg = load_rules_config()
     return {"ok": True, "config": cfg, "source": "db"}
+
+
+@app.get("/__proxy/api/archive")
+def archive_status():
+    """Sizes, and how much would move on the next sweep."""
+    return _archive_status()
+
+
+@app.post("/__proxy/api/archive/run")
+async def archive_run(request: Request):
+    """Move cold bodies now. `force` runs a sweep even while the rule is disabled, so the first
+    one can be a deliberate act rather than something that starts on its own."""
+    try:
+        payload = await request.json() if (await request.body()) else {}
+    except Exception:
+        payload = {}
+    res = await asyncio.to_thread(_archive_sweep, bool(payload.get("force")))
+    return {**res, "status": _archive_status()}
 
 
 @app.post("/__proxy/api/rules/reset")
