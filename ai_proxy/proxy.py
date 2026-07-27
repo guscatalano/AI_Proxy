@@ -7788,8 +7788,11 @@ _REPORT_CSS = """
   thead tr.grp th.blank { background:var(--panel-2); }
   th.seam, td.seam { border-left:1px solid var(--border); }
   thead th.wrap { white-space:normal; max-width:96px; line-height:1.25; }
-  /* Footnotes belong under the thing they qualify — above it they're just a wall to climb. */
-  .fn { color:var(--ink-faint); font-size:11.5px; line-height:1.55; margin:9px 0 0; max-width:88ch; }
+  /* Footnotes belong under the thing they qualify — above it they're just a wall to climb.
+     A list, not paragraphs: four separate caveats set as prose read as one grey slab. */
+  ul.fn { color:var(--ink-faint); font-size:11.5px; line-height:1.6; max-width:86ch;
+          margin:11px 0 0; padding-left:17px; }
+  ul.fn li { margin:0 0 4px; }
   td.win { color:var(--accent); font-weight:700; }
   td.slow { color:var(--bad); font-weight:600; }
   td.ok { color:var(--good); } td.bad { color:var(--bad); font-weight:600; }
@@ -8373,7 +8376,11 @@ def _usage_by_day(days: int = 30) -> dict:
     elec = cfg.get("electricity") or {}
     watts, source = elec.get("watts"), "configured"
     if not watts:
-        watts, source = _gpu_watts(), "reported by the GPU"
+        # Named for what it actually is. nvidia-smi reports one rail, which on unified-memory
+        # parts is a fraction of the module: a GB10 at 96% utilisation reads ~34 W and offers no
+        # power limit at all to sanity-check it against. Calling this "the GPU's draw" on the
+        # page would dress a partial reading up as a measurement.
+        watts, source = _gpu_watts(), "GPU rail only, likely low"
     idle_w, idle_source = elec.get("watts_idle"), "configured"
     if idle_w is None and watts:
         idle_w, idle_source = watts * _IDLE_DRAW_FRACTION, "assumed"
@@ -8709,29 +8716,23 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
         cached_share = (100 * tot["cached_input"] / tot["total"]) if tot.get("total") else 0
         gap = daily.get("missing_days") or 0
         costs = tot.get("costs") or []
+        # One number per card, in the page's own vocabulary. A second hero here competed with
+        # the one at the top of the report, and three mono figures set inline in a 21px
+        # sentence read as jumbled rather than emphatic. Every other section states its
+        # headline numbers as cards; this one has no reason to be different.
         lede = ""
         if priced and costs:
-            # The comparison the whole section exists for: the same work, bought two ways,
-            # against what it drew to make it here. One reference rate would be an argument;
-            # a bracket is a measurement.
-            # One sentence for the comparison, one for what it cost to make. Short clauses:
-            # the numbers are the argument, and prose stacked around them buries it.
-            hi, lo = max(costs), min(costs)
-            hi_name, lo_name = tiers[costs.index(hi)], tiers[costs.index(lo)]
-            bracket = (f'<b>${lo:,.0f}</b> to <b>${hi:,.0f}</b>' if hi != lo
-                       else f'<b>${hi:,.0f}</b>')
-            versus = ""
+            cards = ""
             if power and tot.get("power_cost"):
-                versus = (f' Made here, they drew <b>${tot["power_cost"]:,.2f}</b> '
-                          f'of electricity.')
-            lede = (f'<div class="hero"><p class="lede">The same tokens, bought elsewhere: '
-                    f'{bracket}.{versus}</p>'
-                    # Tier names are user-supplied and often carry their own commas, so they get
-                    # a colon each rather than being folded into a sentence's punctuation.
-                    f'<p class="why">Nothing here was billed; the models run on your hardware. '
-                    f'Low end: {_h(lo_name)}. High end: {_h(hi_name)}. A local model this size '
-                    f'is not frontier quality, but some of this work would have gone to one if '
-                    f'it had not run here. The honest answer is between them.</p></div>')
+                cards += (f'<div class="card hi"><p class="k">Cost to produce</p>'
+                          f'<p class="v">${tot["power_cost"]:,.2f}</p>'
+                          f'<p class="d">electricity, over {tot["busy_s"] / 3600:,.0f} GPU '
+                          f'hours and the idle time around them</p></div>')
+            for name, c in sorted(zip(tiers, costs), key=lambda p: p[1]):
+                cards += (f'<div class="card"><p class="k">{_h(name)}</p>'
+                          f'<p class="v">${c:,.0f}</p>'
+                          f'<p class="d">what the same tokens would have cost</p></div>')
+            lede = f'<div class="cards">{cards}</div>'
 
         # Everything qualifying the table goes below it. Stacked above, three paragraphs of
         # method were a wall between the reader and the only thing they came for.
@@ -8741,6 +8742,11 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
                  f"conversation already running when the range opened has its first turn "
                  f"counted in full, and a real provider's cache expires between turns where "
                  f"this one never does."]
+        if priced and len(costs) > 1:
+            notes.insert(0, "Two reference rates, not one. A frontier price flatters a local "
+                            "model that is not frontier quality; an open-weights price ignores "
+                            "that some of this work would have gone to a frontier model if it "
+                            "had not run here. The honest answer is between them.")
         if power:
             idle_w = power.get("watts_idle") or 0
             how = ("configured" if power.get("idle_source") == "configured"
@@ -8764,7 +8770,11 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
         if tiers:
             groups.append(("Bought elsewhere", len(tiers), "seam"))
         day_html = (
-            "<h2>Day by day</h2>" + lede
+            "<h2>Day by day</h2>"
+            + '<p class="note">What this traffic would have cost bought elsewhere, against the '
+              'electricity spent making it here. Nothing on this page was billed — the models '
+              'run on your own hardware.</p>'
+            + lede
             + '<div class="tbl"><table><thead>'
             + '<tr class="grp">'
             + "".join(f'<th colspan="{n}" class="{cls}">{_h(name)}</th>' for name, n, cls in groups)
@@ -8777,7 +8787,7 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
             + "".join(day_row(d) for d in by_day)
             + (day_row({**tot, "date": by_day[-1]["date"]}, True) if tot else "")
             + "</tbody></table></div>"
-            + "".join(f'<p class="fn">{n}</p>' for n in notes))
+            + '<ul class="fn">' + "".join(f"<li>{n}</li>" for n in notes) + "</ul>")
 
     und = ex.get("undeclared_tools") or []
     tool_html = ""

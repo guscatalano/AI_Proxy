@@ -417,7 +417,7 @@ def test_report_renders_electricity_against_the_tiers(_clean, monkeypatch):
     html = _clean.get("/__proxy/api/stats/report?format=html").text
     assert "GPU hrs" in html and "Electricity" in html
     assert "$0.10" in html               # 1h at 500W = 0.5 kWh at $0.20
-    assert "of electricity" in html
+    assert "Cost to produce" in html         # the headline figures are cards now
     assert "500 W under load (configured)" in html   # the page names its sources
     assert "0 W idle (configured)" in html
 
@@ -431,7 +431,8 @@ def test_report_renders_the_daily_ledger(_clean, monkeypatch):
     conn.close()
     html = _clean.get("/__proxy/api/stats/report?format=html").text
     assert "Day by day" in html
-    assert "The same tokens, bought elsewhere" in html
+    assert "would have cost bought elsewhere" in html
+    assert "<ul class=\"fn\">" in html      # caveats are a list, not a slab of grey prose
     assert "premium tier" in html and "budget tier" in html
     assert "$6.00" in html and "$0.60" in html   # 2M uncached input at $3/M and at $0.30/M
     assert 'class="sum"' in html                 # the total row reads as a total
