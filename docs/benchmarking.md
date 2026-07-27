@@ -232,6 +232,23 @@ The two reports answer different questions and are shaped differently on purpose
 report compares configurations you chose, so it ranks. The usage report describes traffic you
 didn't choose, so it leads with what actually ran and treats latency as a property of the mix.
 
+Three of its sections are computed only when the report is generated, over the **last 24 hours**,
+because they scan stored bodies and are far too expensive to sit behind the dashboard's poll:
+
+- **Conversation depth** — prompt size and latency bucketed by turn index. Latency climbing with
+  depth means each turn is re-reading the whole conversation; latency flat or falling means the
+  prefix cache is holding the shared history. This is the fastest way to see caching work, or
+  stop working.
+- **Where the time goes** — the prefill/decode split of upstream time, plus generation discarded
+  when a client hung up mid-reply. With prompts an order of magnitude larger than replies,
+  prefill *should* dominate; that it doesn't is the cache earning its keep, so a jump in the
+  prefill share is what a caching regression looks like before anything else shows it.
+- **Tool calls the client never offered** — names the model invented, against what its client
+  actually declared. Declarations are sampled once per client rather than read per request (a
+  client sends the same tool list every turn, and the bodies are half a megabyte each). Counts
+  are of what the model *emitted*, so a name the `tool_aliases` rule already rewrites still
+  appears, marked as handled — the rewrite fixes the call, it doesn't stop the model making it.
+
 ## Matrix runs
 
 Any of **models**, **prompt size**, **thinking**, **temperature**, **cache** and **concurrency**

@@ -8186,7 +8186,120 @@ def _bar_cell(value, top):
     return f'<td style="width:120px"><span class="bar"><i style="width:{pct}%"></i></span></td>'
 
 
-def _stats_report_html(d: dict, env: dict) -> str:
+# These run only when a report is generated, never on the dashboard's poll: the tool-hygiene
+# pass parses request bodies, which is far too expensive to sit behind a 3s refresh.
+_TURN_BUCKETS = ((0, 5, "1–4"), (5, 15, "5–14"), (15, 40, "15–39"),
+                 (40, 100, "40–99"), (100, 1 << 30, "100+"))
+
+
+def _usage_extras(window_s: float = 86400.0, hygiene_limit: int = 800) -> dict:
+    """Views the stats endpoint doesn't compute, because they only make sense over a window and
+    the last one is too costly to poll."""
+    out: dict = {"window_s": window_s}
+    conn = db()
+    since = time.time() - window_s
+    try:
+        # --- how conversations grow, and what it costs -----------------------------------
+        case = " ".join(
+            f"WHEN turn_index >= {lo} AND turn_index < {hi} THEN '{label}'"
+            for lo, hi, label in _TURN_BUCKETS)
+        rows = conn.execute(
+            f"""SELECT CASE {case} END AS bucket, COUNT(*) n,
+                       AVG(COALESCE(prompt_tokens, est_prompt_tokens)) prompt,
+                       AVG(duration_ms) dur, AVG(ttft_ms) ttft
+                FROM requests
+                WHERE turn_index IS NOT NULL AND ts > ? AND (status IS NULL OR status < 400)
+                GROUP BY bucket""", (since,)).fetchall()
+        order = {label: i for i, (_lo, _hi, label) in enumerate(_TURN_BUCKETS)}
+        out["by_turn"] = sorted(
+            [{"bucket": r["bucket"], "n": r["n"], "prompt": r["prompt"],
+              "duration_ms": r["dur"], "ttft_ms": r["ttft"]} for r in rows if r["bucket"]],
+            key=lambda r: order.get(r["bucket"], 99))
+
+        # --- where the upstream time actually went ----------------------------------------
+        r = conn.execute(
+            """SELECT SUM(ttft_ms) prefill, SUM(duration_ms - ttft_ms) decode, COUNT(*) n
+               FROM requests WHERE ttft_ms > 0 AND duration_ms > ttft_ms AND ts > ?""",
+            (since,)).fetchone()
+        prefill, decode = (r["prefill"] or 0), (r["decode"] or 0)
+        total = prefill + decode
+        out["time_split"] = {
+            "prefill_ms": prefill, "decode_ms": decode, "n": r["n"] or 0,
+            "prefill_pct": (100 * prefill / total) if total else None,
+            "decode_pct": (100 * decode / total) if total else None,
+            "hours": total / 3600000.0,
+        }
+
+        # 499 is the client hanging up mid-generation: work done, nothing delivered.
+        r = conn.execute(
+            """SELECT COUNT(*) n, SUM(duration_ms) ms FROM requests
+               WHERE status = 499 AND ts > ?""", (since,)).fetchone()
+        out["abandoned"] = {"n": r["n"] or 0, "wasted_ms": r["ms"] or 0}
+
+        # --- tool calls the client never offered -------------------------------------------
+        # The mismatch that had Hermes calling run() ~93k times against a client that declared
+        # terminal. What a client declares is a property of the client, not of the request — it
+        # sends the same tool list every turn — so sample one body per client rather than
+        # parsing thousands of half-megabyte agentic prompts to re-read the same array.
+        declared_by_app: dict = {}
+        apps = conn.execute(
+            """SELECT client_app FROM requests WHERE ts > ?
+               GROUP BY client_app ORDER BY COUNT(*) DESC LIMIT 12""", (since,)).fetchall()
+        for a in apps:
+            app = a["client_app"]
+            row = conn.execute(
+                """SELECT b.request_body FROM requests r JOIN request_blobs b ON b.id = r.id
+                   WHERE r.ts > ? AND r.client_app IS ? AND b.request_body LIKE '%"tools"%'
+                   ORDER BY r.ts DESC LIMIT 1""", (since, app)).fetchone()
+            try:
+                tools = (json.loads(row["request_body"]).get("tools") or []) if row else []
+            except (json.JSONDecodeError, TypeError):
+                tools = []
+            names = {(t.get("function") or {}).get("name")
+                     for t in tools if isinstance(t, dict)}
+            names.discard(None)
+            declared_by_app[app] = names
+
+        # Replies are small next to the prompts, so this side can cover far more requests.
+        # Most tool calls arrive streamed, assembled across SSE deltas rather than sitting in
+        # response_body — _extract_tool_calls is what already knows how to read both.
+        called_undeclared: dict = {}
+        rows = conn.execute(
+            """SELECT r.client_app, b.response_body, b.stream_chunks FROM requests r
+               JOIN request_blobs b ON b.id = r.id
+               WHERE r.ts > ? AND (b.response_body IS NOT NULL OR b.stream_chunks IS NOT NULL)
+               ORDER BY r.ts DESC LIMIT ?""", (since, hygiene_limit)).fetchall()
+        for row in rows:
+            declared = declared_by_app.get(row["client_app"])
+            # No sampled declaration means every name would look invented. Say nothing instead.
+            if not declared:
+                continue
+            for name in _extract_tool_calls(row["response_body"], row["stream_chunks"]):
+                if name in declared:
+                    continue
+                slot = called_undeclared.setdefault(
+                    name, {"tool": name, "calls": 0, "clients": set()})
+                slot["calls"] += 1
+                slot["clients"].add(row["client_app"] or "unknown")
+        # Logging captures what the model emitted, not what the client was handed, so a name an
+        # alias already rewrites still shows up here. That is the useful reading — it says the
+        # model is still getting it wrong — but the row has to say the fix is in place.
+        ta = load_rules_config().get("tool_aliases") or {}
+        amap = (ta.get("map") or {}) if ta.get("enabled") else {}
+        out["undeclared_tools"] = sorted(
+            [{"tool": v["tool"], "calls": v["calls"], "clients": sorted(v["clients"]),
+              "aliased_to": (_alias_target(amap[v["tool"]])[0] or None) if v["tool"] in amap else None}
+             for v in called_undeclared.values()],
+            key=lambda v: -v["calls"])[:10]
+        out["hygiene_sampled"] = len(rows)
+    except sqlite3.Error as e:
+        out["error"] = str(e)
+    finally:
+        conn.close()
+    return out
+
+
+def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
     """Usage over a window. Deliberately not the same shape as the benchmark report: that one
     compares configurations you chose, this one describes traffic you didn't — so it leads with
     volume and composition, and treats latency as a property of the mix rather than a score."""
@@ -8297,6 +8410,74 @@ def _stats_report_html(d: dict, env: dict) -> str:
               ["Tool", "#Calls", ""], tool_rows),
     ])
     # The order is the argument: what ran, who asked for it, how fast it went, then small print.
+    # --- sections computed only for the report ------------------------------------------
+    ex = extras or {}
+    turn_rows = ""
+    for b in (ex.get("by_turn") or []):
+        turn_rows += (
+            f'<tr><th scope="row">{_h(b["bucket"])} turns</th>'
+            f'<td class="n">{_fmt_n(b["n"])}</td>'
+            f'<td class="n">{_fmt_n(b["prompt"], 0)}</td>'
+            f'<td class="n">{_fmt_n(b["ttft_ms"], 0, " ms")}</td>'
+            f'<td class="n">{_fmt_n(b["duration_ms"], 0, " ms")}</td></tr>')
+    turn_html = ""
+    if turn_rows:
+        turn_html = (
+            "<h2>Conversation depth</h2>"
+            '<p class="note">How much context a request carries as a conversation goes on, and '
+            "what it costs. Latency rising with depth means every turn re-reads the "
+            "conversation; latency staying flat, or falling, means the prefix cache is holding "
+            "the shared history and only the new turn is being read.</p>"
+            "<div class=\"tbl\"><table><thead><tr><th>Depth</th><th class=\"n\">Requests</th>"
+            "<th class=\"n\">Prompt tokens</th><th class=\"n\">TTFT</th>"
+            "<th class=\"n\">Total</th></tr></thead><tbody>" + turn_rows + "</tbody></table></div>")
+
+    ts = ex.get("time_split") or {}
+    ab = ex.get("abandoned") or {}
+    time_html = ""
+    if ts.get("prefill_pct") is not None:
+        time_html = (
+            "<h2>Where the time goes</h2>"
+            '<p class="note">Upstream time split between reading the prompt and writing the '
+            "reply. With prompts this much larger than replies, prefill should dominate — that "
+            "it does not is the prompt cache doing its job, so a jump in the prefill share is "
+            "how a caching regression would first show up.</p>"
+            '<div class="cards">'
+            f'<div class="card"><p class="k">Prefill</p><p class="v">{ts["prefill_pct"]:.0f}<small>%</small></p>'
+            f'<p class="d">reading the prompt</p></div>'
+            f'<div class="card hi"><p class="k">Decode</p><p class="v">{ts["decode_pct"]:.0f}<small>%</small></p>'
+            f'<p class="d">writing the reply</p></div>'
+            f'<div class="card"><p class="k">Upstream time</p><p class="v">{ts["hours"]:.1f}<small> h</small></p>'
+            f'<p class="d">across {_fmt_n(ts["n"])} requests</p></div>'
+            + (f'<div class="card"><p class="k">Discarded</p><p class="v">{_fmt_dur((ab.get("wasted_ms") or 0)/1000)}</p>'
+               f'<p class="d">{_fmt_n(ab.get("n"))} generations the client abandoned</p></div>'
+               if ab.get("n") else "")
+            + "</div>")
+
+    und = ex.get("undeclared_tools") or []
+    tool_html = ""
+    if und:
+        rows_html = "".join(
+            f'<tr><th scope="row"><code>{_h(u["tool"])}</code></th>'
+            f'<td class="n">{_fmt_n(u["calls"])}</td>'
+            f'<td>{_h(", ".join(u["clients"]))}</td>'
+            + (f'<td>renamed to <code>{_h(u["aliased_to"])}</code></td>'
+               if u.get("aliased_to") else '<td>reaches the client as-is</td>')
+            + "</tr>"
+            for u in und)
+        tool_html = (
+            "<h2>Tool calls the client never offered</h2>"
+            '<p class="note">Names the model invented, against the tools its client actually '
+            "declared. These are counted as the model emitted them, so a name an alias already "
+            "rewrites still appears — that is the point, it says the model has not stopped "
+            "getting it wrong. Anything unhandled is a call the client will reject, and where "
+            "the intended target is obvious the <code>tool_aliases</code> rule can rename it. "
+            f"Read from the {_fmt_n(ex.get('hygiene_sampled'))} most recent replies, against "
+            "each client's most recently declared tool list.</p>"
+            "<div class=\"tbl\"><table><thead><tr><th>Called</th><th class=\"n\">Times</th>"
+            "<th>Clients</th><th>Status</th></tr></thead><tbody>"
+            + rows_html + "</tbody></table></div>")
+
     body = "".join([
         cards,
         table("Models",
@@ -8313,6 +8494,9 @@ def _stats_report_html(d: dict, env: dict) -> str:
               "describes no real request. Compare a quoted tok/s figure against the bucket that "
               "matches its prompt size.",
               ["Prompt size", "#Samples", "#p50 tok/s", "#p90", "#max"], depth_rows),
+        turn_html,
+        time_html,
+        tool_html,
         f'<div class="band">{minor}</div>',
     ])
 
@@ -8344,7 +8528,8 @@ async def stats_report(format: str = "html"):
     if format != "html":
         return data
     env = await _bench_env_snapshot()
-    return Response(content=_stats_report_html(data, env),
+    extras = await asyncio.to_thread(_usage_extras)
+    return Response(content=_stats_report_html(data, env, extras),
                     media_type="text/html; charset=utf-8")
 
 
