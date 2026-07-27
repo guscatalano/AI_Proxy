@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import collections
 import gzip
+import struct
 import threading
 import ipaddress
 import math
@@ -3353,6 +3354,33 @@ def _decode_b64_image(payload) -> bytes | None:
     return raw
 
 
+def _image_is_complete(raw: bytes) -> bool:
+    """Does the image actually finish, or does it just start convincingly?
+
+    Magic bytes only prove the first few bytes. A screenshot cut off mid-transfer keeps a
+    perfect header — right format, right dimensions — and loses the pixels, so it passes every
+    check we had and then renders as a broken thumbnail with nothing to explain why. Clients cap
+    tool output at a fixed character count and will happily slice a base64 payload in half; the
+    only way to know is to look for the terminator each format is required to end with.
+    """
+    if not isinstance(raw, bytes) or len(raw) < 16:
+        return False
+    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
+        return raw.rstrip().endswith(b"IEND\xaeB`\x82")
+    if raw.startswith(b"\xff\xd8\xff"):
+        return raw.rstrip(b"\x00").endswith(b"\xff\xd9")
+    if raw[:6] in (b"GIF87a", b"GIF89a"):
+        return raw.endswith(b"\x3b")
+    if raw.startswith(b"RIFF"):
+        # The RIFF header declares its own payload size; a short file is a truncated one.
+        try:
+            return len(raw) >= 8 + struct.unpack("<I", raw[4:8])[0]
+        except struct.error:
+            return False
+    # BMP and anything else: no reliable terminator, so don't claim it's broken.
+    return True
+
+
 def _iter_request_images(body: dict):
     """Yield (index, media_type, kind, payload) for each image in a chat request, in order.
     kind='data' → payload is base64 (from a data: URL or Anthropic source); kind='url' →
@@ -6041,8 +6069,12 @@ async def get_request(req_id: str, request: Request):
     if _imgs_col:
         for i, im in enumerate(_imgs_col):
             b64 = im.get("data") or ""
+            raw = _decode_b64_image(b64)
             d["images"].append({"index": i, "media_type": im.get("media_type") or "image/png",
-                                "kind": "data", "size_bytes": len(b64) * 3 // 4})
+                                "kind": "data", "size_bytes": len(b64) * 3 // 4,
+                                # A header-only image renders as a broken thumbnail and looks
+                                # like our fault. Say what actually happened to it.
+                                "complete": _image_is_complete(raw) if raw else False})
     elif d.get("request_body"):
         try:
             _bj = json.loads(d["request_body"])
@@ -6103,8 +6135,11 @@ def get_request_image(req_id: str, idx: int, request: Request):  # sync → thre
         except (ValueError, binascii.Error):
             return JSONResponse({"error": "image data truncated or not valid base64 — full bytes weren't stored"},
                                 status_code=422)
+        # Served either way — a partial screenshot is still worth looking at — but the header
+        # says so, so the viewer isn't left guessing why it renders half-drawn.
         return Response(content=raw, media_type=mt or "image/png",
-                        headers={"Cache-Control": "private, max-age=300"})
+                        headers={"Cache-Control": "private, max-age=300",
+                                 "X-Image-Complete": "1" if _image_is_complete(raw) else "0"})
     return JSONResponse({"error": "image index out of range"}, status_code=404)
 
 

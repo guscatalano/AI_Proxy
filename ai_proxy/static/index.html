@@ -2611,9 +2611,17 @@ async function loadDetail(id) {
         return `<div style="margin:6px 0"><a href="${esc(im.url)}" target="_blank" rel="noopener" style="color:#57d1e0">external image ${im.index} ↗</a> <span style="color:#666;font-size:11px">${esc(im.media_type || '')}</span></div>`;
       }
       const src = `/__proxy/api/requests/${esc(d.id)}/image/${im.index}`;
+      // A truncated image still has a perfect header, so it renders half-drawn with no clue
+      // why. Name the cause: the bytes were cut before they reached the proxy, and whatever
+      // model saw this request got the same broken picture.
+      const cut = im.complete === false ? `<div style="color:#e0a060;font-size:11px;margin-top:3px">
+        ⚠ Truncated — the header is intact but the pixel data ends early, so it arrived cut off.
+        The model received it in this state too. Usually a tool-output size cap in the client
+        slicing the base64 payload.</div>` : '';
       return `<div style="margin:8px 0">
         <a href="${src}" target="_blank" rel="noopener" style="color:#57d1e0">image ${im.index} — ${esc(im.media_type)} · ${num(kb)} KB ↗</a>
-        <div><img src="${src}" loading="lazy" style="max-width:360px;max-height:280px;border:1px solid #333;border-radius:4px;margin-top:4px;display:block" title="click the link above to open full size" onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'(could not render — data may be truncated)',style:'color:#e08080;font-size:11px'}))"></div>
+        <div><img src="${src}" loading="lazy" style="max-width:360px;max-height:280px;border:1px solid ${im.complete === false ? '#7a5a30' : '#333'};border-radius:4px;margin-top:4px;display:block" title="click the link above to open full size" onerror="this.replaceWith(Object.assign(document.createElement('div'),{textContent:'(could not render — data may be truncated)',style:'color:#e08080;font-size:11px'}))"></div>
+        ${cut}
       </div>`;
     }).join('');
     imagesHtml = section(`Images (${d.images.length})`, rows);
