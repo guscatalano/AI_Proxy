@@ -372,13 +372,32 @@ def test_idle_draw_is_charged_for_the_hours_between_requests(_clean, monkeypatch
     _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500, "watts_idle": 100})
     now = time.time()
     _seed([{"id": "i1", "ts": now - 3600, "turn": 1, "ptok": 10, "dur": 3_600_000}])
-    day = P._usage_by_day(days=1)["by_day"][0]
-    assert day["busy_s"] == pytest.approx(3600, rel=0.01)
-    assert day["idle_s"] > 0
+    # Totals, not by_day[0]: an hour-long request started before midnight is split across two
+    # day rows, and asserting on the first one only passes for most of the day.
+    tot = P._usage_by_day(days=1)["total"]
+    assert tot["busy_s"] == pytest.approx(3600, rel=0.01)
+    assert tot["idle_s"] > 0
     # Stated rather than assumed: the total is the two draws over their own hours.
-    assert day["kwh"] == pytest.approx(
-        (day["busy_s"] / 3600) * 0.5 + (day["idle_s"] / 3600) * 0.1, rel=1e-6)
-    assert day["kwh"] > (day["busy_s"] / 3600) * 0.5     # idle actually moved the number
+    assert tot["kwh"] == pytest.approx(
+        (tot["busy_s"] / 3600) * 0.5 + (tot["idle_s"] / 3600) * 0.1, rel=1e-6)
+    assert tot["kwh"] > (tot["busy_s"] / 3600) * 0.5     # idle actually moved the number
+
+
+def test_power_is_not_lost_when_a_request_runs_past_midnight(_clean, monkeypatch):
+    # The row is filed under the day it started, so the day it spilled into has no request of
+    # its own. Looking that day up instead of creating it dropped the power on the floor.
+    _price(monkeypatch, electricity={"usd_per_kwh": 1.0, "watts": 3600, "watts_idle": 0})
+    midnight = time.mktime(time.strptime("2026-07-25 00:00:00", "%Y-%m-%d %H:%M:%S"))
+    _seed([{"id": "mid", "ts": midnight - 1800, "turn": 1, "ptok": 10, "dur": 3_600_000}])
+    daily = P._usage_by_day(days=30)
+    dates = {d["date"]: d for d in daily["by_day"]}
+    assert "2026-07-24" in dates and "2026-07-25" in dates
+    assert dates["2026-07-24"]["busy_s"] == pytest.approx(1800, rel=0.01)
+    assert dates["2026-07-25"]["busy_s"] == pytest.approx(1800, rel=0.01)
+    # 3600 W for one hour at $1/kWh = $3.60, whichever side of midnight it fell on.
+    assert daily["total"]["power_cost"] == pytest.approx(3.6, rel=0.01)
+    # The spilled-into day carries power but no tokens, and must not invent traffic.
+    assert dates["2026-07-25"]["n"] == 0 and dates["2026-07-25"]["input"] == 0
 
 
 def test_idle_draw_is_assumed_from_load_when_not_measured(_clean, monkeypatch):

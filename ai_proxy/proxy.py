@@ -8458,6 +8458,12 @@ def _busy_seconds_by_day(rows) -> dict:
     return out
 
 
+def _blank_day(date: str, n_tiers: int) -> dict:
+    return {"date": date, "n": 0, "input": 0, "cached_input": 0, "output": 0,
+            "costs": [0.0] * n_tiers, "busy_s": 0.0, "idle_s": 0.0, "kwh": 0.0,
+            "power_cost": 0.0}
+
+
 def _usage_by_day(days: int = 30) -> dict:
     """A daily ledger of tokens, what they would have cost elsewhere, and what they cost here.
 
@@ -8516,10 +8522,7 @@ def _usage_by_day(days: int = 30) -> dict:
         prev_prompt = full
         completion = r["completion_tokens"] or 0
 
-        day = per_day.setdefault(r["d"], {"date": r["d"], "n": 0, "input": 0, "cached_input": 0,
-                                          "output": 0, "costs": [0.0] * len(tiers),
-                                          "busy_s": 0.0, "idle_s": 0.0, "kwh": 0.0,
-                                          "power_cost": 0.0})
+        day = per_day.setdefault(r["d"], _blank_day(r["d"], len(tiers)))
         day["n"] += 1
         day["input"] += uncached
         day["cached_input"] += cached
@@ -8550,6 +8553,11 @@ def _usage_by_day(days: int = 30) -> dict:
                         "source": source, "idle_source": idle_source}
         busy = _busy_seconds_by_day(rows)
         now, start = time.time(), time.time() - days * 86400
+        # A generation running across midnight belongs to both days. The second of those may
+        # have no request of its own — the row that started it is filed under the previous day —
+        # and looking days up instead of creating them dropped that power on the floor.
+        for date in busy:
+            per_day.setdefault(date, _blank_day(date, len(tiers)))
         for date, day in per_day.items():
             day["busy_s"] = busy.get(date, 0.0)
             # The machine draws power between requests, and on traffic this bursty that is most
@@ -11344,6 +11352,85 @@ def _ips_share_subnet(a: str | None, b: str | None) -> bool:
         return False
 
 
+def _upstream_error_message(status: int | None, body_text: str | None) -> str | None:
+    """The upstream's own account of a 5xx, lifted out of its response body.
+
+    When vLLM's engine died it returned a perfectly clear EngineDeadError in the body and the
+    row recorded status 500 with a blank error column, so the detail view had nothing to show.
+    Whatever the upstream took the trouble to say is the best explanation available.
+    """
+    if not status or status < 500 or not body_text:
+        return None
+    try:
+        j = json.loads(body_text)
+    except (json.JSONDecodeError, TypeError):
+        # Not JSON: the first non-empty line beats nothing.
+        line = next((l.strip() for l in body_text.splitlines() if l.strip()), "")
+        return f"upstream returned {status}: {line[:300]}" if line else None
+    msg = None
+    if isinstance(j, dict):
+        err = j.get("error")
+        if isinstance(err, dict):
+            msg = err.get("message") or err.get("type")
+        elif isinstance(err, str):
+            msg = err
+        msg = msg or j.get("detail") or j.get("message")
+        if isinstance(msg, (dict, list)):
+            msg = json.dumps(msg)
+    if not msg:
+        return None
+    return f"upstream returned {status}: {str(msg)[:400]}"
+
+
+def _explain_upstream_error(exc, upstream: str | None, url: str | None,
+                            elapsed_ms: float | None = None, got_bytes: bool = False) -> str:
+    """Turn a transport exception into something worth reading in the request detail.
+
+    httpx's own text is frequently useless — a connection dropped mid-response raises
+    ReadError('') with an empty message, which is what the log said for every request lost when
+    vLLM's engine died. The exception type already carries the diagnosis; this spells it out,
+    says which upstream and how far in, and keeps the raw repr on the end for forensics.
+    """
+    name = type(exc).__name__
+    where = f"{upstream or 'the upstream'}"
+    if url:
+        try:                                   # host:port is the useful part, not the full path
+            p = url.split("//", 1)[-1].split("/", 1)[0]
+            where = f"{upstream or 'the upstream'} at {p}"
+        except Exception:
+            pass
+    when = f" after {elapsed_ms:.0f} ms" if elapsed_ms is not None else ""
+    phase = ("mid-response, after part of the answer had arrived" if got_bytes
+             else "before any response bytes arrived")
+
+    if name == "ConnectError":
+        what = (f"Could not open a connection to {where}{when}. Nothing is listening — the "
+                f"upstream is down, restarting, or on a different port.")
+    elif name == "ConnectTimeout":
+        what = (f"Timed out opening a connection to {where}{when} — it is reachable but not "
+                f"completing the handshake.")
+    elif name == "ReadError":
+        what = (f"{where} accepted the request then closed the connection{when}, {phase}. "
+                f"That is what a crashed or restarted upstream looks like from here — its own "
+                f"log will say why.")
+    elif name == "RemoteProtocolError":
+        what = (f"{where} ended the response early{when}, {phase} — the connection closed in "
+                f"the middle of a message rather than at a boundary.")
+    elif name == "ReadTimeout":
+        what = (f"{where} accepted the request but sent nothing back{when}. Reachable but not "
+                f"answering — usually a model still loading, or a queue that is not draining.")
+    elif name == "PoolTimeout":
+        what = (f"No connection slot was free for {where}{when} — the proxy's own pool is "
+                f"saturated, not the upstream.")
+    elif name in ("WriteError", "WriteTimeout"):
+        what = (f"{where} closed the connection while the request was still being sent{when} — "
+                f"often an oversized body, or the upstream dying at the wrong moment.")
+    else:
+        what = f"{where} failed{when}, {phase}."
+    detail = str(exc).strip()
+    return f"{what} [{name}{': ' + detail if detail else ''}]"
+
+
 def _can_view_pii(viewer_ip: str | None, originator_ip: str | None) -> bool:
     """When redaction is on, PII visible iff viewer and originator are the same IP or share a subnet.
     When redaction is off, everything is visible."""
@@ -13557,9 +13644,12 @@ async def proxy(full_path: str, request: Request):
     except Exception as e:
         _release_pri_slot()
         elapsed = (time.perf_counter() - start) * 1000
-        _save_finish(req_id, 0, {}, None, None, elapsed, f"upstream error: {e!r}")
+        explained = _explain_upstream_error(e, upstream_label, upstream_url, elapsed,
+                                            got_bytes=False)
+        _save_finish(req_id, 0, {}, None, None, elapsed, explained)
         return JSONResponse(
-            {"error": "upstream unreachable", "upstream": upstream_base, "detail": str(e)},
+            {"error": "upstream unreachable", "upstream": upstream_base,
+             "detail": str(e), "explanation": explained},
             status_code=502,
         )
 
@@ -13989,7 +14079,11 @@ async def proxy(full_path: str, request: Request):
                     ),
                     "details": {"fixes": xml_applied_s, "streaming": True, "replaced": True},
                 })
-            _save_finish(req_id, upstream_resp.status_code, resp_headers_full, None, full, elapsed, err, ttft_ms=first_chunk_ms)
+            # A streamed 5xx carries its reason in the body too — vLLM sends the whole
+            # EngineDeadError before closing. Keep it unless something already said more.
+            _save_finish(req_id, upstream_resp.status_code, resp_headers_full, None, full, elapsed,
+                         err or _upstream_error_message(upstream_resp.status_code, full),
+                         ttft_ms=first_chunk_ms)
             _fin["saved"] = True
 
         # Wrap streamer to (a) release the priority slot even on disconnect/error, (b)
@@ -13998,8 +14092,10 @@ async def proxy(full_path: str, request: Request):
         # fanout so concurrent duplicates receive the same bytes.
         async def _gen_with_release():
             stream_err: str | None = None
+            sent_any = False
             try:
                 async for chunk in streamer():
+                    sent_any = sent_any or bool(chunk)
                     if _restore_model_name and chunk:
                         try:
                             chunk = _override_model_in_text(
@@ -14011,7 +14107,12 @@ async def proxy(full_path: str, request: Request):
                         _dedup_fanout.push(chunk)
                     yield chunk
             except Exception as e:
-                stream_err = f"{type(e).__name__}: {e}"
+                # Mid-stream failures are the ones worth explaining: the client already had
+                # part of an answer, so "ReadError('')" tells whoever reads this row nothing
+                # about why it stopped halfway.
+                stream_err = _explain_upstream_error(
+                    e, upstream_label, upstream_url, (time.perf_counter() - start) * 1000,
+                    got_bytes=bool(sent_any))
                 raise
             finally:
                 _release_pri_slot()
@@ -14165,7 +14266,8 @@ async def proxy(full_path: str, request: Request):
         except Exception:
             pass
 
-    _save_finish(req_id, upstream_resp.status_code, resp_headers_full, body_text_resp, None, elapsed, None)
+    _save_finish(req_id, upstream_resp.status_code, resp_headers_full, body_text_resp, None,
+                 elapsed, _upstream_error_message(upstream_resp.status_code, body_text_resp))
 
     return Response(
         content=body_bytes,
