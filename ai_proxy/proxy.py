@@ -446,6 +446,11 @@ MIGRATIONS = [
     # 1 if the request carried image/non-text content, so the list can badge it without
     # re-parsing the (large) body per row.
     "ALTER TABLE requests ADD COLUMN has_images INTEGER",
+    # Tool names invoked in the response, as a JSON array, extracted once at write time.
+    # Counting them used to mean re-reading 500 response bodies out of the blob table on every
+    # stats call — 19-27 MB of scattered reads, measured at 5.1s cold against 0.001s for the
+    # same rows without bodies. The response is already in memory when the row is finalised.
+    "ALTER TABLE requests ADD COLUMN tool_calls TEXT",
     # Bench suites: a matrix submission creates one parent row plus a child row per cell.
     # env_json snapshots the machine/engine state at run time so a result stays interpretable
     # weeks later (which quant, which context length, how much VRAM was free).
@@ -1105,6 +1110,9 @@ async def lifespan(app: FastAPI):
     app.state.metrics_task = asyncio.create_task(_metrics_loop(app))
     app.state.task_worker = asyncio.create_task(_task_worker_loop(app))
     app.state.zombie_killer = asyncio.create_task(_inflight_zombie_killer(app))
+    # One-time, throttled, and in a thread: it reads bodies, which is the cost the tool_calls
+    # column exists to keep off the request path. Daemon so it can never hold up a shutdown.
+    threading.Thread(target=_backfill_tool_calls, daemon=True, name="tool-calls-backfill").start()
     try:
         yield
     finally:
@@ -1892,6 +1900,53 @@ async def _collect_once(app: FastAPI):
         await asyncio.to_thread(_artifact_sweep)
     except Exception:
         pass
+
+
+def _backfill_tool_calls(cutoff_days: float = 7.0, chunk: int = 50, pause_s: float = 0.15):
+    """Fill `tool_calls` for rows written before it existed, once, in the background.
+
+    Reading those bodies is exactly the expensive thing this column exists to avoid, so it is
+    done here rather than on the stats path: small chunks, a pause between them, and bounded to
+    rows older than this process — so it converges and never touches anything the write path
+    now handles. Rows with no tool calls are marked `[]` rather than left NULL, or they would be
+    re-read on every pass forever.
+    """
+    started = time.time()
+    since = started - cutoff_days * 86400
+    done = found = 0
+    while True:
+        conn = db()
+        try:
+            rows = conn.execute(
+                """SELECT r.id, b.response_body, b.stream_chunks
+                   FROM requests r JOIN request_blobs b ON b.id = r.id
+                   WHERE r.tool_calls IS NULL AND r.ts > ? AND r.ts < ?
+                     AND (b.response_body IS NOT NULL OR b.stream_chunks IS NOT NULL)
+                   ORDER BY r.ts DESC LIMIT ?""", (since, started, chunk)).fetchall()
+            if not rows:
+                break
+            for r in rows:
+                try:
+                    names = _extract_tool_calls(r["response_body"], r["stream_chunks"])
+                except Exception:
+                    names = []
+                conn.execute("UPDATE requests SET tool_calls=? WHERE id=?",
+                             (json.dumps(names), r["id"]))
+                found += len(names)
+            conn.commit()
+            done += len(rows)
+        except sqlite3.Error:
+            break
+        finally:
+            conn.close()
+        time.sleep(pause_s)
+    if done:
+        try:
+            print(f"[init] backfilled tool_calls for {done} request(s), {found} call(s), "
+                  f"in {time.time() - started:.0f}s")
+        except Exception:
+            pass
+    return done
 
 
 async def _metrics_loop(app: FastAPI):
@@ -5926,20 +5981,23 @@ def stats():  # sync → threadpool
            ORDER BY count DESC"""
     ).fetchall()]
 
-    # Tool usage requires parsing response bodies — scan up to a bounded set.
-    # Trimmed from 5000 → 500 and limited to the last 7 days. With multi-MB response
-    # bodies, the old query was loading hundreds of MB and JSON-parsing every row, which
-    # dominated the stats endpoint latency. The most recent 500 is representative.
+    # Tool usage, from the names extracted when each row was written. This used to re-read 500
+    # response bodies out of the blob table on every call — 19-27 MB of scattered reads,
+    # measured at 5.1s against cold pages while the same rows without bodies took 0.001s. It
+    # was the entire cost of this endpoint. Reading a small text column instead lifts the cap
+    # too: every row in the window counts, not the most recent 500.
     _tool_cutoff = time.time() - 7 * 86400
     tool_rows = conn.execute(
-        """SELECT model, response_body, stream_chunks FROM requests_v
-           WHERE ts > ? AND (response_body IS NOT NULL OR stream_chunks IS NOT NULL)
-           ORDER BY ts DESC LIMIT 500""",
+        """SELECT model, tool_calls FROM requests
+           WHERE ts > ? AND tool_calls IS NOT NULL""",
         (_tool_cutoff,),
     ).fetchall()
     by_tool: dict[str, dict] = {}
     for r in tool_rows:
-        names = _extract_tool_calls(r["response_body"], r["stream_chunks"])
+        try:
+            names = json.loads(r["tool_calls"]) or []
+        except (json.JSONDecodeError, TypeError):
+            continue
         for n in names:
             entry = by_tool.setdefault(n, {"name": n, "calls": 0, "by_model": {}})
             entry["calls"] += 1
@@ -13227,11 +13285,17 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
     parsed_ttft = _extract_ttft_ms(body_text, stream_text)
     if parsed_ttft is not None:
         ttft_ms = parsed_ttft
+    # Extract the tool names now, while the response is in memory. Doing it later means going
+    # back to disk for the whole body, which is what made the stats endpoint slow.
+    try:
+        _tools = _extract_tool_calls(body_text, stream_text)
+    except Exception:
+        _tools = []
     conn = db()
     conn.execute(
         """UPDATE requests
            SET status=?, response_headers=?, duration_ms=?, error=?,
-               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?
+               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?, tool_calls=?
            WHERE id=?""",
         (
             status,
@@ -13239,6 +13303,7 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
             elapsed_ms,
             error,
             pt, ct, tt, ttft_ms,
+            json.dumps(_tools) if _tools else None,
             req_id,
         ),
     )
