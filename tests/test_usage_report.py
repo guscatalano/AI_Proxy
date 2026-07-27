@@ -456,6 +456,31 @@ def test_report_renders_electricity_against_the_tiers(_clean, monkeypatch):
     assert "is a floor rather than a measurement" not in html
 
 
+def test_cost_is_not_at_the_top_of_the_page(_clean, monkeypatch):
+    # The ledger's card markup was assigned to `cards`, the name holding the page's opening
+    # hero. That replaced the top of the report with its cost figures and printed them twice.
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500, "watts_idle": 0})
+    _seed([{"id": "top", "turn": 1, "ptok": 2_000_000, "dur": 9000, "ttft": 200}])
+    html = _clean.get("/__proxy/api/stats/report?format=html").text
+    assert html.count("Cost to produce") == 1, "cost cards rendered more than once"
+    assert "tokens and wrote" in html, "the page's own opening hero went missing"
+    # Whatever money appears, it appears after the traffic tables.
+    assert html.index("tokens and wrote") < html.index("Cost to produce")
+    assert html.index("Day by day") > html.index("Models")
+
+
+def test_opening_does_not_repeat_the_meta_strip(_clean):
+    # Period, request count and token total are already in the header. The hero cards are the
+    # most valuable space on the page and shouldn't spend it restating them.
+    _seed([{"id": "o1", "turn": 1, "ptok": 5000, "dur": 900, "ttft": 200}])
+    html = _clean.get("/__proxy/api/stats/report?format=html").text
+    opening = html[:html.index("Models")]
+    assert "Decode rate" in opening and "Reply length" in opening
+    # "mean" is what it computes; calling it a median was simply wrong.
+    assert "mean across every request" in opening
+    assert "median request wrote this much" not in html
+
+
 def test_report_renders_the_daily_ledger(_clean, monkeypatch):
     _price(monkeypatch)
     _seed([{"id": "rr", "turn": 1, "ptok": 2_000_000}])
@@ -481,6 +506,32 @@ def test_report_renders_the_new_sections(_clean):
     assert "Where the time goes" in html
     assert "Tool calls the client never offered" in html
     assert "<code>run</code>" in html
+
+
+def test_report_streams_a_building_notice_before_the_content(_clean):
+    # Assembling this takes seconds; a browser with nothing to render shows a blank tab that
+    # looks like a hang. The notice must arrive first and hide itself once the content lands.
+    _seed([{"id": "s1", "turn": 1, "ptok": 100, "dur": 10, "ttft": 5}])
+    r = _clean.get("/__proxy/api/stats/report?format=html")
+    assert r.status_code == 200
+    html = r.text
+    assert html.index('id="building"') < html.index("Usage report</title>") + len(html)
+    assert html.index('id="building"') < html.index("<footer")
+    # The hiding rule is sent last, so a saved copy shows no leftover spinner.
+    assert "#building{display:none}" in html
+    assert html.index("#building{display:none}") > html.index('id="building"')
+    assert r.headers.get("cache-control") == "no-store"
+
+
+def test_report_streams_an_error_into_the_page(_clean, monkeypatch):
+    # The head is already on the wire by then, so a failure cannot be a status code.
+    def boom():
+        raise RuntimeError("stats exploded")
+    monkeypatch.setattr(P, "stats", boom)
+    html = _clean.get("/__proxy/api/stats/report?format=html").text
+    assert "could not be built" in html
+    assert "RuntimeError: stats exploded" in html
+    assert "<footer" in html          # the document is still closed properly
 
 
 def test_report_omits_sections_with_nothing_to_say(_clean):
