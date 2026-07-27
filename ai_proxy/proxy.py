@@ -1554,6 +1554,52 @@ def _infer_quant(*sources) -> str | None:
     return None
 
 
+# Phases vLLM announces on its way up, newest-looking first. Weight loading is the long one and
+# the only one that reports a fraction, which is what makes the wait bearable to watch.
+_VLLM_BOOT_PHASES = (
+    (re.compile(r"Loading safetensors checkpoint shards:\s*(\d+)%[^|]*\|\s*(\d+)/(\d+)"),
+     lambda m: f"loading weights — shard {m.group(2)} of {m.group(3)} ({m.group(1)}%)"),
+    (re.compile(r"Capturing CUDA graph"), lambda m: "capturing CUDA graphs"),
+    (re.compile(r"torch\.compile|Compiling|compilation"), lambda m: "compiling the model"),
+    (re.compile(r"Available KV cache memory"), lambda m: "allocating the KV cache"),
+    (re.compile(r"Starting to load model"), lambda m: "starting to load the model"),
+    (re.compile(r"Initializing a V1 LLM engine"), lambda m: "initialising the engine"),
+)
+
+
+async def _vllm_boot_state() -> dict:
+    """Why vLLM isn't answering: still coming up, stopped, or not there at all.
+
+    Only called when /v1/models has already failed, so the docker calls never touch the healthy
+    path. Without this the dashboard shows the same "unreachable" for a container nine minutes
+    into loading 42 GiB of weights as for one that isn't running — and the first is worth
+    waiting for.
+    """
+    docker = _docker_bin()
+    name = await _vllm_container() if docker else None
+    if not name:
+        return {"state": "absent"}
+    code, out = await _run_cmd(
+        [docker, "inspect", name, "--format", "{{.State.Running}}\t{{.State.StartedAt}}"], 15.0)
+    if code != 0:
+        return {"state": "unknown", "container": name}
+    parts = (out.strip().split("\t") + ["", ""])[:2]
+    if parts[0].strip().lower() != "true":
+        return {"state": "stopped", "container": name}
+    info = {"state": "loading", "container": name, "started_at": parts[1].strip() or None}
+    # The tail is enough: these lines are emitted continuously while it comes up.
+    code, logs = await _run_cmd([docker, "logs", "--tail", "40", name], 15.0,
+                                max_chars=20000, keep_tail=True)
+    if code == 0 and logs:
+        for line in reversed(logs.splitlines()):
+            for pat, describe in _VLLM_BOOT_PHASES:
+                m = pat.search(line)
+                if m:
+                    info["phase"] = describe(m)
+                    return info
+    return info
+
+
 async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
     """vLLM OpenAI-compat: /v1/models lists the served model(s) (always 'loaded' — vLLM serves
     one config at a time); /metrics (Prometheus text) has live running/waiting counts + KV usage."""
@@ -1562,6 +1608,7 @@ async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
         r = await client.get(f"{VLLM_URL}/v1/models")
         if r.status_code == 200:
             out["reachable"] = True
+            out["state"] = "ready"
             for m in (r.json().get("data") or []):
                 # `root` is the checkpoint vLLM was launched with (e.g.
                 # "saricles/Qwen3-Coder-Next-NVFP4-GB10"); the served id is usually an alias.
@@ -1571,6 +1618,10 @@ async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
                 out["available"].append(rec)
                 out["loaded"].append(rec)
     except (httpx.RequestError, ValueError):
+        out.update(await _vllm_boot_state())
+        return out
+    if not out["reachable"]:
+        out.update(await _vllm_boot_state())
         return out
     try:
         r = await client.get(f"{VLLM_URL}/metrics")
@@ -6732,9 +6783,15 @@ def _upstream_is_local(url: str) -> bool:
     return host in ("localhost", "127.0.0.1", "::1", "")
 
 
-async def _run_cmd(args: list, timeout: float = 120.0) -> tuple[int, str]:
+async def _run_cmd(args: list, timeout: float = 120.0, max_chars: int = 800,
+                   keep_tail: bool = False) -> tuple[int, str]:
     """No shell: arguments are passed as a list so a container or model name can never become
-    part of a command."""
+    part of a command.
+
+    keep_tail decides which end of an oversized output survives. It matters for `docker logs`,
+    where everything interesting is at the end — taking the head returned the oldest lines of
+    the tail and cut off the progress output entirely.
+    """
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL,
@@ -6746,7 +6803,8 @@ async def _run_cmd(args: list, timeout: float = 120.0) -> tuple[int, str]:
     except asyncio.TimeoutError:
         proc.kill()
         return 124, f"timed out after {timeout:.0f}s"
-    return proc.returncode or 0, (out or b"").decode("utf-8", "replace").strip()[:800]
+    text = (out or b"").decode("utf-8", "replace").strip()
+    return proc.returncode or 0, (text[-max_chars:] if keep_tail else text[:max_chars])
 
 
 async def _vllm_container() -> str | None:

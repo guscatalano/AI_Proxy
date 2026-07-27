@@ -430,6 +430,14 @@
   .reach-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: middle; }
   .reach-dot.ok { background: #68d391; }
   .reach-dot.bad { background: #f07178; }
+  /* Coming up is neither serving nor broken, and pulses so it reads as in-progress. */
+  .reach-dot.warn { background: #f0c674; animation: dotpulse 1.4s ease-in-out infinite; }
+  @keyframes dotpulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+  .spin { animation: spinrot 1.1s linear infinite; }
+  @keyframes spinrot { to { transform: rotate(360deg); } }
+  @media (prefers-reduced-motion: reduce) {
+    .reach-dot.warn, .spin { animation: none; }
+  }
   .sysprov-bar { display: flex; gap: 8px; margin: 16px 0 0; flex-wrap: wrap; border-bottom: 1px solid #262d38; }
   .sysprov-tab { display: inline-flex; align-items: center; gap: 8px; background: transparent; border: 1px solid #262d38; border-bottom: none; color: #9aa4b2; font: inherit; font-size: 13px; padding: 9px 16px; border-radius: 8px 8px 0 0; cursor: pointer; margin-bottom: -1px; transition: color .15s, background .15s; }
   .sysprov-tab:hover { color: #e9edf4; background: #141922; }
@@ -4855,7 +4863,9 @@ function renderSystem() {
 
   // Runtime tabs: one per backend, header always shows a reach dot + count of loaded models.
   const activeProv = window._sysProvTab || (vllm.reachable ? 'vllm' : (lmstudio.reachable ? 'lmstudio' : 'ollama'));
-  const _pTab = (id, label, snap, n) => `<button class="sysprov-tab ${activeProv===id?'on':''}" onclick="setSysProv('${id}')"><span class="reach-dot ${snap.reachable ? 'ok' : 'bad'}"></span>${label}<span class="sysprov-n">${n}</span></button>`;
+  // The tab dot carries the same three-way state, so a backend that is coming up is visible
+  // without opening its panel.
+  const _pTab = (id, label, snap, n) => `<button class="sysprov-tab ${activeProv===id?'on':''}" onclick="setSysProv('${id}')"><span class="reach-dot ${snap.reachable ? 'ok' : (snap.state === 'loading' ? 'warn' : 'bad')}"></span>${label}<span class="sysprov-n">${n}</span></button>`;
   const provBar = `<div class="sysprov-bar">
       ${_pTab('vllm','vLLM',vllm,(vllm.loaded||[]).length)}
       ${_pTab('lmstudio','LM Studio',lmstudio,(lmstudio.loaded||[]).length)}
@@ -4894,12 +4904,40 @@ function renderSystem() {
       ${argChips ? `<details open><summary style="cursor:pointer;color:#888;font-size:11px;margin-bottom:6px">launch command (${vArgPairs.length} flags)</summary><div style="display:flex;flex-wrap:wrap;gap:5px">${argChips}</div></details>` : ''}
     </div>` : '';
 
+  // "offline" for nine minutes of weight loading reads as broken. These are different states
+  // and only one of them is worth doing something about.
+  const vStates = {
+    ready:   ['ok',   '#68d391', 'serving'],
+    loading: ['warn', '#f0c674', 'loading'],
+    stopped: ['bad',  '#e08080', 'container stopped'],
+    absent:  ['bad',  '#666',    'offline'],
+    unknown: ['bad',  '#666',    'unreachable'],
+  };
+  const vState = vllm.state || (vllm.reachable ? 'ready' : 'unknown');
+  const [vDot, vColour, vLabel] = vStates[vState] || vStates.unknown;
+  let vllmNote = '';
+  if (vState === 'loading') {
+    const since = vllm.started_at ? (Date.now() - Date.parse(vllm.started_at)) / 1000 : null;
+    const elapsed = since != null && since >= 0
+      ? `${Math.floor(since / 60)}m ${Math.floor(since % 60)}s in` : '';
+    vllmNote = `<div style="margin:6px 0 2px;padding:8px 10px;border:1px solid #5a4a20;border-radius:4px;background:#2a2410;color:#f0c674;font-size:12px">
+        <span class="spin" style="display:inline-block;margin-right:6px">◐</span>
+        ${esc(vllm.phase || 'starting up')}${elapsed ? ` · ${esc(elapsed)}` : ''}
+        <div style="color:#9a8a5a;font-size:11px;margin-top:3px">Requests will fail until this
+          finishes — weights are read from disk, so it takes minutes, not seconds.</div>
+      </div>`;
+  } else if (vState === 'stopped') {
+    vllmNote = `<div style="margin:6px 0 2px;padding:8px 10px;border:1px solid #4a2020;border-radius:4px;background:#2a1010;color:#e08080;font-size:12px">
+        Container <code>${esc(vllm.container || '?')}</code> exists but is not running.
+      </div>`;
+  }
   const vllmPanel = `
     <div class="stats-section">
-      <h2><span class="reach-dot ${vllm.reachable ? 'ok' : 'bad'}"></span>vLLM ${vllm.reachable ? '<span style="color:#68d391;font-weight:normal;font-size:11px">serving</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
+      <h2><span class="reach-dot ${vDot}"></span>vLLM <span style="color:${vColour};font-weight:normal;font-size:11px">${esc(vLabel)}</span></h2>
+      ${vllmNote}
       <table style="width:100%">
         <thead><tr><th>Served model</th><th class="num">Max context</th><th class="num">Running</th><th class="num">Waiting</th><th class="num">KV cache</th></tr></thead>
-        <tbody>${vllmRows}</tbody>
+        <tbody>${vllmRows || `<tr><td colspan="5" style="color:#666;padding:6px 0">${vState === 'loading' ? 'nothing served yet' : 'no model served'}</td></tr>`}</tbody>
       </table>
     </div>
     ${paramsSection}`;
