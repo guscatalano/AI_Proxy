@@ -8714,55 +8714,49 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
             # The comparison the whole section exists for: the same work, bought two ways,
             # against what it drew to make it here. One reference rate would be an argument;
             # a bracket is a measurement.
+            # One sentence for the comparison, one for what it cost to make. Short clauses:
+            # the numbers are the argument, and prose stacked around them buries it.
             hi, lo = max(costs), min(costs)
-            hi_name = tiers[costs.index(hi)]
-            lo_name = tiers[costs.index(lo)]
-            bracket = (f'between <b>${lo:,.0f}</b> and <b>${hi:,.0f}</b>'
-                       if hi != lo else f'<b>${hi:,.0f}</b>')
+            hi_name, lo_name = tiers[costs.index(hi)], tiers[costs.index(lo)]
+            bracket = (f'<b>${lo:,.0f}</b> to <b>${hi:,.0f}</b>' if hi != lo
+                       else f'<b>${hi:,.0f}</b>')
             versus = ""
             if power and tot.get("power_cost"):
-                ratio = lo / tot["power_cost"] if tot["power_cost"] else 0
-                versus = (f' It drew <b>${tot["power_cost"]:,.2f}</b> of electricity to produce '
-                          f'here — {ratio:,.0f}× less than the cheaper of the two.'
-                          if ratio >= 2 else
-                          f' It drew <b>${tot["power_cost"]:,.2f}</b> of electricity to produce '
-                          f'here.')
-            lede = (f'<div class="hero"><p class="lede">Bought elsewhere, this traffic would '
-                    f'have cost {bracket} — {_h(lo_name)} at the low end, {_h(hi_name)} at '
-                    f'the high.{versus}</p>'
-                    f'<p class="why">Nothing here was billed — these models run on your own '
-                    f'hardware. Two rates rather than one because a frontier price flatters a '
-                    f'local model that is not frontier quality, and an open-weights price '
-                    f'ignores that some of this work would have gone to a better model if it '
-                    f'had not run here.</p></div>')
+                versus = (f' Made here, they drew <b>${tot["power_cost"]:,.2f}</b> '
+                          f'of electricity.')
+            lede = (f'<div class="hero"><p class="lede">The same tokens, bought elsewhere: '
+                    f'{bracket}.{versus}</p>'
+                    # Tier names are user-supplied and often carry their own commas, so they get
+                    # a colon each rather than being folded into a sentence's punctuation.
+                    f'<p class="why">Nothing here was billed; the models run on your hardware. '
+                    f'Low end: {_h(lo_name)}. High end: {_h(hi_name)}. A local model this size '
+                    f'is not frontier quality, but some of this work would have gone to one if '
+                    f'it had not run here. The honest answer is between them.</p></div>')
 
         # Everything qualifying the table goes below it. Stacked above, three paragraphs of
         # method were a wall between the reader and the only thing they came for.
-        notes = ["Prompt tokens are split per conversation: each turn re-sends everything "
-                 "before it, so only the growth counts as input and the rest is a cache read — "
-                 f"{cached_share:.0f}% of all tokens here. A conversation already running when "
-                 "this range opened has its first turn counted in full, and a real provider's "
-                 "cache expires between turns where this one doesn't; both push the estimate "
-                 "low."]
+        notes = [f"Tokens are split per conversation. Each turn re-sends everything before it, "
+                 f"so only the growth counts as input and the rest is a cache read: "
+                 f"{cached_share:.0f}% of all tokens here. Two things push that low. A "
+                 f"conversation already running when the range opened has its first turn "
+                 f"counted in full, and a real provider's cache expires between turns where "
+                 f"this one never does."]
         if power:
             idle_w = power.get("watts_idle") or 0
             how = ("configured" if power.get("idle_source") == "configured"
                    else f"assumed at {_IDLE_DRAW_FRACTION:.0%} of load")
-            idle_txt = f"{idle_w:,.0f} W idle ({how})"
             notes.append(
-                f"GPU hours are wall-clock with concurrent requests merged, not the sum of "
-                f"durations, because energy is billed by the clock. Electricity covers the "
-                f"whole day at {power['watts']:,.0f} W under load "
-                f"({_h(power.get('source') or '')}) and {idle_txt}, at "
-                f"{power['usd_per_kwh']:.3f} $/kWh — the machine draws power between requests "
-                f"too, and on traffic this bursty that is most of it. Counts the GPU only, not "
-                f"the rest of the box.")
+                f"GPU hours are wall-clock, with concurrent requests merged. Energy is billed "
+                f"by the clock, not by the request. Cost covers the whole day: "
+                f"{power['watts']:,.0f} W under load ({_h(power.get('source') or '')}), "
+                f"{idle_w:,.0f} W idle ({how}), at {power['usd_per_kwh']:.3f} $/kWh. The GPU "
+                f"only, not the rest of the machine.")
         if gap:
-            notes.append(f"No traffic at all on {gap} day{'s' if gap != 1 else ''} in this "
-                         "range; those are absent rather than shown as zero.")
+            notes.append(f"No traffic on {gap} day{'s' if gap != 1 else ''} in this range. "
+                         f"Those have no row, and no idle draw counted.")
         if priced:
-            notes.append("Rates, tiers and the wattage are editable under <code>pricing</code> "
-                         "in the rules config.")
+            notes.append("Rates, tiers and wattage live under <code>pricing</code> in the rules "
+                         "config.")
 
         groups = [("", 1, "blank"), ("Tokens", 3, "")]
         if power:
