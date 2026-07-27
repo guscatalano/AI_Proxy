@@ -289,7 +289,9 @@ draw over everything else, clipped to the window at both ends. A box answering t
 hour spends almost all of its day idle, and that power is as real as the rest. Days with no
 traffic at all have no row, so their idle draw isn't counted.
 
-It still counts the GPU only, not the rest of the machine, so treat it as a floor.
+Both wattages mean the **whole machine at the wall**, not the accelerator. Serving a token also
+costs CPU, memory, disks, fans and power-supply losses; charging only the GPU makes local
+inference look cheaper than it is.
 
 Rates and wattage live under `pricing` in the rules config:
 
@@ -303,8 +305,8 @@ Rates and wattage live under `pricing` in the rules config:
   ],
   "electricity": {
     "usd_per_kwh": 0.17,            // US residential average; set your own
-    "watts": null,                  // load draw. null = ask the GPU. See the warning below.
-    "watts_idle": null              // null = assume 30% of load draw, and say so on the page
+    "watts": null,                  // whole machine under load. null = fall back to the GPU.
+    "watts_idle": null              // whole machine at rest. null = assume 30% of load draw.
   }
 }
 ```
@@ -312,11 +314,13 @@ Rates and wattage live under `pricing` in the rules config:
 `cached_input` is the rate that matters. Set it equal to `input` and the same traffic reads as
 roughly seven times more expensive — which is the mistake worth avoiding, not a stricter reading.
 
-> **Set `watts` explicitly on unified-memory hardware.** `nvidia-smi` reports one power domain,
-> which on a DGX Spark / GB10 is a fraction of what the module pulls: 35 W at 96% utilisation,
-> against a machine rated well over a hundred. Left on `null` the report will happily print an
-> electricity cost an order of magnitude too low, and say where the number came from but not
-> that it's wrong. Ten seconds with a watt meter under load settles it.
+> **Set both wattages from a meter.** The `null` fallback asks the GPU, which is wrong twice:
+> it omits everything in the machine that isn't the accelerator, and on unified-memory hardware
+> `nvidia-smi` reports a single rail — a DGX Spark / GB10 reads ~34 W at 96% utilisation, with
+> every power-limit field `N/A` so there's nothing to sanity-check it against, and no `hwmon`
+> system sensor either. The report labels that figure a floor and says why, but a floor an order
+> of magnitude low is still misleading. Ten seconds with a watt meter under load, ten more at
+> rest, and both numbers are real.
 
 ## Matrix runs
 

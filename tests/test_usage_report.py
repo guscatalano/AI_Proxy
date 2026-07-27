@@ -360,7 +360,8 @@ def test_electricity_costs_the_clock_not_the_requests(_clean, monkeypatch):
     _seed([{"id": "e1", "ts": now - 7200, "turn": 1, "ptok": 10, "dur": 7_200_000},
            {"id": "e2", "ts": now - 7200, "turn": 1, "ptok": 10, "dur": 7_200_000}])
     daily = P._usage_by_day()
-    assert daily["power"]["watts"] == 500 and daily["power"]["source"] == "configured"
+    assert daily["power"]["watts"] == 500
+    assert daily["power"]["source"] == "whole system, configured"
     assert daily["total"]["kwh"] == pytest.approx(1.0, rel=0.01)
     assert daily["total"]["power_cost"] == pytest.approx(0.20, rel=0.01)
 
@@ -396,6 +397,18 @@ def test_idle_hours_stop_at_the_window_edge(_clean, monkeypatch):
         assert d["busy_s"] + d["idle_s"] <= 86400 + 1
 
 
+def test_report_says_so_when_the_wattage_is_only_the_gpu(_clean, monkeypatch):
+    # Falling back to the GPU's draw understates the machine twice over. Printing it without
+    # saying so would pass a floor off as the cost of running the box.
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": None})
+    monkeypatch.setattr(P, "_gpu_watts", lambda: 40.0)
+    _seed([{"id": "g1", "turn": 1, "ptok": 10, "dur": 3_600_000}])
+    assert P._usage_by_day()["power"]["source"].startswith("GPU rail")
+    html = _clean.get("/__proxy/api/stats/report?format=html").text
+    assert "is a floor rather than a measurement" in html
+    assert "power-supply losses" in html
+
+
 def test_electricity_is_omitted_without_a_wattage(_clean, monkeypatch):
     # No configured watts and no GPU to ask: say nothing rather than invent a number.
     _price(monkeypatch, electricity={"usd_per_kwh": 0.17, "watts": None})
@@ -418,8 +431,10 @@ def test_report_renders_electricity_against_the_tiers(_clean, monkeypatch):
     assert "GPU hrs" in html and "Electricity" in html
     assert "$0.10" in html               # 1h at 500W = 0.5 kWh at $0.20
     assert "Cost to produce" in html         # the headline figures are cards now
-    assert "500 W under load (configured)" in html   # the page names its sources
+    assert "500 W under load (whole system, configured)" in html   # names its sources
     assert "0 W idle (configured)" in html
+    # A configured wattage is the machine's own; no floor caveat belongs on it.
+    assert "is a floor rather than a measurement" not in html
 
 
 def test_report_renders_the_daily_ledger(_clean, monkeypatch):

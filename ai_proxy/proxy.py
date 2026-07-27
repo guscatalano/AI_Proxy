@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import collections
 import gzip
+import threading
 import ipaddress
 import math
 import datetime
@@ -2159,14 +2160,20 @@ DEFAULT_RULES_CONFIG = {
              "input": 0.30, "cached_input": 0.03, "output": 0.60},
         ],
         # What the work actually cost to produce, for the other side of the comparison.
+        #
+        # Both wattages mean the WHOLE MACHINE at the wall, not the GPU: serving a token also
+        # costs you CPU, RAM, NVMe, fans and PSU losses, and billing only the accelerator makes
+        # local inference look cheaper than it is. A watt meter for ten seconds under load, and
+        # ten more at rest, settles both numbers and beats every estimate here.
+        #
         # usd_per_kwh defaults to the US residential average; set it to your own rate.
-        # watts: leave null to use the GPU's own reported draw. Worth setting explicitly on
-        # unified-memory boards (DGX Spark / GB10 and friends), where nvidia-smi reports only
-        # part of the module and the figure comes out far below what the machine draws at the
-        # wall — a watt meter for ten seconds under load beats any guess here.
-        # watts_idle: the box draws power between requests too, and on traffic this bursty the
+        # watts: left null, the report falls back to the GPU's own reported draw and labels the
+        # figure a floor. That fallback is wrong twice over — it omits the rest of the box, and
+        # on unified-memory parts (DGX Spark / GB10 and friends) nvidia-smi reports only one
+        # rail of the module, with no power limit to check it against.
+        # watts_idle: the machine draws power between requests too, and on bursty traffic the
         # idle hours are most of the day. Left null it is assumed at a fraction of load draw,
-        # which the report says out loud; measure it once and put the real number here.
+        # which the report says out loud.
         "electricity": {"usd_per_kwh": 0.17, "watts": None, "watts_idle": None},
     },
     "tool_injector": {
@@ -4499,25 +4506,62 @@ _DBSTAT_CACHE: dict = {"ts": 0.0, "value": {}}
 _DBSTAT_TTL_S = 300.0
 
 
-def _table_sizes(conn) -> dict:
-    now = time.time()
-    if _DBSTAT_CACHE["value"] and (now - _DBSTAT_CACHE["ts"]) < _DBSTAT_TTL_S:
-        return _DBSTAT_CACHE["value"]
-    sizes: dict = {}
+def _scan_table_sizes() -> dict:
+    """dbstat walks every page in the database. That is 100 seconds on a 6 GB file — measured,
+    not estimated — so nothing may call this on the event loop or on a fixed short timer."""
+    conn = db()
+    started = time.time()
     try:
-        for tbl, sz in conn.execute(
-            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC"
-        ).fetchall():
-            sizes[tbl] = sz
+        sizes = {tbl: sz for tbl, sz in conn.execute(
+            "SELECT name, SUM(pgsize) FROM dbstat GROUP BY name ORDER BY 2 DESC").fetchall()}
+        _DBSTAT_CACHE["cost_s"] = time.time() - started
+        return sizes
     except sqlite3.OperationalError:
         # dbstat virtual table not compiled in — row counts are the best we can do.
         return {}
-    _DBSTAT_CACHE.update({"ts": now, "value": sizes})
-    return sizes
+    finally:
+        conn.close()
+
+
+def _dbstat_ttl() -> float:
+    """Refresh no more often than 60x what the scan costs, so this never spends more than a
+    couple of percent of wall-clock walking the database. A small database keeps the 5-minute
+    floor; a 6 GB one that takes 100 seconds to scan drops to roughly one scan every 100
+    minutes. Table sizes move slowly enough that nobody will notice the difference."""
+    return max(_DBSTAT_TTL_S, (_DBSTAT_CACHE.get("cost_s") or 0.0) * 60)
+
+
+def _table_sizes() -> dict:
+    """Whatever is known right now, immediately — the scan always happens in the background.
+
+    Never blocking, including on the first call. A cold cache used to mean the System tab hung
+    for the length of a full scan (111 seconds on a 6 GB file, measured), and an informational
+    panel folded inside a <details> has not earned that. It arrives on the next load instead.
+    """
+    now = time.time()
+    cached = _DBSTAT_CACHE["value"]
+    if cached and (now - _DBSTAT_CACHE["ts"]) < _dbstat_ttl():
+        return cached
+    if not _DBSTAT_CACHE.get("refreshing"):
+        _DBSTAT_CACHE["refreshing"] = True
+
+        def refresh():
+            try:
+                sizes = _scan_table_sizes()
+                if sizes:
+                    _DBSTAT_CACHE.update({"ts": time.time(), "value": sizes})
+            finally:
+                _DBSTAT_CACHE["refreshing"] = False
+
+        threading.Thread(target=refresh, daemon=True, name="dbstat-refresh").start()
+    return cached
 
 
 @app.get("/__proxy/api/health")
-async def health(tables: bool = False):
+# Sync handler: every line below blocks — five aggregate queries and, with ?tables=1, a scan of
+# every page in the database. As `async def` all of that ran on the event loop, so opening the
+# System tab stalled the proxy itself. Same reasoning as system_history.
+def health(tables: bool = False):
     db_size = 0
     try:
         db_size = Path(DB_PATH).stat().st_size
@@ -4532,8 +4576,8 @@ async def health(tables: bool = False):
     newest = conn.execute("SELECT MAX(ts) FROM requests").fetchone()[0]
     # Opt-in: only the System tab renders these, and it asks with ?tables=1. A liveness poll
     # has no use for them and shouldn't pay a full-database scan to get them.
-    table_sizes = _table_sizes(conn) if tables else {}
     conn.close()
+    table_sizes = _table_sizes() if tables else {}
 
     proc = _read_proc_self_status()
     rss_kb = None
@@ -4573,6 +4617,10 @@ async def health(tables: bool = False):
             "oldest_ts": oldest,
             "newest_ts": newest,
             "table_sizes": table_sizes,
+            # So the UI can say "measuring" instead of silently showing nothing on the first
+            # load after a restart.
+            "table_sizes_pending": bool(tables and not table_sizes
+                                        and _DBSTAT_CACHE.get("refreshing")),
         },
         "process": {
             "pid": os.getpid(),
@@ -4584,6 +4632,92 @@ async def health(tables: bool = False):
         },
         "overhead_ms": overhead,
     }
+
+
+# Deleting rows and rewriting a multi-gigabyte file takes minutes, and the caller deserves to
+# see that rather than a button that has apparently hung. One job at a time: two VACUUMs on the
+# same file contend for the same write lock, and a DELETE racing a VACUUM is worse still.
+_DB_JOB: dict = {"state": "idle"}
+_DB_JOB_LOCK = threading.Lock()
+
+
+def _db_job_status() -> dict:
+    job = dict(_DB_JOB)
+    started = job.get("started")
+    if started:
+        end = job.get("finished") or time.time()
+        job["elapsed_s"] = round(end - started, 1)
+    step_started = job.pop("step_started", None)
+    if step_started and job.get("state") == "running":
+        job["step_elapsed_s"] = round(time.time() - step_started, 1)
+    return job
+
+
+def _db_size() -> int:
+    try:
+        return Path(DB_PATH).stat().st_size
+    except OSError:
+        return 0
+
+
+def _db_reset_job(targets: list, vacuum: bool) -> dict:
+    """Runs in a worker thread. Publishes each step so the UI has something true to show."""
+    def step(name: str):
+        _DB_JOB["step"] = name
+        _DB_JOB["step_started"] = time.time()
+
+    _DB_JOB.update({"state": "running", "started": time.time(), "finished": None,
+                    "targets": list(targets), "vacuum": bool(vacuum), "deleted": {},
+                    "error": None, "size_before": _db_size(), "size_after": None,
+                    "reclaimed_bytes": None})
+    counts: dict = {}
+    try:
+        step("counting rows")
+        conn = db()
+        try:
+            for target, table in (("requests", "requests"), ("metrics", "system_metrics"),
+                                  ("settings", "settings")):
+                if target not in targets:
+                    continue
+                counts[target] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                step(f"deleting {target}")
+                conn.execute(f"DELETE FROM {table}")
+                _DB_JOB["deleted"] = dict(counts)
+            # Blobs live in their own table now; wiping requests without them would strand
+            # gigabytes of bodies with nothing pointing at them.
+            if "requests" in targets:
+                step("deleting request bodies")
+                conn.execute("DELETE FROM request_blobs")
+            conn.commit()
+        finally:
+            conn.close()
+        if vacuum:
+            # VACUUM must run outside any transaction, and rewrites the entire file.
+            step("compacting the database")
+            v = sqlite3.connect(DB_PATH, timeout=60.0)
+            v.isolation_level = None
+            try:
+                v.execute("VACUUM")
+            finally:
+                v.close()
+        _overhead_samples.clear()
+        _DBSTAT_CACHE.update({"ts": 0.0, "value": {}})
+        _DB_JOB.update({"state": "done", "step": "finished"})
+    except Exception as e:
+        _DB_JOB.update({"state": "error", "step": "failed", "error": str(e)})
+    finally:
+        _DB_JOB["finished"] = time.time()
+        _DB_JOB["size_after"] = _db_size()
+        before, after = _DB_JOB.get("size_before") or 0, _DB_JOB["size_after"]
+        _DB_JOB["reclaimed_bytes"] = max(0, before - after)
+    return {"ok": _DB_JOB["state"] == "done", "deleted": counts, "vacuumed": bool(vacuum),
+            "status": _db_job_status()}
+
+
+@app.get("/__proxy/api/db/reset/status")
+def db_reset_status():
+    """Poll target while a wipe runs — the work happens in a thread, so the POST is still open."""
+    return _db_job_status()
 
 
 @app.post("/__proxy/api/db/reset")
@@ -4598,33 +4732,21 @@ async def db_reset(request: Request):
         targets = ["requests", "metrics"]
     valid = {"requests", "metrics", "settings"}
     targets = [t for t in targets if t in valid]
-    counts: dict = {}
-    conn = db()
-    if "requests" in targets:
-        counts["requests"] = conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0]
-        conn.execute("DELETE FROM requests")
-    if "metrics" in targets:
-        counts["metrics"] = conn.execute("SELECT COUNT(*) FROM system_metrics").fetchone()[0]
-        conn.execute("DELETE FROM system_metrics")
-    if "settings" in targets:
-        counts["settings"] = conn.execute("SELECT COUNT(*) FROM settings").fetchone()[0]
-        conn.execute("DELETE FROM settings")
-    conn.commit()
-    conn.close()
-    # VACUUM must run outside any transaction.
-    if payload.get("vacuum", True):
-        v = sqlite3.connect(DB_PATH, timeout=10.0)
-        v.isolation_level = None
-        try:
-            v.execute("VACUUM")
-        finally:
-            v.close()
-    _overhead_samples.clear()
-    return {"ok": True, "deleted": counts, "vacuumed": payload.get("vacuum", True)}
+    if not _DB_JOB_LOCK.acquire(blocking=False):
+        return JSONResponse({"error": "A database maintenance job is already running.",
+                             "status": _db_job_status()}, status_code=409)
+    try:
+        # In a thread: DELETE and VACUUM on a multi-gigabyte file would otherwise hold the event
+        # loop for minutes, which stops the proxy serving anything at all.
+        return await asyncio.to_thread(_db_reset_job, targets, bool(payload.get("vacuum", True)))
+    finally:
+        _DB_JOB_LOCK.release()
 
 
 @app.get("/__proxy/api/system/now")
-async def system_now():
+# Sync for the same reason as health and system_history: it reads the database, and the Live
+# view polls it every few seconds.
+def system_now():
     conn = db()
     row = conn.execute(
         """SELECT ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb,
@@ -8374,13 +8496,16 @@ def _usage_by_day(days: int = 30) -> dict:
 
     # --- what producing it actually drew ---------------------------------------------------
     elec = cfg.get("electricity") or {}
-    watts, source = elec.get("watts"), "configured"
+    # Both figures mean the whole machine at the wall. Serving a token also costs CPU, RAM,
+    # disk, fans and PSU losses, and charging only the accelerator makes local inference look
+    # cheaper than it is.
+    watts, source = elec.get("watts"), "whole system, configured"
     if not watts:
-        # Named for what it actually is. nvidia-smi reports one rail, which on unified-memory
-        # parts is a fraction of the module: a GB10 at 96% utilisation reads ~34 W and offers no
-        # power limit at all to sanity-check it against. Calling this "the GPU's draw" on the
-        # page would dress a partial reading up as a measurement.
-        watts, source = _gpu_watts(), "GPU rail only, likely low"
+        # The fallback is wrong twice: it omits everything that is not the GPU, and on
+        # unified-memory parts nvidia-smi reports one rail of the module — a GB10 at 96%
+        # utilisation reads ~34 W with no power limit to check it against. Named for what it
+        # is, so nobody reads it as the machine's draw.
+        watts, source = _gpu_watts(), "GPU rail only, well under the true figure"
     idle_w, idle_source = elec.get("watts_idle"), "configured"
     if idle_w is None and watts:
         idle_w, idle_source = watts * _IDLE_DRAW_FRACTION, "assumed"
@@ -8722,7 +8847,13 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
         # headline numbers as cards; this one has no reason to be different.
         lede = ""
         if priced and costs:
-            cards = ""
+            # Tokens first: they're what the section is a ledger of, and the money only means
+            # anything once you know how much moved. The table's column groups run in the same
+            # order, so the two read the same way.
+            cards = (f'<div class="card"><p class="k">Tokens</p>'
+                     f'<p class="v">{_fmt_tokens(tot["total"])}</p>'
+                     f'<p class="d">{cached_share:.0f}% of them a cache read, '
+                     f'{_fmt_tokens(tot["output"])} written</p></div>')
             if power and tot.get("power_cost"):
                 cards += (f'<div class="card hi"><p class="k">Cost to produce</p>'
                           f'<p class="v">${tot["power_cost"]:,.2f}</p>'
@@ -8755,8 +8886,16 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
                 f"GPU hours are wall-clock, with concurrent requests merged. Energy is billed "
                 f"by the clock, not by the request. Cost covers the whole day: "
                 f"{power['watts']:,.0f} W under load ({_h(power.get('source') or '')}), "
-                f"{idle_w:,.0f} W idle ({how}), at {power['usd_per_kwh']:.3f} $/kWh. The GPU "
-                f"only, not the rest of the machine.")
+                f"{idle_w:,.0f} W idle ({how}), at {power['usd_per_kwh']:.3f} $/kWh.")
+            # The wattage is meant to be the whole machine at the wall. When it came from the
+            # GPU instead, the reader has to be told the figure is a floor, not a measurement.
+            if power.get("source", "").startswith("GPU rail"):
+                notes.append(
+                    "That wattage is the GPU's own reported draw, which is a floor rather than "
+                    "a measurement: it leaves out the CPU, memory, disks, fans and power-supply "
+                    "losses that serving a token also costs, and on unified-memory boards it "
+                    "covers only one rail of the module. Put a meter on the wall under load and "
+                    "at rest, and set <code>watts</code> and <code>watts_idle</code> from that.")
         if gap:
             notes.append(f"No traffic on {gap} day{'s' if gap != 1 else ''} in this range. "
                          f"Those have no row, and no idle draw counted.")
