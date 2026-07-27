@@ -5058,10 +5058,15 @@ def _db_job_status() -> dict:
 
 
 def _db_size() -> int:
-    try:
-        return Path(DB_PATH).stat().st_size
-    except OSError:
-        return 0
+    """Everything the proxy keeps on disk, main plus archive — the reclaimed figure is
+    meaningless if it ignores the second file."""
+    total = 0
+    for p in (DB_PATH, ARCHIVE_DB_PATH):
+        try:
+            total += Path(p).stat().st_size
+        except OSError:
+            pass
+    return total
 
 
 def _db_reset_job(targets: list, vacuum: bool) -> dict:
@@ -5102,12 +5107,24 @@ def _db_reset_job(targets: list, vacuum: bool) -> dict:
         finally:
             conn.close()
         if vacuum:
-            # VACUUM must run outside any transaction, and rewrites the entire file.
+            # VACUUM must run outside any transaction, and rewrites the entire file. Both
+            # files: emptying the rows leaves the archive's pages on its own free list, so
+            # compacting only main would report space reclaimed while gigabytes stayed on disk.
+            # One connection with the archive attached, rather than a second direct opener —
+            # opening that file directly while other connections have it attached deadlocks.
             step("compacting the database")
             v = sqlite3.connect(DB_PATH, timeout=60.0)
             v.isolation_level = None
             try:
-                v.execute("VACUUM")
+                v.execute("VACUUM main")
+                if Path(ARCHIVE_DB_PATH).exists():
+                    step("compacting the archive")
+                    try:
+                        v.execute("ATTACH DATABASE ? AS arch", (ARCHIVE_DB_PATH,))
+                        v.execute("VACUUM arch")
+                    except sqlite3.Error as e:
+                        # Worth surfacing: the main file shrank and the archive did not.
+                        _DB_JOB["archive_error"] = str(e)
             finally:
                 v.close()
         _overhead_samples.clear()

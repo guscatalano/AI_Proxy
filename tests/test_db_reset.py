@@ -119,6 +119,34 @@ def test_vacuum_runs_and_is_reported(client):
     assert d["status"]["reclaimed_bytes"] is not None
 
 
+def test_vacuum_compacts_the_archive_too(client):
+    # Emptying the rows leaves the archive's pages on its own free list. Compacting only main
+    # would report space reclaimed while gigabytes stayed on disk in the second file.
+    P._ensure_archive_file()
+    P._ARCHIVE_ACTIVE = True
+    conn = P.db()
+    conn.execute("DELETE FROM requests")
+    conn.execute("DELETE FROM arch.request_blobs")
+    conn.executemany("INSERT INTO arch.request_blobs (id, request_body) VALUES (?, ?)",
+                     [(f"v-{i}", "x" * 20000) for i in range(200)])
+    conn.commit()
+    conn.close()
+    grown = P.Path(P.ARCHIVE_DB_PATH).stat().st_size
+    assert grown > 1_000_000, "archive did not actually grow; test proves nothing"
+
+    d = client.post("/__proxy/api/db/reset",
+                    json={"targets": ["requests"], "vacuum": True}).json()
+    assert d["status"].get("archive_error") is None
+    shrunk = P.Path(P.ARCHIVE_DB_PATH).stat().st_size
+    assert shrunk < grown / 2, f"archive not compacted: {grown} -> {shrunk}"
+
+
+def test_reported_size_covers_both_files(client):
+    P._ensure_archive_file()
+    assert P._db_size() >= P.Path(P.DB_PATH).stat().st_size
+    assert P._db_size() >= P.Path(P.ARCHIVE_DB_PATH).stat().st_size
+
+
 def test_table_sizes_serve_stale_rather_than_rescan(client):
     # The System tab asks for these every load. A full-database scan on each one is what made
     # the tab lag; a stale answer now returns instantly and refreshes behind the response.
