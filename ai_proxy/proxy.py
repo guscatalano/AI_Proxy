@@ -2164,7 +2164,10 @@ DEFAULT_RULES_CONFIG = {
         # unified-memory boards (DGX Spark / GB10 and friends), where nvidia-smi reports only
         # part of the module and the figure comes out far below what the machine draws at the
         # wall — a watt meter for ten seconds under load beats any guess here.
-        "electricity": {"usd_per_kwh": 0.17, "watts": None},
+        # watts_idle: the box draws power between requests too, and on traffic this bursty the
+        # idle hours are most of the day. Left null it is assumed at a fraction of load draw,
+        # which the report says out loud; measure it once and put the real number here.
+        "electricity": {"usd_per_kwh": 0.17, "watts": None, "watts_idle": None},
     },
     "tool_injector": {
         # Adds proxy-owned tools to outgoing requests and executes them server-side. The model
@@ -7778,6 +7781,15 @@ _REPORT_CSS = """
   /* A ledger's total is a different kind of row from the days above it, and has to read as one. */
   tbody tr.sum th, tbody tr.sum td { border-top:2px solid var(--border); background:var(--panel-2);
                                      font-weight:600; color:var(--ink); }
+  /* Nine columns of numbers read as noise until they're grouped. The spanning row names what
+     each block of them is, and a rule down the seam keeps the blocks from bleeding together. */
+  thead tr.grp th { text-align:center; font-size:9.5px; letter-spacing:.12em; padding-bottom:4px;
+                    color:var(--ink-faint); border-bottom:none; }
+  thead tr.grp th.blank { background:var(--panel-2); }
+  th.seam, td.seam { border-left:1px solid var(--border); }
+  thead th.wrap { white-space:normal; max-width:96px; line-height:1.25; }
+  /* Footnotes belong under the thing they qualify — above it they're just a wall to climb. */
+  .fn { color:var(--ink-faint); font-size:11.5px; line-height:1.55; margin:9px 0 0; max-width:88ch; }
   td.win { color:var(--accent); font-weight:700; }
   td.slow { color:var(--bad); font-weight:600; }
   td.ok { color:var(--good); } td.bad { color:var(--bad); font-weight:600; }
@@ -8223,6 +8235,12 @@ _TURN_BUCKETS = ((0, 5, "1–4"), (5, 15, "5–14"), (15, 40, "15–39"),
                  (40, 100, "40–99"), (100, 1 << 30, "100+"))
 
 
+# Idle draw as a share of load draw, used only when watts_idle isn't configured. Measured
+# systems land anywhere from ~15% (a big discrete GPU that clocks right down) to ~35% (an
+# always-on SoC), so this is a middle the report names rather than hides.
+_IDLE_DRAW_FRACTION = 0.30
+
+
 def _gpu_watts():
     """Current total GPU draw, or None. A spot reading, not a per-request measurement.
 
@@ -8340,7 +8358,8 @@ def _usage_by_day(days: int = 30) -> dict:
 
         day = per_day.setdefault(r["d"], {"date": r["d"], "n": 0, "input": 0, "cached_input": 0,
                                           "output": 0, "costs": [0.0] * len(tiers),
-                                          "busy_s": 0.0, "kwh": 0.0, "power_cost": 0.0})
+                                          "busy_s": 0.0, "idle_s": 0.0, "kwh": 0.0,
+                                          "power_cost": 0.0})
         day["n"] += 1
         day["input"] += uncached
         day["cached_input"] += cached
@@ -8355,15 +8374,26 @@ def _usage_by_day(days: int = 30) -> dict:
     watts, source = elec.get("watts"), "configured"
     if not watts:
         watts, source = _gpu_watts(), "reported by the GPU"
+    idle_w, idle_source = elec.get("watts_idle"), "configured"
+    if idle_w is None and watts:
+        idle_w, idle_source = watts * _IDLE_DRAW_FRACTION, "assumed"
     rate = elec.get("usd_per_kwh")
     if watts and rate:
-        out["power"] = {"watts": watts, "usd_per_kwh": rate, "source": source}
-        for date, secs in _busy_seconds_by_day(rows).items():
-            day = per_day.get(date)
-            if day is None:
-                continue
-            day["busy_s"] = secs
-            day["kwh"] = (secs / 3600.0) * (watts / 1000.0)
+        out["power"] = {"watts": watts, "watts_idle": idle_w, "usd_per_kwh": rate,
+                        "source": source, "idle_source": idle_source}
+        busy = _busy_seconds_by_day(rows)
+        now, start = time.time(), time.time() - days * 86400
+        for date, day in per_day.items():
+            day["busy_s"] = busy.get(date, 0.0)
+            # The machine draws power between requests, and on traffic this bursty that is most
+            # of the day. Clipped to the window at both ends so the first and last days aren't
+            # charged for hours outside it.
+            midnight = datetime.datetime.combine(
+                datetime.date.fromisoformat(date), datetime.time.min).timestamp()
+            covered = min(now, midnight + 86400) - max(start, midnight)
+            day["idle_s"] = max(0.0, covered - day["busy_s"])
+            day["kwh"] = ((day["busy_s"] / 3600.0) * (watts / 1000.0)
+                          + (day["idle_s"] / 3600.0) * ((idle_w or 0) / 1000.0))
             day["power_cost"] = day["kwh"] * rate
 
     by_day = sorted(per_day.values(), key=lambda d: d["date"])
@@ -8374,7 +8404,7 @@ def _usage_by_day(days: int = 30) -> dict:
         out["total"] = {
             k: sum(d[k] for d in by_day)
             for k in ("n", "input", "cached_input", "output", "total",
-                      "busy_s", "kwh", "power_cost")
+                      "busy_s", "idle_s", "kwh", "power_cost")
         }
         out["total"]["costs"] = [sum(d["costs"][i] for d in by_day) for i in range(len(tiers))]
     else:
@@ -8664,18 +8694,17 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
         def day_row(d, is_total=False):
             label = ("Total" if is_total else
                      datetime.date.fromisoformat(d["date"]).strftime("%b %d"))
-            cells = "".join(f'<td class="n">${c:,.2f}</td>' for c in (d.get("costs") or []))
+            # The row is an argument in three parts: what moved, what it drew, what it saved.
+            cells = "".join(f'<td class="n{" seam" if i == 0 else ""}">${c:,.2f}</td>'
+                            for i, c in enumerate(d.get("costs") or []))
             if power:
-                # Read left to right, the row ends on what it cost against what it would have.
-                cells = (f'<td class="n">{d["busy_s"] / 3600:,.1f} h</td>'
+                cells = (f'<td class="n seam">{d["busy_s"] / 3600:,.1f}</td>'
                          f'<td class="n">${d["power_cost"]:,.2f}</td>' + cells)
             tr = '<tr class="sum">' if is_total else "<tr>"
             return (tr + f'<th scope="row">{_h(label)}</th>'
-                    f'<td class="n">{_fmt_n(d["n"])}</td>'
                     f'<td class="n">{_fmt_tokens(d["input"])}</td>'
                     f'<td class="n">{_fmt_tokens(d["cached_input"])}</td>'
-                    f'<td class="n">{_fmt_tokens(d["output"])}</td>'
-                    f'<td class="n">{_fmt_tokens(d["total"])}</td>{cells}</tr>')
+                    f'<td class="n">{_fmt_tokens(d["output"])}</td>{cells}</tr>')
 
         cached_share = (100 * tot["cached_input"] / tot["total"]) if tot.get("total") else 0
         gap = daily.get("missing_days") or 0
@@ -8701,45 +8730,60 @@ def _stats_report_html(d: dict, env: dict, extras: dict | None = None) -> str:
             lede = (f'<div class="hero"><p class="lede">Bought elsewhere, this traffic would '
                     f'have cost {bracket} — {_h(lo_name)} at the low end, {_h(hi_name)} at '
                     f'the high.{versus}</p>'
-                    f'<p class="why">Nothing here was billed: these models run on your own '
-                    f'hardware. Two reference rates rather than one because a frontier price '
-                    f'flatters a local model that is not frontier quality, and an open-weights '
-                    f'price ignores that some of this work would have gone to a better model if '
-                    f'it had not run here — the truth is inside the bracket. All of it rests on '
-                    f'the cached share: {cached_share:.0f}% of tokens are a prefix an earlier '
-                    f'turn already sent, which every provider discounts roughly tenfold.</p>'
-                    f'</div>')
-        power_note = ""
+                    f'<p class="why">Nothing here was billed — these models run on your own '
+                    f'hardware. Two rates rather than one because a frontier price flatters a '
+                    f'local model that is not frontier quality, and an open-weights price '
+                    f'ignores that some of this work would have gone to a better model if it '
+                    f'had not run here.</p></div>')
+
+        # Everything qualifying the table goes below it. Stacked above, three paragraphs of
+        # method were a wall between the reader and the only thing they came for.
+        notes = ["Prompt tokens are split per conversation: each turn re-sends everything "
+                 "before it, so only the growth counts as input and the rest is a cache read — "
+                 f"{cached_share:.0f}% of all tokens here. A conversation already running when "
+                 "this range opened has its first turn counted in full, and a real provider's "
+                 "cache expires between turns where this one doesn't; both push the estimate "
+                 "low."]
         if power:
-            src = power.get("source") or ""
-            power_note = (
-                f" GPU hours are wall-clock with concurrent requests merged, not the sum of "
-                f"durations, since energy is billed by the clock. Drawn at "
-                f"{power['watts']:,.0f} W ({_h(src)}) and {power['usd_per_kwh']:.3f} $/kWh, "
-                f"counting only time spent working — the machine's idle draw is excluded, as "
-                f"is everything in it that is not the GPU.")
+            idle_w = power.get("watts_idle") or 0
+            how = ("configured" if power.get("idle_source") == "configured"
+                   else f"assumed at {_IDLE_DRAW_FRACTION:.0%} of load")
+            idle_txt = f"{idle_w:,.0f} W idle ({how})"
+            notes.append(
+                f"GPU hours are wall-clock with concurrent requests merged, not the sum of "
+                f"durations, because energy is billed by the clock. Electricity covers the "
+                f"whole day at {power['watts']:,.0f} W under load "
+                f"({_h(power.get('source') or '')}) and {idle_txt}, at "
+                f"{power['usd_per_kwh']:.3f} $/kWh — the machine draws power between requests "
+                f"too, and on traffic this bursty that is most of it. Counts the GPU only, not "
+                f"the rest of the box.")
+        if gap:
+            notes.append(f"No traffic at all on {gap} day{'s' if gap != 1 else ''} in this "
+                         "range; those are absent rather than shown as zero.")
+        if priced:
+            notes.append("Rates, tiers and the wattage are editable under <code>pricing</code> "
+                         "in the rules config.")
+
+        groups = [("", 1, "blank"), ("Tokens", 3, "")]
+        if power:
+            groups.append(("Produced here", 2, "seam"))
+        if tiers:
+            groups.append(("Bought elsewhere", len(tiers), "seam"))
         day_html = (
             "<h2>Day by day</h2>" + lede
-            + '<p class="note">Prompt tokens are split per conversation: each turn re-sends '
-            "everything before it, so only the growth since the previous turn counts as input "
-            "and the rest is a cache read. A conversation already running when this range "
-            "opened has its first turn here counted in full, and a real provider's cache "
-            "expires between turns where this one doesn't — both push the estimate low."
-            + (f" No traffic at all on {gap} day{'s' if gap != 1 else ''} in this range; those "
-               "are absent rather than shown as zero." if gap else "")
-            + power_note
-            + (' Rates, tiers and the wattage are editable under <code>pricing</code> in the '
-               'rules config.' if priced else "")
-            + "</p>"
-            + "<div class=\"tbl\"><table><thead><tr><th>Date</th><th class=\"n\">Requests</th>"
-            "<th class=\"n\">Input</th><th class=\"n\">Cached</th><th class=\"n\">Output</th>"
-            "<th class=\"n\">Total</th>"
-            + ('<th class="n">GPU hours</th><th class="n">Electricity</th>' if power else "")
-            + "".join(f'<th class="n">{_h(name)}</th>' for name in tiers)
+            + '<div class="tbl"><table><thead>'
+            + '<tr class="grp">'
+            + "".join(f'<th colspan="{n}" class="{cls}">{_h(name)}</th>' for name, n, cls in groups)
+            + "</tr><tr><th>Date</th>"
+            '<th class="n">Input</th><th class="n">Cached</th><th class="n">Output</th>'
+            + ('<th class="n seam">GPU hrs</th><th class="n">Electricity</th>' if power else "")
+            + "".join(f'<th class="n wrap{" seam" if i == 0 else ""}">{_h(name)}</th>'
+                      for i, name in enumerate(tiers))
             + "</tr></thead><tbody>"
             + "".join(day_row(d) for d in by_day)
             + (day_row({**tot, "date": by_day[-1]["date"]}, True) if tot else "")
-            + "</tbody></table></div>")
+            + "</tbody></table></div>"
+            + "".join(f'<p class="fn">{n}</p>' for n in notes))
 
     und = ex.get("undeclared_tools") or []
     tool_html = ""

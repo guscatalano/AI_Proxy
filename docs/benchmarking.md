@@ -284,8 +284,12 @@ of the longest, and energy is billed by the clock. Summing durations overstates 
 severalfold. Intervals are split at midnight, so a generation running over the boundary is
 charged to both days.
 
-Only time spent working counts. The machine's idle draw is excluded, as is everything in it that
-isn't the GPU, so this is the floor rather than your power bill.
+The cost covers the **whole day**, not just the busy part: load draw over the GPU hours plus idle
+draw over everything else, clipped to the window at both ends. A box answering three requests an
+hour spends almost all of its day idle, and that power is as real as the rest. Days with no
+traffic at all have no row, so their idle draw isn't counted.
+
+It still counts the GPU only, not the rest of the machine, so treat it as a floor.
 
 Rates and wattage live under `pricing` in the rules config:
 
@@ -299,7 +303,8 @@ Rates and wattage live under `pricing` in the rules config:
   ],
   "electricity": {
     "usd_per_kwh": 0.17,            // US residential average; set your own
-    "watts": null                   // null = ask the GPU. See the warning below.
+    "watts": null,                  // load draw. null = ask the GPU. See the warning below.
+    "watts_idle": null              // null = assume 30% of load draw, and say so on the page
   }
 }
 ```

@@ -220,7 +220,7 @@ def _price(monkeypatch, **over):
         "enabled": True,
         "tiers": [{"name": "premium tier", "input": 3.0, "cached_input": 0.30, "output": 15.0},
                   {"name": "budget tier", "input": 0.30, "cached_input": 0.03, "output": 0.60}],
-        "electricity": {"usd_per_kwh": 0.0, "watts": None},
+        "electricity": {"usd_per_kwh": 0.0, "watts": None, "watts_idle": 0},
         **over}
     monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
     return cfg
@@ -354,15 +354,46 @@ def test_busy_time_ignores_requests_that_never_finished(_clean):
 
 
 def test_electricity_costs_the_clock_not_the_requests(_clean, monkeypatch):
-    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500})
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500, "watts_idle": 0})
     now = time.time()
     # Two hours of wall-clock work, served two-at-a-time. At 500W that is 1 kWh, not 2.
     _seed([{"id": "e1", "ts": now - 7200, "turn": 1, "ptok": 10, "dur": 7_200_000},
            {"id": "e2", "ts": now - 7200, "turn": 1, "ptok": 10, "dur": 7_200_000}])
     daily = P._usage_by_day()
-    assert daily["power"] == {"watts": 500, "usd_per_kwh": 0.20, "source": "configured"}
+    assert daily["power"]["watts"] == 500 and daily["power"]["source"] == "configured"
     assert daily["total"]["kwh"] == pytest.approx(1.0, rel=0.01)
     assert daily["total"]["power_cost"] == pytest.approx(0.20, rel=0.01)
+
+
+def test_idle_draw_is_charged_for_the_hours_between_requests(_clean, monkeypatch):
+    # The box draws power whether or not it is answering, and on bursty traffic those hours are
+    # most of the day. Charging only busy time would understate the real cost several times.
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500, "watts_idle": 100})
+    now = time.time()
+    _seed([{"id": "i1", "ts": now - 3600, "turn": 1, "ptok": 10, "dur": 3_600_000}])
+    day = P._usage_by_day(days=1)["by_day"][0]
+    assert day["busy_s"] == pytest.approx(3600, rel=0.01)
+    assert day["idle_s"] > 0
+    # Stated rather than assumed: the total is the two draws over their own hours.
+    assert day["kwh"] == pytest.approx(
+        (day["busy_s"] / 3600) * 0.5 + (day["idle_s"] / 3600) * 0.1, rel=1e-6)
+    assert day["kwh"] > (day["busy_s"] / 3600) * 0.5     # idle actually moved the number
+
+
+def test_idle_draw_is_assumed_from_load_when_not_measured(_clean, monkeypatch):
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500})
+    _seed([{"id": "i2", "turn": 1, "ptok": 10, "dur": 1000}])
+    power = P._usage_by_day()["power"]
+    assert power["watts_idle"] == pytest.approx(500 * P._IDLE_DRAW_FRACTION)
+    assert power["idle_source"] == "assumed"    # the page has to say so, so the data must too
+
+
+def test_idle_hours_stop_at_the_window_edge(_clean, monkeypatch):
+    # A one-day window must not bill the first day for hours before the window opened.
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500, "watts_idle": 100})
+    _seed([{"id": "i3", "turn": 1, "ptok": 10, "dur": 1000}])
+    for d in P._usage_by_day(days=1)["by_day"]:
+        assert d["busy_s"] + d["idle_s"] <= 86400 + 1
 
 
 def test_electricity_is_omitted_without_a_wattage(_clean, monkeypatch):
@@ -376,7 +407,7 @@ def test_electricity_is_omitted_without_a_wattage(_clean, monkeypatch):
 
 
 def test_report_renders_electricity_against_the_tiers(_clean, monkeypatch):
-    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500})
+    _price(monkeypatch, electricity={"usd_per_kwh": 0.20, "watts": 500, "watts_idle": 0})
     now = time.time()
     _seed([{"id": "w1", "ts": now - 3600, "turn": 1, "ptok": 2_000_000, "dur": 3_600_000}])
     conn = P.db()
@@ -384,10 +415,11 @@ def test_report_renders_electricity_against_the_tiers(_clean, monkeypatch):
     conn.commit()
     conn.close()
     html = _clean.get("/__proxy/api/stats/report?format=html").text
-    assert "GPU hours" in html and "Electricity" in html
+    assert "GPU hrs" in html and "Electricity" in html
     assert "$0.10" in html               # 1h at 500W = 0.5 kWh at $0.20
     assert "of electricity to produce" in html
-    assert "500 W (configured)" in html  # the page says where the wattage came from
+    assert "500 W under load (configured)" in html   # the page names its sources
+    assert "0 W idle (configured)" in html
 
 
 def test_report_renders_the_daily_ledger(_clean, monkeypatch):
