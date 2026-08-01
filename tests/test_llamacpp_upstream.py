@@ -82,7 +82,7 @@ def test_it_counts_toward_decode_rate_stats(client):
 
 
 def test_bench_index_includes_llamacpp_models(client, monkeypatch):
-    async def fake_now():
+    def fake_now():          # sync, like the real handler — an async fake hid a real bug
         return {"ollama": {}, "lmstudio": {}, "vllm": {},
                 "llamacpp": {"reachable": True, "n_ctx": 65536, "parallel": 4,
                              "model_path": "/m/x-UD-IQ2_XXS-00001-of-00003.gguf",
@@ -105,7 +105,7 @@ def test_bench_lists_it_as_a_backend(client, monkeypatch):
     # is up but cannot swap models there, same as vLLM.
     assert P._BENCH_LOAD_MODES["llamacpp"] == "fixed"
 
-    async def fake_now():
+    def fake_now():          # sync, like the real handler
         return {"llamacpp": {"reachable": True, "available": [{"id": "ds4"}]}}
     monkeypatch.setattr(P, "system_now", fake_now)
     d = asyncio.run(P.bench_models())

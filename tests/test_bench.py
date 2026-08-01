@@ -256,7 +256,7 @@ def test_model_index_reads_the_snapshot_keys_the_snapshots_actually_emit(monkeyp
     """Regression: the index read `lmstudio.models` / `vllm.models`, but both snapshots emit
     `loaded` / `available`. The result was that LM Studio and vLLM models never appeared in the
     bench picker at all — silently, since an empty list looks like 'nothing is running'."""
-    async def fake_system_now():
+    def fake_system_now():
         return {
             "ollama": {"tags": [{"name": "llama3:8b"}], "ps": [{"name": "llama3:8b"}]},
             "lmstudio": {
@@ -291,7 +291,7 @@ def test_model_index_reads_the_snapshot_keys_the_snapshots_actually_emit(monkeyp
 def test_model_index_records_per_backend_load_semantics(monkeypatch):
     """vLLM can't load on demand, so an unloaded model there is a guaranteed failure rather
     than a slow first request. The UI needs that distinction to warn correctly."""
-    async def fake_system_now():
+    def fake_system_now():
         return {
             "ollama": {"tags": [{"name": "m1"}], "ps": []},
             "lmstudio": {"available": [{"id": "m2", "state": "not-loaded"}]},
@@ -308,7 +308,7 @@ def test_model_index_records_per_backend_load_semantics(monkeypatch):
 def test_loaded_entry_wins_over_catalogue_entry(monkeypatch):
     """Ollama lists a model in both /api/tags and /api/ps; the running one must not be
     overwritten by the catalogue entry and reported as cold."""
-    async def fake_system_now():
+    def fake_system_now():
         return {"ollama": {"tags": [{"name": "dup"}], "ps": [{"name": "dup"}]},
                 "lmstudio": {}, "vllm": {}}
 

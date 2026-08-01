@@ -8190,7 +8190,10 @@ async def _bench_model_index() -> dict:
         index[key] = rec
 
     try:
-        sysinfo = await system_now()
+        # system_now is a sync handler (it reads the DB and must stay off the event loop).
+        # `await`ing it raised TypeError into the blanket except below, silently skipping
+        # every backend's enrichment — the bench showed 0 models for all of them but Ollama.
+        sysinfo = await asyncio.to_thread(system_now)
         ollama = sysinfo.get("ollama") or {}
         for t in (ollama.get("tags") or []):
             if isinstance(t, dict):
