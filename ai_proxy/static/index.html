@@ -5242,6 +5242,18 @@ function _busyLabel(name) {
 function _svcBtn(name, reachable) {
   const svc = _svcState[name];
   if (!svc) return '';
+  // Prefer what systemd says over what this browser remembers. `activating` is a real unit
+  // state that every client can see, so it survives a reload, a second tab, and this page
+  // never having been open when the operation started — _powerBusy cannot do any of that.
+  // Type=simple units report `active` the moment they fork, so systemd alone cannot say
+  // "still loading". The honest signal is the same one vLLM uses: the unit is up but the
+  // backend is not answering yet. Both facts come from the server, so this survives a reload,
+  // a second tab, and this page not having been open when the operation started.
+  if (svc.running && !reachable) {
+    const slow = name === 'llamacpp' ? ' — loading weights, several minutes' : '';
+    return `<span style="margin-left:8px;font-size:11px;color:#f0c674;font-weight:normal">
+      <span class="spin">◐</span> starting…${slow}</span>`;
+  }
   if (_powerBusy[name]) return _busyLabel(name);
   const stopping = reachable || svc.running;
   return `<button data-svc="${esc(name)}" data-svc-act="${stopping ? 'stop' : 'start'}"
