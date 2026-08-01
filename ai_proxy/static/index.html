@@ -4979,12 +4979,18 @@ function renderSystem() {
   // The tab dot carries the same three-way state, so a backend that is coming up is visible
   // without opening its panel.
   const _pTab = (id, label, snap, n) => `<button class="sysprov-tab ${activeProv===id?'on':''}" onclick="setSysProv('${id}')"><span class="reach-dot ${snap.reachable ? 'ok' : (snap.state === 'loading' ? 'warn' : 'bad')}"></span>${label}<span class="sysprov-n">${n}</span></button>`;
+  // Built from the registry the server reports, so registering a backend is the only step
+  // needed for it to appear here. Hand-listing these is what hid llama.cpp twice.
+  const _backendMeta = (now.backends_meta && now.backends_meta.length) ? now.backends_meta : [
+    { name: 'vllm', label: 'vLLM' }, { name: 'lmstudio', label: 'LM Studio' },
+    { name: 'ollama', label: 'Ollama' }, { name: 'llamacpp', label: 'llama.cpp' },
+    { name: 'comfyui', label: 'ComfyUI' }];
+  const _count = (id, snap) => id === 'ollama' ? (snap.ps || []).length
+    : id === 'comfyui' ? ((snap.queue_running || 0) + (snap.queue_pending || 0))
+    : (snap.loaded || []).length;
   const provBar = `<div class="sysprov-bar">
-      ${_pTab('vllm','vLLM',vllm,(vllm.loaded||[]).length)}
-      ${_pTab('lmstudio','LM Studio',lmstudio,(lmstudio.loaded||[]).length)}
-      ${_pTab('ollama','Ollama',ollama,(ollama.ps||[]).length)}
-      ${_pTab('llamacpp','llama.cpp',llamacpp,(llamacpp.loaded||[]).length)}
-      ${_pTab('comfyui','ComfyUI',comfyui,(comfyui.queue_running||0)+(comfyui.queue_pending||0))}
+      ${_backendMeta.map(b => _pTab(b.name, b.label, now[b.name] || {},
+                                    _count(b.name, now[b.name] || {}))).join('')}
     </div>`;
 
   // Launch args (docker command line): pair each --flag with its value; bare flags = "on".
@@ -5144,7 +5150,23 @@ function renderSystem() {
         </table>
       ` : `<div style="color:#888;font-size:12px;padding:6px">Probed at <code>${esc(llamacpp.url || '')}</code> — nothing serving. Start <code>llama-server</code> there and it becomes a routable upstream like any other.</div>`}
     </div>`;
+  // A backend registered without a bespoke panel gets a usable generic one rather than a
+  // blank tab, so the registry alone is enough to make it visible and controllable.
+  const _genericPanel = (b) => {
+    const snap = now[b.name] || {};
+    const rows = (snap.loaded || []).map(m => `<tr><td><code>${esc(m.id || m.name || '?')}</code></td>
+        <td>${esc(m.quant || '—')}</td>
+        <td class="num">${m.max_context_length ? num(m.max_context_length) : '—'}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="color:#666;padding:6px 0">no model served</td></tr>';
+    return `<div class="stats-section">
+      <h2><span class="reach-dot ${snap.reachable ? 'ok' : 'bad'}"></span>${esc(b.label || b.name)}
+        <span style="color:${snap.reachable ? '#68d391' : '#666'};font-weight:normal;font-size:11px">${snap.reachable ? 'serving' : 'offline'}</span>${_svcBtn(b.name, snap.reachable)}</h2>
+      <table style="width:100%"><thead><tr><th>Served model</th><th>Quant</th><th class="num">Max context</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+    </div>`;
+  };
   const provPanels = { vllm: vllmPanel, llamacpp: lcpPanel, lmstudio: lmsPanel, ollama: ollamaPanel, comfyui: renderComfyUISection(comfyui) };
+  for (const b of _backendMeta) if (!provPanels[b.name]) provPanels[b.name] = _genericPanel(b);
 
   $('system').innerHTML = `
     ${renderProxyHealth(systemHealthCache)}

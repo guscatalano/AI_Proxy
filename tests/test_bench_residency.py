@@ -129,7 +129,8 @@ def test_freeing_reports_when_the_memory_never_arrives(client, monkeypatch):
 
 def test_restore_puts_back_exactly_what_was_found(client, monkeypatch):
     calls = _stub(monkeypatch)
-    monkeypatch.setattr(P, "_vllm_ready", lambda t: asyncio.sleep(0, result=True))
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", lambda t=0: asyncio.sleep(0, result=True), raising=False)
     snap = asyncio.run(P._bench_residency_snapshot())
     calls.clear()
     res = asyncio.run(P._bench_restore_residency(snap))
@@ -153,10 +154,11 @@ def test_restore_waits_for_vllm_to_answer(client, monkeypatch):
     _stub(monkeypatch)
     waited = []
 
-    async def ready(t):
+    async def ready(t=0):
         waited.append(t)
         return False
-    monkeypatch.setattr(P, "_vllm_ready", ready)
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", ready, raising=False)
     snap = asyncio.run(P._bench_residency_snapshot())
     res = asyncio.run(P._bench_restore_residency(snap))
     assert waited, "did not wait for readiness"
@@ -166,7 +168,8 @@ def test_restore_waits_for_vllm_to_answer(client, monkeypatch):
 def test_quiesce_persists_the_snapshot_until_restored(client, monkeypatch):
     # A bench that stops the daily driver and dies would leave it stopped indefinitely.
     _stub(monkeypatch)
-    monkeypatch.setattr(P, "_vllm_ready", lambda t: asyncio.sleep(0, result=True))
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", lambda t=0: asyncio.sleep(0, result=True), raising=False)
     state = asyncio.run(P._bench_quiesce(True, keep=""))
     pending = P.get_setting(P._RESIDENCY_SETTING)
     assert pending, "snapshot was not persisted before anything was stopped"
@@ -179,7 +182,8 @@ def test_quiesce_persists_the_snapshot_until_restored(client, monkeypatch):
 
 def test_startup_finishes_an_interrupted_restore(client, monkeypatch):
     calls = _stub(monkeypatch)
-    monkeypatch.setattr(P, "_vllm_ready", lambda t: asyncio.sleep(0, result=True))
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", lambda t=0: asyncio.sleep(0, result=True), raising=False)
     snap = asyncio.run(P._bench_residency_snapshot())
     P._save_pending_residency(snap)          # as if the process died mid-bench
     calls.clear()

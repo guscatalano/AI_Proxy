@@ -2062,6 +2062,21 @@ class Provider(SideService):
     def base_url(self) -> str:
         raise NotImplementedError
 
+    async def ready(self, timeout_s: float = 900.0) -> bool:
+        """Serving, not merely started. Both fixed-model backends take minutes to load their
+        weights, and every caller that reported success on the process starting was reporting
+        a lie — this is the same poll _vllm_ready and _llamacpp_ready each had separately."""
+        deadline = time.time() + timeout_s
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+            while time.time() < deadline:
+                try:
+                    if (await c.get(f"{self.base_url}/v1/models")).status_code == 200:
+                        return True
+                except httpx.RequestError:
+                    pass
+                await asyncio.sleep(5.0)
+        return False
+
     def models(self, snapshot: dict) -> list:
         """Rows for the bench index, from a probe snapshot."""
         return [m for m in (snapshot.get("available") or []) if isinstance(m, dict)]
@@ -5502,6 +5517,12 @@ def system_now():
         "mem": {"total_mb": d["mem_total_mb"], "used_mb": d["mem_used_mb"], "avail_mb": d["mem_avail_mb"]},
         "gpus": json.loads(d["gpu_json"]) if d["gpu_json"] else [],
         **_backends_from_row(d),
+        # So the UI can build its tab bar from the registry instead of a list it has to
+        # be told to update — the omission that hid llama.cpp twice.
+        "backends_meta": [{"name": n, "label": b.label, "kind": kind}
+                          for kind, group in (("provider", PROVIDERS),
+                                              ("side", SIDE_SERVICES))
+                          for n, b in group.items()],
     }
 
 
@@ -7551,39 +7572,15 @@ def _write_llamacpp_override(ctx: int, parallel: int) -> tuple[bool, str]:
 
 
 async def _llamacpp_ready(timeout_s: float) -> bool:
-    """Loading ~91 GB takes minutes; reporting success on the unit starting would be a lie."""
-    deadline = time.time() + timeout_s
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
-        while time.time() < deadline:
-            try:
-                if (await c.get(f"{LLAMACPP_URL}/v1/models")).status_code == 200:
-                    return True
-            except httpx.RequestError:
-                pass
-            await asyncio.sleep(5.0)
-    return False
+    """Kept as a name for existing callers; the poll itself lives on the provider now."""
+    return await PROVIDERS["llamacpp"].ready(timeout_s)
 
 
 async def _vllm_ready(timeout_s: float) -> bool:
-    """vLLM takes minutes to become ready — docker start returns long before the server does, so
-    reporting success on the container starting would be reporting a lie."""
-    deadline = time.time() + timeout_s
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
-        while time.time() < deadline:
-            try:
-                r = await c.get(f"{VLLM_URL}/v1/models")
-                if r.status_code == 200:
-                    return True
-            except httpx.RequestError:
-                pass
-            await asyncio.sleep(3.0)
-    return False
+    """Kept as a name for existing callers; the poll itself lives on the provider now."""
+    return await PROVIDERS["vllm"].ready(timeout_s)
 
 
-# LM Studio has no load/unload over HTTP — the `lms` CLI is the only way in. That means this
-# works only when the proxy runs on the same machine as LM Studio, which is the common single-box
-# setup but not Docker or a remote LMSTUDIO_URL. Rather than fail confusingly there, the
-# capability reports itself as unavailable with the reason.
 def _lms_bin() -> str | None:
     for cand in (os.environ.get("PROXY_LMS_BIN"),
                  str(Path.home() / ".lmstudio" / "bin" / "lms"),
@@ -11552,11 +11549,8 @@ async def _bench_restore_residency(snap: dict) -> dict:
         started = await b.start()
         # Started is not serving. vLLM measured ~9 minutes to reload its weights, and reporting
         # "restored" while the daily driver still refuses connections is worse than silence.
-        ready = None
-        if entry["name"] == "vllm":
-            ready = await _vllm_ready(_vllm_ready_timeout())
-        elif entry["name"] == "llamacpp":
-            ready = await _llamacpp_ready(1800)
+        # Started is not serving; ask the backend itself rather than mapping names to waiters.
+        ready = await b.ready(_vllm_ready_timeout()) if isinstance(b, Provider) else None
         res["started"].append({"name": entry["name"], **started, "ready": ready})
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as c:
