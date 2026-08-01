@@ -120,3 +120,41 @@ def test_one_failing_probe_does_not_lose_the_whole_sample(client, monkeypatch):
     import inspect
     src = inspect.getsource(P._collect_once)
     assert "return_exceptions=True" in src
+
+
+def test_one_place_knows_how_each_backend_starts(client, monkeypatch):
+    """The three mechanisms were re-derived from the backend's name at every call site — the
+    residency handshake, the load endpoint and the UI each knew vLLM means docker and ComfyUI
+    means systemd. Adding llama.cpp meant teaching all of them again."""
+    import asyncio
+    calls = []
+
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        calls.append(list(args))
+        return 0, ""
+
+    async def container():
+        return "qwen-vllm"
+
+    cfg = dict(P.load_rules_config())
+    mc = dict(cfg.get("model_control") or {})
+    mc["services"] = {"comfyui": {"unit": "comfyui.service", "scope": "user"},
+                      "llamacpp": {"unit": "llamacpp.service", "scope": "user"}}
+    cfg["model_control"] = mc
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    monkeypatch.setattr(P, "_run_cmd", run)
+    monkeypatch.setattr(P, "_vllm_container", container)
+    monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
+
+    assert asyncio.run(P.PROVIDERS["vllm"].stop())["via"] == "docker"
+    assert ["/usr/bin/docker", "stop", "qwen-vllm"] in calls
+    assert asyncio.run(P.PROVIDERS["llamacpp"].start())["via"] == "systemctl"
+    assert ["systemctl", "--user", "start", "llamacpp.service"] in calls
+    assert asyncio.run(P.SIDE_SERVICES["comfyui"].stop())["via"] == "systemctl"
+
+
+def test_an_unmanaged_backend_says_so_rather_than_pretending(client):
+    import asyncio
+    res = asyncio.run(P.PROVIDERS["ollama"].start())
+    assert res["ok"] is False and res["via"] == "none"
+    assert "not managed" in res["detail"]

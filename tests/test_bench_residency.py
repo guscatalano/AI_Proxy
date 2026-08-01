@@ -67,20 +67,26 @@ def _stub(monkeypatch, *, vllm_running=True, svc_running=True, ollama=("qwen3:4b
     return calls
 
 
+def _entry(snap, name):
+    return next((e for e in snap["backends"] if e["name"] == name), None)
+
+
 def test_snapshot_discovers_what_is_running(client, monkeypatch):
     _stub(monkeypatch)
     snap = asyncio.run(P._bench_residency_snapshot())
-    assert snap["vllm"] == {"container": "qwen-vllm", "was_running": True}
-    assert snap["services"] == [{"name": "comfyui", "was_running": True}]
+    assert _entry(snap, "vllm")["was_running"] is True
+    assert _entry(snap, "comfyui")["was_running"] is True
     assert snap["ollama"] == ["qwen3:4b"]
+    # Backends the proxy cannot start are not in the list at all — there is nothing to restore.
+    assert _entry(snap, "ollama") is None
 
 
 def test_snapshot_records_what_was_already_down(client, monkeypatch):
     # Restoring must not start something the bench found stopped.
     _stub(monkeypatch, vllm_running=False, svc_running=False, ollama=())
     snap = asyncio.run(P._bench_residency_snapshot())
-    assert snap["vllm"]["was_running"] is False
-    assert snap["services"][0]["was_running"] is False
+    assert _entry(snap, "vllm")["was_running"] is False
+    assert _entry(snap, "comfyui")["was_running"] is False
     assert snap["ollama"] == []
 
 
@@ -92,7 +98,7 @@ def test_freeing_stops_everything_that_was_up(client, monkeypatch):
     assert ["systemctl", "--user", "stop", "comfyui.service"] in calls
     assert ["/usr/bin/docker", "stop", "qwen-vllm"] in calls
     assert ["evict-ollama", "target"] in calls
-    assert out["stopped_vllm"]["ok"] is True
+    assert any(x["name"] == "vllm" and x["ok"] for x in out["stopped"])
 
 
 def test_freeing_leaves_alone_what_was_already_down(client, monkeypatch):
@@ -130,7 +136,7 @@ def test_restore_puts_back_exactly_what_was_found(client, monkeypatch):
     assert ["/usr/bin/docker", "start", "qwen-vllm"] in calls
     assert ["systemctl", "--user", "start", "comfyui.service"] in calls
     assert ["ollama-post", "qwen3:4b", "30m"] in calls
-    assert res["started_vllm"]["ready"] is True
+    assert any(x["name"] == "vllm" and x["ready"] is True for x in res["started"])
 
 
 def test_restore_does_not_start_what_was_not_running(client, monkeypatch):
@@ -154,7 +160,7 @@ def test_restore_waits_for_vllm_to_answer(client, monkeypatch):
     snap = asyncio.run(P._bench_residency_snapshot())
     res = asyncio.run(P._bench_restore_residency(snap))
     assert waited, "did not wait for readiness"
-    assert res["started_vllm"]["ready"] is False
+    assert any(x["name"] == "vllm" and x["ready"] is False for x in res["started"])
 
 
 def test_quiesce_persists_the_snapshot_until_restored(client, monkeypatch):
@@ -164,7 +170,8 @@ def test_quiesce_persists_the_snapshot_until_restored(client, monkeypatch):
     state = asyncio.run(P._bench_quiesce(True, keep=""))
     pending = P.get_setting(P._RESIDENCY_SETTING)
     assert pending, "snapshot was not persisted before anything was stopped"
-    assert json.loads(pending["value"])["vllm"]["container"] == "qwen-vllm"
+    names = {e["name"] for e in json.loads(pending["value"])["backends"]}
+    assert "vllm" in names
 
     asyncio.run(P._bench_quiesce(False, state))
     assert not P.get_setting(P._RESIDENCY_SETTING), "snapshot outlived the restore"

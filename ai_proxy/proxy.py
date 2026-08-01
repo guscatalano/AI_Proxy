@@ -2038,6 +2038,13 @@ class SideService:
         """Everything needed to render a control: running, and why not if not."""
         return {"running": False, "control": self.control}
 
+    async def start(self) -> dict:
+        """Bring it up. Returns {ok, detail}; readiness is a separate question."""
+        return await _control_backend(self, "start")
+
+    async def stop(self) -> dict:
+        return await _control_backend(self, "stop")
+
 
 class Provider(SideService):
     """A SideService that serves models and can be benchmarked."""
@@ -2106,6 +2113,31 @@ class _FnSideService(SideService):
             if svc:
                 return {**(await _service_state(svc)), "control": "unit"}
         return {"running": None, "control": self.control}
+
+
+async def _control_backend(b, action: str) -> dict:
+    """The three start/stop mechanisms, in one place.
+
+    They were previously re-derived from the backend's name at every call site — the residency
+    handshake, the load endpoint and the UI each knew that vLLM means docker and ComfyUI means
+    systemd. Adding llama.cpp meant teaching all of them again.
+    """
+    if b.control == "unit":
+        svc = _service_def(b.name)
+        if not svc:
+            return {"ok": False, "detail": f"{b.name} has no unit configured"}
+        code, out = await _run_cmd(_systemctl_args(svc, action), 120.0,
+                                   env=_systemctl_env(svc))
+        return {"ok": code == 0, "detail": out[:300], "via": "systemctl"}
+    if b.control == "docker":
+        container = await _vllm_container()
+        if not container:
+            return {"ok": False, "detail": "no container publishing this backend's port"}
+        docker_action = "start" if action == "start" else "stop"
+        code, out = await _run_cmd([_docker_bin(), docker_action, container], 180.0)
+        return {"ok": code == 0, "detail": out[:300], "via": "docker",
+                "container": container}
+    return {"ok": False, "detail": f"{b.name} is not managed by the proxy", "via": "none"}
 
 
 # Order matters only for display: this is the order the System tab shows backends in.
@@ -11432,26 +11464,26 @@ async def _bench_residency_snapshot() -> dict:
     and ComfyUI is a unit and Ollama is an HTTP keep_alive. Whatever is up when the bench starts
     is what comes back when it ends.
     """
-    snap: dict = {"taken_at": time.time(), "vllm": None, "services": [], "ollama": []}
-    try:
-        container = await _vllm_container()
-        if container:
-            code, out = await _run_cmd(
-                [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
-                15.0, max_chars=100)
-            snap["vllm"] = {"container": container,
-                            "was_running": code == 0 and out.strip().lower() == "true"}
-    except Exception as e:
-        snap["vllm_error"] = f"{type(e).__name__}: {e}"
-    try:
-        svcs = ((load_rules_config().get("model_control") or {}).get("services") or {})
-        for name in svcs:
-            svc = _service_def(name)
-            if svc:
-                st = await _service_state(svc)
-                snap["services"].append({"name": name, "was_running": st["running"]})
-    except Exception as e:
-        snap["services_error"] = f"{type(e).__name__}: {e}"
+    snap: dict = {"taken_at": time.time(), "backends": [], "ollama": []}
+    for name, b in list(PROVIDERS.items()) + list(SIDE_SERVICES.items()):
+        if b.control == "none":
+            continue          # nothing to stop or restore
+        try:
+            st = await b.state()
+            running = st.get("running")
+            if running is None and b.control == "docker":
+                # docker's state() reports the container, not whether it is up.
+                container = st.get("container")
+                if container:
+                    code, out = await _run_cmd(
+                        [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
+                        15.0, max_chars=100)
+                    running = code == 0 and out.strip().lower() == "true"
+            snap["backends"].append({"name": name, "was_running": bool(running),
+                                     "control": b.control})
+        except Exception as e:
+            snap.setdefault("errors", []).append(f"{name}: {type(e).__name__}: {e}")
+    # Ollama holds models rather than a process the proxy starts, so it is recorded separately.
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
             ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
@@ -11476,19 +11508,15 @@ async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
     measures a machine that is still tidying up, which is exactly the kind of contaminated
     number a benchmark exists to avoid.
     """
-    out: dict = {"stopped_services": [], "stopped_vllm": None, "evicted_ollama": []}
-    for svc in (snap.get("services") or []):
-        if not svc.get("was_running"):
+    out: dict = {"stopped": [], "evicted_ollama": []}
+    for entry in (snap.get("backends") or []):
+        if not entry.get("was_running"):
+            continue          # restoring must not start what was already down
+        b = backend(entry["name"])
+        if not b:
             continue
-        d = _service_def(svc["name"])
-        if not d:
-            continue
-        code, msg = await _run_cmd(_systemctl_args(d, "stop"), 60.0, env=_systemctl_env(d))
-        out["stopped_services"].append({"name": svc["name"], "ok": code == 0, "output": msg[:200]})
-    v = snap.get("vllm") or {}
-    if v.get("was_running") and v.get("container"):
-        code, msg = await _run_cmd([_docker_bin(), "stop", v["container"]], 180.0)
-        out["stopped_vllm"] = {"container": v["container"], "ok": code == 0, "output": msg[:200]}
+        res = await b.stop()
+        out["stopped"].append({"name": entry["name"], **res})
     out["evicted_ollama"] = await _bench_evict_ollama(keep)
 
     before = _free_mem_mb()
@@ -11514,22 +11542,22 @@ async def _bench_restore_residency(snap: dict) -> dict:
     reporting "restored" while the daily driver is still refusing connections would be worse
     than saying nothing.
     """
-    res: dict = {"started_services": [], "started_vllm": None, "reloaded_ollama": []}
-    v = snap.get("vllm") or {}
-    if v.get("was_running") and v.get("container"):
-        code, msg = await _run_cmd([_docker_bin(), "start", v["container"]], 180.0)
-        ready = await _vllm_ready(_vllm_ready_timeout()) if code == 0 else False
-        res["started_vllm"] = {"container": v["container"], "ok": code == 0,
-                               "ready": ready, "output": msg[:200]}
-    for svc in (snap.get("services") or []):
-        if not svc.get("was_running"):
+    res: dict = {"started": [], "reloaded_ollama": []}
+    for entry in (snap.get("backends") or []):
+        if not entry.get("was_running"):
             continue
-        d = _service_def(svc["name"])
-        if not d:
+        b = backend(entry["name"])
+        if not b:
             continue
-        code, msg = await _run_cmd(_systemctl_args(d, "start"), 90.0, env=_systemctl_env(d))
-        res["started_services"].append({"name": svc["name"], "ok": code == 0,
-                                        "output": msg[:200]})
+        started = await b.start()
+        # Started is not serving. vLLM measured ~9 minutes to reload its weights, and reporting
+        # "restored" while the daily driver still refuses connections is worse than silence.
+        ready = None
+        if entry["name"] == "vllm":
+            ready = await _vllm_ready(_vllm_ready_timeout())
+        elif entry["name"] == "llamacpp":
+            ready = await _llamacpp_ready(1800)
+        res["started"].append({"name": entry["name"], **started, "ready": ready})
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as c:
             for name in (snap.get("ollama") or []):
