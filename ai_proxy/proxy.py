@@ -2576,6 +2576,15 @@ DEFAULT_RULES_CONFIG = {
         "services": {
             "comfyui": {"unit": "comfyui.service", "scope": "user"},
         },
+        # llama.cpp serves one model per process with its context fixed at launch, so changing
+        # the context means relaunching it. These are the pieces the proxy needs to rewrite the
+        # unit's command line; everything not listed here is left exactly as the unit has it.
+        "llamacpp": {
+            "unit": "llamacpp.service", "scope": "user",
+            "binary": "", "model": "",
+            "host": "0.0.0.0", "port": 8080, "ngl": 999,
+            "extra_args": [],
+        },
     },
     "archive": {
         # Request bodies are ~340 KB each and arrive at ~3 GB/day, while the row describing
@@ -7308,6 +7317,54 @@ async def _vllm_container() -> str | None:
     return None
 
 
+def _llamacpp_cfg() -> dict:
+    return ((load_rules_config().get("model_control") or {}).get("llamacpp") or {})
+
+
+def _llamacpp_override_path(unit: str) -> Path:
+    return Path.home() / ".config" / "systemd" / "user" / f"{unit}.d" / "override.conf"
+
+
+def _write_llamacpp_override(ctx: int, parallel: int) -> tuple[bool, str]:
+    """Rewrite the unit's command line via a systemd drop-in.
+
+    A drop-in rather than editing the unit: the original file stays the source of truth for
+    everything else, and deleting one file restores it. The empty `ExecStart=` is required —
+    without it systemd appends rather than replaces, and the server is launched twice.
+    """
+    cfg = _llamacpp_cfg()
+    binary, model = (cfg.get("binary") or "").strip(), (cfg.get("model") or "").strip()
+    if not binary or not model:
+        return False, ("model_control.llamacpp needs `binary` and `model` set before the "
+                       "context can be changed from here")
+    args = [binary, "-m", model, "--ctx-size", str(int(ctx)), "--parallel", str(int(parallel)),
+            "-ngl", str(int(cfg.get("ngl") or 999)),
+            "--host", str(cfg.get("host") or "0.0.0.0"),
+            "--port", str(int(cfg.get("port") or 8080))]
+    args += [str(a) for a in (cfg.get("extra_args") or [])]
+    path = _llamacpp_override_path(str(cfg.get("unit") or "llamacpp.service"))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[Service]\nExecStart=\nExecStart=" + " ".join(args) + "\n")
+    except OSError as e:
+        return False, str(e)
+    return True, " ".join(args)
+
+
+async def _llamacpp_ready(timeout_s: float) -> bool:
+    """Loading ~91 GB takes minutes; reporting success on the unit starting would be a lie."""
+    deadline = time.time() + timeout_s
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+        while time.time() < deadline:
+            try:
+                if (await c.get(f"{LLAMACPP_URL}/v1/models")).status_code == 200:
+                    return True
+            except httpx.RequestError:
+                pass
+            await asyncio.sleep(5.0)
+    return False
+
+
 async def _vllm_ready(timeout_s: float) -> bool:
     """vLLM takes minutes to become ready — docker start returns long before the server does, so
     reporting success on the container starting would be reporting a lie."""
@@ -7776,9 +7833,10 @@ async def control_model_load(request: Request):
         payload = {}
     upstream = (payload.get("upstream") or "ollama").strip().lower()
     name = (payload.get("model") or "").strip()
-    # vLLM needs no model name: the server was launched with one and starting the container is
-    # the whole operation. Requiring a name here made starting it impossible.
-    if not name and upstream != "vllm":
+    # vLLM and llama.cpp need no model name: each server was launched with one, so starting it
+    # (or relaunching it at a different context size) is the whole operation. Requiring a name
+    # here made starting them impossible.
+    if not name and upstream not in ("vllm", "llamacpp"):
         return JSONResponse({"error": "'model' is required"}, status_code=400)
     if upstream == "lmstudio":
         ok, why = _lms_available()
@@ -7806,6 +7864,40 @@ async def control_model_load(request: Request):
             return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
         return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
                 "load_ms": round((time.perf_counter() - t0) * 1000)}
+    if upstream == "llamacpp":
+        cfg = _llamacpp_cfg()
+        svc = _service_def("llamacpp") or {"unit": str(cfg.get("unit") or "llamacpp.service"),
+                                           "scope": cfg.get("scope") or "user",
+                                           "name": "llamacpp"}
+        ctx = int(payload.get("context_length") or payload.get("ctx") or 0)
+        par = int(payload.get("parallel") or 0)
+        if ctx or par:
+            # Carry over whatever was not specified so changing one does not silently reset
+            # the other to a default the caller never asked for.
+            cur = await _llamacpp_snapshot(app.state.metrics_client)
+            par = par or int(cur.get("parallel") or 1)
+            ctx = ctx or int((cur.get("n_ctx") or 0) * max(1, par)) or 65536
+            ok, detail = _write_llamacpp_override(ctx, par)
+            if not ok:
+                return JSONResponse({"error": detail}, status_code=400)
+            # daemon-reload takes no unit — _systemctl_args always appends one, which
+            # systemctl rejects with "Too many arguments."
+            reload_args = [a for a in _systemctl_args(svc, "daemon-reload")
+                           if a != svc["unit"]]
+            code, out = await _run_cmd(reload_args, 30.0, env=_systemctl_env(svc))
+            if code != 0:
+                return JSONResponse({"error": f"daemon-reload failed: {out[:200]}"},
+                                    status_code=502)
+        t0 = time.perf_counter()
+        code, out = await _run_cmd(_systemctl_args(svc, "restart"), 120.0,
+                                   env=_systemctl_env(svc))
+        if code != 0:
+            return JSONResponse({"error": f"restart failed: {out[:300]}"}, status_code=502)
+        ready = await _llamacpp_ready(float(payload.get("ready_timeout_s") or 1800))
+        return {"ok": ready, "upstream": "llamacpp", "ready": ready,
+                "context_length": ctx or None, "parallel": par or None,
+                "load_ms": round((time.perf_counter() - t0) * 1000),
+                "note": None if ready else "restarted, but the server did not answer in time"}
     if upstream == "vllm":
         wanted = (payload.get("container") or "").strip()
         configs = await _vllm_configs()
