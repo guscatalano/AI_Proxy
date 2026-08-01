@@ -2045,6 +2045,25 @@ class SideService:
     async def stop(self) -> dict:
         return await _control_backend(self, "stop")
 
+    async def died(self) -> str | None:
+        """Why the process is gone, if it is. None means "still up, or can't tell".
+
+        Only ever used to stop waiting early, so an uncertain answer must be None: claiming a
+        healthy backend died would abort a load that was merely slow.
+        """
+        if self.control == "unit":
+            svc = _service_def(self.name)
+            if svc:
+                st = await _service_state(svc)
+                # "activating" and "reloading" are still on their way up. Only a terminal state
+                # means no amount of further waiting will help.
+                if st.get("active") in ("failed", "inactive"):
+                    _code, log = await _run_cmd(
+                        _systemctl_args(svc, "status", "--no-pager", "-n", "8"),
+                        15.0, max_chars=600, keep_tail=True, env=_systemctl_env(svc))
+                    return f"{svc['unit']} is {st['active']}: {log.strip()[-400:]}"
+        return None
+
 
 class Provider(SideService):
     """A SideService that serves models and can be benchmarked."""
@@ -2071,6 +2090,7 @@ class Provider(SideService):
         weights, and every caller that reported success on the process starting was reporting
         a lie — this is the same poll _vllm_ready and _llamacpp_ready each had separately."""
         deadline = time.time() + timeout_s
+        checks = 0
         async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
             while time.time() < deadline:
                 try:
@@ -2078,6 +2098,13 @@ class Provider(SideService):
                         return True
                 except httpx.RequestError:
                     pass
+                checks += 1
+                # A process that has exited will never answer, and polling a corpse for the
+                # whole timeout turns a fast, explicable failure — "the KV pool did not fit" —
+                # into a quarter-hour of silence. Skip the first pass: a unit that has just
+                # been restarted is legitimately not up yet.
+                if checks > 1 and await self.died():
+                    return False
                 await asyncio.sleep(5.0)
         return False
 
@@ -2226,6 +2253,9 @@ class _LlamaCppProvider(_FnProvider):
             await self.load({"context_length": per_slot * want_par, "parallel": want_par,
                              "ready_timeout_s": _BENCH_RESIZE_READY_S}, ""))
         if not ok:
+            # Why it died beats "did not become ready in time" — the usual answer is that the
+            # KV pool did not fit, and that is actionable where a timeout is not.
+            why = await self.died()
             # A server that did not come back is worse than a bench that did not run: roll the
             # drop-in back rather than leaving the box with nothing serving on port 8080.
             rolled = None
@@ -2233,7 +2263,8 @@ class _LlamaCppProvider(_FnProvider):
                 rolled = _load_result(
                     await self.load(dict(prev, ready_timeout_s=_BENCH_RESIZE_READY_S), ""))[0]
             return {"ok": False, "changed": False, "previous": None, "rolled_back": rolled,
-                    "detail": detail or "llama.cpp did not come back after the resize"}
+                    "detail": why or detail
+                    or f"llama.cpp did not come back at {per_slot * want_par:,} context"}
         return {"ok": True, "changed": True, "previous": prev, "detail": detail,
                 "per_slot": per_slot, "parallel": want_par}
 

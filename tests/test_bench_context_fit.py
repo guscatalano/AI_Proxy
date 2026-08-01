@@ -305,3 +305,77 @@ def test_a_standalone_run_has_no_cell_rollup(client):
     conn.close()
 
     assert "cells" not in client.get("/__proxy/api/bench/runs").json()["items"][0]
+
+
+# ---- not waiting on a dead server -------------------------------------------------------
+
+def test_ready_stops_polling_a_process_that_exited(client, monkeypatch):
+    """The usual reason a resize never becomes ready is that the KV pool did not fit. Polling
+    a corpse for the full timeout turns that fast, explicable failure into 15 minutes of
+    silence — and the rollback cannot start until it ends."""
+    polls = []
+
+    class _Resp:
+        status_code = 503
+
+    class _C:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def get(self, url, *a, **kw):
+            polls.append(url)
+            return _Resp()
+
+    monkeypatch.setattr(P.httpx, "AsyncClient", lambda *a, **kw: _C())
+    # Bind the real sleep before shadowing it, or the replacement calls itself.
+    _real_sleep = asyncio.sleep
+    monkeypatch.setattr(P.asyncio, "sleep", lambda *a, **kw: _real_sleep(0))
+
+    async def died(self=None):
+        return "llamacpp.service is failed: failed to allocate KV cache"
+    monkeypatch.setattr(P.PROVIDERS["llamacpp"], "died", died)
+
+    assert asyncio.run(P.PROVIDERS["llamacpp"].ready(900.0)) is False
+    assert len(polls) <= 2, f"kept polling a dead server {len(polls)} times"
+
+
+def test_a_still_starting_unit_is_not_mistaken_for_a_dead_one(client, monkeypatch):
+    # Type=simple reports 'activating' briefly; aborting there would kill every slow load.
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "is-active" in args:
+            return 0, "activating"
+        return 0, "enabled"
+
+    cfg = dict(P.load_rules_config())
+    mc = dict(cfg.get("model_control") or {})
+    mc["services"] = {"llamacpp": {"unit": "llamacpp.service", "scope": "user"}}
+    cfg["model_control"] = mc
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    monkeypatch.setattr(P, "_run_cmd", run)
+    assert asyncio.run(P.PROVIDERS["llamacpp"].died()) is None
+
+
+def test_a_failed_unit_reports_why(client, monkeypatch):
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "is-active" in args:
+            return 0, "failed"
+        if "status" in args:
+            return 0, "llama-server: failed to allocate KV cache: out of memory"
+        return 0, "enabled"
+
+    cfg = dict(P.load_rules_config())
+    mc = dict(cfg.get("model_control") or {})
+    mc["services"] = {"llamacpp": {"unit": "llamacpp.service", "scope": "user"}}
+    cfg["model_control"] = mc
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    monkeypatch.setattr(P, "_run_cmd", run)
+    why = asyncio.run(P.PROVIDERS["llamacpp"].died())
+    assert why and "out of memory" in why
+
+
+def test_an_unmanaged_backend_never_claims_to_have_died(client):
+    # died() gates an early abort, so an uncertain answer must be None.
+    assert asyncio.run(P.PROVIDERS["ollama"].died()) is None
