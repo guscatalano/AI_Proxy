@@ -2496,6 +2496,16 @@ DEFAULT_RULES_CONFIG = {
         "lmstudio_context_length": None,
         "lmstudio_parallel": None,
         "lmstudio_gpu": None,
+        # Services the proxy can start and stop, by systemd unit. `scope: "user"` uses
+        # `systemctl --user`, which needs no privileges when the proxy runs as the same user
+        # that owns the unit — the alternative is a sudoers grant, and widening what this
+        # process can do as root to press a button is a poor trade.
+        #
+        # Only units listed here can be touched, and only with start/stop/restart: the unit
+        # name reaches systemctl as an argument, never through a shell.
+        "services": {
+            "comfyui": {"unit": "comfyui.service", "scope": "user"},
+        },
     },
     "archive": {
         # Request bodies are ~340 KB each and arrive at ~3 GB/day, while the row describing
@@ -7153,7 +7163,7 @@ def _upstream_is_local(url: str) -> bool:
 
 
 async def _run_cmd(args: list, timeout: float = 120.0, max_chars: int = 800,
-                   keep_tail: bool = False) -> tuple[int, str]:
+                   keep_tail: bool = False, env: dict | None = None) -> tuple[int, str]:
     """No shell: arguments are passed as a list so a container or model name can never become
     part of a command.
 
@@ -7164,7 +7174,9 @@ async def _run_cmd(args: list, timeout: float = 120.0, max_chars: int = 800,
     try:
         proc = await asyncio.create_subprocess_exec(
             *args, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            # Merged, not replaced: a bare env would drop PATH and the command would vanish.
+            env=({**os.environ, **env} if env else None))
     except (OSError, ValueError) as e:
         return 127, str(e)
     try:
@@ -7347,6 +7359,97 @@ async def _vllm_configs() -> list:
             "args": " ".join(args),
         })
     return out_list
+
+
+_SERVICE_ACTIONS = ("start", "stop", "restart")
+
+
+def _service_def(name: str) -> dict | None:
+    """Only units named in the config are reachable, so a request can never point systemctl at
+    something that was never offered."""
+    svcs = ((load_rules_config().get("model_control") or {}).get("services") or {})
+    d = svcs.get(name)
+    if not isinstance(d, dict) or not d.get("unit"):
+        return None
+    return {"name": name, "unit": str(d["unit"]),
+            "scope": "user" if (d.get("scope") or "user") == "user" else "system"}
+
+
+def _systemctl_args(svc: dict, *rest: str) -> list:
+    args = ["systemctl"]
+    if svc["scope"] == "user":
+        args.append("--user")
+    return args + list(rest) + [svc["unit"]]
+
+
+def _systemctl_env(svc: dict) -> dict | None:
+    """`systemctl --user` needs to find the user manager's bus, and this process is a *system*
+    service — it inherits no XDG_RUNTIME_DIR, so systemctl reports "Failed to connect to bus:
+    No medium found" and every call looks like the unit is broken. Point it at the runtime dir
+    for our own uid. The manager still has to exist, which is what `loginctl enable-linger`
+    guarantees across logouts and reboots.
+    """
+    if svc["scope"] != "user":
+        return None
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    if not runtime:
+        uid = os.getuid() if hasattr(os, "getuid") else None
+        if uid is None:
+            return None
+        runtime = f"/run/user/{uid}"
+    return {"XDG_RUNTIME_DIR": runtime,
+            "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime}/bus"}
+
+
+async def _service_state(svc: dict) -> dict:
+    env = _systemctl_env(svc)
+    code, out = await _run_cmd(_systemctl_args(svc, "is-active"), 10.0, max_chars=200, env=env)
+    active = out.strip().splitlines()[0] if out.strip() else "unknown"
+    code2, out2 = await _run_cmd(_systemctl_args(svc, "is-enabled"), 10.0, max_chars=200, env=env)
+    enabled = out2.strip().splitlines()[0] if out2.strip() else "unknown"
+    return {"name": svc["name"], "unit": svc["unit"], "scope": svc["scope"],
+            "active": active, "enabled": enabled, "running": active == "active"}
+
+
+@app.get("/__proxy/api/control/services")
+async def list_services():
+    svcs = ((load_rules_config().get("model_control") or {}).get("services") or {})
+    out = []
+    for name in svcs:
+        svc = _service_def(name)
+        if svc:
+            out.append(await _service_state(svc))
+    return {"services": out}
+
+
+@app.post("/__proxy/api/control/services/{name}")
+async def control_service(name: str, request: Request):
+    """start / stop / restart a configured unit."""
+    svc = _service_def(name)
+    if not svc:
+        return JSONResponse({"error": f"no service named {name!r} is configured"},
+                            status_code=404)
+    try:
+        payload = await request.json() if (await request.body()) else {}
+    except Exception:
+        payload = {}
+    action = (payload.get("action") or "").strip().lower()
+    if action not in _SERVICE_ACTIONS:
+        return JSONResponse({"error": f"action must be one of {', '.join(_SERVICE_ACTIONS)}"},
+                            status_code=400)
+    code, out = await _run_cmd(_systemctl_args(svc, action), 90.0, max_chars=1200,
+                               keep_tail=True, env=_systemctl_env(svc))
+    if code != 0:
+        hint = ""
+        if "No medium found" in out or "Failed to connect to bus" in out:
+            hint = (" — the per-user systemd manager isn't running. "
+                    "`sudo loginctl enable-linger " + (os.environ.get("USER") or "the proxy user")
+                    + "` makes it start at boot and survive logout.")
+        return JSONResponse({"error": f"systemctl {action} failed: {out[:400]}{hint}",
+                             "state": await _service_state(svc)}, status_code=502)
+    # A unit that reports active has been forked, not necessarily made ready — ComfyUI takes
+    # a while to load. The caller polls the backend's own probe for readiness.
+    return {"ok": True, "action": action, "state": await _service_state(svc)}
 
 
 @app.get("/__proxy/api/control/models/vllm")

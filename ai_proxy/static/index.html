@@ -4739,15 +4739,19 @@ function _bindModelControls() {
 }
 
 async function loadSystem() {
-  const [now, hist, hp] = await Promise.all([
+  const [now, hist, hp, svcs] = await Promise.all([
     fetch('/__proxy/api/system/now').then(r => r.json()),
     fetch('/__proxy/api/system/history?minutes=60').then(r => r.json()),
     fetch('/__proxy/api/health?tables=1').then(r => r.json()).catch(() => null),
+    fetch('/__proxy/api/control/services').then(r => r.json()).catch(() => null),
   ]);
   systemNowCache = now;
   systemHistoryCache = hist;
   systemHealthCache = hp;
+  _svcState = {};
+  for (const s of ((svcs && svcs.services) || [])) _svcState[s.name] = s;
   _bindModelControls();
+  _bindServiceControls();
   renderSystem();
 }
 
@@ -5064,6 +5068,48 @@ function _fmtBytes(b) {
   return `${b.toFixed(b >= 10 ? 0 : 1)} ${u[i]}`;
 }
 
+// Start/stop for a backend the proxy manages by systemd unit. Rendered only when the service
+// is actually configured — a button that 404s is worse than no button.
+let _svcState = {};
+
+function _svcBtn(name, reachable) {
+  const svc = _svcState[name];
+  if (!svc) return '';
+  const stopping = reachable || svc.running;
+  return `<button data-svc="${esc(name)}" data-svc-act="${stopping ? 'stop' : 'start'}"
+    style="margin-left:10px;background:${stopping ? '#4a2e2e' : '#2e4a3a'};color:${stopping ? '#e08080' : '#68d391'};border:1px solid ${stopping ? '#6a3030' : '#3a6a4a'};padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;font-weight:normal;vertical-align:middle">${stopping ? 'Stop' : 'Start'}</button>
+    <span data-svc-status="${esc(name)}" style="margin-left:8px;font-size:11px;color:#888;font-weight:normal"></span>`;
+}
+
+function _bindServiceControls() {
+  const host = $('system');
+  if (!host || host._svcBound) return;
+  host._svcBound = true;
+  host.addEventListener('click', async (e) => {
+    const btn = e.target.closest('[data-svc]');
+    if (!btn) return;
+    const name = btn.dataset.svc, act = btn.dataset.svcAct;
+    const st = host.querySelector(`[data-svc-status="${name}"]`);
+    btn.disabled = true;
+    if (st) { st.textContent = act === 'start' ? 'starting…' : 'stopping…'; st.style.color = '#f0c674'; }
+    try {
+      const r = await fetch(`/__proxy/api/control/services/${encodeURIComponent(name)}`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ action: act }),
+      });
+      const d = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+      // systemd reports active as soon as it has forked; ComfyUI needs a while to load, so
+      // the panel refresh is what actually confirms it, not this response.
+      if (st) { st.textContent = act === 'start' ? 'started — loading…' : 'stopped'; st.style.color = '#68d391'; }
+      setTimeout(() => loadSystem(), act === 'start' ? 4000 : 800);
+    } catch (err) {
+      if (st) { st.textContent = '✗ ' + err.message; st.style.color = '#e08080'; }
+      btn.disabled = false;
+    }
+  });
+}
+
 function renderComfyUISection(comfyui) {
   const reachable = !!comfyui.reachable;
   const ramTot = comfyui.ram_total, ramFree = comfyui.ram_free;
@@ -5083,7 +5129,7 @@ function renderComfyUISection(comfyui) {
   const queuePending = comfyui.queue_pending ?? '—';
   return `
     <div class="stats-section">
-      <h2><span class="reach-dot ${reachable ? 'ok' : 'bad'}"></span>ComfyUI ${reachable ? '<span style="color:#68d391;font-weight:normal;font-size:11px">running</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
+      <h2><span class="reach-dot ${reachable ? 'ok' : 'bad'}"></span>ComfyUI ${reachable ? '<span style="color:#68d391;font-weight:normal;font-size:11px">running</span>' : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}${_svcBtn('comfyui', reachable)}</h2>
       ${reachable ? `
         <div class="cards" style="margin-bottom:12px">
           <div class="card"><div class="l">Queue</div><div class="v">${esc(String(queueRunning))} <span style="color:#888;font-size:13px">running</span> · ${esc(String(queuePending))} <span style="color:#888;font-size:13px">pending</span></div></div>
