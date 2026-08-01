@@ -2000,6 +2000,142 @@ async def _comfyui_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+# ---- Backend registry -------------------------------------------------------------------
+# Every backend used to be wired by hand into ten separate places: the metrics gather, the
+# INSERT column list, the INSERT *values* (forgetting that one killed telemetry for an hour),
+# system_now, GENERATION_RATE_UPSTREAMS, _BENCH_LOAD_MODES, the bench index, the router's
+# upstream table, a System-tab provider tab and its panel. Every UI bug in this area has been a
+# missed site rather than a logic error, and adding a fifth backend meant finding all ten.
+#
+# A SideService is something the proxy can start and stop but does not send inference to
+# (ComfyUI). A Provider is a SideService that also serves models. The registry is the single
+# list; the fan-out sites read from it instead of repeating themselves.
+#
+# Deliberately delegating to the existing functions rather than reimplementing them: the point
+# of this step is to change where the knowledge lives, not what it does, so the behaviour is
+# provably identical while the call sites move over one at a time.
+
+
+class SideService:
+    """Startable, stoppable, and able to say whether it is up. No models."""
+
+    name: str = ""
+    label: str = ""
+    #  "unit"   -> systemd (see model_control.services)
+    #  "docker" -> a container publishing the backend's port
+    #  "none"   -> not managed by the proxy
+    control: str = "none"
+
+    async def probe(self, client) -> dict:
+        """Reachability plus whatever the backend reports about itself."""
+        return {"reachable": False}
+
+    async def state(self) -> dict:
+        """Everything needed to render a control: running, and why not if not."""
+        return {"running": False, "control": self.control}
+
+
+class Provider(SideService):
+    """A SideService that serves models and can be benchmarked."""
+
+    #  "on-demand" -> the backend loads whatever is asked for (Ollama)
+    #  "jit"       -> loads on first use, evicts on its own schedule (LM Studio)
+    #  "fixed"     -> one model per process, chosen at launch (vLLM, llama.cpp)
+    load_mode: str = "fixed"
+    # Whether decode-rate statistics can be attributed to this backend. A backend left out of
+    # this is not merely missing from a chart — 100% of its traffic silently vanishes from the
+    # throughput figures, which is what happened to vLLM once already.
+    measures_decode: bool = True
+
+    @property
+    def base_url(self) -> str:
+        raise NotImplementedError
+
+    def models(self, snapshot: dict) -> list:
+        """Rows for the bench index, from a probe snapshot."""
+        return [m for m in (snapshot.get("available") or []) if isinstance(m, dict)]
+
+
+class _FnProvider(Provider):
+    """Adapter over the existing module-level snapshot functions.
+
+    Each backend keeps its current probe verbatim; only the ownership moves. Replacing these
+    with real implementations is the next step and can be done one at a time.
+    """
+
+    def __init__(self, name, label, probe_fn, url_fn, load_mode="fixed",
+                 control="none", measures_decode=True):
+        self.name, self.label = name, label
+        self._probe, self._url = probe_fn, url_fn
+        self.load_mode, self.control = load_mode, control
+        self.measures_decode = measures_decode
+
+    @property
+    def base_url(self) -> str:
+        return self._url()
+
+    async def probe(self, client) -> dict:
+        return await self._probe(client)
+
+    async def state(self) -> dict:
+        if self.control == "unit":
+            svc = _service_def(self.name)
+            if svc:
+                st = await _service_state(svc)
+                return {**st, "control": "unit"}
+        if self.control == "docker":
+            container = await _vllm_container()
+            return {"running": None, "container": container, "control": "docker"}
+        return {"running": None, "control": self.control}
+
+
+class _FnSideService(SideService):
+    def __init__(self, name, label, probe_fn, control="none"):
+        self.name, self.label, self._probe, self.control = name, label, probe_fn, control
+
+    async def probe(self, client) -> dict:
+        return await self._probe(client)
+
+    async def state(self) -> dict:
+        if self.control == "unit":
+            svc = _service_def(self.name)
+            if svc:
+                return {**(await _service_state(svc)), "control": "unit"}
+        return {"running": None, "control": self.control}
+
+
+# Order matters only for display: this is the order the System tab shows backends in.
+PROVIDERS: dict = {}
+SIDE_SERVICES: dict = {}
+
+
+def _register_backends():
+    """Built once at import. Kept as a function so tests can rebuild it after patching URLs."""
+    PROVIDERS.clear()
+    SIDE_SERVICES.clear()
+    for p in (
+        _FnProvider("vllm", "vLLM", _vllm_snapshot, lambda: VLLM_URL,
+                    load_mode="fixed", control="docker"),
+        _FnProvider("llamacpp", "llama.cpp", _llamacpp_snapshot, lambda: LLAMACPP_URL,
+                    load_mode="fixed", control="unit"),
+        _FnProvider("lmstudio", "LM Studio", _lmstudio_snapshot, lambda: LMSTUDIO_URL,
+                    load_mode="jit"),
+        _FnProvider("ollama", "Ollama", _ollama_snapshot, lambda: OLLAMA_URL,
+                    load_mode="on-demand"),
+    ):
+        PROVIDERS[p.name] = p
+    for s in (_FnSideService("comfyui", "ComfyUI", _comfyui_snapshot, control="unit"),):
+        SIDE_SERVICES[s.name] = s
+
+
+def backend(name: str):
+    return PROVIDERS.get(name) or SIDE_SERVICES.get(name)
+
+
+# Built at import, immediately after the snapshot functions it references.
+_register_backends()
+
+
 async def _collect_once(app: FastAPI):
     cpu = _cpu_pct()
     mem = _mem_snapshot()
@@ -6450,7 +6586,7 @@ def stats():  # sync → threadpool
     # vLLM streams token-by-token like the other local engines and belongs here — it was
     # missing until 2026-07, which silently emptied the decode metric on any box that had
     # moved its daily driver to vLLM.
-    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio", "vllm", "llamacpp"}
+    GENERATION_RATE_UPSTREAMS = {n for n, p in PROVIDERS.items() if p.measures_decode}
     for r in tps_rows:
         ct = r["completion_tokens"] or 0
         pt = r["prompt_tokens"] or 0
@@ -8251,8 +8387,10 @@ async def bench_suites():
 # "fixed" means the server serves exactly what it was launched with: the bench cannot swap
 # models there, only measure the one that is up. llama.cpp is fixed for the same reason vLLM
 # is — one model per process, chosen on the command line.
-_BENCH_LOAD_MODES = {"ollama": "on-demand", "lmstudio": "jit", "vllm": "fixed",
-                     "llamacpp": "fixed"}
+# Derived, not repeated: a backend added to the registry appears in the bench without
+# anyone remembering to update a second list.
+def _bench_load_modes() -> dict:
+    return {name: p.load_mode for name, p in PROVIDERS.items()}
 
 
 async def _bench_model_index() -> dict:
@@ -8274,7 +8412,7 @@ async def _bench_model_index() -> dict:
             return
         key = f"{upstream}:{name}"
         rec = {"model": name, "upstream": upstream, "loaded": bool(loaded),
-               "load_mode": _BENCH_LOAD_MODES.get(upstream, "unknown")}
+               "load_mode": _bench_load_modes().get(upstream, "unknown")}
         rec.update({k: v for k, v in extra.items() if v is not None})
         # A loaded entry always wins over a catalogue entry for the same pair.
         if key in index and index[key].get("loaded") and not loaded:
@@ -8416,7 +8554,7 @@ async def bench_models():
     # Per-backend rollup: what's reachable, how much of it is resident, and whether unloaded
     # models there can be used at all. This is what the upstream picker is built from.
     upstreams = []
-    for name, mode in _BENCH_LOAD_MODES.items():
+    for name, mode in _bench_load_modes().items():
         mine = [i for i in items if i["upstream"] == name]
         upstreams.append({
             "upstream": name,
@@ -8428,7 +8566,7 @@ async def bench_models():
     out: dict = {
         "items": items,
         "upstreams": upstreams,
-        "load_modes": dict(_BENCH_LOAD_MODES),
+        "load_modes": _bench_load_modes(),
         # Kept for older clients / convenience.
         "ollama": {
             "loaded": [i["model"] for i in items if i["upstream"] == "ollama" and i["loaded"]],
@@ -8468,11 +8606,11 @@ async def bench_run(request: Request):
             raw = str(entry or "").strip()
             name, up = raw, ""
             head = raw.split(":", 1)[0].lower()
-            if head in _BENCH_LOAD_MODES and ":" in raw:
+            if head in PROVIDERS and ":" in raw:
                 up, name = head, raw.split(":", 1)[1]
         if not name:
             return None
-        if up and up not in _BENCH_LOAD_MODES:
+        if up and up not in PROVIDERS:
             return None
         return {"model": name, "upstream": up}
 
@@ -14395,8 +14533,7 @@ async def proxy(full_path: str, request: Request):
     # both Ollama and LM Studio speak the same /v1 shape, so no body translation is needed.
     # "anthropic" is deliberately NOT a target: forwarding an OpenAI-shape body there without
     # the protocol bridge (which only goes anthropic→ollama) would produce 400s.
-    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL,
-                       "llamacpp": LLAMACPP_URL}
+    _UPSTREAM_BASES = {n: p.base_url for n, p in PROVIDERS.items()}
     # x-proxy-upstream forces the backend directly, without needing a routing rule. Same
     # motivation as x-proxy-no-router: benchmark the engine you meant to benchmark.
     # Kept OUT of `rewrite`: that dict is the model_router verdict and downstream audit code

@@ -75,10 +75,7 @@ def test_it_counts_toward_decode_rate_stats(client):
     # Left out, 100% of its traffic would be invisible in the throughput figures — exactly the
     # bug vLLM had when it was added as an upstream and this set was not updated. The set is a
     # local inside stats(), so this guards the literal rather than an importable name.
-    import inspect
-    src = inspect.getsource(P.stats)
-    line = next(l for l in src.splitlines() if "GENERATION_RATE_UPSTREAMS = " in l)
-    assert "llamacpp" in line, line
+    assert P.PROVIDERS["llamacpp"].measures_decode is True
 
 
 def test_bench_index_includes_llamacpp_models(client, monkeypatch):
@@ -98,12 +95,12 @@ def test_bench_index_includes_llamacpp_models(client, monkeypatch):
 
 
 def test_bench_lists_it_as_a_backend(client, monkeypatch):
-    # The bench's backend chips come from _BENCH_LOAD_MODES, not from the model index, so a
-    # backend missing from that table is invisible in the bench UI even when it is serving.
-    assert "llamacpp" in P._BENCH_LOAD_MODES
+    # The bench's backend chips are derived from the registry, so registering a backend is
+    # the single act that makes it appear — no second list to remember.
+    assert "llamacpp" in P.PROVIDERS
     # "fixed": one model per process, chosen on the command line — the bench can measure what
     # is up but cannot swap models there, same as vLLM.
-    assert P._BENCH_LOAD_MODES["llamacpp"] == "fixed"
+    assert P.PROVIDERS["llamacpp"].load_mode == "fixed"
 
     def fake_now():          # sync, like the real handler
         return {"llamacpp": {"reachable": True, "available": [{"id": "ds4"}]}}
