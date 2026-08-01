@@ -1202,6 +1202,9 @@ async def lifespan(app: FastAPI):
     app.state.metrics_task = asyncio.create_task(_metrics_loop(app))
     app.state.task_worker = asyncio.create_task(_task_worker_loop(app))
     app.state.zombie_killer = asyncio.create_task(_inflight_zombie_killer(app))
+    # A bench that stopped the daily driver and then died would leave it stopped. Restoring
+    # takes minutes (vLLM reloads its weights), so it runs as a task rather than blocking boot.
+    app.state.residency_restore = asyncio.create_task(_restore_pending_residency())
     # One-time, throttled, and in a thread: it reads bodies, which is the cost the tool_calls
     # column exists to keep off the request path. Daemon so it can never hold up a shutdown.
     threading.Thread(target=_backfill_tool_calls, daemon=True, name="tool-calls-backfill").start()
@@ -10921,13 +10924,186 @@ async def _bench_evict_ollama(keep: str = "") -> list:
     return unloaded
 
 
-async def _bench_quiesce(enable: bool, prior: dict | None = None, keep: str = "") -> dict:
-    """Quiet the box for a clean run, and put it back afterward.
+async def _bench_residency_snapshot() -> dict:
+    """Everything currently holding the GPU, so it can be put back exactly as found.
 
-    Exclusive mode only gates traffic *through the proxy* — Ollama still serves whatever asks
-    it directly on its own port, and an idle loaded model still holds VRAM. So quiescing also
-    unloads Ollama's models, sparing `keep` so the cell about to run isn't evicted and then
-    immediately reloaded. Returns the prior state so it can be restored.
+    Discovered rather than declared: the caller shouldn't have to know that vLLM is a container
+    and ComfyUI is a unit and Ollama is an HTTP keep_alive. Whatever is up when the bench starts
+    is what comes back when it ends.
+    """
+    snap: dict = {"taken_at": time.time(), "vllm": None, "services": [], "ollama": []}
+    try:
+        container = await _vllm_container()
+        if container:
+            code, out = await _run_cmd(
+                [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
+                15.0, max_chars=100)
+            snap["vllm"] = {"container": container,
+                            "was_running": code == 0 and out.strip().lower() == "true"}
+    except Exception as e:
+        snap["vllm_error"] = f"{type(e).__name__}: {e}"
+    try:
+        svcs = ((load_rules_config().get("model_control") or {}).get("services") or {})
+        for name in svcs:
+            svc = _service_def(name)
+            if svc:
+                st = await _service_state(svc)
+                snap["services"].append({"name": name, "was_running": st["running"]})
+    except Exception as e:
+        snap["services_error"] = f"{type(e).__name__}: {e}"
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+            ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+            snap["ollama"] = [m.get("name") or m.get("model")
+                              for m in (ps.get("models") or []) if (m.get("name") or m.get("model"))]
+    except Exception:
+        pass
+    return snap
+
+
+def _free_mem_mb() -> float:
+    m = _mem_snapshot() or {}
+    return float(m.get("avail_mb") or 0)
+
+
+async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
+                          timeout_s: float = 240.0) -> dict:
+    """Stop everything in the snapshot, then wait for the memory to actually come back.
+
+    The waiting is the part that matters. `docker stop` returns as soon as the process is
+    signalled, but unmapping ~99 GB takes seconds longer — starting the run at that moment
+    measures a machine that is still tidying up, which is exactly the kind of contaminated
+    number a benchmark exists to avoid.
+    """
+    out: dict = {"stopped_services": [], "stopped_vllm": None, "evicted_ollama": []}
+    for svc in (snap.get("services") or []):
+        if not svc.get("was_running"):
+            continue
+        d = _service_def(svc["name"])
+        if not d:
+            continue
+        code, msg = await _run_cmd(_systemctl_args(d, "stop"), 60.0, env=_systemctl_env(d))
+        out["stopped_services"].append({"name": svc["name"], "ok": code == 0, "output": msg[:200]})
+    v = snap.get("vllm") or {}
+    if v.get("was_running") and v.get("container"):
+        code, msg = await _run_cmd([_docker_bin(), "stop", v["container"]], 180.0)
+        out["stopped_vllm"] = {"container": v["container"], "ok": code == 0, "output": msg[:200]}
+    out["evicted_ollama"] = await _bench_evict_ollama(keep)
+
+    before = _free_mem_mb()
+    if want_free_mb:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            if _free_mem_mb() >= want_free_mb:
+                break
+            await asyncio.sleep(2.0)
+    else:
+        # Even without a target, give the kernel a moment to finish reclaiming.
+        await asyncio.sleep(3.0)
+    out["free_mb_before"] = before
+    out["free_mb_after"] = _free_mem_mb()
+    out["reached_target"] = (not want_free_mb) or out["free_mb_after"] >= want_free_mb
+    return out
+
+
+async def _bench_restore_residency(snap: dict) -> dict:
+    """Put back exactly what the snapshot found running, and wait for it to be usable.
+
+    vLLM measured ~9 minutes to reload its weights, so this returns only once it answers —
+    reporting "restored" while the daily driver is still refusing connections would be worse
+    than saying nothing.
+    """
+    res: dict = {"started_services": [], "started_vllm": None, "reloaded_ollama": []}
+    v = snap.get("vllm") or {}
+    if v.get("was_running") and v.get("container"):
+        code, msg = await _run_cmd([_docker_bin(), "start", v["container"]], 180.0)
+        ready = await _vllm_ready(_vllm_ready_timeout()) if code == 0 else False
+        res["started_vllm"] = {"container": v["container"], "ok": code == 0,
+                               "ready": ready, "output": msg[:200]}
+    for svc in (snap.get("services") or []):
+        if not svc.get("was_running"):
+            continue
+        d = _service_def(svc["name"])
+        if not d:
+            continue
+        code, msg = await _run_cmd(_systemctl_args(d, "start"), 90.0, env=_systemctl_env(d))
+        res["started_services"].append({"name": svc["name"], "ok": code == 0,
+                                        "output": msg[:200]})
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as c:
+            for name in (snap.get("ollama") or []):
+                await c.post(f"{OLLAMA_URL}/api/generate",
+                             json={"model": name, "prompt": "", "keep_alive": "30m"})
+                res["reloaded_ollama"].append(name)
+    except Exception:
+        pass
+    return res
+
+
+def _vllm_ready_timeout() -> float:
+    try:
+        return float((load_rules_config().get("model_control") or {}).get(
+            "vllm_ready_timeout_s") or 420)
+    except Exception:
+        return 420.0
+
+
+# A bench that stops the daily driver and then dies would leave it stopped indefinitely. The
+# snapshot is persisted the moment anything is stopped and cleared only once it is restored, so
+# a restart can finish the job — the same shape as failing orphaned bench rows at startup.
+_RESIDENCY_SETTING = "bench_residency_pending"
+
+
+def _save_pending_residency(snap: dict | None):
+    try:
+        if snap:
+            set_setting(_RESIDENCY_SETTING, json.dumps(snap))
+        else:
+            delete_setting(_RESIDENCY_SETTING)
+    except Exception:
+        pass
+
+
+async def _restore_pending_residency() -> dict | None:
+    """Called at startup: if a previous run stopped things and never put them back, do it now."""
+    try:
+        row = get_setting(_RESIDENCY_SETTING)
+    except Exception:
+        return None
+    # get_setting hands back the whole row ({"value", "updated_ts"}), not the stored string —
+    # treating the wrapper as the snapshot silently "restored" nothing at all.
+    raw = row.get("value") if isinstance(row, dict) else row
+    if not raw:
+        return None
+    try:
+        snap = json.loads(raw) if isinstance(raw, str) else raw
+    except (json.JSONDecodeError, TypeError):
+        _save_pending_residency(None)
+        return None
+    if not isinstance(snap, dict):
+        _save_pending_residency(None)
+        return None
+    try:
+        print("[init] a previous benchmark left services stopped — restoring")
+    except Exception:
+        pass
+    res = await _bench_restore_residency(snap)
+    _save_pending_residency(None)
+    return res
+
+
+async def _bench_quiesce(enable: bool, prior: dict | None = None, keep: str = "",
+                         want_free_mb: float = 0) -> dict:
+    """Quiet the box for a clean run, and put it back exactly as found.
+
+    Gating proxy traffic is not enough on its own: vLLM holds ~99 GB whether or not anything is
+    asking it, and an idle Ollama model still occupies VRAM. On this box that left ~19 GB free —
+    less than the smallest model worth benchmarking — so a run either failed to load or measured
+    a contended GPU.
+
+    So quiescing now takes a snapshot of everything running, stops all of it, waits for the
+    memory to actually come back, and restores the same set afterwards. `keep` spares the model
+    the next cell needs so it isn't evicted and immediately reloaded.
     """
     state: dict = {"panic_was": _PANIC_MODE, "ollama_was": []}
     if enable:
@@ -10935,7 +11111,14 @@ async def _bench_quiesce(enable: bool, prior: dict | None = None, keep: str = ""
             _set_panic_mode(True)
         except Exception as e:
             state["panic_error"] = f"{type(e).__name__}: {e}"
-        state["ollama_was"] = await _bench_evict_ollama(keep)
+        # Discover before stopping anything: whatever is up now is what gets put back.
+        snap = await _bench_residency_snapshot()
+        state["residency"] = snap
+        # Persist first. If this process dies between here and the restore, startup finds it.
+        _save_pending_residency(snap)
+        state["freed"] = await _bench_free_gpu(snap, keep=keep, want_free_mb=want_free_mb)
+        # Ollama models the snapshot already recorded; don't double-count them on restore.
+        state["ollama_was"] = []
         return state
     # Restore.
     prior = prior or {}
@@ -10944,6 +11127,11 @@ async def _bench_quiesce(enable: bool, prior: dict | None = None, keep: str = ""
             _set_panic_mode(False)
     except Exception:
         pass
+    snap = prior.get("residency")
+    if snap:
+        prior["restored"] = await _bench_restore_residency(snap)
+        _save_pending_residency(None)
+        return prior
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
             for name in (prior.get("ollama_was") or []):
