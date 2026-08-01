@@ -379,3 +379,38 @@ def test_a_failed_unit_reports_why(client, monkeypatch):
 def test_an_unmanaged_backend_never_claims_to_have_died(client):
     # died() gates an early abort, so an uncertain answer must be None.
     assert asyncio.run(P.PROVIDERS["ollama"].died()) is None
+
+
+def test_the_running_cell_is_visible_on_the_parent(client):
+    """Grouping the cells removed the only place per-cell progress showed. The parent's own
+    counter ticks once per finished cell, so a graded 262k sweep sits at 0/6 for many minutes
+    and reads as stuck."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    now = time.time()
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status, progress, progress_total) "
+        "VALUES (?,?,?,?,'running',0,6)",
+        ("b_sweep", now, "ds4-flash", json.dumps({"models": ["ds4-flash"]})))
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, label, "
+        "progress, progress_total) VALUES (?,?,?,'{}','done',?,?,?,?)",
+        ("b_sweep_c0", now, "ds4-flash", "b_sweep", "cell 0", 12, 12))
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, label, "
+        "progress, progress_total) VALUES (?,?,?,'{}','running',?,?,?,?)",
+        ("b_sweep_c1", now, "ds4-flash", "b_sweep", "ds4 · 131k ctx · cold", 5, 12))
+    conn.commit()
+    conn.close()
+
+    it = client.get("/__proxy/api/bench/runs").json()["items"][0]
+    assert it["cells"]["now"] == {"label": "ds4 · 131k ctx · cold",
+                                 "progress": 5, "progress_total": 12}
+
+
+def test_a_finished_sweep_has_no_running_cell(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    _sweep(conn, "b_sweep", ["done", "done"])
+    conn.close()
+    assert "now" not in client.get("/__proxy/api/bench/runs").json()["items"][0]["cells"]

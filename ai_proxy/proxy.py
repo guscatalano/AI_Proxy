@@ -8980,6 +8980,17 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
             entry = cells.setdefault(c["parent_id"], {"total": 0})
             entry[c["status"]] = c["n"]
             entry["total"] += c["n"]
+        # Which cell is in flight, and how far into it. The parent's own counter only ticks
+        # when a whole cell finishes, so on a graded sweep with large prompts it can sit at
+        # 0/6 for many minutes. That detail used to be visible because every cell had its own
+        # history row; now that they are grouped, it has to come along with the group.
+        for c in conn.execute(
+            f"SELECT parent_id, label, progress, progress_total FROM bench_runs "
+            f"WHERE parent_id IN ({qs}) AND status='running' ORDER BY ts, rowid", ids,
+        ).fetchall():
+            entry = cells.setdefault(c["parent_id"], {"total": 0})
+            entry.setdefault("now", {"label": c["label"], "progress": c["progress"],
+                                     "progress_total": c["progress_total"]})
     conn.close()
     viewer = _client_ip(request)
     items = []
