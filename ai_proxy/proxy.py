@@ -443,6 +443,10 @@ MIGRATIONS = [
     "ALTER TABLE system_metrics ADD COLUMN comfyui_json TEXT",
     "ALTER TABLE system_metrics ADD COLUMN vllm_json TEXT",
     "ALTER TABLE system_metrics ADD COLUMN llamacpp_json TEXT",
+    # One blob keyed by backend name, so adding a backend is a registry entry rather than
+    # a migration plus four edits to the INSERT — the shape that silently dropped the
+    # llamacpp value and stopped telemetry dead for an hour.
+    "ALTER TABLE system_metrics ADD COLUMN backends_json TEXT",
     "ALTER TABLE requests ADD COLUMN ttft_ms REAL",
     "ALTER TABLE requests ADD COLUMN upstream TEXT",
     # Chars-based estimate of the prompt token count, stored at request time. Compared against
@@ -2140,21 +2144,27 @@ async def _collect_once(app: FastAPI):
     cpu = _cpu_pct()
     mem = _mem_snapshot()
     gpus = _gpu_snapshot()
-    ollama, lmstudio, comfyui, vllm, llamacpp = await asyncio.gather(
-        _ollama_snapshot(app.state.metrics_client),
-        _lmstudio_snapshot(app.state.metrics_client),
-        _comfyui_snapshot(app.state.metrics_client),
-        _vllm_snapshot(app.state.metrics_client),
-        _llamacpp_snapshot(app.state.metrics_client),
-        return_exceptions=False,
+    # Probe whatever is registered. return_exceptions=True because one unreachable backend
+    # must not abort the whole sample — losing every metric because a single probe raised is
+    # how the collector became a single point of failure before.
+    entries = list(PROVIDERS.items()) + list(SIDE_SERVICES.items())
+    results = await asyncio.gather(
+        *(b.probe(app.state.metrics_client) for _n, b in entries),
+        return_exceptions=True,
     )
+    backends = {}
+    for (name, _b), res in zip(entries, results):
+        if isinstance(res, BaseException):
+            backends[name] = {"reachable": False, "error": f"{type(res).__name__}: {res}"}
+        else:
+            backends[name] = res
     ts = time.time()
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO system_metrics
            (ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb, gpu_json,
-            ollama_json, lmstudio_json, comfyui_json, vllm_json, llamacpp_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            backends_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             ts,
             cpu,
@@ -2163,11 +2173,7 @@ async def _collect_once(app: FastAPI):
             mem.get("used_mb"),
             mem.get("avail_mb"),
             json.dumps(gpus) if gpus else None,
-            json.dumps(ollama),
-            json.dumps(lmstudio),
-            json.dumps(comfyui),
-            json.dumps(vllm),
-            json.dumps(llamacpp),
+            json.dumps(backends),
         ),
     )
     # Retention
@@ -5412,6 +5418,35 @@ async def db_reset(request: Request):
         _DB_JOB_LOCK.release()
 
 
+def _backends_from_row(d: dict) -> dict:
+    """Per-backend snapshots from a metrics row, newest storage first.
+
+    Rows written before the registry have one column per backend; rows written since have a
+    single blob. Reading both keeps history intact — and keeps every consumer's keys the same,
+    which is why none of them had to change.
+    """
+    out = {name: {} for name in list(PROVIDERS) + list(SIDE_SERVICES)}
+    for name in list(out):
+        col = f"{name}_json"
+        try:
+            raw = d[col] if col in d.keys() else None
+        except (TypeError, IndexError):
+            raw = None
+        if raw:
+            try:
+                out[name] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    raw = d["backends_json"] if "backends_json" in d.keys() else None
+    if raw:
+        try:
+            out.update({k: v for k, v in (json.loads(raw) or {}).items()
+                        if isinstance(v, dict)})
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return out
+
+
 @app.get("/__proxy/api/system/now")
 # Sync for the same reason as health and system_history: it reads the database, and the Live
 # view polls it every few seconds.
@@ -5420,7 +5455,7 @@ def system_now():
     row = conn.execute(
         """SELECT ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb,
                   gpu_json, ollama_json, lmstudio_json, comfyui_json, vllm_json,
-                  llamacpp_json
+                  llamacpp_json, backends_json
            FROM system_metrics ORDER BY ts DESC LIMIT 1"""
     ).fetchone()
     conn.close()
@@ -5434,11 +5469,7 @@ def system_now():
         "load_1m": d["load_1m"],
         "mem": {"total_mb": d["mem_total_mb"], "used_mb": d["mem_used_mb"], "avail_mb": d["mem_avail_mb"]},
         "gpus": json.loads(d["gpu_json"]) if d["gpu_json"] else [],
-        "ollama": json.loads(d["ollama_json"]) if d["ollama_json"] else {},
-        "lmstudio": json.loads(d["lmstudio_json"]) if d["lmstudio_json"] else {},
-        "comfyui": json.loads(d["comfyui_json"]) if d["comfyui_json"] else {},
-        "vllm": json.loads(d["vllm_json"]) if d["vllm_json"] else {},
-        "llamacpp": json.loads(d["llamacpp_json"]) if d["llamacpp_json"] else {},
+        **_backends_from_row(d),
     }
 
 

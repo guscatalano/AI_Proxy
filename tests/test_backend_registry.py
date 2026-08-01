@@ -66,3 +66,57 @@ def test_control_mechanism_is_declared_per_backend():
     assert P.PROVIDERS["llamacpp"].control == "unit"
     assert P.SIDE_SERVICES["comfyui"].control == "unit"
     assert P.PROVIDERS["ollama"].control == "none"
+
+
+def _row(**cols):
+    """A metrics row as sqlite3.Row would present it."""
+    class R(dict):
+        def keys(self):
+            return list(super().keys())
+    return R(cols)
+
+
+def test_snapshots_are_stored_as_one_blob_per_sample(client):
+    # The INSERT no longer names backends, so adding one cannot desync its column list from
+    # its value list — the failure that stopped telemetry for an hour.
+    import inspect
+    src = inspect.getsource(P._collect_once)
+    assert "backends_json" in src
+    for legacy in ("ollama_json", "vllm_json", "llamacpp_json"):
+        assert legacy not in src, f"{legacy} still written by hand"
+
+
+def test_reading_prefers_the_blob(client):
+    row = _row(backends_json='{"ollama": {"reachable": true}, "vllm": {"reachable": false}}')
+    out = P._backends_from_row(row)
+    assert out["ollama"]["reachable"] is True
+    assert out["vllm"]["reachable"] is False
+
+
+def test_rows_written_before_the_registry_still_read(client):
+    # History must survive the storage change, or every chart loses its past.
+    row = _row(ollama_json='{"reachable": true}', vllm_json='{"reachable": true}',
+               backends_json=None)
+    out = P._backends_from_row(row)
+    assert out["ollama"]["reachable"] is True
+    assert out["vllm"]["reachable"] is True
+
+
+def test_every_registered_backend_gets_a_key_even_when_absent(client):
+    # Consumers index these directly; a missing key would be an AttributeError in the UI.
+    out = P._backends_from_row(_row(backends_json=None))
+    for name in list(P.PROVIDERS) + list(P.SIDE_SERVICES):
+        assert name in out and out[name] == {}
+
+
+def test_corrupt_json_does_not_take_the_sample_down(client):
+    out = P._backends_from_row(_row(backends_json="not json", ollama_json='{"reachable": true}'))
+    assert out["ollama"]["reachable"] is True     # the legacy column still read
+
+
+def test_one_failing_probe_does_not_lose_the_whole_sample(client, monkeypatch):
+    """return_exceptions=True: losing every metric because a single backend raised is how the
+    collector became a single point of failure."""
+    import inspect
+    src = inspect.getsource(P._collect_once)
+    assert "return_exceptions=True" in src
