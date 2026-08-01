@@ -1180,6 +1180,18 @@ def _is_anthropic_path(path: str) -> bool:
     return p.startswith("/v1/messages") or p.startswith("/v1/complete")
 
 
+# Ollama-native endpoints that are *about* models rather than inference with one. Only Ollama
+# implements them, so sending one anywhere else is a guaranteed 404 — and rewriting the model
+# name in a metadata query answers a question the client did not ask.
+_OLLAMA_NATIVE_ONLY = ("/api/show", "/api/tags", "/api/ps", "/api/pull", "/api/push",
+                       "/api/create", "/api/copy", "/api/delete", "/api/blobs", "/api/version")
+
+
+def _is_ollama_native_only(path: str) -> bool:
+    p = "/" + (path or "").lstrip("/")
+    return any(p == n or p.startswith(n + "/") for n in _OLLAMA_NATIVE_ONLY)
+
+
 def _pick_upstream(full_path: str) -> tuple[str, str]:
     """Path-based routing. Anthropic for /v1/messages* and /v1/complete*; everything else
     (OpenAI-compat /v1/chat/completions, /v1/models, embeddings, plus all Ollama /api/*)
@@ -14172,6 +14184,12 @@ async def proxy(full_path: str, request: Request):
     # routing rule in play, asking for "qwen" can silently measure a different model on a
     # different backend, and the stored result would attribute the numbers to "qwen".
     _skip_router = (request.headers.get("x-proxy-no-router") or "").strip().lower() in ("1", "true", "yes")
+    # Ollama's metadata endpoints are not inference. Routing POST /api/show to vLLM because the
+    # model name matched a rule sent a native Ollama call to an OpenAI-compatible server, which
+    # 404s every time — 21 of them in one second from vscode-copilot. Rewriting the model there
+    # is wrong too: the client asked about a specific model, not whichever one the rule prefers.
+    if _is_ollama_native_only(full_path):
+        _skip_router = True
     rewrite = (evaluate_router(body_json, router_ctx)
                if isinstance(body_json, dict) and not _skip_router else None)
 
@@ -14192,6 +14210,9 @@ async def proxy(full_path: str, request: Request):
     if _pin_upstream not in _UPSTREAM_BASES:
         _pin_upstream = ""
     _want_upstream = _pin_upstream or ((rewrite or {}).get("upstream") or "")
+    # Even an explicit x-proxy-upstream cannot make another backend answer /api/show.
+    if _is_ollama_native_only(full_path):
+        _want_upstream = ""
     if _want_upstream and upstream_label != "anthropic":
         _new_label = str(_want_upstream).lower()
         _new_base = _UPSTREAM_BASES.get(_new_label)
