@@ -2096,6 +2096,24 @@ class Provider(SideService):
         return JSONResponse({"error": f"{self.name} cannot load models on request"},
                             status_code=501)
 
+    # Whether the served context window can be changed by relaunching. vLLM bakes max_model_len
+    # into the container's arguments, so changing it means recreating the container rather than
+    # restarting it — a different and much less safe operation.
+    resizable_context: bool = False
+
+    async def context_window(self) -> tuple[int, int]:
+        """(tokens per slot, slot count) as currently served. (0, 1) when unknown."""
+        return 0, 1
+
+    async def resize_context(self, per_slot: int, concurrency: int = 1) -> dict:
+        """Relaunch serving at least `per_slot` tokens, with room for `concurrency` requests.
+
+        Returns {ok, changed, detail, previous}. `previous` is whatever must be handed back to
+        restore the old window, or None when nothing was changed.
+        """
+        return {"ok": False, "changed": False, "previous": None,
+                "detail": f"{self.name} cannot change its context window"}
+
 
 class _FnProvider(Provider):
     """Adapter over the existing module-level snapshot functions.
@@ -2159,8 +2177,54 @@ class _LmStudioProvider(_FnProvider):
                 "load_ms": round((time.perf_counter() - t0) * 1000)}
 
 
+def _load_result(res) -> tuple[bool, str]:
+    """Read a load() outcome. It returns a response body on success and a JSONResponse to set a
+    status code, and callers inside the process need both read the same way."""
+    if isinstance(res, JSONResponse):
+        try:
+            body = json.loads(bytes(res.body).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            body = {}
+        return False, str(body.get("error") or f"HTTP {res.status_code}")
+    d = res or {}
+    return bool(d.get("ok")), str(d.get("error") or d.get("note") or d.get("detail") or "")
+
+
 class _LlamaCppProvider(_FnProvider):
     requires_model_name = False
+    resizable_context = True
+
+    async def context_window(self) -> tuple[int, int]:
+        snap = await _llamacpp_snapshot(app.state.metrics_client)
+        return int(snap.get("n_ctx") or 0), max(1, int(snap.get("parallel") or 1))
+
+    async def resize_context(self, per_slot: int, concurrency: int = 1) -> dict:
+        """`--ctx-size` is the whole KV pool, divided across `--parallel` slots, so the window a
+        single request actually gets is total/parallel. That makes lowering parallel the usual
+        way to buy a bigger window: one slot of 36k costs less memory than four of 32k, not
+        more. Sizing the pool to the concurrency being measured rather than to whatever the
+        server happens to be running is the whole point.
+        """
+        per_slot, want_par = int(per_slot), max(1, int(concurrency))
+        cur_slot, cur_par = await self.context_window()
+        if cur_slot >= per_slot and cur_par >= want_par:
+            return {"ok": True, "changed": False, "previous": None,
+                    "detail": f"already serving {cur_slot:,} per slot across {cur_par}",
+                    "per_slot": cur_slot, "parallel": cur_par}
+        prev = ({"context_length": cur_slot * cur_par, "parallel": cur_par}
+                if cur_slot else None)
+        ok, detail = _load_result(
+            await self.load({"context_length": per_slot * want_par, "parallel": want_par}, ""))
+        if not ok:
+            # A server that did not come back is worse than a bench that did not run: roll the
+            # drop-in back rather than leaving the box with nothing serving on port 8080.
+            rolled = None
+            if prev:
+                rolled = _load_result(await self.load(prev, ""))[0]
+            return {"ok": False, "changed": False, "previous": None, "rolled_back": rolled,
+                    "detail": detail or "llama.cpp did not come back after the resize"}
+        return {"ok": True, "changed": True, "previous": prev, "detail": detail,
+                "per_slot": per_slot, "parallel": want_par}
 
     async def load(self, payload: dict, name: str):
         cfg = _llamacpp_cfg()
@@ -8661,6 +8725,10 @@ async def bench_models():
             "total": len(mine),
             "loaded": sum(1 for i in mine if i["loaded"]),
             "reachable": bool(mine),
+            # Lets the UI say "will be resized" instead of "expect empty completions" for the
+            # backends where that is now true.
+            "resizable_context": bool(
+                getattr(PROVIDERS.get(name), "resizable_context", False)),
         })
     out: dict = {
         "items": items,
@@ -11436,6 +11504,80 @@ def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
     }
 
 
+# The reply needs room alongside the prompt, and the char-per-token estimate drifts by ~15%
+# between tokenisers, so a run sized right up to the limit returns empty completions.
+_BENCH_CTX_HEADROOM = 0.9
+
+
+def _bench_ctx_budget(window: int, max_tokens: int) -> float:
+    """The largest prompt that fits in `window`. Inverse of _bench_ctx_needed."""
+    return (window - int(max_tokens)) * _BENCH_CTX_HEADROOM
+
+
+def _bench_ctx_needed(prompt_tokens: int, max_tokens: int) -> int:
+    """The window a request of this shape needs end to end."""
+    return int(math.ceil(int(prompt_tokens) / _BENCH_CTX_HEADROOM)) + int(max_tokens)
+
+
+def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str | None:
+    """Why this run cannot produce a measurement, checked before a single request is sent.
+
+    A doomed run is not free: it still costs the full request count — 54 empty completions
+    against a backend serving a different model — and with `exclusive` set every other proxy
+    client queues behind it for the duration. The matrix path already skipped cells that could
+    not fit; a single run had no equivalent and just sent them.
+    """
+    if not upstream:
+        known = sorted({v.get("model") for v in index.values() if v.get("model")})
+        return (f"no reachable backend serves {model!r}"
+                + (f" — reachable models: {', '.join(known[:8])}" if known else
+                   " — no backend is reachable"))
+    if not meta:
+        served = sorted(v.get("model") for v in index.values()
+                        if v.get("upstream") == upstream and v.get("model"))
+        if not served:
+            return (f"{upstream} is not serving anything — it is unreachable, or it has no "
+                    f"model loaded")
+        return (f"{upstream} does not serve {model!r} — it has "
+                f"{', '.join(served[:6])}{' …' if len(served) > 6 else ''}")
+    return None
+
+
+async def _bench_fit_context(upstream: str, needed: int, concurrency: int) -> dict:
+    """Make `upstream` serve at least `needed` tokens per slot, or say why it cannot.
+
+    Returns {ok, detail, changed, restore}. `restore` is the token for _bench_restore_context,
+    and is None when nothing was changed and so nothing needs putting back.
+    """
+    prov = PROVIDERS.get(upstream)
+    if prov is None or not prov.resizable_context:
+        return {"ok": False, "changed": False, "restore": None,
+                "detail": f"{upstream} cannot change its context window"}
+    res = await prov.resize_context(needed, concurrency)
+    prev = res.get("previous")
+    return {"ok": bool(res.get("ok")), "changed": bool(res.get("changed")),
+            "detail": res.get("detail") or "",
+            "restore": dict(prev, upstream=upstream) if prev else None}
+
+
+async def _bench_restore_context(token: dict | None) -> dict | None:
+    """Put the window back where the bench found it.
+
+    Same reasoning as the residency handshake: a bench that permanently reconfigures the box
+    silently changes what the *next* bench measures, and the difference would be read as a
+    property of the model.
+    """
+    if not token:
+        return None
+    prov = PROVIDERS.get(token.get("upstream"))
+    if prov is None:
+        return None
+    ok, detail = _load_result(await prov.load(
+        {"context_length": token["context_length"], "parallel": token["parallel"]}, ""))
+    return {"ok": ok, "detail": detail, "context_length": token["context_length"],
+            "parallel": token["parallel"]}
+
+
 async def _bench_env_snapshot() -> dict:
     """Machine + engine state at run time. Without this a number from three weeks ago is
     uninterpretable: you can't tell which quant was loaded, how much context it was serving,
@@ -11790,6 +11932,9 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     child_ids = []
     skipped = 0
     now = time.time()
+    # Largest window any cell needs, and the widest concurrency it needs it at. Collected while
+    # planning so the backend is sized once, before the first cell runs.
+    need_ctx, need_par, need_up = 0, 1, ""
     for axes in cells:
         cid = "b_" + uuid.uuid4().hex[:12]
         child_cfg = dict(cfg)
@@ -11814,10 +11959,22 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         child_cfg["quiesce"] = False
         meta = _bench_resolve_model(index, axes["model"], axes.get("upstream", ""))
         window = meta.get("loaded_context") or meta.get("max_context")
-        # The reply needs room too, and the char-per-token estimate drifts by ~15% between
-        # tokenisers, so leave headroom rather than sail right up to the limit.
-        budget = (window - int(child_cfg.get("max_tokens", 256))) * 0.9 if window else None
-        if budget and axes["prompt_tokens"] > budget:
+        budget = (_bench_ctx_budget(window, child_cfg.get("max_tokens", 256))
+                  if window else None)
+        cell_up = axes.get("upstream") or meta.get("upstream") or ""
+        cell_prov = PROVIDERS.get(cell_up)
+        if budget and axes["prompt_tokens"] > budget and cell_prov is not None \
+                and cell_prov.resizable_context:
+            # Resizable: record what the sweep needs and let the cell run. Sizing once to the
+            # largest cell rather than per-cell is both far cheaper (one restart, not 24) and
+            # more comparable — every cell then measures against the same KV pool, so a
+            # difference between them is the axis rather than the window.
+            need_ctx = max(need_ctx,
+                           _bench_ctx_needed(axes["prompt_tokens"],
+                                             child_cfg.get("max_tokens", 256)))
+            need_par = max(need_par, int(child_cfg["concurrency"]))
+            need_up = need_up or cell_up
+        elif budget and axes["prompt_tokens"] > budget:
             conn.execute(
                 """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
                                            parent_id, axes_json, label, error, finished_ts)
@@ -11852,6 +12009,21 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     quiesce_state = None
     if cfg.get("quiesce"):
         quiesce_state = await _bench_quiesce(True, keep="")
+    ctx_restore = None
+    if need_ctx:
+        fit = await _bench_fit_context(need_up, need_ctx, need_par)
+        if not fit["ok"]:
+            conn = db()
+            conn.execute(
+                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                (f"could not size {need_up} to the {need_ctx:,}-token window this sweep "
+                 f"needs: {fit['detail']}", time.time(), parent_id))
+            conn.commit()
+            conn.close()
+            if quiesce_state is not None:
+                await _bench_quiesce(False, quiesce_state)
+            return
+        ctx_restore = fit["restore"]
     try:
       try:
         for i, cid in enumerate(child_ids, start=1):
@@ -11884,6 +12056,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     finally:
         if quiesce_state is not None:
             await _bench_quiesce(False, quiesce_state)
+        await _bench_restore_context(ctx_restore)
     conn = db()
     conn.execute(
         "UPDATE bench_runs SET status='done', finished_ts=?, results_json=? WHERE id=?",
@@ -11942,8 +12115,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Resolve the backend from the model unless the user pinned one explicitly. Asking the
         # user to state both invites contradictions (an Ollama model aimed at vLLM just errors),
         # and the proxy already knows the answer.
-        model_meta = _bench_resolve_model(await _bench_model_index(), model,
-                                          str(cfg.get("upstream") or ""))
+        index = await _bench_model_index()
+        model_meta = _bench_resolve_model(index, model, str(cfg.get("upstream") or ""))
         if not cfg.get("upstream") and model_meta.get("upstream"):
             cfg["upstream"] = model_meta["upstream"]
             cfg["upstream_inferred"] = True
@@ -11958,6 +12131,42 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                      (json.dumps(env), json.dumps(cfg), bench_id))
         conn.commit()
         conn.close()
+
+        def _abort(reason: str):
+            conn = db()
+            conn.execute(
+                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                (reason, time.time(), bench_id))
+            conn.commit()
+            conn.close()
+
+        # Everything below this point costs real time and, under `exclusive`, blocks every other
+        # proxy client. Refuse here rather than discovering it 54 empty completions later.
+        why = _bench_preflight(model, model_meta, str(cfg.get("upstream") or ""), index)
+        if why:
+            _abort(why)
+            return
+        # Fit the window. Children of a sweep skip this: the suite sized the backend once for
+        # the whole matrix, and the metrics snapshot this reads from may not have caught up yet.
+        ctx_restore = None
+        window = model_meta.get("loaded_context") or model_meta.get("max_context")
+        if row["parent_id"] is None and window:
+            needed = _bench_ctx_needed(prompt_tokens, max_tokens)
+            if needed > int(window):
+                fit = await _bench_fit_context(str(cfg.get("upstream") or ""), needed,
+                                               concurrency)
+                if not fit["ok"]:
+                    _abort(f"{prompt_tokens:,} prompt tokens need a {needed:,}-token window; "
+                           f"{cfg.get('upstream')} serves {int(window):,} and {fit['detail']}")
+                    return
+                ctx_restore = fit["restore"]
+                env["context_resized_to"] = needed
+                env["context_was"] = int(window)
+                conn = db()
+                conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                             (json.dumps(env), bench_id))
+                conn.commit()
+                conn.close()
         # Exclusive mode: clear the gate, optionally drain in-flight requests, run, then re-set.
         gate_held = False
         if exclusive:
@@ -12088,6 +12297,20 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         finally:
             if quiesce_state is not None:
                 await _bench_quiesce(False, quiesce_state)
+            restored = await _bench_restore_context(ctx_restore)
+            if restored is not None:
+                conn = db()
+                row2 = conn.execute("SELECT env_json FROM bench_runs WHERE id=?",
+                                    (bench_id,)).fetchone()
+                try:
+                    e = json.loads(row2["env_json"]) if row2 and row2["env_json"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    e = {}
+                e["context_restored"] = restored
+                conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                             (json.dumps(e), bench_id))
+                conn.commit()
+                conn.close()
             if gate_held:
                 _BENCH_TRAFFIC_OK.set()
                 _BENCH_EXCLUSIVE_DEADLINE = 0.0

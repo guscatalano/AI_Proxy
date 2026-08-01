@@ -7030,12 +7030,20 @@ function _benchUpdatePlan() {
       : {level: 'bad', text: `⚠ ${loadable.join(', ')} not loaded and warm-up is off — load time will land in the first measurement`});
   }
   // A prompt bigger than the model's window returns an empty completion, not an error — worth
-  // catching before you spend a sweep discovering it.
+  // catching before you spend a sweep discovering it. Backends whose window is a launch
+  // argument get resized to fit instead, so those are told apart here: one is a warning, the
+  // other is just something that is about to happen.
   const ctxSizes = Array.isArray(b.prompt_tokens) ? b.prompt_tokens : [b.prompt_tokens];
   const biggest = Math.max(...ctxSizes.map(Number), 0);
+  const canResize = new Set(_benchUpstreams.filter(u => u.resizable_context).map(u => u.upstream));
   const tooSmall = metas.filter(m => (m.max_context || 0) > 0 && biggest > m.max_context * 0.9);
-  if (tooSmall.length) {
-    warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${tooSmall.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — expect empty completions`});
+  const fixable = tooSmall.filter(m => canResize.has(m.upstream));
+  const stuck = tooSmall.filter(m => !canResize.has(m.upstream));
+  if (stuck.length) {
+    warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${stuck.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — the run will be refused rather than return empty completions`});
+  }
+  if (fixable.length) {
+    warns.push({level: 'info', text: `↻ ${fixable.map(m => m.upstream).filter((v, i, a) => a.indexOf(v) === i).join(', ')} will be restarted at a larger window to fit ${biggest.toLocaleString()} tokens, then put back — this adds several minutes`});
   }
   // Warnings go on their own line: inline they read as part of the sentence, and the ones that
   // matter ("this will fail") deserve to be seen before the button is pressed, not skimmed past.
