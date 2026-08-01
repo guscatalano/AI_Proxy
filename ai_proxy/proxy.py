@@ -7462,6 +7462,102 @@ async def control_vllm_configs():
     return {"configs": await _vllm_configs(), "url": VLLM_URL}
 
 
+# Pulling a model is tens of gigabytes over minutes to hours, so it cannot be a request that
+# blocks until done. One at a time: two concurrent pulls of that size just thrash the disk and
+# make both progress bars meaningless.
+_PULL_JOB: dict = {"state": "idle"}
+_PULL_LOCK = threading.Lock()
+_PULL_TASK: asyncio.Task | None = None
+
+
+def _pull_status() -> dict:
+    job = dict(_PULL_JOB)
+    if job.get("started"):
+        job["elapsed_s"] = round((job.get("finished") or time.time()) - job["started"], 1)
+    total, done = job.get("total_bytes") or 0, job.get("completed_bytes") or 0
+    job["percent"] = round(100.0 * done / total, 1) if total else None
+    return job
+
+
+async def _ollama_pull(model: str):
+    """Stream Ollama's pull and keep a running total across layers.
+
+    Ollama reports progress per layer digest, not for the download as a whole, so a naive
+    reading restarts from zero on every layer. Summing the per-digest totals is the only way to
+    get a figure that moves in one direction.
+    """
+    layers: dict = {}
+    _PULL_JOB.update({"state": "running", "model": model, "started": time.time(),
+                      "finished": None, "status": "starting", "error": None,
+                      "total_bytes": 0, "completed_bytes": 0})
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(None)) as c:
+            async with c.stream("POST", f"{OLLAMA_URL}/api/pull",
+                                json={"model": model, "stream": True}) as r:
+                if r.status_code >= 400:
+                    body = (await r.aread()).decode("utf-8", "replace")[:300]
+                    raise RuntimeError(f"ollama said {r.status_code}: {body}")
+                async for line in r.aiter_lines():
+                    if not line.strip():
+                        continue
+                    try:
+                        ev = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if ev.get("error"):
+                        raise RuntimeError(str(ev["error"]))
+                    _PULL_JOB["status"] = ev.get("status") or _PULL_JOB.get("status")
+                    dg = ev.get("digest")
+                    if dg and ev.get("total"):
+                        layers[dg] = (ev.get("total") or 0, ev.get("completed") or 0)
+                        _PULL_JOB["total_bytes"] = sum(t for t, _ in layers.values())
+                        _PULL_JOB["completed_bytes"] = sum(c for _, c in layers.values())
+        _PULL_JOB.update({"state": "done", "status": "success"})
+    except asyncio.CancelledError:
+        _PULL_JOB.update({"state": "cancelled", "status": "cancelled"})
+        raise
+    except Exception as e:
+        _PULL_JOB.update({"state": "error", "error": f"{type(e).__name__}: {e}"})
+    finally:
+        _PULL_JOB["finished"] = time.time()
+        if _PULL_LOCK.locked():
+            _PULL_LOCK.release()
+
+
+@app.get("/__proxy/api/control/models/pull")
+def pull_status():
+    return _pull_status()
+
+
+@app.post("/__proxy/api/control/models/pull")
+async def pull_model(request: Request):
+    """Start downloading a model into Ollama. Returns immediately — poll for progress."""
+    global _PULL_TASK
+    try:
+        payload = await request.json() if (await request.body()) else {}
+    except Exception:
+        payload = {}
+    model = (payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"error": "'model' is required"}, status_code=400)
+    if not _PULL_LOCK.acquire(blocking=False):
+        return JSONResponse({"error": f"already pulling {_PULL_JOB.get('model')!r}",
+                             "status": _pull_status()}, status_code=409)
+    # The lock is released by the task itself, in its finally.
+    _PULL_TASK = asyncio.create_task(_ollama_pull(model))
+    return {"ok": True, "model": model, "status": _pull_status()}
+
+
+@app.post("/__proxy/api/control/models/pull/cancel")
+async def pull_cancel():
+    t = _PULL_TASK
+    if t is None or t.done():
+        return JSONResponse({"error": "no pull is running", "status": _pull_status()},
+                            status_code=409)
+    t.cancel()
+    return {"ok": True, "status": _pull_status()}
+
+
 @app.get("/__proxy/api/control/models/capabilities")
 async def control_model_capabilities():
     """What can actually be loaded or unloaded, per backend, and why not when not. The UI needs

@@ -4636,6 +4636,76 @@ async function resetDb(btn) {
   }
 }
 
+// Pulling a model is tens of GB over minutes to hours, so the request only starts the job and
+// the page follows it by polling. The poll owns the UI state, so reopening the tab mid-download
+// picks the progress back up instead of losing it.
+let _pullPoll = null;
+
+function _renderPull(s) {
+  const wrap = $('pull-progress'), bar = $('pull-bar'), txt = $('pull-text');
+  const btn = $('pull-btn'), cancel = $('pull-cancel');
+  if (!wrap) return;
+  const running = s && s.state === 'running';
+  wrap.style.display = (s && s.state && s.state !== 'idle') ? 'block' : 'none';
+  if (btn) { btn.disabled = running; btn.textContent = running ? 'pulling…' : 'Pull'; }
+  if (cancel) cancel.style.display = running ? '' : 'none';
+  if (!s || s.state === 'idle') return;
+  const pct = s.percent;
+  if (bar) bar.style.width = (pct == null ? 0 : pct) + '%';
+  const size = s.total_bytes ? `${fmtBytes(s.completed_bytes || 0)} / ${fmtBytes(s.total_bytes)}` : '';
+  const el = s.elapsed_s != null ? ` · ${Math.round(s.elapsed_s)}s` : '';
+  if (!txt) return;
+  if (s.state === 'error') {
+    txt.innerHTML = `<span style="color:#e08080">✗ ${esc(s.error || 'failed')}</span>`;
+  } else if (s.state === 'done') {
+    txt.innerHTML = `<span style="color:#68d391">✓ ${esc(s.model || '')} downloaded${el}</span>`;
+  } else if (s.state === 'cancelled') {
+    txt.innerHTML = '<span style="color:#f0c674">cancelled</span>';
+  } else {
+    txt.textContent = `${s.model || ''} — ${s.status || ''}${pct != null ? ` · ${pct}%` : ''}${size ? ' · ' + size : ''}${el}`;
+  }
+}
+
+function _watchPull() {
+  if (_pullPoll) return;
+  _pullPoll = setInterval(async () => {
+    try {
+      const s = await (await fetch('/__proxy/api/control/models/pull')).json();
+      _renderPull(s);
+      if (s.state !== 'running') {
+        clearInterval(_pullPoll); _pullPoll = null;
+        // A finished pull changes what Ollama has, so refresh the lists.
+        if (s.state === 'done') setTimeout(() => loadSystem(), 600);
+      }
+    } catch { clearInterval(_pullPoll); _pullPoll = null; }
+  }, 1000);
+}
+
+async function startPull(btn) {
+  const model = ($('pull-model').value || '').trim();
+  if (!model) { _renderPull({ state: 'error', error: 'enter a model name' }); return; }
+  btn.disabled = true;
+  try {
+    const r = await fetch('/__proxy/api/control/models/pull', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    _renderPull(d.status || { state: 'running', model });
+    _watchPull();
+  } catch (e) {
+    _renderPull({ state: 'error', error: e.message });
+    btn.disabled = false;
+  }
+}
+
+async function cancelPull(btn) {
+  btn.disabled = true;
+  try { await fetch('/__proxy/api/control/models/pull/cancel', { method: 'POST' }); } catch {}
+  btn.disabled = false;
+}
+
 async function restartProxy(btn) {
   const status = $('restart-status');
   const wasManaged = (systemHealthCache && systemHealthCache.process && systemHealthCache.process.managed_by_systemd);
@@ -4752,6 +4822,11 @@ async function loadSystem() {
   for (const s of ((svcs && svcs.services) || [])) _svcState[s.name] = s;
   _bindModelControls();
   _bindServiceControls();
+  // Re-render from the server's job state so a pull started before this tab was opened (or
+  // before a reload) shows its progress rather than an empty bar.
+  fetch('/__proxy/api/control/models/pull').then(r => r.json())
+    .then(s => { _renderPull(s); if (s.state === 'running') _watchPull(); })
+    .catch(() => {});
   renderSystem();
 }
 
@@ -4974,6 +5049,17 @@ function renderSystem() {
     ${ollamaConfigSection(ollama)}
     <div class="stats-section">
       <h2>Ollama Available (top 25)</h2>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+        <input id="pull-model" placeholder="e.g. llama3:70b-instruct" spellcheck="false"
+          style="flex:1;min-width:240px;background:#161a20;color:#ddd;border:1px solid #333;border-radius:4px;padding:5px 9px;font-size:12px;font-family:ui-monospace,monospace">
+        <button onclick="startPull(this)" id="pull-btn"
+          style="background:#2e3a4a;color:#8ab4e8;border:1px solid #3a4a5a;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px">Pull</button>
+        <button onclick="cancelPull(this)" id="pull-cancel" style="display:none;background:#4a2e2e;color:#e08080;border:1px solid #6a3030;padding:5px 12px;border-radius:4px;cursor:pointer;font-size:12px">Cancel</button>
+      </div>
+      <div id="pull-progress" style="display:none;margin-bottom:10px">
+        <div class="bar-bg" style="height:8px"><div id="pull-bar" class="bar-fg" style="width:0%"></div></div>
+        <div id="pull-text" style="font-size:11px;color:#888;margin-top:4px"></div>
+      </div>
       <table style="width:100%">
         <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th>Parallel</th><th></th></tr></thead>
         <tbody>${ollamaTags}</tbody>
