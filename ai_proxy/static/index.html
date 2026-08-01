@@ -4715,6 +4715,31 @@ async function dismissPull() {
   _renderPull({ state: 'idle' });
 }
 
+// vLLM is a container rather than a unit, so its power control goes through the model
+// load/unload endpoints. Starting waits for the server to answer, which takes minutes — the
+// endpoint blocks for that, so the button says so rather than looking hung.
+async function vllmPower(action, btn) {
+  const st = $('vllm-power-status');
+  btn.disabled = true;
+  if (st) {
+    st.textContent = action === 'stop' ? 'stopping…' : 'starting — loading weights, several minutes…';
+    st.style.color = '#f0c674';
+  }
+  try {
+    const r = await fetch(`/__proxy/api/control/models/${action === 'stop' ? 'unload' : 'load'}`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ upstream: 'vllm' }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+    if (st) { st.textContent = action === 'stop' ? 'stopped' : 'ready'; st.style.color = '#68d391'; }
+    setTimeout(() => loadSystem(), 600);
+  } catch (e) {
+    if (st) { st.textContent = '✗ ' + e.message; st.style.color = '#e08080'; }
+    btn.disabled = false;
+  }
+}
+
 async function restartProxy(btn) {
   const status = $('restart-status');
   const wasManaged = (systemHealthCache && systemHealthCache.process && systemHealthCache.process.managed_by_systemd);
@@ -5023,7 +5048,10 @@ function renderSystem() {
   }
   const vllmPanel = `
     <div class="stats-section">
-      <h2><span class="reach-dot ${vDot}"></span>vLLM <span style="color:${vColour};font-weight:normal;font-size:11px">${esc(vLabel)}</span></h2>
+      <h2><span class="reach-dot ${vDot}"></span>vLLM <span style="color:${vColour};font-weight:normal;font-size:11px">${esc(vLabel)}</span>
+        <button onclick="vllmPower('${vState === 'ready' || vState === 'loading' ? 'stop' : 'start'}', this)"
+          style="margin-left:10px;background:${vState === 'ready' || vState === 'loading' ? '#4a2e2e' : '#2e4a3a'};color:${vState === 'ready' || vState === 'loading' ? '#e08080' : '#68d391'};border:1px solid ${vState === 'ready' || vState === 'loading' ? '#6a3030' : '#3a6a4a'};padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;font-weight:normal;vertical-align:middle">${vState === 'ready' || vState === 'loading' ? 'Stop' : 'Start'}</button>
+        <span id="vllm-power-status" style="margin-left:8px;font-size:11px;color:#888;font-weight:normal"></span></h2>
       ${vllmNote}
       <table style="width:100%">
         <thead><tr><th>Served model</th><th class="num">Max context</th><th class="num">Running</th><th class="num">Waiting</th><th class="num">KV cache</th></tr></thead>
@@ -5104,7 +5132,7 @@ function renderSystem() {
       <h2><span class="reach-dot ${llamacpp.reachable ? 'ok' : 'bad'}"></span>llama.cpp
         ${llamacpp.reachable
           ? '<span style="color:#68d391;font-weight:normal;font-size:11px">serving</span>'
-          : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
+          : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}${_svcBtn('llamacpp', llamacpp.reachable)}</h2>
       ${llamacpp.reachable ? `
         <div class="cards" style="margin-bottom:12px">
           <div class="card"><div class="l">Context</div><div class="v">${llamacpp.n_ctx ? num(llamacpp.n_ctx) : '—'}</div><div class="s">loaded n_ctx</div></div>
