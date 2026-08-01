@@ -4901,6 +4901,7 @@ function renderSystem() {
   const lmstudio = now.lmstudio || {};
   const vllm = now.vllm || {};
   const comfyui = now.comfyui || {};
+  const llamacpp = now.llamacpp || {};
 
   // Parallel-capability badge: whether a model can serve concurrent requests on its runtime.
   // Ollama serializes the Qwen3 family; LM Studio (llama.cpp batching) parallelizes everything.
@@ -4958,6 +4959,7 @@ function renderSystem() {
       ${_pTab('vllm','vLLM',vllm,(vllm.loaded||[]).length)}
       ${_pTab('lmstudio','LM Studio',lmstudio,(lmstudio.loaded||[]).length)}
       ${_pTab('ollama','Ollama',ollama,(ollama.ps||[]).length)}
+      ${_pTab('llamacpp','llama.cpp',llamacpp,(llamacpp.loaded||[]).length)}
       ${_pTab('comfyui','ComfyUI',comfyui,(comfyui.queue_running||0)+(comfyui.queue_pending||0))}
     </div>`;
 
@@ -5088,7 +5090,34 @@ function renderSystem() {
       <div id="ollama-upd-results" style="color:#666;font-size:12px;padding:6px">Click "Check" to compare local model digests against the Ollama registry.</div>
     </div>`;
 
-  const provPanels = { vllm: vllmPanel, lmstudio: lmsPanel, ollama: ollamaPanel, comfyui: renderComfyUISection(comfyui) };
+
+  // llama.cpp serves one model per process from a file on disk, so there is no library to
+  // list — what matters is which file, at what context, and how many slots it will serve
+  // concurrently. That last number is the one that decides whether a model is usable here.
+  const lcpRows = (llamacpp.loaded || []).map(m => `
+      <tr><td><code>${esc(m.id || '?')}</code></td>
+        <td>${esc(m.quant || '—')}</td>
+        <td class="num">${m.max_context_length ? num(m.max_context_length) : '—'}</td></tr>`).join('')
+    || '<tr><td colspan="3" style="color:#666;padding:6px 0">no model served</td></tr>';
+  const lcpPanel = `
+    <div class="stats-section">
+      <h2><span class="reach-dot ${llamacpp.reachable ? 'ok' : 'bad'}"></span>llama.cpp
+        ${llamacpp.reachable
+          ? '<span style="color:#68d391;font-weight:normal;font-size:11px">serving</span>'
+          : '<span style="color:#666;font-weight:normal;font-size:11px">offline</span>'}</h2>
+      ${llamacpp.reachable ? `
+        <div class="cards" style="margin-bottom:12px">
+          <div class="card"><div class="l">Context</div><div class="v">${llamacpp.n_ctx ? num(llamacpp.n_ctx) : '—'}</div><div class="s">loaded n_ctx</div></div>
+          <div class="card"><div class="l">Parallel slots</div><div class="v">${llamacpp.parallel != null ? llamacpp.parallel : '—'}</div><div class="s">concurrent requests</div></div>
+        </div>
+        ${llamacpp.model_path ? `<div style="font-size:11px;color:#888;margin-bottom:8px">file <code>${esc(llamacpp.model_path)}</code></div>` : ''}
+        <table style="width:100%">
+          <thead><tr><th>Served model</th><th>Quant</th><th class="num">Max context</th></tr></thead>
+          <tbody>${lcpRows}</tbody>
+        </table>
+      ` : `<div style="color:#888;font-size:12px;padding:6px">Probed at <code>${esc(llamacpp.url || '')}</code> — nothing serving. Start <code>llama-server</code> there and it becomes a routable upstream like any other.</div>`}
+    </div>`;
+  const provPanels = { vllm: vllmPanel, llamacpp: lcpPanel, lmstudio: lmsPanel, ollama: ollamaPanel, comfyui: renderComfyUISection(comfyui) };
 
   $('system').innerHTML = `
     ${renderProxyHealth(systemHealthCache)}

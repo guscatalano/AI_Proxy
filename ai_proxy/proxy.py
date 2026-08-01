@@ -8131,7 +8131,12 @@ async def bench_suites():
 #               catalogue lists everything downloaded, with per-model state
 #   vllm      — serves exactly the model(s) the server process was launched with. Nothing else
 #               is reachable without restarting that server, so an unlisted model is unbenchable
-_BENCH_LOAD_MODES = {"ollama": "on-demand", "lmstudio": "jit", "vllm": "fixed"}
+# How each backend gets a model into memory, which decides what a benchmark can ask of it.
+# "fixed" means the server serves exactly what it was launched with: the bench cannot swap
+# models there, only measure the one that is up. llama.cpp is fixed for the same reason vLLM
+# is — one model per process, chosen on the command line.
+_BENCH_LOAD_MODES = {"ollama": "on-demand", "lmstudio": "jit", "vllm": "fixed",
+                     "llamacpp": "fixed"}
 
 
 async def _bench_model_index() -> dict:

@@ -97,6 +97,23 @@ def test_bench_index_includes_llamacpp_models(client, monkeypatch):
     assert "IQ2_XXS" in (rec.get("quant") or "")
 
 
+def test_bench_lists_it_as_a_backend(client, monkeypatch):
+    # The bench's backend chips come from _BENCH_LOAD_MODES, not from the model index, so a
+    # backend missing from that table is invisible in the bench UI even when it is serving.
+    assert "llamacpp" in P._BENCH_LOAD_MODES
+    # "fixed": one model per process, chosen on the command line — the bench can measure what
+    # is up but cannot swap models there, same as vLLM.
+    assert P._BENCH_LOAD_MODES["llamacpp"] == "fixed"
+
+    async def fake_now():
+        return {"llamacpp": {"reachable": True, "available": [{"id": "ds4"}]}}
+    monkeypatch.setattr(P, "system_now", fake_now)
+    d = asyncio.run(P.bench_models())
+    names = {u["upstream"] for u in d["upstreams"]}
+    assert "llamacpp" in names
+    assert next(u for u in d["upstreams"] if u["upstream"] == "llamacpp")["reachable"] is True
+
+
 def test_info_advertises_the_slot(client):
     d = client.get("/__proxy/api/info").json()
     assert d.get("llamacpp") == P.LLAMACPP_URL
