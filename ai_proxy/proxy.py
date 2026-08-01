@@ -7274,13 +7274,24 @@ async def _vllm_container() -> str | None:
         port = str(httpx.URL(VLLM_URL).port or 8000)
     except Exception:
         return None
-    code, out = await _run_cmd([docker, "ps", "-a", "--format", "{{.Names}}	{{.Ports}}"], 20.0)
+    # {{.Ports}} is the LIVE port map and is empty once a container stops, so matching on it
+    # only ever found vLLM while it was already running: the proxy could stop it and then could
+    # not find it again to start it, which is precisely when you need it. PortBindings is the
+    # container's configuration and survives being stopped — that is what "running or not" has
+    # to mean.
+    code, names = await _run_cmd([docker, "ps", "-a", "--format", "{{.Names}}"], 20.0,
+                                 max_chars=4000)
+    if code != 0 or not names.split():
+        return None
+    code, out = await _run_cmd(
+        [docker, "inspect", "--format", "{{.Name}}	{{json .HostConfig.PortBindings}}"]
+        + names.split(), 25.0, max_chars=8000)
     if code != 0:
         return None
     for line in out.splitlines():
-        name, _, ports = line.partition("	")
-        if f":{port}->" in ports:
-            return name.strip()
+        name, _, bindings = line.partition("	")
+        if f'"HostPort":"{port}"' in bindings.replace(" ", ""):
+            return name.strip().lstrip("/")
     return None
 
 

@@ -114,6 +114,32 @@ def test_bench_lists_it_as_a_backend(client, monkeypatch):
     assert next(u for u in d["upstreams"] if u["upstream"] == "llamacpp")["reachable"] is True
 
 
+def test_vllm_container_is_found_while_stopped(client, monkeypatch):
+    """The whole point of a Start button is that it works when the thing is not running.
+
+    docker's {{.Ports}} column is the live port map and is empty for a stopped container, so
+    matching on it meant the proxy could stop vLLM and then report "no local vLLM container
+    publishing this port was found" when asked to start it again.
+    """
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "ps" in args:
+            return 0, "qwen-vllm\nornith-vllm\ndockpeek\n"
+        if "inspect" in args:
+            # Exactly what a stopped container reports: bindings present, live ports absent.
+            return 0, ('/qwen-vllm\t{"8000/tcp":[{"HostIp":"","HostPort":"8001"}]}\n'
+                       '/ornith-vllm\t{"8000/tcp":[{"HostIp":"","HostPort":"8002"}]}\n'
+                       '/dockpeek\t{"8000/tcp":[{"HostIp":"","HostPort":"3420"}]}\n')
+        return 1, ""
+    monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(P, "_run_cmd", run)
+    monkeypatch.setattr(P, "VLLM_URL", "http://localhost:8001")
+    assert asyncio.run(P._vllm_container()) == "qwen-vllm"
+
+    # And it must not grab a container that merely happens to be listed.
+    monkeypatch.setattr(P, "VLLM_URL", "http://localhost:9999")
+    assert asyncio.run(P._vllm_container()) is None
+
+
 def test_info_advertises_the_slot(client):
     d = client.get("/__proxy/api/info").json()
     assert d.get("llamacpp") == P.LLAMACPP_URL
