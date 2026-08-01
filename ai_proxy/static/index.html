@@ -4719,12 +4719,10 @@ async function dismissPull() {
 // load/unload endpoints. Starting waits for the server to answer, which takes minutes — the
 // endpoint blocks for that, so the button says so rather than looking hung.
 async function vllmPower(action, btn) {
-  const st = $('vllm-power-status');
   btn.disabled = true;
-  if (st) {
-    st.textContent = action === 'stop' ? 'stopping…' : 'starting — loading weights, several minutes…';
-    st.style.color = '#f0c674';
-  }
+  _powerBusy['vllm'] = { action, since: Date.now() };
+  const st = $('vllm-power-status');
+  if (st) st.innerHTML = _busyLabel('vllm');
   try {
     const r = await fetch(`/__proxy/api/control/models/${action === 'stop' ? 'unload' : 'load'}`, {
       method: 'POST', headers: { 'content-type': 'application/json' },
@@ -4732,9 +4730,10 @@ async function vllmPower(action, btn) {
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
-    if (st) { st.textContent = action === 'stop' ? 'stopped' : 'ready'; st.style.color = '#68d391'; }
+    delete _powerBusy['vllm'];
     setTimeout(() => loadSystem(), 600);
   } catch (e) {
+    delete _powerBusy['vllm'];
     if (st) { st.textContent = '✗ ' + e.message; st.style.color = '#e08080'; }
     btn.disabled = false;
   }
@@ -5049,8 +5048,8 @@ function renderSystem() {
   const vllmPanel = `
     <div class="stats-section">
       <h2><span class="reach-dot ${vDot}"></span>vLLM <span style="color:${vColour};font-weight:normal;font-size:11px">${esc(vLabel)}</span>
-        <button onclick="vllmPower('${vState === 'ready' || vState === 'loading' ? 'stop' : 'start'}', this)"
-          style="margin-left:10px;background:${vState === 'ready' || vState === 'loading' ? '#4a2e2e' : '#2e4a3a'};color:${vState === 'ready' || vState === 'loading' ? '#e08080' : '#68d391'};border:1px solid ${vState === 'ready' || vState === 'loading' ? '#6a3030' : '#3a6a4a'};padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;font-weight:normal;vertical-align:middle">${vState === 'ready' || vState === 'loading' ? 'Stop' : 'Start'}</button>
+        ${_powerBusy['vllm'] ? _busyLabel('vllm') : `<button onclick="vllmPower('${vState === 'ready' || vState === 'loading' ? 'stop' : 'start'}', this)"
+          style="margin-left:10px;background:${vState === 'ready' || vState === 'loading' ? '#4a2e2e' : '#2e4a3a'};color:${vState === 'ready' || vState === 'loading' ? '#e08080' : '#68d391'};border:1px solid ${vState === 'ready' || vState === 'loading' ? '#6a3030' : '#3a6a4a'};padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;font-weight:normal;vertical-align:middle">${vState === 'ready' || vState === 'loading' ? 'Stop' : 'Start'}</button>`}
         <span id="vllm-power-status" style="margin-left:8px;font-size:11px;color:#888;font-weight:normal"></span></h2>
       ${vllmNote}
       <table style="width:100%">
@@ -5227,10 +5226,23 @@ function _fmtBytes(b) {
 // Start/stop for a backend the proxy manages by systemd unit. Rendered only when the service
 // is actually configured — a button that 404s is worse than no button.
 let _svcState = {};
+// name -> {action, since}. Survives the periodic re-render; cleared when the call returns.
+let _powerBusy = {};
+
+function _busyLabel(name) {
+  const b = _powerBusy[name];
+  if (!b) return '';
+  const secs = Math.round((Date.now() - b.since) / 1000);
+  const what = b.action === 'stop' ? 'stopping' : 'starting';
+  const slow = (b.action === 'start' && (name === 'vllm' || name === 'llamacpp'))
+    ? ' — loading weights, several minutes' : '';
+  return `<span style="margin-left:8px;font-size:11px;color:#f0c674;font-weight:normal">${what}…${slow} · ${secs}s</span>`;
+}
 
 function _svcBtn(name, reachable) {
   const svc = _svcState[name];
   if (!svc) return '';
+  if (_powerBusy[name]) return _busyLabel(name);
   const stopping = reachable || svc.running;
   return `<button data-svc="${esc(name)}" data-svc-act="${stopping ? 'stop' : 'start'}"
     style="margin-left:10px;background:${stopping ? '#4a2e2e' : '#2e4a3a'};color:${stopping ? '#e08080' : '#68d391'};border:1px solid ${stopping ? '#6a3030' : '#3a6a4a'};padding:2px 10px;border-radius:3px;cursor:pointer;font-size:11px;font-weight:normal;vertical-align:middle">${stopping ? 'Stop' : 'Start'}</button>
@@ -5247,7 +5259,8 @@ function _bindServiceControls() {
     const name = btn.dataset.svc, act = btn.dataset.svcAct;
     const st = host.querySelector(`[data-svc-status="${name}"]`);
     btn.disabled = true;
-    if (st) { st.textContent = act === 'start' ? 'starting…' : 'stopping…'; st.style.color = '#f0c674'; }
+    _powerBusy[name] = { action: act, since: Date.now() };
+    if (st) { st.innerHTML = _busyLabel(name); }
     try {
       const r = await fetch(`/__proxy/api/control/services/${encodeURIComponent(name)}`, {
         method: 'POST', headers: { 'content-type': 'application/json' },
@@ -5257,9 +5270,10 @@ function _bindServiceControls() {
       if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
       // systemd reports active as soon as it has forked; ComfyUI needs a while to load, so
       // the panel refresh is what actually confirms it, not this response.
-      if (st) { st.textContent = act === 'start' ? 'started — loading…' : 'stopped'; st.style.color = '#68d391'; }
+      delete _powerBusy[name];
       setTimeout(() => loadSystem(), act === 'start' ? 4000 : 800);
     } catch (err) {
+      delete _powerBusy[name];
       if (st) { st.textContent = '✗ ' + err.message; st.style.color = '#e08080'; }
       btn.disabled = false;
     }
