@@ -7114,7 +7114,11 @@ async function _benchRefreshHistory() {
 }
 
 function _benchRowSig(it) {
+  // The cell rollup belongs here: a sweep's row is otherwise only redrawn when the parent's
+  // own counters move, so "3 done, 1 failed" would freeze while the matrix kept running.
+  const c = it.cells || {};
   return [it.status, it.progress, it.progress_total, it.error || '',
+          c.total, c.done, c.failed, c.skipped, c.running, c.pending,
           _benchSelected.has(it.id) ? 1 : 0].join('|');
 }
 
@@ -7123,13 +7127,26 @@ function _benchRowHead(it) {
   const isSelected = _benchSelected.has(it.id);
   let summaryLine = '';
   let resultsBlock = '';
+  // A sweep's cells are not listed separately any more, so its outcome has to be legible from
+  // the one row: "done" alone hides a matrix that skipped or failed half of itself.
+  const cells = it.cells;
+  let cellNote = '';
+  if (cells && cells.total) {
+    const bits = [];
+    if (cells.done) bits.push(`${cells.done} done`);
+    if (cells.failed) bits.push(`<span style="color:#e08080">${cells.failed} failed</span>`);
+    if (cells.skipped) bits.push(`<span style="color:#d9c37a">${cells.skipped} skipped</span>`);
+    const pend = (cells.pending || 0) + (cells.running || 0);
+    if (pend) bits.push(`${pend} to go`);
+    cellNote = ` · <span style="color:#888">${cells.total} cells: ${bits.join(', ')}</span>`;
+  }
   if (it.status === 'running' || it.status === 'pending') {
     const total = it.progress_total || cfg.runs || 0;
-    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}`;
+    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}${cellNote}`;
   } else if (it.status === 'failed') {
     summaryLine = `<span style="color:#e08080">failed</span> · ${esc(it.error || '')}`;
   } else if (it.status === 'done') {
-    summaryLine = `<span style="color:#5a5">✓ done</span>`;
+    summaryLine = `<span style="color:#5a5">✓ done</span>${cellNote}`;
   }
   return `
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">

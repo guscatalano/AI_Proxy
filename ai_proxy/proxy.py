@@ -8917,15 +8917,38 @@ async def bench_run(request: Request):
 
 
 @app.get("/__proxy/api/bench/runs")
-async def bench_runs_list(request: Request, limit: int = 50):
+async def bench_runs_list(request: Request, limit: int = 50, include_children: bool = False):
+    """History, one entry per submission.
+
+    A sweep's cells are rows in this table too, so listing everything showed one click as 25
+    entries — and, because the limit counts them, two sweeps pushed every earlier run off the
+    end of the history. The cells are already rendered inside their parent's detail view, so
+    listing them again at the top level was duplication as well as noise.
+    """
     limit = max(1, min(int(limit or 50), 200))
     conn = db()
     rows = conn.execute(
         "SELECT id, ts, model, config_json, status, progress, progress_total, "
         "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label "
-        "FROM bench_runs ORDER BY ts DESC LIMIT ?",
+        "FROM bench_runs "
+        + ("" if include_children else "WHERE parent_id IS NULL ")
+        + "ORDER BY ts DESC LIMIT ?",
         (limit,),
     ).fetchall()
+    # How each sweep's cells actually landed. The parent's own progress counter only tracks
+    # cells that were queued, so without this a sweep that skipped or failed half its matrix
+    # still reads as a clean "done".
+    cells: dict = {}
+    ids = [r["id"] for r in rows if not r["parent_id"]]
+    if ids:
+        qs = ",".join("?" * len(ids))
+        for c in conn.execute(
+            f"SELECT parent_id, status, COUNT(*) n FROM bench_runs "
+            f"WHERE parent_id IN ({qs}) GROUP BY parent_id, status", ids,
+        ).fetchall():
+            entry = cells.setdefault(c["parent_id"], {"total": 0})
+            entry[c["status"]] = c["n"]
+            entry["total"] += c["n"]
     conn.close()
     viewer = _client_ip(request)
     items = []
@@ -8941,6 +8964,8 @@ async def bench_runs_list(request: Request, limit: int = 50):
             d["axes"] = json.loads(d.pop("axes_json") or "null")
         except (json.JSONDecodeError, TypeError):
             d["axes"] = None
+        if cells.get(d["id"]):
+            d["cells"] = cells[d["id"]]
         items.append(d)
     return {"items": items}
 

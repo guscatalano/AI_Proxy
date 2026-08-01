@@ -228,3 +228,80 @@ def test_a_run_too_big_for_a_fixed_backend_is_refused_not_attempted(client, monk
     assert "32,000 prompt tokens need" in row["error"]
     assert "8,192" in row["error"], "should say what the backend actually serves"
     assert sent == []
+
+
+# ---- history grouping -------------------------------------------------------------------
+
+def _sweep(conn, parent, kids):
+    """A sweep as _bench_execute_suite writes one: a parent plus a row per cell."""
+    now = time.time()
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) VALUES (?,?,?,?,'done')",
+        (parent, now, "ds4-flash", json.dumps({"models": ["ds4-flash"], "runs": 3})))
+    for i, status in enumerate(kids):
+        conn.execute(
+            "INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, label) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (f"{parent}_c{i}", now, "ds4-flash", "{}", status, parent, f"cell {i}"))
+    conn.commit()
+
+
+def test_one_click_is_one_history_entry(client):
+    """A sweep's cells are rows in this table too, so a single click showed up as 25 entries —
+    and each cell was already rendered inside its parent's detail view, so it was duplication
+    as well as noise."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    _sweep(conn, "b_sweep", ["done", "done", "failed", "skipped"])
+    conn.close()
+
+    items = client.get("/__proxy/api/bench/runs").json()["items"]
+    assert [i["id"] for i in items] == ["b_sweep"]
+
+
+def test_the_row_says_how_the_cells_landed(client):
+    # "done" alone hides a matrix that skipped or failed half of itself.
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    _sweep(conn, "b_sweep", ["done", "done", "failed", "skipped"])
+    conn.close()
+
+    it = client.get("/__proxy/api/bench/runs").json()["items"][0]
+    assert it["cells"] == {"total": 4, "done": 2, "failed": 1, "skipped": 1}
+
+
+def test_cells_can_still_be_listed_when_asked_for(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    _sweep(conn, "b_sweep", ["done", "done"])
+    conn.close()
+
+    items = client.get("/__proxy/api/bench/runs?include_children=1").json()["items"]
+    assert len(items) == 3
+
+
+def test_a_sweep_no_longer_crowds_out_earlier_runs(client):
+    """The limit counted cells, so two 24-cell sweeps pushed every earlier run off the end."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    _sweep(conn, "b_big", ["done"] * 24)
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) VALUES (?,?,?,?,'done')",
+        ("b_solo", time.time() - 60, "qwen3:4b", "{}"))
+    conn.commit()
+    conn.close()
+
+    items = client.get("/__proxy/api/bench/runs?limit=2").json()["items"]
+    assert {i["id"] for i in items} == {"b_big", "b_solo"}
+
+
+def test_a_standalone_run_has_no_cell_rollup(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) VALUES (?,?,?,?,'done')",
+        ("b_solo", time.time(), "qwen3:4b", "{}"))
+    conn.commit()
+    conn.close()
+
+    assert "cells" not in client.get("/__proxy/api/bench/runs").json()["items"][0]
