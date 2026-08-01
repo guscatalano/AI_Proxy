@@ -1,7 +1,9 @@
-# Backend registry: what's done, what's left
+# Backend registry
 
-Written at the end of the session that introduced `Provider` / `SideService`. Everything here
-is deployed and green (316 tests) on `feature/local-backends-and-usage-reporting`.
+Written at the end of the session that introduced `Provider` / `SideService`, and updated when
+the last hand-wired site was closed. The refactor is **complete**: all ten fan-out sites now
+read from the registry. Everything here is deployed and green (321 tests) on
+`feature/local-backends-and-usage-reporting`.
 
 ## Why this exists
 
@@ -30,51 +32,52 @@ area was a *missed site*, never a logic error:
 | `db30f4a` | Metrics stored as one `backends_json` blob per sample. No backend name appears in the `INSERT` any more, so the desync is unrepresentable. Probes gather with `return_exceptions=True`. Reads fall back to legacy columns so history survives. |
 | `a39c6a1` | `SideService.start()` / `.stop()`; `_control_backend` implements docker / systemd / unmanaged **once**. The bench residency handshake iterates the registry instead of carrying a field per backend. |
 | `417fe3c` | Tab bar built from `backends_meta`; generic panel for any backend without a bespoke one. `Provider.ready()` replaces the identical `_vllm_ready` / `_llamacpp_ready` polls. |
+| _this commit_ | `Provider.load()` — the tenth and last site. `control_model_load` went from 118 lines of four-way branching to 22 with no backend named in it. |
 
 Adding a backend today is **one registry entry**. It then appears in the tab bar, gets a panel,
-is routable, benchmarkable, counted in decode stats, stopped/restored by the bench, and stored
-in metrics. `tests/test_backend_registry.py::test_registering_a_backend_is_the_only_step` pins
-that property.
+is routable, loadable, benchmarkable, counted in decode stats, stopped/restored by the bench,
+and stored in metrics. `tests/test_backend_registry.py::test_registering_a_backend_is_the_only_step`
+and `::test_a_registered_backend_is_loadable_without_touching_the_endpoint` pin that property.
 
-## What's left: `control_model_load`
+## The last site: `control_model_load`
 
-The tenth site. `control_model_load` still branches per upstream instead of calling
-`provider.load(...)`. It is the only place left that maps a backend name to a mechanism by hand.
-
-**Target shape**
-
-```python
-prov = PROVIDERS.get(upstream)
-if prov is None:
-    return JSONResponse({"error": f"unknown upstream {upstream!r}",
-                         "known": sorted(PROVIDERS)}, status_code=404)
-return await prov.load(payload, name)
-```
-
-**The four branches, and why this isn't mechanical.** Each takes a genuinely different parameter
-shape, so `load()` cannot be one signature with one body:
+`load()` is the one method that genuinely differs per backend rather than being shared, because
+the four mechanisms have nothing in common:
 
 | Backend | Mechanism | Parameters |
 |---|---|---|
-| `lmstudio` | `lms` CLI | `--context-length`, `--parallel`, `--gpu`, `--ttl`; needs `_lms_available()` gate first |
-| `vllm` | docker start | optional `container` chosen from `_vllm_configs()`, validated against `serves_port`; then `ready()` |
+| `lmstudio` | `lms` CLI | `--context-length`, `--parallel`, `--gpu`, `--ttl`; `_lms_available()` gate first |
+| `vllm` | docker start | optional `container` from `_vllm_configs()`, validated against `serves_port`; stops rivals on the port; then `ready()` |
 | `llamacpp` | systemd drop-in rewrite | `context_length`, `parallel`; carries over unspecified values from the running server; `daemon-reload` (**no unit argument**) then restart, then `ready()` |
 | `ollama` | HTTP keep-alive warm | model name only |
 
-Note `vllm` and `llamacpp` are exempt from the `'model' is required` guard — they take a
-container or a context, not a name.
+Two behaviours moved out of the handler and onto the backends:
 
-**Do it by hand, not by script.** Two attempts to relocate these with text substitution failed
-in this session:
+- **`requires_model_name`.** vLLM and llama.cpp are launched with one model, so "load" means
+  "start this server". That exemption used to be a literal `upstream not in ("vllm",
+  "llamacpp")` in the handler — a fact about two backends, written somewhere neither of them
+  could see.
+- **Unknown upstreams now 404** instead of falling through the branch chain into the Ollama
+  path, where a typo'd backend name quietly asked Ollama to load a model it had never heard of.
+  A registered backend with no `load()` gets a 501 that names itself.
+
+`_llamacpp_ready` / `_vllm_ready` are still called as module-level functions inside `load()`
+rather than `self.ready()`. They already delegate to the registry, and they are the seam the
+tests patch.
+
+**It was done by hand.** Two earlier attempts to relocate these branches with text substitution
+failed:
 
 1. Replacing `_vllm_ready` by slicing between two anchors deleted everything between them,
    taking `_lms_bin`, `_lms_is_local`, `_lms_available`, `_lms_run` and `VLLM_ARG_SUMMARY`.
 2. A regex dedent of the branch bodies handled 8-space indentation but not deeper levels and
    produced an `IndentationError`.
 
-Both were caught by the suite in seconds and nothing broken reached production, but the lesson
-is that this file does not tolerate blind structural surgery. Read the branches, move them
-deliberately, run the suite after each one.
+What worked: the branch bodies sit at 8 spaces inside `if upstream == ...:` and at 8 spaces
+again inside a method, so they transfer verbatim with **no dedent at all**. Move them into
+subclasses first, leave the originals in a dead function, delete that function by line number
+once the suite is green, and check afterwards that the neighbouring helpers still exist — that
+is the specific thing attempt 1 broke.
 
 ## Follow-ups not related to the refactor
 

@@ -2057,6 +2057,10 @@ class Provider(SideService):
     # this is not merely missing from a chart — 100% of its traffic silently vanishes from the
     # throughput figures, which is what happened to vLLM once already.
     measures_decode: bool = True
+    # Whether load() needs a model name. The fixed-model backends are launched with one, so the
+    # operation is "start this server", not "load that model" — a blanket name check at the
+    # endpoint made starting them impossible.
+    requires_model_name: bool = True
 
     @property
     def base_url(self) -> str:
@@ -2080,6 +2084,17 @@ class Provider(SideService):
     def models(self, snapshot: dict) -> list:
         """Rows for the bench index, from a probe snapshot."""
         return [m for m in (snapshot.get("available") or []) if isinstance(m, dict)]
+
+    async def load(self, payload: dict, name: str):
+        """Make this backend serve `name`, and wait until it actually does.
+
+        The mechanisms have nothing in common — a CLI, a docker start, a systemd drop-in
+        rewrite, an HTTP warm-up — so this is the one method that genuinely differs per
+        backend rather than being shared. Returns the endpoint's response body directly, or a
+        JSONResponse to set a status code.
+        """
+        return JSONResponse({"error": f"{self.name} cannot load models on request"},
+                            status_code=501)
 
 
 class _FnProvider(Provider):
@@ -2113,6 +2128,140 @@ class _FnProvider(Provider):
             container = await _vllm_container()
             return {"running": None, "container": container, "control": "docker"}
         return {"running": None, "control": self.control}
+
+
+class _LmStudioProvider(_FnProvider):
+    async def load(self, payload: dict, name: str):
+        ok, why = _lms_available()
+        if not ok:
+            return JSONResponse({"error": why}, status_code=501)
+        args = ["load", name, "--yes"]
+        # These matter for real workloads: a model loaded at the wrong context length or without
+        # parallelism benchmarks as a different thing entirely. The request wins over the
+        # per-box defaults in model_control.
+        mc = load_rules_config().get("model_control") or {}
+        ctx = payload.get("context_length") or mc.get("lmstudio_context_length")
+        par = payload.get("parallel") or mc.get("lmstudio_parallel")
+        gpu = payload.get("gpu") or mc.get("lmstudio_gpu")
+        if ctx:
+            args += ["--context-length", str(int(ctx))]
+        if par:
+            args += ["--parallel", str(int(par))]
+        if gpu:
+            args += ["--gpu", str(gpu)]
+        if payload.get("ttl_s"):
+            args += ["--ttl", str(int(payload["ttl_s"]))]
+        t0 = time.perf_counter()
+        code, out = await _lms_run(args)
+        if code != 0:
+            return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
+        return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
+                "load_ms": round((time.perf_counter() - t0) * 1000)}
+
+
+class _LlamaCppProvider(_FnProvider):
+    requires_model_name = False
+
+    async def load(self, payload: dict, name: str):
+        cfg = _llamacpp_cfg()
+        svc = _service_def("llamacpp") or {"unit": str(cfg.get("unit") or "llamacpp.service"),
+                                           "scope": cfg.get("scope") or "user",
+                                           "name": "llamacpp"}
+        ctx = int(payload.get("context_length") or payload.get("ctx") or 0)
+        par = int(payload.get("parallel") or 0)
+        if ctx or par:
+            # Carry over whatever was not specified so changing one does not silently reset
+            # the other to a default the caller never asked for.
+            cur = await _llamacpp_snapshot(app.state.metrics_client)
+            par = par or int(cur.get("parallel") or 1)
+            ctx = ctx or int((cur.get("n_ctx") or 0) * max(1, par)) or 65536
+            ok, detail = _write_llamacpp_override(ctx, par)
+            if not ok:
+                return JSONResponse({"error": detail}, status_code=400)
+            # daemon-reload takes no unit — _systemctl_args always appends one, which
+            # systemctl rejects with "Too many arguments."
+            reload_args = [a for a in _systemctl_args(svc, "daemon-reload")
+                           if a != svc["unit"]]
+            code, out = await _run_cmd(reload_args, 30.0, env=_systemctl_env(svc))
+            if code != 0:
+                return JSONResponse({"error": f"daemon-reload failed: {out[:200]}"},
+                                    status_code=502)
+        t0 = time.perf_counter()
+        code, out = await _run_cmd(_systemctl_args(svc, "restart"), 120.0,
+                                   env=_systemctl_env(svc))
+        if code != 0:
+            return JSONResponse({"error": f"restart failed: {out[:300]}"}, status_code=502)
+        # Module-level rather than self.ready() on purpose: it is the seam the tests patch, and
+        # it already delegates here.
+        ready = await _llamacpp_ready(float(payload.get("ready_timeout_s") or 1800))
+        return {"ok": ready, "upstream": "llamacpp", "ready": ready,
+                "context_length": ctx or None, "parallel": par or None,
+                "load_ms": round((time.perf_counter() - t0) * 1000),
+                "note": None if ready else "restarted, but the server did not answer in time"}
+
+
+class _VllmProvider(_FnProvider):
+    requires_model_name = False
+
+    async def load(self, payload: dict, name: str):
+        wanted = (payload.get("container") or "").strip()
+        configs = await _vllm_configs()
+        if wanted:
+            match = next((c for c in configs if c["container"] == wanted), None)
+            if not match:
+                return JSONResponse(
+                    {"error": f"no vLLM container named {wanted!r}",
+                     "available": [c["container"] for c in configs]}, status_code=404)
+            if not match["serves_port"]:
+                return JSONResponse(
+                    {"error": f"{wanted!r} does not publish {VLLM_URL} — starting it would not "
+                              f"make it reachable through this proxy"}, status_code=409)
+            container = wanted
+        else:
+            container = await _vllm_container()
+        if not container:
+            return JSONResponse(
+                {"error": "no local vLLM container publishing this port was found",
+                 "available": [c["container"] for c in configs]}, status_code=501)
+        t0 = time.perf_counter()
+        # They contend for one port, so anything else running must come down first — otherwise
+        # docker start fails on the binding and the error looks unrelated.
+        stopped = []
+        for c in configs:
+            if c["running"] and c["container"] != container:
+                await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
+                stopped.append(c["container"])
+        code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
+        if code != 0:
+            return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
+        # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
+        cfg_mc = load_rules_config().get("model_control") or {}
+        ready = await _vllm_ready(float(payload.get("wait_s")
+                                        or cfg_mc.get("vllm_ready_timeout_s") or 420))
+        return {"ok": ready, "started_container": container, "stopped_containers": stopped,
+                "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
+                "error": None if ready else "container started but the server did not become "
+                                            "ready in time — it may still be loading"}
+
+
+class _OllamaProvider(_FnProvider):
+    async def load(self, payload: dict, name: str):
+        """A zero-token generate is how you ask Ollama to make a model resident. Loading a large
+        model takes tens of seconds, so this waits for it rather than returning early — the
+        caller wants to know it is actually resident, not that the request was accepted."""
+        keep = payload.get("keep_alive") or "30m"
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
+                r = await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "prompt": "", "keep_alive": keep})
+                if r.status_code >= 400:
+                    return JSONResponse({"error": f"ollama said {r.status_code}: {r.text[:200]}"},
+                                        status_code=502)
+        except httpx.RequestError as e:
+            return JSONResponse({"error": f"ollama unreachable: {e}"}, status_code=502)
+        return {"ok": True, "model": name, "keep_alive": keep,
+                "load_ms": round((time.perf_counter() - t0) * 1000)}
 
 
 class _FnSideService(SideService):
@@ -2165,14 +2314,14 @@ def _register_backends():
     PROVIDERS.clear()
     SIDE_SERVICES.clear()
     for p in (
-        _FnProvider("vllm", "vLLM", _vllm_snapshot, lambda: VLLM_URL,
-                    load_mode="fixed", control="docker"),
-        _FnProvider("llamacpp", "llama.cpp", _llamacpp_snapshot, lambda: LLAMACPP_URL,
-                    load_mode="fixed", control="unit"),
-        _FnProvider("lmstudio", "LM Studio", _lmstudio_snapshot, lambda: LMSTUDIO_URL,
-                    load_mode="jit"),
-        _FnProvider("ollama", "Ollama", _ollama_snapshot, lambda: OLLAMA_URL,
-                    load_mode="on-demand"),
+        _VllmProvider("vllm", "vLLM", _vllm_snapshot, lambda: VLLM_URL,
+                      load_mode="fixed", control="docker"),
+        _LlamaCppProvider("llamacpp", "llama.cpp", _llamacpp_snapshot, lambda: LLAMACPP_URL,
+                          load_mode="fixed", control="unit"),
+        _LmStudioProvider("lmstudio", "LM Studio", _lmstudio_snapshot, lambda: LMSTUDIO_URL,
+                          load_mode="jit"),
+        _OllamaProvider("ollama", "Ollama", _ollama_snapshot, lambda: OLLAMA_URL,
+                        load_mode="on-demand"),
     ):
         PROVIDERS[p.name] = p
     for s in (_FnSideService("comfyui", "ComfyUI", _comfyui_snapshot, control="unit"),):
@@ -8016,12 +8165,12 @@ async def control_model_unload(request: Request):
 
 @app.post("/__proxy/api/control/models/load")
 async def control_model_load(request: Request):
-    """Load a model into Ollama without generating anything.
-    Body: {"model": name, "keep_alive": "30m"}.
+    """Make a backend serve a model, and wait until it does.
+    Body: {"upstream": "ollama", "model": name, ...} — the rest is per-backend.
 
-    A zero-token generate is how you ask Ollama to make a model resident. Loading a large model
-    takes tens of seconds, so this waits for it rather than returning early — the caller wants to
-    know it is actually resident, not that the request was accepted.
+    Every mechanism lives on its Provider, so this handler only resolves the name and checks the
+    one thing common to all of them. It used to branch four ways here, which is how llama.cpp
+    ended up needing an exemption written into a condition rather than stated on the backend.
     """
     try:
         payload = await request.json()
@@ -8029,123 +8178,13 @@ async def control_model_load(request: Request):
         payload = {}
     upstream = (payload.get("upstream") or "ollama").strip().lower()
     name = (payload.get("model") or "").strip()
-    # vLLM and llama.cpp need no model name: each server was launched with one, so starting it
-    # (or relaunching it at a different context size) is the whole operation. Requiring a name
-    # here made starting them impossible.
-    if not name and upstream not in ("vllm", "llamacpp"):
+    prov = PROVIDERS.get(upstream)
+    if prov is None:
+        return JSONResponse({"error": f"unknown upstream {upstream!r}",
+                             "known": sorted(PROVIDERS)}, status_code=404)
+    if not name and prov.requires_model_name:
         return JSONResponse({"error": "'model' is required"}, status_code=400)
-    if upstream == "lmstudio":
-        ok, why = _lms_available()
-        if not ok:
-            return JSONResponse({"error": why}, status_code=501)
-        args = ["load", name, "--yes"]
-        # These matter for real workloads: a model loaded at the wrong context length or without
-        # parallelism benchmarks as a different thing entirely. The request wins over the
-        # per-box defaults in model_control.
-        mc = load_rules_config().get("model_control") or {}
-        ctx = payload.get("context_length") or mc.get("lmstudio_context_length")
-        par = payload.get("parallel") or mc.get("lmstudio_parallel")
-        gpu = payload.get("gpu") or mc.get("lmstudio_gpu")
-        if ctx:
-            args += ["--context-length", str(int(ctx))]
-        if par:
-            args += ["--parallel", str(int(par))]
-        if gpu:
-            args += ["--gpu", str(gpu)]
-        if payload.get("ttl_s"):
-            args += ["--ttl", str(int(payload["ttl_s"]))]
-        t0 = time.perf_counter()
-        code, out = await _lms_run(args)
-        if code != 0:
-            return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
-        return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
-                "load_ms": round((time.perf_counter() - t0) * 1000)}
-    if upstream == "llamacpp":
-        cfg = _llamacpp_cfg()
-        svc = _service_def("llamacpp") or {"unit": str(cfg.get("unit") or "llamacpp.service"),
-                                           "scope": cfg.get("scope") or "user",
-                                           "name": "llamacpp"}
-        ctx = int(payload.get("context_length") or payload.get("ctx") or 0)
-        par = int(payload.get("parallel") or 0)
-        if ctx or par:
-            # Carry over whatever was not specified so changing one does not silently reset
-            # the other to a default the caller never asked for.
-            cur = await _llamacpp_snapshot(app.state.metrics_client)
-            par = par or int(cur.get("parallel") or 1)
-            ctx = ctx or int((cur.get("n_ctx") or 0) * max(1, par)) or 65536
-            ok, detail = _write_llamacpp_override(ctx, par)
-            if not ok:
-                return JSONResponse({"error": detail}, status_code=400)
-            # daemon-reload takes no unit — _systemctl_args always appends one, which
-            # systemctl rejects with "Too many arguments."
-            reload_args = [a for a in _systemctl_args(svc, "daemon-reload")
-                           if a != svc["unit"]]
-            code, out = await _run_cmd(reload_args, 30.0, env=_systemctl_env(svc))
-            if code != 0:
-                return JSONResponse({"error": f"daemon-reload failed: {out[:200]}"},
-                                    status_code=502)
-        t0 = time.perf_counter()
-        code, out = await _run_cmd(_systemctl_args(svc, "restart"), 120.0,
-                                   env=_systemctl_env(svc))
-        if code != 0:
-            return JSONResponse({"error": f"restart failed: {out[:300]}"}, status_code=502)
-        ready = await _llamacpp_ready(float(payload.get("ready_timeout_s") or 1800))
-        return {"ok": ready, "upstream": "llamacpp", "ready": ready,
-                "context_length": ctx or None, "parallel": par or None,
-                "load_ms": round((time.perf_counter() - t0) * 1000),
-                "note": None if ready else "restarted, but the server did not answer in time"}
-    if upstream == "vllm":
-        wanted = (payload.get("container") or "").strip()
-        configs = await _vllm_configs()
-        if wanted:
-            match = next((c for c in configs if c["container"] == wanted), None)
-            if not match:
-                return JSONResponse(
-                    {"error": f"no vLLM container named {wanted!r}",
-                     "available": [c["container"] for c in configs]}, status_code=404)
-            if not match["serves_port"]:
-                return JSONResponse(
-                    {"error": f"{wanted!r} does not publish {VLLM_URL} — starting it would not "
-                              f"make it reachable through this proxy"}, status_code=409)
-            container = wanted
-        else:
-            container = await _vllm_container()
-        if not container:
-            return JSONResponse(
-                {"error": "no local vLLM container publishing this port was found",
-                 "available": [c["container"] for c in configs]}, status_code=501)
-        t0 = time.perf_counter()
-        # They contend for one port, so anything else running must come down first — otherwise
-        # docker start fails on the binding and the error looks unrelated.
-        stopped = []
-        for c in configs:
-            if c["running"] and c["container"] != container:
-                await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
-                stopped.append(c["container"])
-        code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
-        if code != 0:
-            return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
-        # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
-        cfg_mc = load_rules_config().get("model_control") or {}
-        ready = await _vllm_ready(float(payload.get("wait_s")
-                                        or cfg_mc.get("vllm_ready_timeout_s") or 420))
-        return {"ok": ready, "started_container": container, "stopped_containers": stopped,
-                "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
-                "error": None if ready else "container started but the server did not become "
-                                            "ready in time — it may still be loading"}
-    keep = payload.get("keep_alive") or "30m"
-    t0 = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
-            r = await c.post(f"{OLLAMA_URL}/api/generate",
-                             json={"model": name, "prompt": "", "keep_alive": keep})
-            if r.status_code >= 400:
-                return JSONResponse({"error": f"ollama said {r.status_code}: {r.text[:200]}"},
-                                    status_code=502)
-    except httpx.RequestError as e:
-        return JSONResponse({"error": f"ollama unreachable: {e}"}, status_code=502)
-    return {"ok": True, "model": name, "keep_alive": keep,
-            "load_ms": round((time.perf_counter() - t0) * 1000)}
+    return await prov.load(payload, name)
 
 
 @app.get("/__proxy/api/control/artifacts")

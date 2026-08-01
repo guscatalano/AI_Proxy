@@ -158,3 +158,71 @@ def test_an_unmanaged_backend_says_so_rather_than_pretending(client):
     res = asyncio.run(P.PROVIDERS["ollama"].start())
     assert res["ok"] is False and res["via"] == "none"
     assert "not managed" in res["detail"]
+
+
+def test_the_load_endpoint_does_not_branch_on_backend_names(client):
+    """The tenth and last hand-wired site.
+
+    `control_model_load` used to be four `if upstream == "..."` branches, each with its own
+    mechanism inline — which is how llama.cpp's exemption from the model-name check ended up
+    written into a condition here instead of stated on the backend it describes.
+    """
+    import ast
+    import inspect
+    src = inspect.getsource(P.control_model_load)
+    fn = ast.parse(src).body[0]
+    doc = fn.body[0]                                   # prose may name backends; code may not
+    src = "\n".join(src.splitlines()[doc.end_lineno:])
+    for name in P.PROVIDERS:
+        # A default upstream is a default, not a branch, so only comparisons count.
+        assert f'== "{name}"' not in src, f"{name} still branched on in the load endpoint"
+        assert f'"{name}",' not in src, f"{name} still listed in the load endpoint"
+    assert "upstream ==" not in src and " in (" not in src
+
+
+def test_whether_a_name_is_needed_is_the_backend_s_own_answer(client):
+    # vLLM and llama.cpp are launched with one model, so "load" means "start this server".
+    assert P.PROVIDERS["ollama"].requires_model_name is True
+    assert P.PROVIDERS["lmstudio"].requires_model_name is True
+    assert P.PROVIDERS["vllm"].requires_model_name is False
+    assert P.PROVIDERS["llamacpp"].requires_model_name is False
+
+
+def test_an_unknown_upstream_is_rejected_rather_than_sent_to_ollama(client):
+    # It used to fall through the branches into the Ollama path, so a typo'd backend name
+    # quietly asked Ollama to load a model it had never heard of and reported its 404 instead.
+    r = client.post("/__proxy/api/control/models/load",
+                    json={"upstream": "vlmm", "model": "qwen"})
+    assert r.status_code == 404
+    body = r.json()
+    assert "vlmm" in body["error"]
+    assert "vllm" in body["known"], "the reply should say what it would have accepted"
+
+
+def test_a_registered_backend_is_loadable_without_touching_the_endpoint(monkeypatch, client):
+    """Completes the property: registration alone reaches the load path too."""
+    class Newthing(P._FnProvider):
+        async def load(self, payload, name):
+            return {"ok": True, "model": name, "upstream": "newthing"}
+
+    async def probe(c):
+        return {"reachable": True}
+
+    monkeypatch.setitem(P.PROVIDERS, "newthing",
+                        Newthing("newthing", "New Thing", probe, lambda: "http://localhost:9"))
+    d = client.post("/__proxy/api/control/models/load",
+                    json={"upstream": "newthing", "model": "m"}).json()
+    assert d == {"ok": True, "model": "m", "upstream": "newthing"}
+
+
+def test_a_backend_with_no_load_mechanism_says_so(monkeypatch, client):
+    # Better a 501 than the silent fall-through to Ollama that the branch chain gave.
+    async def probe(c):
+        return {"reachable": True}
+
+    monkeypatch.setitem(P.PROVIDERS, "inert",
+                        P._FnProvider("inert", "Inert", probe, lambda: "http://localhost:9"))
+    r = client.post("/__proxy/api/control/models/load",
+                    json={"upstream": "inert", "model": "m"})
+    assert r.status_code == 501
+    assert "cannot load" in r.json()["error"]
