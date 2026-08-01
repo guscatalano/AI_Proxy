@@ -2031,6 +2031,7 @@ async def _collect_once(app: FastAPI):
             json.dumps(lmstudio),
             json.dumps(comfyui),
             json.dumps(vllm),
+            json.dumps(llamacpp),
         ),
     )
     # Retention
@@ -2259,13 +2260,25 @@ def _backfill_tool_calls(cutoff_days: float = 7.0, chunk: int = 50, pause_s: flo
 
 async def _metrics_loop(app: FastAPI):
     # Prime CPU sample so the first real reading is meaningful.
+    _metrics_fail = 0
     _cpu_pct()
     await asyncio.sleep(1)
     while True:
         try:
             await _collect_once(app)
-        except Exception:
-            pass  # Telemetry must never crash the proxy.
+            _metrics_fail = 0
+        except Exception as e:
+            # Telemetry must never crash the proxy — but silence here once cost an hour of
+            # stale data: a column added to the INSERT without its value made every tick throw,
+            # and the dashboard went on serving an hour-old sample as if it were current. Say
+            # something, at a rate that cannot become a log flood.
+            _metrics_fail += 1
+            if _metrics_fail in (1, 10) or _metrics_fail % 100 == 0:
+                try:
+                    print(f"[metrics] collection failing ({_metrics_fail}x): "
+                          f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
         await asyncio.sleep(METRICS_INTERVAL_S)
 
 
