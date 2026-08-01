@@ -143,6 +143,46 @@ def test_status_reports_percent_and_elapsed(client):
     _reset()
 
 
+def test_a_finished_pull_goes_stale_instead_of_sitting_there_forever(client):
+    # A failed pull used to stay on the System tab indefinitely, redrawn on every refresh,
+    # with nothing to dismiss it.
+    _reset()
+    P._PULL_JOB.update({"state": "error", "model": "m", "error": "boom",
+                        "started": time.time() - 300, "finished": time.time() - 5})
+    assert P._pull_status()["stale"] is False        # still news
+    P._PULL_JOB["finished"] = time.time() - (P._PULL_RESULT_TTL_S + 10)
+    assert P._pull_status()["stale"] is True         # now clutter
+    _reset()
+
+
+def test_a_running_pull_is_never_stale(client):
+    _reset()
+    P._PULL_JOB.update({"state": "running", "model": "m", "started": time.time() - 100000})
+    assert P._pull_status()["stale"] is False
+    _reset()
+
+
+def test_dismiss_clears_a_finished_pull(client):
+    _reset()
+    P._PULL_JOB.update({"state": "error", "model": "m", "error": "boom",
+                        "finished": time.time()})
+    r = client.post("/__proxy/api/control/models/pull/clear")
+    assert r.status_code == 200
+    assert P._pull_status()["state"] == "idle"
+
+
+def test_dismiss_refuses_while_a_pull_is_running(client):
+    # Otherwise a click hides live work and the download continues invisibly.
+    _reset()
+    P._PULL_JOB.update({"state": "running", "model": "big:latest"})
+    try:
+        r = client.post("/__proxy/api/control/models/pull/clear")
+        assert r.status_code == 409
+        assert P._PULL_JOB["state"] == "running"
+    finally:
+        _reset()
+
+
 def test_cancel_with_nothing_running(client):
     _reset()
     P._PULL_TASK = None

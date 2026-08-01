@@ -7470,13 +7470,34 @@ _PULL_LOCK = threading.Lock()
 _PULL_TASK: asyncio.Task | None = None
 
 
+# How long a finished pull keeps reporting itself. Long enough to read the outcome, short
+# enough that a failure from an hour ago isn't still on the System tab.
+_PULL_RESULT_TTL_S = 120.0
+
+
 def _pull_status() -> dict:
     job = dict(_PULL_JOB)
     if job.get("started"):
         job["elapsed_s"] = round((job.get("finished") or time.time()) - job["started"], 1)
     total, done = job.get("total_bytes") or 0, job.get("completed_bytes") or 0
     job["percent"] = round(100.0 * done / total, 1) if total else None
+    # A terminal state is news for a minute or two, then it is clutter. Without this a failed
+    # pull sat on the System tab indefinitely, redrawn on every refresh, with no way to dismiss.
+    fin = job.get("finished")
+    if job.get("state") in ("done", "error", "cancelled") and fin:
+        job["stale"] = (time.time() - fin) > _PULL_RESULT_TTL_S
+    else:
+        job["stale"] = False
     return job
+
+
+def _pull_clear() -> bool:
+    """Forget a finished pull. Refuses while one is running so a click can't hide live work."""
+    if _PULL_JOB.get("state") == "running":
+        return False
+    _PULL_JOB.clear()
+    _PULL_JOB.update({"state": "idle"})
+    return True
 
 
 async def _ollama_pull(model: str):
@@ -7546,6 +7567,14 @@ async def pull_model(request: Request):
     # The lock is released by the task itself, in its finally.
     _PULL_TASK = asyncio.create_task(_ollama_pull(model))
     return {"ok": True, "model": model, "status": _pull_status()}
+
+
+@app.post("/__proxy/api/control/models/pull/clear")
+async def pull_clear():
+    if not _pull_clear():
+        return JSONResponse({"error": "a pull is running — cancel it first",
+                             "status": _pull_status()}, status_code=409)
+    return {"ok": True, "status": _pull_status()}
 
 
 @app.post("/__proxy/api/control/models/pull/cancel")

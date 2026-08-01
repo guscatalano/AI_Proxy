@@ -4643,13 +4643,17 @@ let _pullPoll = null;
 
 function _renderPull(s) {
   const wrap = $('pull-progress'), bar = $('pull-bar'), txt = $('pull-text');
-  const btn = $('pull-btn'), cancel = $('pull-cancel');
+  const btn = $('pull-btn'), cancel = $('pull-cancel'), dismiss = $('pull-dismiss');
   if (!wrap) return;
   const running = s && s.state === 'running';
-  wrap.style.display = (s && s.state && s.state !== 'idle') ? 'block' : 'none';
+  // A finished pull is worth showing for a couple of minutes; after that the server marks it
+  // stale and it stops being redrawn on every System-tab refresh.
+  const show = s && s.state && s.state !== 'idle' && !s.stale;
+  wrap.style.display = show ? 'block' : 'none';
   if (btn) { btn.disabled = running; btn.textContent = running ? 'pulling…' : 'Pull'; }
   if (cancel) cancel.style.display = running ? '' : 'none';
-  if (!s || s.state === 'idle') return;
+  if (dismiss) dismiss.style.display = (show && !running) ? '' : 'none';
+  if (!show) return;
   const pct = s.percent;
   if (bar) bar.style.width = (pct == null ? 0 : pct) + '%';
   const size = s.total_bytes ? `${fmtBytes(s.completed_bytes || 0)} / ${fmtBytes(s.total_bytes)}` : '';
@@ -4704,6 +4708,11 @@ async function cancelPull(btn) {
   btn.disabled = true;
   try { await fetch('/__proxy/api/control/models/pull/cancel', { method: 'POST' }); } catch {}
   btn.disabled = false;
+}
+
+async function dismissPull() {
+  try { await fetch('/__proxy/api/control/models/pull/clear', { method: 'POST' }); } catch {}
+  _renderPull({ state: 'idle' });
 }
 
 async function restartProxy(btn) {
@@ -5058,7 +5067,11 @@ function renderSystem() {
       </div>
       <div id="pull-progress" style="display:none;margin-bottom:10px">
         <div class="bar-bg" style="height:8px"><div id="pull-bar" class="bar-fg" style="width:0%"></div></div>
-        <div id="pull-text" style="font-size:11px;color:#888;margin-top:4px"></div>
+        <div style="display:flex;align-items:center;gap:8px;margin-top:4px">
+          <div id="pull-text" style="font-size:11px;color:#888;flex:1"></div>
+          <button id="pull-dismiss" onclick="dismissPull()" title="dismiss"
+            style="display:none;background:none;border:1px solid #333;color:#888;border-radius:3px;padding:0 6px;font-size:12px;cursor:pointer;line-height:16px">×</button>
+        </div>
       </div>
       <table style="width:100%">
         <thead><tr><th>Name</th><th>Params</th><th class="num">Size</th><th>Parallel</th><th></th></tr></thead>
