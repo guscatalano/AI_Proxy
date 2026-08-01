@@ -7168,6 +7168,7 @@ function _benchRowHead(it) {
         <span style="margin-left:auto;color:#888">${_benchAgo(it.ts)}</span>
         <span>${summaryLine}</span>
         ${it.status === 'done' ? `<a href="/__proxy/api/bench/report?format=html&ids=${encodeURIComponent(it.id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Standalone HTML report — print it to PDF from the browser" style="color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px">Report ↗</a>` : ''}
+        ${it.status === 'running' || it.status === 'pending' ? `<a href="#" onclick="event.stopPropagation();event.preventDefault();setView('live')" title="Watch the bench's requests as they run — they appear as ai-proxy-bench" style="color:#7af;font-size:11px;text-decoration:none;border:1px solid #2a4458;border-radius:3px;padding:2px 8px">Live ↗</a>` : ''}
         <button type="button" data-bench-del title="Delete this run" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer">🗑</button>
       </div>`;
 }
