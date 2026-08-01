@@ -122,6 +122,9 @@ def test_vacuum_runs_and_is_reported(client):
 def test_vacuum_compacts_the_archive_too(client):
     # Emptying the rows leaves the archive's pages on its own free list. Compacting only main
     # would report space reclaimed while gigabytes stayed on disk in the second file.
+    #
+    # Deliberately leaves _ARCHIVE_ACTIVE False before the wipe: the job has to reach the
+    # archive on its own, or "wipe requests" silently strands every archived body.
     P._ensure_archive_file()
     P._ARCHIVE_ACTIVE = True
     conn = P.db()
@@ -134,6 +137,7 @@ def test_vacuum_compacts_the_archive_too(client):
     grown = P.Path(P.ARCHIVE_DB_PATH).stat().st_size
     assert grown > 1_000_000, "archive did not actually grow; test proves nothing"
 
+    P._ARCHIVE_ACTIVE = False        # as if nothing had been archived this run
     d = client.post("/__proxy/api/db/reset",
                     json={"targets": ["requests"], "vacuum": True}).json()
     assert d["status"].get("archive_error") is None

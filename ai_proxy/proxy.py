@@ -54,6 +54,10 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
+# llama.cpp's own server. Its own slot rather than borrowing LM Studio's port: both speak the
+# same OpenAI shape, so squatting works — and then every log row, bench result and report says
+# "lmstudio" for numbers that came from llama.cpp. Mislabelled measurements are worse than none.
+LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://localhost:8080").rstrip("/")
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 
@@ -438,6 +442,7 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
     "ALTER TABLE system_metrics ADD COLUMN comfyui_json TEXT",
     "ALTER TABLE system_metrics ADD COLUMN vllm_json TEXT",
+    "ALTER TABLE system_metrics ADD COLUMN llamacpp_json TEXT",
     "ALTER TABLE requests ADD COLUMN ttft_ms REAL",
     "ALTER TABLE requests ADD COLUMN upstream TEXT",
     # Chars-based estimate of the prompt token count, stored at request time. Compared against
@@ -1598,6 +1603,42 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+async def _llamacpp_snapshot(client: httpx.AsyncClient) -> dict:
+    """llama-server: /v1/models lists what it was launched with (one model per process), and
+    /props carries the loaded context size and the model path — which is the only place the
+    quantisation is visible, since the filename carries it and the API does not."""
+    out = {"reachable": False, "loaded": [], "available": [], "url": LLAMACPP_URL}
+    try:
+        r = await client.get(f"{LLAMACPP_URL}/v1/models")
+        if r.status_code != 200:
+            return out
+        out["reachable"] = True
+        for m in (r.json().get("data") or []):
+            rec = {"id": m.get("id"), "state": "loaded", "arch": "llama.cpp",
+                   "quant": _infer_quant(m.get("id"))}
+            out["available"].append(rec)
+            out["loaded"].append(rec)
+    except (httpx.RequestError, ValueError):
+        return out
+    try:
+        r = await client.get(f"{LLAMACPP_URL}/props")
+        if r.status_code == 200:
+            p = r.json()
+            path = (p.get("model_path") or p.get("default_generation_settings", {})
+                    .get("model") or "")
+            out["model_path"] = path
+            out["n_ctx"] = (p.get("default_generation_settings") or {}).get("n_ctx") or p.get("n_ctx")
+            out["parallel"] = p.get("total_slots")
+            if path:
+                q = _infer_quant(path)
+                for rec in out["loaded"]:
+                    rec["quant"] = rec.get("quant") or q
+                    rec["max_context_length"] = out.get("n_ctx")
+    except (httpx.RequestError, ValueError):
+        pass
+    return out
+
+
 async def _lmstudio_snapshot(client: httpx.AsyncClient) -> dict:
     """Try LM Studio's REST v0 API first (richer info), fall back to OpenAI-compat /v1/models."""
     out = {"reachable": False, "loaded": [], "available": []}
@@ -1963,11 +2004,12 @@ async def _collect_once(app: FastAPI):
     cpu = _cpu_pct()
     mem = _mem_snapshot()
     gpus = _gpu_snapshot()
-    ollama, lmstudio, comfyui, vllm = await asyncio.gather(
+    ollama, lmstudio, comfyui, vllm, llamacpp = await asyncio.gather(
         _ollama_snapshot(app.state.metrics_client),
         _lmstudio_snapshot(app.state.metrics_client),
         _comfyui_snapshot(app.state.metrics_client),
         _vllm_snapshot(app.state.metrics_client),
+        _llamacpp_snapshot(app.state.metrics_client),
         return_exceptions=False,
     )
     ts = time.time()
@@ -1975,8 +2017,8 @@ async def _collect_once(app: FastAPI):
     conn.execute(
         """INSERT OR REPLACE INTO system_metrics
            (ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb, gpu_json,
-            ollama_json, lmstudio_json, comfyui_json, vllm_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ollama_json, lmstudio_json, comfyui_json, vllm_json, llamacpp_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             ts,
             cpu,
@@ -4853,7 +4895,8 @@ async def info():
     except OSError:
         pass
     return {"version": __version__, "ui": ui, "upstream": OLLAMA_URL, "anthropic": ANTHROPIC_URL,
-            "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL, "port": PROXY_PORT}
+            "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL, "llamacpp": LLAMACPP_URL,
+            "port": PROXY_PORT}
 
 
 @app.get("/__proxy/api/whoami")
@@ -5104,6 +5147,14 @@ def _db_reset_job(targets: list, vacuum: bool) -> dict:
                     "targets": list(targets), "vacuum": bool(vacuum), "deleted": {},
                     "error": None, "size_before": _db_size(), "size_after": None,
                     "reclaimed_bytes": None})
+    # Force the archive attach for this job rather than trusting the lazy flag. Without it, a
+    # proxy that has not archived anything yet skips `DELETE FROM arch.request_blobs` into a
+    # swallowed except — the rows survive a "wipe requests", and the following VACUUM then has
+    # nothing to reclaim while still reporting success.
+    global _ARCHIVE_ACTIVE
+    if Path(ARCHIVE_DB_PATH).exists():
+        _ensure_archive_file()
+        _ARCHIVE_ACTIVE = True
     counts: dict = {}
     try:
         step("counting rows")
@@ -5150,6 +5201,14 @@ def _db_reset_job(targets: list, vacuum: bool) -> dict:
                     except sqlite3.Error as e:
                         # Worth surfacing: the main file shrank and the archive did not.
                         _DB_JOB["archive_error"] = str(e)
+                # In WAL mode the reclaimed pages sit in the write-ahead log until a
+                # checkpoint, so the file on disk keeps its old size and the job reports
+                # freeing nothing. TRUNCATE is what actually hands the space back.
+                for schema in ("main", "arch"):
+                    try:
+                        v.execute(f"PRAGMA {schema}.wal_checkpoint(TRUNCATE)")
+                    except sqlite3.Error:
+                        pass
             finally:
                 v.close()
         _overhead_samples.clear()
@@ -5202,12 +5261,14 @@ def system_now():
     conn = db()
     row = conn.execute(
         """SELECT ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb,
-                  gpu_json, ollama_json, lmstudio_json, comfyui_json, vllm_json
+                  gpu_json, ollama_json, lmstudio_json, comfyui_json, vllm_json,
+                  llamacpp_json
            FROM system_metrics ORDER BY ts DESC LIMIT 1"""
     ).fetchone()
     conn.close()
     if not row:
-        return {"ts": None, "cpu_pct": None, "mem": None, "gpus": [], "ollama": {}, "lmstudio": {}, "comfyui": {}, "vllm": {}}
+        return {"ts": None, "cpu_pct": None, "mem": None, "gpus": [], "ollama": {}, "lmstudio": {}, "comfyui": {}, "vllm": {},
+                "llamacpp": {}}
     d = dict(row)
     return {
         "ts": d["ts"],
@@ -5219,6 +5280,7 @@ def system_now():
         "lmstudio": json.loads(d["lmstudio_json"]) if d["lmstudio_json"] else {},
         "comfyui": json.loads(d["comfyui_json"]) if d["comfyui_json"] else {},
         "vllm": json.loads(d["vllm_json"]) if d["vllm_json"] else {},
+        "llamacpp": json.loads(d["llamacpp_json"]) if d["llamacpp_json"] else {},
     }
 
 
@@ -6366,7 +6428,7 @@ def stats():  # sync → threadpool
     # vLLM streams token-by-token like the other local engines and belongs here — it was
     # missing until 2026-07, which silently emptied the decode metric on any box that had
     # moved its daily driver to vLLM.
-    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio", "vllm"}
+    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio", "vllm", "llamacpp"}
     for r in tps_rows:
         ct = r["completion_tokens"] or 0
         pt = r["prompt_tokens"] or 0
@@ -8133,6 +8195,15 @@ async def _bench_model_index() -> dict:
                     prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
                                     if vcfg.get("enable_prefix_caching") is not None else None),
                     kv_cache_dtype=vcfg.get("cache_dtype"))
+        lcp = sysinfo.get("llamacpp") or {}
+        for m in (lcp.get("available") or []):
+            if isinstance(m, dict):
+                put(m.get("id"), "llamacpp", True,
+                    arch=m.get("arch"), quant=m.get("quant"),
+                    max_context=m.get("max_context_length") or lcp.get("n_ctx"),
+                    loaded_context=lcp.get("n_ctx"),
+                    checkpoint=lcp.get("model_path"),
+                    parallel=lcp.get("parallel"))
     except Exception:
         pass
     if index:
@@ -14200,7 +14271,8 @@ async def proxy(full_path: str, request: Request):
     # both Ollama and LM Studio speak the same /v1 shape, so no body translation is needed.
     # "anthropic" is deliberately NOT a target: forwarding an OpenAI-shape body there without
     # the protocol bridge (which only goes anthropic→ollama) would produce 400s.
-    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL}
+    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL,
+                       "llamacpp": LLAMACPP_URL}
     # x-proxy-upstream forces the backend directly, without needing a routing rule. Same
     # motivation as x-proxy-no-router: benchmark the engine you meant to benchmark.
     # Kept OUT of `rewrite`: that dict is the model_router verdict and downstream audit code
