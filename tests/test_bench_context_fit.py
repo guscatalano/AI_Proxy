@@ -58,14 +58,16 @@ def test_lowering_parallel_is_what_buys_the_window(monkeypatch, client):
     seen = _llamacpp(monkeypatch, n_ctx=32768, parallel=4)
     res = asyncio.run(P.PROVIDERS["llamacpp"].resize_context(35840, concurrency=1))
     assert res["ok"] and res["changed"]
-    assert seen == [{"context_length": 35840, "parallel": 1}]
+    assert seen == [{"context_length": 35840, "parallel": 1,
+                     "ready_timeout_s": P._BENCH_RESIZE_READY_S}]
     assert seen[0]["context_length"] < 32768 * 4, "asked for a bigger pool than it needed"
 
 
 def test_the_pool_is_sized_to_the_concurrency_being_measured(monkeypatch, client):
     seen = _llamacpp(monkeypatch, n_ctx=32768, parallel=4)
     asyncio.run(P.PROVIDERS["llamacpp"].resize_context(40000, concurrency=4))
-    assert seen == [{"context_length": 160000, "parallel": 4}]
+    assert seen == [{"context_length": 160000, "parallel": 4,
+                     "ready_timeout_s": P._BENCH_RESIZE_READY_S}]
 
 
 def test_a_big_enough_server_is_left_alone(monkeypatch, client):
@@ -84,13 +86,24 @@ def test_a_wider_sweep_still_resizes_even_when_the_window_fits(monkeypatch, clie
     assert res["changed"] is True and seen[0]["parallel"] == 4
 
 
+def test_a_resize_waits_a_bounded_time_before_giving_up(monkeypatch, client):
+    """load() defaults to a 1800s ready poll. The usual reason a resize never comes back is
+    that the pool did not fit in memory, and waiting half an hour to learn that — before even
+    starting the rollback — is the whole cost of the mistake."""
+    seen = _llamacpp(monkeypatch, n_ctx=32768, parallel=4)
+    asyncio.run(P.PROVIDERS["llamacpp"].resize_context(35840, concurrency=1))
+    assert seen[0]["ready_timeout_s"] == P._BENCH_RESIZE_READY_S
+    assert P._BENCH_RESIZE_READY_S < 1800
+
+
 def test_a_resize_that_kills_the_server_is_rolled_back(monkeypatch, client):
     """A box left with nothing on port 8080 is worse than a bench that did not run."""
     seen = _llamacpp(monkeypatch, n_ctx=32768, parallel=4, load_ok=False)
     res = asyncio.run(P.PROVIDERS["llamacpp"].resize_context(262144, concurrency=1))
     assert res["ok"] is False
     assert len(seen) == 2, "did not attempt a rollback"
-    assert seen[1] == {"context_length": 32768 * 4, "parallel": 4}, "rolled back to the wrong size"
+    assert seen[1]["context_length"] == 32768 * 4, "rolled back to the wrong size"
+    assert seen[1]["parallel"] == 4, "rolled back to the wrong slot count"
     assert res["previous"] is None, "a failed resize must not hand back a restore token"
 
 
@@ -110,7 +123,7 @@ def test_the_window_is_put_back_afterwards(monkeypatch, client):
     fit = asyncio.run(P._bench_fit_context("llamacpp", 35840, 1))
     assert fit["restore"] == {"upstream": "llamacpp", "context_length": 131072, "parallel": 4}
     asyncio.run(P._bench_restore_context(fit["restore"]))
-    assert seen[-1] == {"context_length": 131072, "parallel": 4}
+    assert seen[-1]["context_length"] == 131072 and seen[-1]["parallel"] == 4
 
 
 def test_restoring_nothing_is_not_an_error(client):

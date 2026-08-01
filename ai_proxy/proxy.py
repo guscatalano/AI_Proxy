@@ -2177,6 +2177,12 @@ class _LmStudioProvider(_FnProvider):
                 "load_ms": round((time.perf_counter() - t0) * 1000)}
 
 
+# How long a bench-driven resize waits for the server to serve again. Generous enough for a
+# 90 GB model to load from disk, short enough that an over-large pool is diagnosed and rolled
+# back inside a bench rather than after it.
+_BENCH_RESIZE_READY_S = 900.0
+
+
 def _load_result(res) -> tuple[bool, str]:
     """Read a load() outcome. It returns a response body on success and a JSONResponse to set a
     status code, and callers inside the process need both read the same way."""
@@ -2213,14 +2219,19 @@ class _LlamaCppProvider(_FnProvider):
                     "per_slot": cur_slot, "parallel": cur_par}
         prev = ({"context_length": cur_slot * cur_par, "parallel": cur_par}
                 if cur_slot else None)
+        # Bounded, unlike load()'s 1800s default. The usual reason a resize never becomes ready
+        # is that the pool did not fit in memory, and waiting half an hour to find that out —
+        # before even starting the rollback — is the whole cost of the mistake.
         ok, detail = _load_result(
-            await self.load({"context_length": per_slot * want_par, "parallel": want_par}, ""))
+            await self.load({"context_length": per_slot * want_par, "parallel": want_par,
+                             "ready_timeout_s": _BENCH_RESIZE_READY_S}, ""))
         if not ok:
             # A server that did not come back is worse than a bench that did not run: roll the
             # drop-in back rather than leaving the box with nothing serving on port 8080.
             rolled = None
             if prev:
-                rolled = _load_result(await self.load(prev, ""))[0]
+                rolled = _load_result(
+                    await self.load(dict(prev, ready_timeout_s=_BENCH_RESIZE_READY_S), ""))[0]
             return {"ok": False, "changed": False, "previous": None, "rolled_back": rolled,
                     "detail": detail or "llama.cpp did not come back after the resize"}
         return {"ok": True, "changed": True, "previous": prev, "detail": detail,
@@ -11573,7 +11584,8 @@ async def _bench_restore_context(token: dict | None) -> dict | None:
     if prov is None:
         return None
     ok, detail = _load_result(await prov.load(
-        {"context_length": token["context_length"], "parallel": token["parallel"]}, ""))
+        {"context_length": token["context_length"], "parallel": token["parallel"],
+         "ready_timeout_s": _BENCH_RESIZE_READY_S}, ""))
     return {"ok": ok, "detail": detail, "context_length": token["context_length"],
             "parallel": token["parallel"]}
 
