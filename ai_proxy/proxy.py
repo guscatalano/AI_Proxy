@@ -8690,6 +8690,27 @@ async def _bench_model_index() -> dict:
                     prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
                                     if vcfg.get("enable_prefix_caching") is not None else None),
                     kv_cache_dtype=vcfg.get("cache_dtype"))
+        # Containers that are configured but not running. vLLM serves exactly what its process
+        # was launched with, so a stopped container looked identical to a model that does not
+        # exist — the only way to benchmark it was to go to the System tab, start it by hand,
+        # come back, and hope you picked the right one. The proxy already knows how to start it
+        # and what it would serve, so offer it here and let the bench do it.
+        try:
+            for c in await _vllm_configs():
+                if c.get("running") or not c.get("serves_port") or not c.get("model"):
+                    continue
+                put(c["model"], "vllm", False, startable=True, container=c["container"],
+                    quant=c.get("quant"), checkpoint=c.get("checkpoint"),
+                    max_context=int(c["max_model_len"]) if c.get("max_model_len") else None,
+                    kv_cache_dtype=c.get("kv_cache_dtype"),
+                    prefix_caching=c.get("prefix_caching"))
+        except Exception as e:
+            # Not silent: a failure here makes stopped containers vanish from the picker, which
+            # looks exactly like "that model does not exist".
+            try:
+                print(f"[bench] vLLM container scan failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         lcp = sysinfo.get("llamacpp") or {}
         for m in (lcp.get("available") or []):
             if isinstance(m, dict):
@@ -11831,6 +11852,8 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
         return (f"no reachable backend serves {model!r}"
                 + (f" — reachable models: {', '.join(known[:8])}" if known else
                    " — no backend is reachable"))
+    if meta.get("startable") and not meta.get("loaded"):
+        return None          # not running yet, but the bench knows how to start it
     if not meta:
         served = sorted(v.get("model") for v in index.values()
                         if v.get("upstream") == upstream and v.get("model"))
@@ -11840,6 +11863,40 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
         return (f"{upstream} does not serve {model!r} — it has "
                 f"{', '.join(served[:6])}{' …' if len(served) > 6 else ''}")
     return None
+
+
+async def _bench_start_backend(meta: dict) -> dict:
+    """Bring up a stopped backend the run needs, and say how to put it back.
+
+    Returns {ok, detail, started, restore}. `restore` is non-None only when the bench actually
+    started something: a backend that was already up is the user's, not the bench's, and
+    stopping it afterwards would take away something they were using.
+    """
+    upstream, container = meta.get("upstream") or "", meta.get("container")
+    prov = PROVIDERS.get(upstream)
+    if prov is None:
+        return {"ok": False, "started": False, "restore": None,
+                "detail": f"unknown upstream {upstream!r}"}
+    payload = {"container": container} if container else {}
+    res = await prov.load(payload, meta.get("model") or "")
+    ok, detail = _load_result(res)
+    return {"ok": ok, "started": ok, "detail": detail,
+            "restore": {"upstream": upstream} if ok else None}
+
+
+async def _bench_restore_backend(token: dict | None) -> dict | None:
+    """Stop what the bench started. vLLM holds ~99 GB whether or not anything is asking it, so
+    leaving it up after a run quietly takes the box away from whatever comes next."""
+    if not token:
+        return None
+    prov = PROVIDERS.get(token.get("upstream"))
+    if prov is None:
+        return None
+    try:
+        res = await prov.stop()
+    except Exception as e:
+        return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+    return {"ok": bool(res.get("ok")), "detail": res.get("detail")}
 
 
 async def _bench_fit_context(upstream: str, needed: int, concurrency: int,
@@ -11931,9 +11988,35 @@ async def _bench_evict_ollama(keep: str = "") -> list:
                 await c.post(f"{OLLAMA_URL}/api/generate",
                              json={"model": name, "keep_alive": 0, "prompt": ""})
                 unloaded.append(name)
-    except Exception:
-        pass
+    except Exception as e:
+        # Not silent: the caller takes an empty list to mean the GPU is clear, and proceeds to
+        # measure a contended box as if it were quiet. Three outages this codebase has had were
+        # a live failure swallowed exactly here.
+        try:
+            print(f"[bench] Ollama eviction failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
     return unloaded
+
+
+async def _bench_reload_ollama(names: list) -> list:
+    """Make previously-resident Ollama models resident again.
+
+    Eviction used to be opt-in, so losing them was the point. Now that every run evicts, the
+    models have to come back — otherwise a three-minute benchmark quietly leaves the daily
+    driver cold and the next request pays a full load with nothing explaining it.
+    """
+    back = []
+    for name in names or []:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
+                r = await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "prompt": "", "keep_alive": "30m"})
+                if r.status_code < 400:
+                    back.append(name)
+        except httpx.RequestError:
+            pass
+    return back
 
 
 async def _bench_residency_snapshot() -> dict:
@@ -12255,6 +12338,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     # planning so the backend is sized once, before the first cell runs.
     need_ctx, need_par, need_up = 0, 1, ""
     ctx_axis_up = ""      # set when the sweep varies the window itself, per cell
+    start_meta = None     # a configured-but-stopped backend this sweep needs
     for axes in cells:
         cid = "b_" + uuid.uuid4().hex[:12]
         child_cfg = dict(cfg)
@@ -12285,6 +12369,8 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
                   if window else None)
         cell_up = axes.get("upstream") or meta.get("upstream") or ""
         cell_prov = PROVIDERS.get(cell_up)
+        if meta.get("startable") and not meta.get("loaded") and start_meta is None:
+            start_meta = meta
         if axes.get("server_context"):
             # The sweep is varying the window on purpose. Sizing it once here would flatten the
             # axis into a constant — which is what it did to a prompt sweep that meant this.
@@ -12335,6 +12421,21 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     quiesce_state = None
     if cfg.get("quiesce"):
         quiesce_state = await _bench_quiesce(True, keep="")
+    backend_restore = None
+    if start_meta is not None:
+        got = await _bench_start_backend(start_meta)
+        if not got["ok"]:
+            conn = db()
+            conn.execute(
+                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                (f"could not start {start_meta.get('upstream')} for "
+                 f"{start_meta.get('model')!r}: {got['detail']}", time.time(), parent_id))
+            conn.commit()
+            conn.close()
+            if quiesce_state is not None:
+                await _bench_quiesce(False, quiesce_state)
+            return
+        backend_restore = got["restore"]
     ctx_restore = None
     if need_ctx:
         fit = await _bench_fit_context(need_up, need_ctx, need_par)
@@ -12392,6 +12493,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         if quiesce_state is not None:
             await _bench_quiesce(False, quiesce_state)
         await _bench_restore_context(ctx_restore)
+        await _bench_restore_backend(backend_restore)
     conn = db()
     conn.execute(
         "UPDATE bench_runs SET status='done', finished_ts=?, results_json=? WHERE id=?",
@@ -12481,6 +12583,24 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         if why:
             _abort(why)
             return
+        # Bring the backend up if the run needs a container that is configured but stopped.
+        # Before the ready() poll and the window fit, both of which assume something is serving.
+        backend_restore = None
+        if model_meta.get("startable") and not model_meta.get("loaded"):
+            got = await _bench_start_backend(model_meta)
+            if not got["ok"]:
+                _abort(f"could not start {cfg.get('upstream')} for {model!r}: {got['detail']}")
+                return
+            env["started_backend"] = model_meta.get("container") or cfg.get("upstream")
+            # Only a standalone run puts it back. In a sweep the suite started it once for the
+            # whole matrix; stopping it here would make every cell pay a full vLLM boot.
+            if row["parent_id"] is None:
+                backend_restore = got["restore"]
+            # Re-resolve: the index entry was the container's configuration, and what the server
+            # actually reports once up is the authority for context size and quantisation.
+            model_meta = _bench_resolve_model(await _bench_model_index(), model,
+                                              str(cfg.get("upstream") or "")) or model_meta
+
         # Fit the window. Children of a sweep skip this: the suite sized the backend once for
         # the whole matrix, and the metrics snapshot this reads from may not have caught up yet.
         ctx_restore = None
@@ -12535,9 +12655,12 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Spare the model about to run, or it would be evicted and immediately reloaded.
         quiesce_state = (await _bench_quiesce(True, keep=model)
                          if cfg.get("quiesce") else None)
-        if cfg.get("evict_others") and not cfg.get("quiesce"):
-            # Same eviction without the traffic gate, for the common case of wanting a clean
-            # measurement without also blocking everyone.
+        # Always, not on request. A benchmark that leaves other models resident is not measuring
+        # the model, it is measuring whatever the box happened to be holding — and on a unified
+        # memory box an idle model competes for the same bandwidth whichever backend is being
+        # measured. That is not a preference, so it stopped being a checkbox.
+        evicted = []
+        if not cfg.get("quiesce"):        # quiesce already does this, and restores it
             evicted = await _bench_evict_ollama(keep=model)
             if evicted:
                 env["evicted_before_run"] = evicted
@@ -12651,6 +12774,12 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         finally:
             if quiesce_state is not None:
                 await _bench_quiesce(False, quiesce_state)
+            # Reload what was evicted. Opt-in, this was the user's explicit choice to clear the
+            # GPU; unconditional, a three-minute bench would silently leave their daily driver
+            # cold with nothing saying why.
+            if evicted:
+                await _bench_reload_ollama(evicted)
+            await _bench_restore_backend(backend_restore)
             restored = await _bench_restore_context(ctx_restore)
             if restored is not None:
                 conn = db()
