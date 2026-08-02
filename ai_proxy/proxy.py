@@ -9570,13 +9570,13 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             for t in (q.get("tasks") or []):
                 tasks.setdefault(t["task"], {})[nm] = t.get("perfect_rate")
         if tasks:
-            labels = list(axis_names)
-            th = "".join(f"<th>{_h(l)}</th>" for l in labels)
+            col_labels = list(axis_names)
+            th = "".join(f"<th>{_h(l)}</th>" for l in col_labels)
             # With one configuration, a row per task is a column of identical 100%s. Only the
             # tasks that lost a case carry information, so list those and count the rest.
             items = sorted(tasks.items())
             if len(rows) == 1:
-                lab = labels[0]
+                lab = col_labels[0]
                 imperfect = [(t, per) for t, per in items if (per.get(lab) or 0) < 1]
                 clean = len(items) - len(imperfect)
                 if not imperfect:
@@ -9593,7 +9593,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 task_summary = ""
                 trs = []
                 for tname, per in items:
-                    tds = "".join(f'<td class="n">{pct(per.get(l))}</td>' for l in labels)
+                    tds = "".join(f'<td class="n">{pct(per.get(l))}</td>' for l in col_labels)
                     trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
             tier_rows = ""
             if any(r.get("tiers") for r in rows):

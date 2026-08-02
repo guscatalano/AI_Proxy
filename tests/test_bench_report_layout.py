@@ -26,7 +26,12 @@ def _run(bench_id, *, prompt=32000, cache="cold", model="/m/big-model-00001-of-0
             "n_success": 36, "n_total": 36, "served_models": [model],
             "ttft_ms": {"p50": 305.0}, "decode_tps": {"p50": 17.6},
             "total_ms": {"p50": 8516.0}, "mean_tokens": {"p50": 166},
-            "quality": ({"perfect_rate": 0.94, "case_pass_rate": 0.93, "tasks": []}
+            "quality": ({"perfect_rate": 0.94, "case_pass_rate": 0.93,
+                         # Real per-task rows: the block that renders these reassigned a name
+                         # the shared-settings block also used, and an empty list skipped it
+                         # entirely — so the tests passed while the page 500'd.
+                         "tasks": [{"task": "binary_search", "perfect_rate": 1.0},
+                                   {"task": "roman", "perfect_rate": 0.5}]}
                         if graded else {}),
         }},
     }
@@ -99,3 +104,10 @@ def test_no_full_paths_survive_into_the_page():
 def test_a_single_run_still_renders():
     html = _render([_run("solo")])
     assert "Configuration" in html and "vs best" not in html
+
+
+def test_the_per_task_table_renders_alongside_the_summary():
+    """This path reassigned `labels`, which the Held-constant block also read. With no tasks it
+    never ran, so every test passed and the deployed page returned 500."""
+    html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
+    assert "binary_search" in html and "Held constant" in html
