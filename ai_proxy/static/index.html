@@ -589,6 +589,39 @@
   .snav.on svg { opacity: 1; color: #57d1e0; }
   .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #57d1e0; }
   .snav .cntx { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; color: #5f6675; }
+  /* While a run is live the setup is not what anyone is looking at, so it folds to one line
+     and the status takes the space. Collapsed rather than hidden: the settings are still one
+     click away, and a control that vanishes reads as a bug. */
+  .bench-collapsed { display: flex; align-items: center; gap: 10px; background: #12141b;
+    border: 1px solid #262d38; border-radius: 8px; padding: 9px 12px; margin-bottom: 12px;
+    font-size: 12px; color: #9aa4b2; }
+  .bench-collapsed button { margin-left: auto; background: #1b2430; color: #c9d3e1;
+    border: 1px solid #2f3a49; border-radius: 6px; padding: 4px 11px; font-size: 11.5px;
+    cursor: pointer; }
+  .bench-collapsed button:hover { border-color: #3a4e6a; }
+  .bench-live { background: linear-gradient(180deg, #141922, #11151d);
+    border: 1px solid #2a3e5a; border-left: 3px solid #57d1e0; border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 12px; }
+  .bench-live .top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    font-size: 12px; color: #8b97a8; }
+  .bench-live .dot { width: 8px; height: 8px; border-radius: 50%; background: #57d1e0;
+    box-shadow: 0 0 8px #57d1e0; animation: shell-pulse 1.6s infinite; flex: none; }
+  .bench-live .cells { margin-left: auto; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-live .cur { font-size: 15px; color: #e9edf4; margin: 9px 0 0; letter-spacing: -.01em;
+    overflow-wrap: anywhere; }
+  .bench-live .cur b { font-family: var(--mono, ui-monospace, monospace); font-size: 13px;
+    color: #57d1e0; font-weight: 600; }
+  .bench-live .track { height: 6px; border-radius: 3px; background: #1b2430; overflow: hidden;
+    margin: 9px 0 0; border: 1px solid #262d38; }
+  .bench-live .track i { display: block; height: 100%; background: #57d1e0; transition: width .4s; }
+  .bench-live .track.sweep i { background: #3f8f5f; }
+  .bench-live .phase { color: #d9c37a; font-size: 12px; margin: 8px 0 0; }
+  .bench-live .warn { color: #f0a35a; font-size: 12px; margin: 6px 0 0; }
+  .bench-live .foot { display: flex; align-items: center; gap: 8px; margin: 11px 0 0;
+    font-size: 11.5px; color: #8b97a8; }
+  .bench-live .foot a { color: #7af; text-decoration: none; border: 1px solid #2a4458;
+    border-radius: 6px; padding: 3px 10px; }
+  @media (prefers-reduced-motion: reduce) { .bench-live .dot { animation: none; } }
   .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
   .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
     color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
@@ -6531,6 +6564,11 @@ async function loadBench() {
           <button type="button" class="bench-mode" data-mode="advanced" aria-pressed="false">Advanced</button>
         </div>
       </div>
+      <div id="bench-active"></div>
+      <div id="bench-collapsed" class="bench-collapsed" style="display:none">
+        <span id="bench-collapsed-what"></span>
+        <button type="button" id="bench-expand">Change settings</button>
+      </div>
       <div class="bench-form">
         <div class="bench-lede">
           Compares models on <strong>speed</strong> and, with a graded suite, on <strong>whether the code they return actually works</strong>. Timing separates <strong>TTFT</strong> (first token of any kind) from <strong>TTFC</strong> (first content token) — the gap between them is the model thinking.
@@ -6849,6 +6887,14 @@ function _benchSelectionCost() {
 
 function _benchBindSelectAll() {
   const all = $('bench-sel-all'), none = $('bench-sel-none');
+  const exp = $('bench-expand');
+  if (exp) exp.onclick = () => {
+    // Sticky for the session: having the panel fold itself away again on the next poll, while
+    // someone is halfway through changing something, would be worse than never folding it.
+    _benchUserExpanded = true;
+    document.querySelector('.bench-form').style.display = '';
+    $('bench-collapsed').style.display = 'none';
+  };
   const ss = $('bench-suite-simple');
   if (ss) ss.addEventListener('change', _benchUpdatePlan);
   if (all) all.onclick = () => {
@@ -7254,6 +7300,58 @@ function _benchUpdatePlan() {
 // The server refuses a second submission outright; this is so the button says so before it is
 // pressed rather than after. Server-side stays authoritative — this is the same answer arriving
 // earlier, not a substitute for it.
+// The running card, and folding the setup away behind it. Driven from the same poll as the
+// history so the two can never disagree about whether something is running.
+function _benchRenderActive(it) {
+  const card = $('bench-active');
+  const form = document.querySelector('.bench-form');
+  const strip = $('bench-collapsed');
+  if (!card || !form || !strip) return;
+  if (!it) {
+    card.innerHTML = '';
+    if (!_benchUserExpanded) { form.style.display = ''; strip.style.display = 'none'; }
+    return;
+  }
+  const c = it.cells || {};
+  const n = c.now || {};
+  const cfg = it.config || {};
+  const total = c.total || it.progress_total || 0;
+  const done = (c.done || 0) + (c.failed || 0) + (c.skipped || 0);
+  const sweepPct = total ? Math.round(done / total * 100) : 0;
+  const cellPct = n.progress_total ? Math.round((n.progress || 0) / n.progress_total * 100) : 0;
+  // The axes, not the model path — the model is the same across most cells of a sweep.
+  const axes = String(n.label || '').split(' · ');
+  const who = _benchShortModel(axes[0] || it.model || '');
+  const rest = axes.slice(1).filter(x => x && !x.startsWith('@')).join(' · ');
+  card.innerHTML = `
+    <div class="bench-live">
+      <div class="top"><span class="dot"></span><span>Running</span>
+        ${cfg.suite ? `<span>· ${esc(cfg.suite)}</span>` : '<span>· speed only</span>'}
+        <span class="cells">${done} / ${total} cells${c.eta_s > 0 ? ` · ~${_benchEta(c.eta_s)} left` : ''}</span>
+      </div>
+      <div class="track sweep"><i style="width:${sweepPct}%"></i></div>
+      ${n.label ? `<p class="cur"><b>${esc(who)}</b>${rest ? ' · ' + esc(rest) : ''}
+         <span style="float:right;color:#8b97a8;font-size:12px">${n.progress || 0}/${n.progress_total || '?'}</span></p>
+        <div class="track"><i style="width:${cellPct}%"></i></div>` : ''}
+      ${n.phase ? `<p class="phase">⏳ ${esc(n.phase)}</p>` : ''}
+      ${it.phase && !n.phase ? `<p class="phase">⏳ ${esc(it.phase)}</p>` : ''}
+      ${it.memory_warning ? `<p class="warn">⚠ measured under memory pressure — ${esc(it.memory_warning)}</p>` : ''}
+      <div class="foot">
+        ${c.failed ? `<span style="color:#e08080">${c.failed} failed</span>` : ''}
+        <a href="#" onclick="event.preventDefault();setView('live')" title="Watch the requests as they run">Live ↗</a>
+      </div>
+    </div>`;
+  if (!_benchUserExpanded) {
+    form.style.display = 'none';
+    strip.style.display = 'flex';
+    const models = (cfg.models || []).length || 1;
+    $('bench-collapsed-what').textContent =
+      `${models} model${models > 1 ? 's' : ''} · ${cfg.suite || 'speed only'} · ${cfg.runs || 1} run${(cfg.runs || 1) > 1 ? 's' : ''}`;
+  }
+}
+
+let _benchUserExpanded = false;
+
 function _benchSetGoState(active) {
   const btn = $('bench-go');
   if (!btn) return;
@@ -7309,7 +7407,9 @@ async function _benchRefreshHistory() {
     const empty = wrap.querySelector('[data-bench-empty]');
     if (empty) empty.remove();
     _benchSyncRows(wrap, items);
-    _benchSetGoState(items.find(i => i.status === 'running' || i.status === 'pending'));
+    const live = items.find(i => i.status === 'running' || i.status === 'pending');
+    _benchSetGoState(live);
+    _benchRenderActive(live);
   } catch (e) {
     wrap.innerHTML = `<div style="color:#f07178">${esc(e.message)}</div>`;
   }
