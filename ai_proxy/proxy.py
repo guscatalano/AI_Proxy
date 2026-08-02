@@ -9263,6 +9263,11 @@ _REPORT_CSS = """
   th.cfg { max-width:30ch; white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
   code.mdl { max-width:26ch; display:inline-block; overflow-wrap:anywhere; line-height:1.35;
              vertical-align:top; }
+  /* Settings columns are context, not findings: keep them present but visually behind the
+     measurements, so the eye lands on the numbers that answer the question. */
+  td.ax { font-family:var(--mono); font-size:11.5px; color:var(--ink-faint); white-space:nowrap; }
+  .warnbox { border-left:3px solid var(--warn); background:var(--panel);
+             padding:10px 14px; border-radius:0 8px 8px 0; color:var(--ink-dim); }
   /* Footnotes belong under the thing they qualify — above it they're just a wall to climb.
      A list, not paragraphs: four separate caveats set as prose read as one grey slab. */
   /* Sent before any query runs; a rule at the end of the stream hides it once the real
@@ -9369,7 +9374,8 @@ def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
     """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
     or printed. Charts here exist to make the ordering obvious at a glance; the table beside
     them carries the actual numbers."""
-    vals = [(_bench_label_display(r["label"]), r.get(key)) for r in rows if r.get(key) is not None]
+    vals = [(r.get("_name") or _bench_label_display(r["label"]), r.get(key))
+            for r in rows if r.get(key) is not None]
     if not vals:
         return ""
     top = max(v for _n, v in vals) or 1
@@ -9406,6 +9412,54 @@ def _h(v) -> str:
             .replace(">", "&gt;").replace('"', "&quot;"))
 
 
+_BENCH_AXIS_LABELS = [
+    ("model", "Model"), ("quant", "Quant"), ("size", "Size"), ("backend", "Backend"),
+    ("think", "Think"), ("cache", "Cache"), ("prompt", "Prompt"), ("ctx", "Server ctx"),
+    ("temp", "Temp"), ("conc", "Parallel"),
+]
+
+
+def _bench_axis_values(r: dict, cfg: dict) -> dict:
+    """Everything about a cell that is a *setting* rather than a measurement."""
+    return {
+        "model": _bench_model_display(r.get("served") or r.get("model") or "?"),
+        "quant": r.get("quant"),
+        "size": (f"{round(r['size_mb'] / 1024, 1)} GB" if r.get("size_mb") else None),
+        "backend": cfg.get("upstream"),
+        "think": r.get("thinking") or "auto",
+        "cache": r.get("cache"),
+        "prompt": (f"{r['prompt_tokens']:,}" if r.get("prompt_tokens") else None),
+        "ctx": (f"{r['server_context']:,}" if r.get("server_context") else None),
+        "temp": (str(r["temperature"]) if r.get("temperature") is not None else None),
+        "conc": (str(cfg["concurrency"]) if (cfg.get("concurrency") or 1) != 1 else None),
+    }
+
+
+def _bench_axis_split(rows: list[dict], runs: list[dict]) -> tuple[list, dict, list]:
+    """Split a comparison's settings into what differs and what every cell shares.
+
+    A comparison table should carry what varies and nothing else. This report used to print
+    seventeen columns, five of which held the same value in every row, beside a Configuration
+    column that restated most of the others — so the two numbers a reader actually wanted were
+    somewhere off the right-hand edge. Constants are facts about the run as a whole and belong
+    above the table, once.
+    """
+    vals = [_bench_axis_values(r, run.get("config") or {}) for r, run in zip(rows, runs)]
+    if not vals:
+        return [], {}, []
+    keys = [k for k, _lbl in _BENCH_AXIS_LABELS]
+    varying = [k for k in keys if len({str(v.get(k)) for v in vals}) > 1]
+    constant = {k: vals[0][k] for k in keys
+                if k not in varying and vals[0].get(k) not in (None, "")}
+    return varying, constant, vals
+
+
+def _bench_cell_name(v: dict, varying: list) -> str:
+    """Name a cell by what makes it different from the others, and nothing more."""
+    bits = [str(v[k]) for k in varying if v.get(k) not in (None, "")]
+    return " · ".join(bits) or str(v.get("model") or "run")
+
+
 def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
 
@@ -9431,12 +9485,22 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         return "—" if v is None else f"{v * 100:.0f}%"
 
     # Table -------------------------------------------------------------------------------
-    head = ["Configuration", "Model", "Quant", "Size", "Backend", "Think", "Cache", "Prompt",
-            "Server ctx", "TTFT p50", "Decode p50", "Tokens", "Total p50", "vs best", "OK"]
-    if graded:
-        head[13:13] = ["Fully correct", "Cases"]
-    if len(rows) == 1:
-        head.remove("vs best")
+    varying, constant, axis_vals = _bench_axis_split(rows, runs)
+    axis_names = [_bench_cell_name(v, varying) for v in axis_vals]
+    for _r, _nm in zip(rows, axis_names):
+        _r["_name"] = _nm
+    labels = dict(_BENCH_AXIS_LABELS)
+    # Built in the same order the body appends its cells, from the same two conditions. They
+    # used to be assembled separately — head by slice-index, body by append — and had drifted:
+    # the graded pair was inserted before "vs best" in the header and after it in every row, so
+    # the ratio printed under "Fully correct" and each quality figure sat one column left of
+    # its name.
+    show_vs = len(rows) > 1
+    head = (["Configuration"] + [labels[k] for k in varying]
+            + ["TTFT p50", "Decode p50", "Tokens", "Total p50"]
+            + (["Fully correct", "Cases"] if graded else [])
+            + (["vs best"] if show_vs else [])
+            + ["OK"])
     # Slowdown against the fastest configuration in the set. A raw latency column doesn't make
     # "16x slower for no quality gain" jump out; a ratio does.
     fastest = min((r["total_p50"] for r in rows if r["total_p50"]), default=None)
@@ -9445,31 +9509,24 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     best_q = max((r["perfect_rate"] for r in rows if r["perfect_rate"] is not None), default=None)
 
     body_rows = []
-    for r, run in zip(rows, runs):
+    for r, run, av, nm in zip(rows, runs, axis_vals, axis_names):
         cfg = run.get("config") or {}
         slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
-        cells = [
-            f'<th scope="row" class="cfg">{_h(_bench_label_display(r["label"]))}</th>',
-            f'<td><code class="mdl">{_h(_bench_model_display(r["served"] or r["model"]))}</code></td>',
-            f'<td>{_h(r.get("quant") or "—")}</td>',
-            f'<td class="n">{(str(round(r["size_mb"] / 1024, 1)) + " GB") if r.get("size_mb") else "—"}</td>',
-            f'<td>{_h(cfg.get("upstream") or "—")}</td>',
-            f'<td>{_h(r["thinking"] or "auto")}</td>',
-            f'<td>{_h(r.get("cache") or "—")}</td>',
-            f'<td class="n">{fmt(r["prompt_tokens"])}</td>',
-            f'<td class="n">{fmt(r.get("server_context"))}</td>',
+        cells = [f'<th scope="row" class="cfg">{_h(nm)}</th>']
+        cells += [f'<td class="ax">{_h(av.get(k) or "—")}</td>' for k in varying]
+        cells += [
             f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
             f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>',
             f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>',
         ]
-        if len(rows) > 1:
-            cells.append(
-                f'<td class="n{" slow" if (slow or 0) >= 2 else ""}">'
-                f'{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>')
         if graded:
             cells.append(f'<td class="n{" win" if r["perfect_rate"] == best_q else ""}">{pct(r["perfect_rate"])}</td>')
             cells.append(f'<td class="n">{pct(r["case_pass_rate"])}</td>')
+        if show_vs:
+            cells.append(
+                f'<td class="n{" slow" if (slow or 0) >= 2 else ""}">'
+                f'{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>')
         ok = r["n_success"] == r["n_total"]
         cells.append(f'<td class="n {"ok" if ok else "bad"}">{r["n_success"]}/{r["n_total"]}</td>')
         body_rows.append("<tr>" + "".join(cells) + "</tr>")
@@ -9508,12 +9565,12 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     task_html = ""
     if graded:
         tasks = {}
-        for r, run in zip(rows, runs):
+        for r, run, nm in zip(rows, runs, axis_names):
             q = (((run.get("results") or {}).get("summary") or {}).get("quality") or {})
             for t in (q.get("tasks") or []):
-                tasks.setdefault(t["task"], {})[_bench_label_display(r["label"])] = t.get("perfect_rate")
+                tasks.setdefault(t["task"], {})[nm] = t.get("perfect_rate")
         if tasks:
-            labels = [_bench_label_display(r["label"]) for r in rows]
+            labels = list(axis_names)
             th = "".join(f"<th>{_h(l)}</th>" for l in labels)
             # With one configuration, a row per task is a column of identical 100%s. Only the
             # tasks that lost a case carry information, so list those and count the rest.
@@ -9608,7 +9665,7 @@ ordinary slowness rather than a misconfiguration.</p>
             cold_rows.append((r, cold_t, warm_t, cold_t / warm_t))
     if cold_rows:
         trs = "".join(
-            f'<tr><th scope="row" class="cfg">{_h(_bench_label_display(r["label"]))}</th>'
+            f'<tr><th scope="row" class="cfg">{_h(r.get("_name") or r["label"])}</th>'
             f'<td class="n">{fmt(r["prompt_tokens"])}</td>'
             f'<td class="n">{fmt(c, 0, " ms")}</td><td class="n">{fmt(w, 0, " ms")}</td>'
             f'<td class="n win">{fmt(ratio, 0, "x")}</td></tr>'
@@ -9658,14 +9715,27 @@ ordinary slowness rather than a misconfiguration.</p>
   </div>
 """
     else:
+        # Everything every cell shares, stated once above the table instead of repeated down it.
+        shared = "".join(
+            f'<div><p class="k">{_h(labels[k])}</p><p class="v">{_h(constant[k])}</p></div>'
+            for k in [k for k, _l in _BENCH_AXIS_LABELS] if k in constant)
+        held = (f'<h2>Held constant</h2><div class="spec">{shared}</div>' if shared else "")
+        # A sweep whose axes all collapsed measured one thing N times. Say so at the top rather
+        # than leaving the reader to notice that every row matches.
+        inert = ""
+        if not varying and len(rows) > 1:
+            inert = ('<p class="note warnbox">Every cell in this comparison used identical '
+                     'settings, so the rows below differ only by run-to-run noise.</p>')
         results = f"""
+  {held}
   <h2>Results</h2>
   <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
   the gap between them is time the model spent reasoning. Decode rate is measured from the first
   token onward, so reasoning tokens count as generated work. Best value in each column is
   highlighted.</p>
+  {inert}
   <div class="tbl"><table>
-    <thead><tr>{"".join(f'<th>{_h(h)}</th>' for h in head)}</tr></thead>
+    <thead><tr>{"".join(f'<th class="{"n" if h.endswith(("p50", "best", "OK", "Cases", "correct")) else ""}">{_h(h)}</th>' for h in head)}</tr></thead>
     <tbody>{"".join(body_rows)}</tbody>
   </table></div>
 """
