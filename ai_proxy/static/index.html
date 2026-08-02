@@ -6543,6 +6543,10 @@ async function loadBench() {
             <button type="button" class="bench-preset-opt" data-preset="long" aria-pressed="false">Long context <span class="cost" style="opacity:.7"></span></button>
           </div>
           <div id="bench-preset-desc"></div>
+          <div class="bench-row stack" style="margin-top:9px">
+            <label for="bench-suite-simple">Graded suite <span class="bench-hint">— what the answers are scored against</span></label>
+            <select id="bench-suite-simple"><option value="">none — measure speed only</option></select>
+          </div>
           <label class="bench-check" style="margin-top:9px" title="Other clients keep their connections and resume as soon as the benchmark finishes — they wait, they don't fail. Without this, whatever else is using the model gets measured along with it.">
             <input type="checkbox" id="bench-hold" checked>
             <span>Hold other proxy clients while it runs<em>they queue until it finishes — required for numbers that mean anything</em></span>
@@ -6739,8 +6743,18 @@ async function _benchPopulateModels() {
     const sel2 = $('bench-suite');
     // Copy matches the static markup it replaces — the two drifting apart is how a control ends
     // up describing itself two different ways depending on whether a fetch succeeded.
-    if (sel2) sel2.innerHTML = '<option value="">none — measure speed only</option>' +
+    const opts = '<option value="">none — measure speed only</option>' +
       (s.suites || []).map(x => `<option value="${esc(x.name)}">${esc(x.name)} — ${x.task_count} tasks / ${x.case_count} cases</option>`).join('');
+    for (const id of ['bench-suite', 'bench-suite-simple']) {
+      const el = $(id);
+      if (!el) continue;
+      const had = el.value;
+      el.innerHTML = opts;
+      // Preserve a choice across refreshes; otherwise fall back to what the presets have
+      // always used, so adding a suite never silently changes what a run measures.
+      const hasV1 = (s.suites || []).some(x => x.name === 'coding-v1');
+      el.value = had || (hasV1 ? 'coding-v1' : '');
+    }
     _benchRenderPresetCosts();   // task count is only known once the suites have loaded
   } catch { /* suites are optional */ }
   _benchUpdatePlan();
@@ -6835,6 +6849,8 @@ function _benchSelectionCost() {
 
 function _benchBindSelectAll() {
   const all = $('bench-sel-all'), none = $('bench-sel-none');
+  const ss = $('bench-suite-simple');
+  if (ss) ss.addEventListener('change', _benchUpdatePlan);
   if (all) all.onclick = () => {
     // Everything currently listed: with a backend filter on, "all" means all of what you can
     // see, not a silent sweep of things scrolled out of view.
@@ -7036,8 +7052,15 @@ function _benchPreset() {
   const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
   const base = _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
   const hold = $('bench-hold');
-  return Object.assign({}, base, { exclusive: !hold || hold.checked,
-                                   resume: _benchResumeOn() });
+  const suiteEl = $('bench-suite-simple');
+  const out = Object.assign({}, base, { exclusive: !hold || hold.checked,
+                                        resume: _benchResumeOn() });
+  if (suiteEl) {
+    // Explicit, including the empty choice: "" means speed only, and must not fall back to
+    // the preset's default.
+    out.suite = suiteEl.value || undefined;
+  }
+  return out;
 }
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
