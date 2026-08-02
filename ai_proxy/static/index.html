@@ -7310,7 +7310,7 @@ function _benchRowSig(it) {
           c.total, c.done, c.failed, c.skipped, c.running, c.pending,
           // Bucketed: the raw value moves every poll and would redraw the row each time.
           c.eta_s === undefined ? '' : Math.round(c.eta_s / 60),
-          n.label, n.progress, n.progress_total, n.phase, it.phase,
+          n.label, n.progress, n.progress_total, n.phase, it.phase, it.memory_warning,
           _benchSelected.has(it.id) ? 1 : 0].join('|');
 }
 
@@ -7354,6 +7354,10 @@ function _benchRowHead(it) {
     summaryLine = `<span style="color:#e08080">failed</span> · ${esc(it.error || '')}`;
   } else if (it.status === 'done') {
     summaryLine = `<span style="color:#5a5">✓ done</span>${cellNote}`;
+  }
+  // Ran but short of memory: the numbers exist and should not be trusted as a comparison.
+  if (it.memory_warning) {
+    summaryLine += `<div style="color:#f0a35a;margin-top:2px">⚠ measured under memory pressure — ${esc(it.memory_warning)}</div>`;
   }
   return `
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">

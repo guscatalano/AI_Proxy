@@ -9302,7 +9302,8 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
     conn = db()
     rows = conn.execute(
         "SELECT id, ts, model, config_json, status, progress, progress_total, "
-        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label, phase "
+        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label, phase, "
+        "env_json "
         "FROM bench_runs "
         + ("" if include_children else "WHERE parent_id IS NULL ")
         + "ORDER BY ts DESC LIMIT ?",
@@ -9363,6 +9364,10 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
             d["axes"] = None
         if cells.get(d["id"]):
             d["cells"] = cells[d["id"]]
+        try:
+            d["memory_warning"] = (json.loads(r["env_json"] or "{}") or {}).get("memory_warning")
+        except (json.JSONDecodeError, TypeError):
+            d["memory_warning"] = None
         items.append(d)
     return {"items": items}
 
@@ -9477,6 +9482,9 @@ def _bench_report_row(run: dict) -> dict:
         "prompt_tokens": cfg.get("prompt_tokens"),
         # What the server was serving, as distinct from what the run sent it.
         "server_context": cfg.get("server_context") or (run.get("env") or {}).get("loaded_context"),
+        # A cell that ran short of memory still produced numbers; they are just numbers about
+        # memory pressure. Carried through to the report so that is visible rather than inferred.
+        "memory_warning": (run.get("env") or {}).get("memory_warning"),
         "n_success": s.get("n_success"),
         "n_total": s.get("n_total"),
         "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
@@ -10047,6 +10055,18 @@ ordinary slowness rather than a misconfiguration.</p>
         held = (f'<h2>Held constant</h2><div class="spec">{shared}</div>' if shared else "")
         # A sweep whose axes all collapsed measured one thing N times. Say so at the top rather
         # than leaving the reader to notice that every row matches.
+        # Cells that could not get the memory they wanted. Named under the table rather than
+        # marked in it: the point is that these particular numbers should not be compared with
+        # the others, and a superscript does not say that loudly enough.
+        starved = [(nm, r["memory_warning"]) for r, nm in zip(rows, axis_names)
+                   if r.get("memory_warning")]
+        starved_html = ""
+        if starved:
+            starved_html = (
+                '<p class="note warnbox"><b>Measured under memory pressure.</b> '
+                + "; ".join(f"{_h(nm)} — {_h(w)}" for nm, w in starved)
+                + ". A model that does not fit is partly offloaded, so these figures describe "
+                  "the machine as much as the model and are not comparable with the rest.</p>")
         inert = ""
         if not varying and len(rows) > 1:
             inert = ('<p class="note warnbox">Every cell in this comparison used identical '
@@ -10059,6 +10079,7 @@ ordinary slowness rather than a misconfiguration.</p>
   token onward, so reasoning tokens count as generated work. Best value in each column is
   highlighted.</p>
   {inert}
+  {starved_html}
   <div class="tbl"><table>
     <thead><tr>{"".join(f'<th class="{"n" if h.endswith(("p50", "best", "OK", "Cases", "correct")) else ""}">{_h(h)}</th>' for h in head)}</tr></thead>
     <tbody>{"".join(body_rows)}</tbody>

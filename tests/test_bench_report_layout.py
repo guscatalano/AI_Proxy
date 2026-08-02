@@ -137,3 +137,20 @@ def test_the_per_task_table_renders_alongside_the_summary():
     never ran, so every test passed and the deployed page returned 500."""
     html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
     assert "binary_search" in html and "Held constant" in html
+
+
+def test_a_starved_cell_is_named_under_the_table(client):
+    """A cell that ran short of memory still produces numbers; they are just numbers about the
+    machine. Marking it in the table with a symbol does not say loudly enough that it should not
+    be compared with the rest."""
+    runs = [_run("a", prompt=32000), _run("b", prompt=131072)]
+    runs[1]["env"]["memory_warning"] = "only 28 GB free after stopping others; 44 GB wanted"
+    html = _render(runs)
+    assert "Measured under memory pressure" in html
+    assert "28 GB free" in html
+    assert "not comparable" in html
+
+
+def test_a_clean_run_says_nothing_about_memory(client):
+    html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
+    assert "memory pressure" not in html
