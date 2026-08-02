@@ -7417,7 +7417,9 @@ function _benchRenderActive(it) {
   // The axes, not the model path — the model is the same across most cells of a sweep.
   const axes = String(n.label || '').split(' · ');
   const who = _benchShortModel(axes[0] || it.model || '');
-  const rest = axes.slice(1).filter(x => x && !x.startsWith('@')).join(' · ');
+  // Always here: this is the one line saying what is running right now, and "which engine" is
+  // part of that even when the sweep only touches one.
+  const rest = axes.slice(1).filter(Boolean).join(' · ');
   card.innerHTML = `
     <div class="bench-live">
       <div class="top"><span class="dot"></span><span>Running</span>
@@ -7464,6 +7466,23 @@ let _benchLeadFor = '';
 // Cells that have finished already carry full results, and the report endpoint expands a
 // running parent to its children — so the standings exist long before the sweep does. Held
 // outside the card for the same reason as the tiles: the card is rebuilt on every history poll.
+// The '@backend' token in a cell label was being stripped as noise. On a mixed run it is the
+// only thing telling qwen3-coder-next on Ollama from the same weights on vLLM — without it the
+// standings show what looks like one model listed twice.
+function _benchCellBits(label, showBackend) {
+  const parts = String(label || '').split(' · ').slice(1);
+  return parts.filter(x => x && (showBackend || !x.startsWith('@')));
+}
+
+function _benchBackendsIn(rows) {
+  const ups = new Set();
+  for (const r of rows || []) {
+    const at = String(r.label || '').split(' · ').find(x => x.startsWith('@'));
+    if (at) ups.add(at);
+  }
+  return ups.size;
+}
+
 function _benchLeadRender() {
   const host = $('bench-lead');
   if (!host) return;
@@ -7474,10 +7493,11 @@ function _benchLeadRender() {
   // is good", and among the good ones, "which is quickest".
   rows.sort((a, b) => (b.perfect_rate ?? -1) - (a.perfect_rate ?? -1)
                    || (b.decode_p50 || 0) - (a.decode_p50 || 0));
+  const multi = _benchBackendsIn(rows) > 1;
   const top = _benchLeadAll ? rows : rows.slice(0, 6);
   host.innerHTML = `<h4>Standings — ${rows.length} cell${rows.length > 1 ? 's' : ''} in</h4>
     <div class="${_benchLeadAll ? 'scroll' : ''}"><table><tbody>${top.map((r, i) => {
-      const bits = String(r.label || '').split(' · ').slice(1).filter(x => x && !x.startsWith('@'));
+      const bits = _benchCellBits(r.label, multi);
       const q = r.perfect_rate;
       const cls = q == null ? '' : (q >= 0.9 ? 'q' : q >= 0.6 ? 'q mid' : 'q low');
       return `<tr>
@@ -7510,11 +7530,12 @@ function _benchQueueRender() {
   if (!host) return;
   const pending = (_benchLeadRows || []).filter(r => r.decode_p50 == null);
   if (!pending.length) { host.innerHTML = ''; return; }
+  const multi = _benchBackendsIn(_benchLeadRows) > 1;
   const show = _benchLeadAll ? pending : pending.slice(0, 5);
   host.innerHTML = `<h4>Up next — ${pending.length} to go</h4>
     <p class="rule">backend, then context window, then model name, then cold before cached</p>
     <ol>${show.map((r, i) => {
-      const bits = String(r.label || '').split(' · ').slice(1).filter(x => x && !x.startsWith('@'));
+      const bits = _benchCellBits(r.label, multi);
       return `<li class="${i === 0 ? 'next' : ''}">
         <span class="pos">${i + 1}</span>
         <span class="m">${esc(_benchShortModel(r.model || ''))}</span>
@@ -7584,7 +7605,7 @@ function _benchMiniRender() {
     return `<div class="bench-tile ${esc(st)}">
       <div class="hd">
         <span class="chip">${esc(st)}</span>
-        <span class="who">${esc(_benchShortModel(t.model || '?'))}</span>
+        <span class="who">${esc(_benchShortModel(t.model || '?'))}${t.upstream ? ` <span style="color:#6b7787">@${esc(t.upstream)}</span>` : ''}</span>
         <span class="clock">${((t.elapsed_ms || 0) / 1000).toFixed(1)}s</span>
       </div>
       <div class="body${showResp ? '' : ' ask'}">${text || '<span style="color:#4d5765">…</span>'}</div>
