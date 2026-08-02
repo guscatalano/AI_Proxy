@@ -2067,6 +2067,17 @@ class SideService:
                         _systemctl_args(svc, "status", "--no-pager", "-n", "8"),
                         15.0, max_chars=600, keep_tail=True, env=_systemctl_env(svc))
                     return f"{svc['unit']} is {st['active']}: {log.strip()[-400:]}"
+        if self.control == "docker":
+            container = await _vllm_container()
+            if container:
+                code, out = await _run_cmd(
+                    [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
+                    15.0, max_chars=100)
+                if code == 0 and out.strip().lower() == "false":
+                    _c, log = await _run_cmd(
+                        [_docker_bin(), "logs", "--tail", "12", container],
+                        20.0, max_chars=600, keep_tail=True)
+                    return f"{container} is not running: {log.strip()[-400:]}"
         return None
 
 
@@ -2214,6 +2225,9 @@ class _LmStudioProvider(_FnProvider):
 # 90 GB model to load from disk, short enough that an over-large pool is diagnosed and rolled
 # back inside a bench rather than after it.
 _BENCH_RESIZE_READY_S = 900.0
+# How long a bench waits for a backend it started to begin serving. Deliberately generous: the
+# run has hours to spend and a stalled start is now detected by died(), not by this expiring.
+_BENCH_START_READY_S = 1800.0
 
 
 def _load_result(res) -> tuple[bool, str]:
@@ -11330,6 +11344,318 @@ _BENCH_BASE_TASK = (
 # in a scratch cwd, with the parent's env stripped down. That contains accidents and runaway loops
 # — it is NOT a sandbox against deliberately hostile code. Grading is opt-in per bench run.
 _BENCH_SUITES: dict[str, list[dict]] = {
+    # coding-v2: modelled on HumanEval+ / BigCodeBench rather than on LeetCode.
+    #
+    # coding-v1 is saturated: seventeen of its eighteen tasks were solved perfectly in every one
+    # of twenty-three runs, including its whole "hard" tier. Only `calculator` ever discriminated
+    # — and the reason is the useful one. It is the single task where a *plausible* solution
+    # fails: operator precedence, parentheses, unary minus. Everything else is recall of an
+    # algorithm these models have memorised, so running them costs wall-clock and returns the
+    # same answer for every model.
+    #
+    # So difficulty here is not exotic algorithms. It is specifications with traps and cases that
+    # punish the obvious implementation: tie-breaking rules, escape sequences, validation that
+    # must reject, output formats stated exactly. That is EvalPlus's finding too — the gap
+    # between HumanEval and HumanEval+ is almost entirely adversarial inputs against code that
+    # looked correct.
+    "coding-v2": [
+        {
+            "id": "semver_cmp",
+            "tier": "core",
+            "prompt": (
+                "Write a Python function `semver_cmp(a: str, b: str) -> int` comparing two "
+                "semantic versions, returning -1 if a < b, 0 if equal, 1 if a > b.\n"
+                "Rules: compare major, minor, patch numerically. A version WITH a pre-release "
+                "tag has LOWER precedence than the same version without one (1.0.0-alpha < "
+                "1.0.0). Compare pre-release by splitting on '.': identifiers that are all "
+                "digits compare numerically and rank lower than non-numeric identifiers, which "
+                "compare as ASCII strings. A longer pre-release with an otherwise equal prefix "
+                "is greater. Build metadata after '+' is ignored entirely.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "semver_cmp",
+            "cases": [
+                {"args": ["1.0.0", "1.0.1"], "expect": -1},
+                {"args": ["1.2.0", "1.10.0"], "expect": -1},
+                # The trap: a pre-release is LOWER than the release it precedes.
+                {"args": ["1.0.0-alpha", "1.0.0"], "expect": -1},
+                {"args": ["1.0.0-alpha", "1.0.0-alpha.1"], "expect": -1},
+                {"args": ["1.0.0-alpha.1", "1.0.0-alpha.beta"], "expect": -1},
+                {"args": ["1.0.0-beta.2", "1.0.0-beta.11"], "expect": -1},
+                {"args": ["1.0.0+build.9", "1.0.0+build.1"], "expect": 0},
+                {"args": ["2.0.0", "2.0.0"], "expect": 0},
+            ],
+        },
+        {
+            "id": "csv_line",
+            "tier": "core",
+            "prompt": (
+                "Write a Python function `csv_line(line: str) -> list[str]` splitting one CSV "
+                "record into fields.\n"
+                "Rules: fields are comma separated. A field may be wrapped in double quotes, in "
+                "which case it may contain commas and doubled quotes ("
+                '"" ) which represent one literal quote character. Quotes only have meaning at '
+                "the very start of a field. Do not strip whitespace. An empty input returns "
+                "['']. Do not use the csv module.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "csv_line",
+            "cases": [
+                {"args": ["a,b,c"], "expect": ["a", "b", "c"]},
+                {"args": ['a,"b,c",d'], "expect": ["a", "b,c", "d"]},
+                {"args": ['"he said ""hi""",x'], "expect": ['he said "hi"', "x"]},
+                {"args": ["a,,c"], "expect": ["a", "", "c"]},
+                {"args": [""], "expect": [""]},
+                # Quote mid-field is literal, not a delimiter.
+                {"args": ['a,b"c,d'], "expect": ["a", 'b"c', "d"]},
+                {"args": [' a , b '], "expect": [" a ", " b "]},
+                {"args": ['""'], "expect": [""]},
+            ],
+        },
+        {
+            "id": "glob_match",
+            "tier": "hard",
+            "prompt": (
+                "Write a Python function `glob_match(pattern: str, text: str) -> bool` returning "
+                "whether pattern matches the whole of text. '?' matches exactly one character. "
+                "'*' matches any sequence including empty. All other characters match "
+                "themselves. Do not use the re, fnmatch or glob modules.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "glob_match",
+            "cases": [
+                {"args": ["a*c", "abbbc"], "expect": True},
+                {"args": ["a?c", "abc"], "expect": True},
+                {"args": ["a?c", "ac"], "expect": False},
+                # Greedy matching fails this one.
+                {"args": ["*a*b", "aaab"], "expect": True},
+                {"args": ["*", ""], "expect": True},
+                {"args": ["", ""], "expect": True},
+                {"args": ["", "a"], "expect": False},
+                {"args": ["**a", "a"], "expect": True},
+                {"args": ["a*", "a"], "expect": True},
+                {"args": ["*b*", "abc"], "expect": True},
+            ],
+        },
+        {
+            "id": "roman_strict",
+            "tier": "hard",
+            "prompt": (
+                "Write a Python function `roman_strict(s: str) -> int | None` converting a "
+                "canonical uppercase Roman numeral (1-3999) to an int, returning None if s is "
+                "not canonical.\n"
+                "Canonical means: I, X, C repeat at most three times; V, L, D never repeat; the "
+                "only subtractive pairs are IV, IX, XL, XC, CD, CM and each may appear at most "
+                "once; symbols otherwise appear in non-increasing value order. 'IIII', 'VV', "
+                "'IC' and 'MCMC' are all invalid.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "roman_strict",
+            "cases": [
+                {"args": ["MCMXCIV"], "expect": 1994},
+                {"args": ["III"], "expect": 3},
+                {"args": ["IV"], "expect": 4},
+                {"args": ["MMMCMXCIX"], "expect": 3999},
+                # Everything below must be rejected; a permissive parser returns a number.
+                {"args": ["IIII"], "expect": None},
+                {"args": ["VV"], "expect": None},
+                {"args": ["IC"], "expect": None},
+                {"args": ["MCMC"], "expect": None},
+                {"args": [""], "expect": None},
+                {"args": ["XLIX"], "expect": 49},
+            ],
+        },
+        {
+            "id": "topo_lex",
+            "tier": "hard",
+            "prompt": (
+                "Write a Python function `topo_lex(n: int, edges: list) -> list | None` returning "
+                "a topological ordering of nodes 0..n-1 given a list of [u, v] edges meaning u "
+                "must come before v. Among all valid orderings return the lexicographically "
+                "smallest. Return None if the graph has a cycle. Duplicate edges may appear.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "topo_lex",
+            "cases": [
+                {"args": [4, [[0, 1], [1, 2], [2, 3]]], "expect": [0, 1, 2, 3]},
+                # A plain DFS or arbitrary-queue topo sort gets a valid but non-minimal order.
+                {"args": [4, [[2, 3]]], "expect": [0, 1, 2, 3]},
+                {"args": [3, [[1, 0]]], "expect": [1, 0, 2]},
+                {"args": [2, [[0, 1], [1, 0]]], "expect": None},
+                {"args": [1, []], "expect": [0]},
+                {"args": [3, [[0, 2], [0, 2]]], "expect": [0, 1, 2]},
+                {"args": [5, [[4, 0], [4, 1]]], "expect": [2, 3, 4, 0, 1]},
+            ],
+        },
+        {
+            "id": "lru_ops",
+            "tier": "core",
+            "prompt": (
+                "Write a Python function `lru_ops(capacity: int, ops: list) -> list` simulating "
+                "an LRU cache. Each op is ['put', key, value] or ['get', key]. Return the list "
+                "of results of the 'get' operations only, using -1 for a miss.\n"
+                "A get counts as a use. A put of an existing key updates its value and counts as "
+                "a use. When capacity is exceeded evict the least recently used key.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "lru_ops",
+            "cases": [
+                {"args": [2, [["put", 1, 1], ["put", 2, 2], ["get", 1], ["put", 3, 3],
+                              ["get", 2], ["get", 3]]], "expect": [1, -1, 3]},
+                # put on an existing key must refresh recency, not just overwrite.
+                {"args": [2, [["put", 1, 1], ["put", 2, 2], ["put", 1, 10], ["put", 3, 3],
+                              ["get", 2], ["get", 1]]], "expect": [-1, 10]},
+                {"args": [1, [["put", 1, 1], ["put", 2, 2], ["get", 1]]], "expect": [-1]},
+                {"args": [2, [["get", 9]]], "expect": [-1]},
+                {"args": [3, [["put", 1, 1], ["put", 2, 2], ["put", 3, 3], ["get", 1],
+                              ["put", 4, 4], ["get", 2], ["get", 1]]], "expect": [1, -1, 1]},
+            ],
+        },
+        {
+            "id": "justify",
+            "tier": "hard",
+            "prompt": (
+                "Write a Python function `justify(words: list, width: int) -> list` performing "
+                "full text justification. Pack as many words per line as fit with at least one "
+                "space between them. Pad each line to exactly width by distributing spaces "
+                "between words as evenly as possible, putting the extra spaces on the LEFT gaps "
+                "first. The last line, and any line holding a single word, is left justified "
+                "with the remaining space on the right.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "justify",
+            "cases": [
+                {"args": [["This", "is", "an", "example", "of", "text", "justification."], 16],
+                 "expect": ["This    is    an", "example  of text", "justification.  "]},
+                {"args": [["What", "must", "be", "acknowledgment", "shall", "be"], 16],
+                 "expect": ["What   must   be", "acknowledgment  ", "shall be        "]},
+                {"args": [["a"], 3], "expect": ["a  "]},
+                {"args": [["aa", "bb"], 5], "expect": ["aa bb"]},
+            ],
+        },
+        {
+            "id": "path_norm",
+            "tier": "core",
+            "prompt": (
+                "Write a Python function `path_norm(path: str) -> str` normalising an absolute "
+                "POSIX path. Collapse repeated slashes, resolve '.' and '..', and remove any "
+                "trailing slash. '..' at the root stays at the root. The result always starts "
+                "with '/' and is '/' when nothing remains. Do not use os.path or pathlib.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "path_norm",
+            "cases": [
+                {"args": ["/home/"], "expect": "/home"},
+                {"args": ["/a/./b/../../c/"], "expect": "/c"},
+                # Escaping above root is the trap.
+                {"args": ["/../"], "expect": "/"},
+                {"args": ["/a//b////c/d//././/.."], "expect": "/a/b/c"},
+                {"args": ["/"], "expect": "/"},
+                {"args": ["/..hidden"], "expect": "/..hidden"},
+                {"args": ["/a/../../b"], "expect": "/b"},
+            ],
+        },
+        {
+            "id": "json_pointer",
+            "tier": "hard",
+            "prompt": (
+                "Write a Python function `json_pointer(doc, pointer: str)` resolving an RFC 6901 "
+                "JSON Pointer against doc, returning the referenced value or None if it does not "
+                "resolve.\n"
+                "The empty pointer '' returns doc itself. Otherwise the pointer starts with '/' "
+                "and is split on '/' into reference tokens. In each token '~1' decodes to '/' and "
+                "'~0' decodes to '~', and '~1' must be decoded BEFORE '~0'. A token addressing a "
+                "list must be all digits with no leading zeros (except '0' itself) and in range. "
+                "Return None rather than raising.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "json_pointer",
+            "cases": [
+                {"args": [{"a": {"b": [1, 2, 3]}}, "/a/b/1"], "expect": 2},
+                {"args": [{"a": 1}, ""], "expect": {"a": 1}},
+                {"args": [{"a/b": 7}, "/a~1b"], "expect": 7},
+                {"args": [{"m~n": 8}, "/m~0n"], "expect": 8},
+                # Decoding ~0 first would turn ~01 into / and find the wrong key.
+                {"args": [{"~1": 9}, "/~01"], "expect": 9},
+                {"args": [{"a": [1]}, "/a/01"], "expect": None},
+                {"args": [{"a": [1]}, "/a/5"], "expect": None},
+                {"args": [{"a": 1}, "/b"], "expect": None},
+            ],
+        },
+        {
+            "id": "base_convert",
+            "tier": "core",
+            "prompt": (
+                "Write a Python function `base_convert(s: str, frm: int, to: int) -> str | None` "
+                "converting the integer written in base `frm` to base `to`, for bases 2..36.\n"
+                "Input may have a leading '-' and leading zeros, and uses digits 0-9 then "
+                "letters case-insensitively. Output uses lowercase letters, has no leading zeros, "
+                "and zero is '0' with no sign. Return None if s is empty, is only a sign, "
+                "contains a digit not valid in base frm, or if either base is out of range.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "base_convert",
+            "cases": [
+                {"args": ["ff", 16, 2], "expect": "11111111"},
+                {"args": ["-1A", 16, 10], "expect": "-26"},
+                {"args": ["0007", 10, 10], "expect": "7"},
+                {"args": ["0", 10, 36], "expect": "0"},
+                {"args": ["-0", 10, 2], "expect": "0"},
+                {"args": ["z", 36, 10], "expect": "35"},
+                {"args": ["2", 2, 10], "expect": None},
+                {"args": ["", 10, 2], "expect": None},
+                {"args": ["-", 10, 2], "expect": None},
+                {"args": ["10", 1, 10], "expect": None},
+            ],
+        },
+        {
+            "id": "interval_intersect",
+            "tier": "core",
+            "prompt": (
+                "Write a Python function `interval_intersect(a: list, b: list) -> list` returning "
+                "the intersection of two lists of closed intervals [start, end]. Each input list "
+                "is sorted and its own intervals are disjoint, but intervals that merely touch "
+                "(one ends where the next begins) DO intersect and the shared point is a valid "
+                "result interval. Return the intersections in order.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "interval_intersect",
+            "cases": [
+                {"args": [[[0, 2], [5, 10]], [[1, 5], [8, 12]]],
+                 "expect": [[1, 2], [5, 5], [8, 10]]},
+                {"args": [[], [[1, 2]]], "expect": []},
+                {"args": [[[1, 3]], [[3, 5]]], "expect": [[3, 3]]},
+                {"args": [[[1, 10]], [[2, 3], [4, 5]]], "expect": [[2, 3], [4, 5]]},
+                {"args": [[[1, 2]], [[3, 4]]], "expect": []},
+            ],
+        },
+        {
+            "id": "tokenize_expr",
+            "tier": "hard",
+            "prompt": (
+                "Write a Python function `tokenize_expr(s: str) -> list | None` tokenising an "
+                "arithmetic expression into a list of tokens.\n"
+                "Numbers are non-negative integers or decimals like '3' or '2.5' and become "
+                "floats if they contain '.', ints otherwise. Operators are '+', '-', '*', '/' "
+                "and parentheses '(' and ')', each its own single-character string token. "
+                "Whitespace separates tokens but is not a token. A '-' is always an operator "
+                "token, never part of a number. Return None if any other character appears or if "
+                "a number has more than one '.'.\n"
+                "Return only the function in a single ```python code block."
+            ),
+            "entry": "tokenize_expr",
+            "cases": [
+                {"args": ["1+2"], "expect": [1, "+", 2]},
+                {"args": ["  12 * ( 3.5 - 4 ) "], "expect": [12, "*", "(", 3.5, "-", 4, ")"]},
+                {"args": ["-3"], "expect": ["-", 3]},
+                {"args": ["2--3"], "expect": [2, "-", "-", 3]},
+                {"args": ["10.25/2"], "expect": [10.25, "/", 2]},
+                {"args": ["1.2.3"], "expect": None},
+                {"args": ["1$2"], "expect": None},
+                {"args": [""], "expect": []},
+            ],
+        },
+    ],
     "coding-v1": [
         {
             "id": "binary_search",
@@ -12107,8 +12433,15 @@ async def _bench_start_backend(meta: dict, persist: bool = True,
     if bench_id:
         _bench_phase(bench_id, f"starting {upstream} and waiting for it to serve "
                                f"(a large model takes minutes)")
-    res = await prov.load({"container": container} if container else {},
-                          meta.get("model") or "")
+    # A bench is already committed to waiting, and 420s is not enough for a large vLLM
+    # checkpoint on this box — qwen3-coder-next was stopped mid-load at the deadline and
+    # recorded as a failure. Waiting longer is only safe because died() now covers docker as
+    # well as systemd: a container that actually exits is caught in seconds, so the ceiling
+    # only ever applies to something genuinely still loading.
+    payload = {"container": container} if container else {}
+    payload["wait_s"] = _BENCH_START_READY_S
+    payload["ready_timeout_s"] = _BENCH_START_READY_S
+    res = await prov.load(payload, meta.get("model") or "")
     ok, detail = _load_result(res)
     # `ok` is "it is serving"; this is "the box was changed". vLLM's load starts the container
     # and *then* waits for readiness, so a timeout leaves it running. Reporting nothing to undo

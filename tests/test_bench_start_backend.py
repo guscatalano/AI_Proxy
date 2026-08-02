@@ -87,7 +87,7 @@ def test_starting_passes_the_container_through(client, monkeypatch):
     res = asyncio.run(P._bench_start_backend(
         {"model": "qwen3-coder", "upstream": "vllm", "container": "qwen-vllm"}))
     assert res["ok"] and res["started"]
-    assert seen == [{"container": "qwen-vllm"}], "the wrong container would serve wrong numbers"
+    assert seen[0]["container"] == "qwen-vllm", "the wrong container would serve wrong numbers"
     assert res["restore"]["upstream"] == "vllm" and res["restore"]["stop"] is True
 
 
@@ -281,3 +281,55 @@ def test_a_cell_inside_a_sweep_does_not_overwrite_the_sweeps_snapshot(client, mo
     assert saved == [], "a cell overwrote the sweep's record of the original state"
     assert res["restore"]["residency"] is None
     assert res["restore"]["stop"] is True, "it still has to stop what it started"
+
+
+# ---- waiting long enough, safely -----------------------------------------------------------
+
+def test_a_bench_start_waits_far_longer_than_the_default(client, monkeypatch):
+    """qwen3-coder-next was stopped mid-load at the 420s default and recorded as a failure,
+    while ornith-nvfp4 -- a 4-bit checkpoint -- loaded inside it. A bench has hours to spend."""
+    seen = []
+    _quiet_residency(monkeypatch)
+
+    async def load(payload, name):
+        seen.append(dict(payload))
+        return {"ok": True, "started_container": "qwen-vllm", "ready": True}
+
+    monkeypatch.setattr(P.PROVIDERS["vllm"], "load", load)
+    asyncio.run(P._bench_start_backend({"upstream": "vllm", "container": "qwen-vllm"}))
+    assert seen[0]["wait_s"] == P._BENCH_START_READY_S
+    assert P._BENCH_START_READY_S >= 1800, "still too tight for a large checkpoint"
+
+
+def test_a_dead_container_is_noticed_without_waiting_it_out(client, monkeypatch):
+    """What makes the long wait safe. Without this, raising the ceiling would just mean a
+    crashed container burns thirty minutes instead of seven."""
+    async def container():
+        return "qwen-vllm"
+
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "inspect" in args:
+            return 0, "false"
+        if "logs" in args:
+            return 0, "CUDA out of memory"
+        return 0, ""
+
+    monkeypatch.setattr(P, "_vllm_container", container)
+    monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(P, "_run_cmd", run)
+    why = asyncio.run(P.PROVIDERS["vllm"].died())
+    assert why and "not running" in why
+    assert "out of memory" in why, "the reason has to come with it"
+
+
+def test_a_running_container_is_not_reported_as_dead(client, monkeypatch):
+    async def container():
+        return "qwen-vllm"
+
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        return (0, "true") if "inspect" in args else (0, "")
+
+    monkeypatch.setattr(P, "_vllm_container", container)
+    monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(P, "_run_cmd", run)
+    assert asyncio.run(P.PROVIDERS["vllm"].died()) is None
