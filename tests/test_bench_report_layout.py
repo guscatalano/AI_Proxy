@@ -123,8 +123,11 @@ def test_the_warm_up_footer_uses_short_names_too():
     for r in runs:
         r["results"]["summary"]["warmup_ms"] = 900_000.0
     html = _render(runs)
-    assert "Warm-up" in html
+    assert "Cold-start cost" in html
     assert "/m/big-model" not in html
+    # And it ranks: the slower cold start must come first in the table.
+    seg = html.split("Cold-start cost")[-1]
+    assert seg.index("Cold start") < seg.index("</table>")
 
 
 def test_a_single_run_still_renders():

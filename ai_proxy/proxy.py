@@ -9809,6 +9809,8 @@ def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
                        f'text-anchor="middle">{tick}</text>')
     out.append(f'<text x="{(x0 + x1) / 2:.0f}" y="{height - 6}" class="ct" '
                f'text-anchor="middle">output tokens/sec (log)</text>')
+    out.append(f'<text x="{x1 - 6}" y="{y0 + 4}" class="ct" text-anchor="end" '
+               f'fill="var(--accent)" fill-opacity=".8">better ↗</text>')
 
     # The frontier as a staircase: from each frontier point you trade rate for correctness only
     # by stepping, never smoothly, so a curve would be a fiction.
@@ -9826,31 +9828,42 @@ def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
         cx, cy = px(xv), py(yv)
         out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4.5 if on else 3}" '
                    f'fill="{"var(--accent)" if on else "currentColor"}" '
-                   f'fill-opacity="{1 if on else .28}"/>')
+                   f'fill-opacity="{1 if on else .28}">'
+                   f'<title>{_h(name)} — {yv:.0f}% correct at {xv:.1f} tok/s</title></circle>')
         # Only the frontier is named. Thirty-eight labels is a smear, and the dominated points
         # are precisely the ones nobody needs to identify.
         if on and labelled < 8:
             labelled += 1
             anchor = "end" if cx > x1 - 90 else "start"
             dx = -7 if anchor == "end" else 7
+            # First and last segment of the compound name: the model, and the axis value that
+            # distinguishes this cell from its siblings. The middle is shared context.
+            _segs = name.split(" · ")
+            short = _segs[0] if len(_segs) < 3 else f"{_segs[0]} · {_segs[-1]}"
             out.append(f'<text x="{cx + dx:.1f}" y="{cy + 3.5:.1f}" class="cl" '
-                       f'text-anchor="{anchor}">{_h(name[:34])}</text>')
+                       f'text-anchor="{anchor}">{_h(short[:34])}</text>')
     out.append("</svg>")
     return "".join(out)
 
 
-def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
+def _bench_bar_svg(rows, key, label, unit, better="high", width=680, limit=12):
     """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
-    or printed. Charts here exist to make the ordering obvious at a glance; the table beside
-    them carries the actual numbers."""
+    or printed. Charts exist to make the ordering obvious at a glance; the table carries the
+    full field. Capped at the leaders: three charts of thirty-eight bars each was three
+    thousand pixels of the table repeated, and rank 31 vs rank 34 is not a question anyone
+    brings to a chart."""
     vals = [(r.get("_name") or _bench_label_display(r["label"]), r.get(key))
             for r in rows if r.get(key) is not None]
     if not vals:
         return ""
+    total_n = len(vals)
+    # Each chart ranks its own metric; the table's quality-first order is a different question.
+    vals.sort(key=(lambda nv: -nv[1]) if better == "high" else (lambda nv: nv[1]))
+    vals = vals[:limit]
     top = max(v for _n, v in vals) or 1
     best = max(v for _n, v in vals) if better == "high" else min(v for _n, v in vals)
     bar_h, gap, pad_l = 20, 8, 250
-    height = len(vals) * (bar_h + gap) + 26
+    height = len(vals) * (bar_h + gap) + 26 + (18 if total_n > len(vals) else 0)
 
     def elide(name, limit=42):
         """Elide the MIDDLE, not the tail. Cell labels share a long prefix (the model) and
@@ -9871,6 +9884,9 @@ def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
         parts.append(f'<text x="0" y="{y + 14}" class="cl">{_h(elide(name))}</text>')
         parts.append(f'<rect x="{pad_l}" y="{y}" width="{w}" height="{bar_h}" rx="3" fill="{fill}"/>')
         parts.append(f'<text x="{pad_l + w + 6}" y="{y + 14}" class="cv">{v:,.1f}</text>')
+    if total_n > len(vals):
+        parts.append(f'<text x="0" y="{height - 5}" class="ct">'
+                     f'top {len(vals)} of {total_n} — the full field is in the table</text>')
     parts.append("</svg>")
     return "".join(parts)
 
@@ -10065,18 +10081,17 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             + spread("Total", r0.get("total"), "ms")
             + '</tbody></table>')
     else:
-        charts = ""
         _sc = _bench_scatter_svg(rows) if graded else ""
+        scatter_html = ""
         if _sc:
-            charts += ('<p class="note">Correctness against output rate. A point below and to '
-                       'the left of another is beaten on both counts at once, so the dashed '
-                       'frontier is the shortlist — everything off it is dominated by '
-                       'something on it. Only the frontier is labelled.</p>' + _sc)
-        charts += _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
+            scatter_html = (
+                '<h2>The trade-off</h2>'
+                '<p class="note">Every configuration, placed by correctness and output rate. '
+                'A point below and to the left of another is beaten on both counts at once, so '
+                'the dashed frontier is the shortlist — everything off it is dominated by '
+                'something on it. Hover any point for its name.</p>' + _sc)
+        charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
         charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
-        if graded:
-            qrows = [dict(r, q=(r["perfect_rate"] or 0) * 100) for r in rows]
-            charts += _bench_bar_svg(qrows, "q", "Fully-correct responses", "%", "high")
 
     # Per-task quality --------------------------------------------------------------------
     task_html = ""
@@ -10140,17 +10155,30 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 names = {"core": "Core", "hard": "Hard"}
                 tiers_present = [t for t in ("core", "hard")
                                  if any((r.get("tiers") or {}).get(t) for r in rows)]
+
+                def _tier_pr(r, t):
+                    return ((r.get("tiers") or {}).get(t) or {}).get("perfect_rate")
+
+                # Same inversion as the per-task table: a row reading 100% / 100% separates
+                # nothing, and most rows here read exactly that.
+                shown = [(r, nm) for r, nm in zip(rows, axis_names)
+                         if any((_tier_pr(r, t) or 0) < 1 for t in tiers_present
+                                if _tier_pr(r, t) is not None)]
+                clean_n = len(rows) - len(shown)
                 ttrs = []
-                for r, nm in zip(rows, axis_names):
-                    tds = "".join(
-                        f'<td class="n">{pct(((r.get("tiers") or {}).get(t) or {}).get("perfect_rate"))}</td>'
-                        for t in tiers_present)
+                for r, nm in shown:
+                    tds = "".join(f'<td class="n">{pct(_tier_pr(r, t))}</td>'
+                                  for t in tiers_present)
                     ttrs.append(f'<tr><th scope="row" class="cfg">{_h(nm)}</th>{tds}</tr>')
                 tier_head = "".join(f'<th class="n">{_h(names.get(t, t))}</th>'
                                     for t in tiers_present)
-                tier_rows = ('<div class="tbl"><table><thead><tr><th>Configuration</th>'
-                             + tier_head + '</tr></thead><tbody>'
-                             + "".join(ttrs) + '</tbody></table></div>')
+                clean_note = (f'<p class="note"><b>{clean_n}</b> configuration'
+                              f'{"s" if clean_n != 1 else ""} cleared both tiers in full and '
+                              f'are not listed.</p>') if clean_n else ""
+                tier_rows = (clean_note + (
+                    '<div class="tbl"><table><thead><tr><th>Configuration</th>'
+                    + tier_head + '</tr></thead><tbody>'
+                    + "".join(ttrs) + '</tbody></table></div>' if ttrs else ""))
             # Runs recorded before the hard tier existed carry no tier data; an empty heading
             # with a paragraph explaining a table that isn't there is worse than no section.
             tier_html = ("<h2>Correctness by tier</h2>"
@@ -10188,7 +10216,7 @@ everywhere except one task and a model mediocre throughout can share an overall 
                 f'<td class="n">{fmt(cached, 0, " ms")}</td>'
                 f'<td class="n{" win" if speedup and speedup >= 1.5 else ""}">{fmt(speedup, 1, "x") if speedup else "—"}</td>'
                 f'<td>{_h(verdict)}</td></tr>')
-        cache_html = f"""<h2>Prompt cache</h2>
+        cache_html = f"""<h2>Prompt cache — cold vs cached cells</h2>
 <p class="note">Cold sends a uniquely salted prompt every time so nothing can be reused; cached
 repeats one identical prompt after a priming request. A backend whose prefix caching is off or
 unsupported shows roughly the same first-token latency in both columns — which looks like
@@ -10221,12 +10249,27 @@ ordinary slowness rather than a misconfiguration.</p>
             "<table><thead><tr><th>Configuration</th><th>Prompt</th><th>Cold TTFT</th>"
             "<th>Cached TTFT</th><th>Faster by</th></tr></thead><tbody>" + trs + "</tbody></table>")
 
-    warm = [(fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')
-             if len(rows) == 1 else
-             f"{r.get('_name') or r['label']}: "
-             f"{fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}")
-            for r, run in zip(rows, runs)
-            if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
+    _wvals = [(r.get("_name") or _bench_label_display(r["label"]),
+               ((run.get("results") or {}).get("summary") or {}).get("warmup_ms"))
+              for r, run in zip(rows, runs)
+              if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
+    if len(rows) == 1:
+        warm = [fmt(v, 0, " ms") for _n, v in _wvals]
+    elif _wvals:
+        # Ranked, slowest first: the question this answers is which models are expensive to
+        # make resident, and a comma-run of thirty-eight "name: ms" pairs answers nothing.
+        _wvals.sort(key=lambda nv: -nv[1])
+        _wtop = _wvals[:10]
+        warm = ['<div class="tbl"><table><thead><tr><th>Configuration</th>'
+                '<th class="n">Cold start</th></tr></thead><tbody>'
+                + "".join(f'<tr><th scope="row" class="cfg">{_h(n)}</th>'
+                          f'<td class="n">{fmt(v / 1000, 1, " s")}</td></tr>'
+                          for n, v in _wtop)
+                + '</tbody></table></div>'
+                + (f'<p class="note">+ {len(_wvals) - len(_wtop)} more under '
+                   f'{_wtop[-1][1] / 1000:.1f} s.</p>' if len(_wvals) > len(_wtop) else "")]
+    else:
+        warm = []
 
     if single:
         r0 = rows[0]
@@ -10284,7 +10327,8 @@ ordinary slowness rather than a misconfiguration.</p>
         if not varying and len(rows) > 1:
             inert = ('<p class="note warnbox">Every cell in this comparison used identical '
                      'settings, so the rows below differ only by run-to-run noise.</p>')
-        # The finding, before the evidence. A comparison whose answer is only recoverable by
+        scatter_html = ""
+    # The finding, before the evidence. A comparison whose answer is only recoverable by
         # scanning thirty-eight rows has buried it. Best quality first, and among equals the
         # quickest — the same order the table is now sorted in, so the lede names its top row.
         _lede = ""
@@ -10307,6 +10351,7 @@ ordinary slowness rather than a misconfiguration.</p>
   </div>"""
         results = f"""
   {_lede}
+  {scatter_html}
   {held}
   <h2>Results</h2>
   <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
@@ -10361,7 +10406,7 @@ ordinary slowness rather than a misconfiguration.</p>
     body = f"""
   {results}
 
-  <h2>{"Consistency" if single else "At a glance"}</h2>
+  <h2>{"Consistency" if single else "Speed ranking"}</h2>
   {charts}
 
   {cache_html}
@@ -10372,7 +10417,7 @@ ordinary slowness rather than a misconfiguration.</p>
 
   {method_html}
 
-  {"<h2>Warm-up</h2><p class='note'>Excluded from every measurement above. A large value is the model-load cost for a model that was not resident when the run started.</p><p class='note'>" + _h(" · ".join(warm)) + "</p>" if warm else ""}
+  {"<h2>Cold-start cost</h2><p class='note'>Time for the discarded warm-up request — the price of making the model resident, excluded from every measurement above.</p>" + (warm[0] if len(rows) > 1 else "<p class='note'>" + _h(warm[0]) + "</p>") if warm else ""}
 """
     return _report_page(
         title=f"Benchmark — {title}",
