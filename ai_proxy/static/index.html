@@ -6547,6 +6547,10 @@ async function loadBench() {
             <input type="checkbox" id="bench-hold" checked>
             <span>Hold other proxy clients while it runs<em>they queue until it finishes — required for numbers that mean anything</em></span>
           </label>
+          <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run. Changing any setting changes the cell, so it is measured again. Worth ticking for anything long: a restart otherwise loses the whole run.">
+            <input type="checkbox" id="bench-resume-simple">
+            <span>Reuse completed cells<em>skip what an earlier run already measured — a long run survives a restart</em></span>
+          </label>
         </div>
         <div class="bench-groups">
 
@@ -6794,6 +6798,15 @@ function _benchModelCount() {
 // prevents. Models never benchmarked fall back to the median of those that have.
 // llama.cpp names a model by its full path, and a split GGUF adds a shard suffix. Fine in the
 // picker, unreadable in a one-line summary.
+// Simple and advanced modes have their own copy of this control, and only one is on screen.
+// Reading just the advanced one meant every preset run silently said "no".
+function _benchResumeOn() {
+  return ['bench-resume', 'bench-resume-simple'].some(id => {
+    const el = $(id);
+    return el && el.offsetParent !== null && el.checked;
+  });
+}
+
 function _benchShortModel(name) {
   let s = String(name || '').trim();
   if (!s) return '';
@@ -7023,9 +7036,8 @@ function _benchPreset() {
   const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
   const base = _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
   const hold = $('bench-hold');
-  const res = $('bench-resume');
   return Object.assign({}, base, { exclusive: !hold || hold.checked,
-                                   resume: !!(res && res.checked) });
+                                   resume: _benchResumeOn() });
 }
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
@@ -7102,7 +7114,7 @@ function _benchBody() {
     bypass_router: $('bench-bypass').checked,
     no_nudge: $('bench-nonudge').checked,
     warmup: $('bench-warmup').checked,
-    resume: !!($('bench-resume') || {}).checked,
+    resume: _benchResumeOn(),
   };
   if (temps) body.temperature = temps.length > 1 ? temps : temps[0];
   // No top-level `upstream`: each selected model already carries its own, which is what makes
