@@ -91,3 +91,52 @@ def test_the_size_is_read_from_the_shape_the_snapshot_actually_uses(client, monk
     assert idx["ollama:qwen3:235b-a22b"]["size_mb"] == 135_580, "size never reached the index"
     assert idx["ollama:qwen3:235b-a22b"]["fits"] is False
     assert idx["ollama:qwen3:4b"]["fits"] is True
+
+
+# ---- capability, as distinct from capacity -------------------------------------------------
+
+def test_a_model_that_cannot_complete_is_refused(client, monkeypatch):
+    """An embedding model cannot produce a measurement under any configuration, so it is
+    refused the way a model that does not fit is."""
+    async def caps(client_, name):
+        return {"nomic-embed": ["embedding"], "qwen3:4b": ["completion", "tools"]}.get(name)
+
+    monkeypatch.setattr(P, "_ollama_capabilities", caps)
+    index = {"ollama:nomic-embed": {"model": "nomic-embed", "upstream": "ollama"},
+             "ollama:qwen3:4b": {"model": "qwen3:4b", "upstream": "ollama"}}
+    asyncio.run(P._bench_annotate_caps(index, None))
+    assert index["ollama:nomic-embed"]["benchable"] is False
+    assert "embedding" in index["ollama:nomic-embed"]["bench_detail"]
+    assert "benchable" not in index["ollama:qwen3:4b"]
+
+
+def test_a_vision_model_is_flagged_but_not_refused(client, monkeypatch):
+    """It completes text, so timing it is a perfectly good speed benchmark. Only its score on a
+    coding suite is meaningless — and that is a fact about the suite, not the model."""
+    async def caps(client_, name):
+        return ["tools", "thinking", "completion", "vision"]
+
+    monkeypatch.setattr(P, "_ollama_capabilities", caps)
+    index = {"ollama:minicpm-v4.5": {"model": "minicpm-v4.5", "upstream": "ollama"}}
+    asyncio.run(P._bench_annotate_caps(index, None))
+    assert index["ollama:minicpm-v4.5"]["vision"] is True
+    assert index["ollama:minicpm-v4.5"].get("benchable") is not False, \
+        "a vision model can still be measured for speed"
+
+
+def test_silence_from_ollama_is_not_a_refusal(client, monkeypatch):
+    async def caps(client_, name):
+        return None
+
+    monkeypatch.setattr(P, "_ollama_capabilities", caps)
+    index = {"ollama:mystery": {"model": "mystery", "upstream": "ollama"}}
+    asyncio.run(P._bench_annotate_caps(index, None))
+    assert "benchable" not in index["ollama:mystery"]
+
+
+def test_preflight_refuses_a_model_that_cannot_complete(client):
+    meta = {"model": "nomic-embed", "upstream": "ollama", "loaded": True,
+            "benchable": False, "bench_detail": "cannot answer a chat request — "
+                                                "Ollama reports embedding"}
+    why = P._bench_preflight("nomic-embed", meta, "ollama", {"ollama:nomic-embed": meta})
+    assert why and "cannot be benchmarked" in why

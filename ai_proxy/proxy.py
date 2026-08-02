@@ -8756,6 +8756,10 @@ async def _bench_model_index() -> dict:
             pass
     if index:
         _bench_annotate_fit(index)
+        try:
+            await _bench_annotate_caps(index, app.state.metrics_client)
+        except Exception as e:
+            print(f"[bench] capability probe failed: {type(e).__name__}: {e}")
         return index
     # The snapshot comes from the background metrics collector, which hasn't necessarily run
     # yet on a freshly-started proxy — and a bench submitted in that window would silently get
@@ -8828,6 +8832,28 @@ _BENCH_FIT_OVERHEAD = 1.15
 _BENCH_FIT_RESERVE_MB = 4096
 
 
+# Capabilities are a property of the model tag, so they never change once read. Cached for the
+# process: /api/show is a call per model, and the picker would otherwise make fifteen of them
+# every time someone opened the bench tab.
+_OLLAMA_CAPS: dict = {}
+
+
+async def _ollama_capabilities(client, name: str):
+    """What Ollama says a model can do, or None if it would not say."""
+    if name in _OLLAMA_CAPS:
+        return _OLLAMA_CAPS[name]
+    caps = None
+    try:
+        r = await client.post(f"{OLLAMA_URL}/api/show", json={"model": name})
+        if r.status_code == 200:
+            got = (r.json() or {}).get("capabilities")
+            caps = [str(c) for c in got] if isinstance(got, list) else None
+    except (httpx.RequestError, ValueError):
+        caps = None
+    _OLLAMA_CAPS[name] = caps
+    return caps
+
+
 def _bench_fits(size_mb: float | None, total_mb: float | None) -> bool | None:
     """Can this model be resident on this box at all? None when the size is unknown.
 
@@ -8838,6 +8864,35 @@ def _bench_fits(size_mb: float | None, total_mb: float | None) -> bool | None:
     if not size_mb or not total_mb:
         return None
     return (size_mb * _BENCH_FIT_OVERHEAD) <= (total_mb - _BENCH_FIT_RESERVE_MB)
+
+
+async def _bench_annotate_caps(index: dict, client) -> None:
+    """Mark what cannot answer a chat request at all, and what merely will not answer it well.
+
+    Two different judgements, deliberately kept apart. A model with no `completion` capability
+    — an embedding model — cannot produce a measurement under any configuration, so it is
+    refused the same way a model that does not fit is. A vision model *can*: it completes text,
+    and timing it is a perfectly good speed benchmark. Only its score on a coding suite is
+    meaningless, and that is a fact about the suite you chose, not about the model.
+    """
+    names = [r.get("model") for r in index.values()
+             if r.get("upstream") == "ollama" and r.get("model")]
+    if not names:
+        return
+    caps = await asyncio.gather(*(_ollama_capabilities(client, n) for n in names),
+                                return_exceptions=True)
+    by_name = {n: (c if isinstance(c, list) else None) for n, c in zip(names, caps)}
+    for rec in index.values():
+        got = by_name.get(rec.get("model"))
+        if got is None:
+            continue          # Ollama would not say; an unknown is not a refusal
+        rec["capabilities"] = got
+        if "vision" in got:
+            rec["vision"] = True
+        if "completion" not in got:
+            rec["benchable"] = False
+            rec["bench_detail"] = ("cannot answer a chat request — Ollama reports "
+                                   f"{', '.join(got) or 'no capabilities'}")
 
 
 def _bench_annotate_fit(index: dict) -> None:
@@ -12003,6 +12058,8 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
         return (f"no reachable backend serves {model!r}"
                 + (f" — reachable models: {', '.join(known[:8])}" if known else
                    " — no backend is reachable"))
+    if meta.get("benchable") is False:
+        return f"{model!r} cannot be benchmarked — {meta.get('bench_detail') or 'it does not answer chat requests'}"
     if meta.get("fits") is False:
         return f"{model!r} does not fit on this machine — {meta.get('fit_detail') or 'too large'}"
     if meta.get("startable") and not meta.get("loaded"):

@@ -6826,7 +6826,7 @@ function _benchBindSelectAll() {
     // Everything currently listed: with a backend filter on, "all" means all of what you can
     // see, not a silent sweep of things scrolled out of view.
     const items = (_benchUpFilter ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels)
-      .filter(m => m.fits !== false);
+      .filter(m => m.fits !== false && m.benchable !== false);
     for (const m of items) _benchModelSel.add(m.key);
     _benchRenderModels(); _benchUpdatePlan();
   };
@@ -6852,7 +6852,7 @@ function _benchRenderModels() {
   // along into a sweep — which is how a run meant for one model spent fourteen minutes on
   // another. An empty selection is now a state the user can actually be in.
   if (!_benchModelSel.size && !_benchDefaulted && items.length) {
-    const usable = items.filter(i => i.fits !== false);
+    const usable = items.filter(i => i.fits !== false && i.benchable !== false);
     const first = usable.find(i => i.loaded) || usable[0];
     if (first) _benchModelSel.add(first.key);
     _benchDefaulted = true;
@@ -6881,12 +6881,14 @@ function _benchRenderModels() {
       // A model larger than the machine cannot be measured, so it is not offered. Shown rather
       // than hidden, with the reason: a model missing from the list is indistinguishable from
       // one that was never pulled.
-      if (it.fits === false) {
-        return `<label class="bench-list-row" style="opacity:.5;cursor:not-allowed" title="${esc(it.model)} — ${esc(it.fit_detail || 'too large for this machine')}">
+      const blocked = it.fits === false ? (it.fit_detail || "won't fit")
+        : it.benchable === false ? (it.bench_detail || "cannot answer a chat request") : '';
+      if (blocked) {
+        return `<label class="bench-list-row" style="opacity:.5;cursor:not-allowed" title="${esc(it.model)} — ${esc(blocked)}">
           <input type="checkbox" disabled>
           <span class="dot" style="color:#7a4a4a">⊘</span>
           <span class="nm" style="text-decoration:line-through">${esc(it.model)}</span>
-          <span class="meta" style="color:#a06868">${esc(it.fit_detail || "won't fit")}</span>
+          <span class="meta" style="color:#a06868">${esc(blocked)}</span>
         </label>`;
       }
       return `<label class="bench-list-row${on ? ' on' : ''}" title="${esc(it.model)}${tip}">
@@ -7174,6 +7176,12 @@ function _benchUpdatePlan() {
   const svc = Array.isArray(b.server_context) ? b.server_context : (b.server_context ? [b.server_context] : []);
   if (svc.length > 1) {
     warns.push({level: 'info', text: `↻ ${svc.length} server-context values — the backend restarts and reloads once per value, which dominates the run time`});
+  }
+  const seeing = (b.models || [])
+    .map(m => _benchModelIndex[`${m.upstream}:${m.model}`])
+    .filter(m => m && m.vision).map(m => m.model);
+  if (b.suite && seeing.length) {
+    warns.push({level: 'bad', text: `⚠ ${seeing.join(', ')} is a vision model — it will produce a ${b.suite} score, but not a meaningful one. Speed measurements are still valid.`});
   }
   if (fixable.length) {
     warns.push({level: 'info', text: `↻ ${fixable.map(m => m.upstream).filter((v, i, a) => a.indexOf(v) === i).join(', ')} will be restarted at a larger window to fit ${biggest.toLocaleString()} tokens, then put back — this adds several minutes`});
