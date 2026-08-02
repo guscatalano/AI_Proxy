@@ -6792,6 +6792,16 @@ function _benchModelCount() {
 // What the current selection would cost, from what these models have actually taken before.
 // A "test everything" run is hours, and finding that out an hour in is the failure this
 // prevents. Models never benchmarked fall back to the median of those that have.
+// llama.cpp names a model by its full path, and a split GGUF adds a shard suffix. Fine in the
+// picker, unreadable in a one-line summary.
+function _benchShortModel(name) {
+  let s = String(name || '').trim();
+  if (!s) return '';
+  const cut = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  if (cut >= 0) s = s.slice(cut + 1);
+  return s.replace(/\.gguf$/i, '').replace(/-\d{4,5}-of-\d{4,5}$/, '');
+}
+
 function _benchSelectionCost() {
   const el = $('bench-sel-cost');
   if (!el) return;
@@ -6819,7 +6829,10 @@ function _benchBindSelectAll() {
     for (const m of items) _benchModelSel.add(m.key);
     _benchRenderModels(); _benchUpdatePlan();
   };
-  if (none) none.onclick = () => { _benchModelSel.clear(); _benchRenderModels(); _benchUpdatePlan(); };
+  if (none) none.onclick = () => {
+    _benchDefaulted = true;            // clearing must stay cleared
+    _benchModelSel.clear(); _benchRenderModels(); _benchUpdatePlan();
+  };
 }
 
 function _benchRenderModels() {
@@ -6833,9 +6846,14 @@ function _benchRenderModels() {
     return;
   }
   // Default to something already resident, so the obvious first run measures a warm model.
-  if (!_benchModelSel.size) {
+  // Pre-select something resident on the first render only. This used to run on every render,
+  // so "None" re-added a model the instant it cleared one, and a tick nobody chose could ride
+  // along into a sweep — which is how a run meant for one model spent fourteen minutes on
+  // another. An empty selection is now a state the user can actually be in.
+  if (!_benchModelSel.size && !_benchDefaulted && items.length) {
     const first = items.find(i => i.loaded) || items[0];
     if (first) _benchModelSel.add(first.key);
+    _benchDefaulted = true;
   }
   const ctx = n => n == null ? '' : (n >= 1024 ? Math.round(n / 1024) + 'K' : String(n));
   const byUp = {};
@@ -6925,6 +6943,7 @@ function _benchRenderAxes() {
 }
 
 let _benchModelSel = new Set();
+let _benchDefaulted = false;   // the pre-selection is a first-render courtesy, not a floor
 let _benchPromptSel = new Set(['0']);
 let _benchThinkSel = new Set(['auto']);
 let _benchServerCtxSel = new Set();
@@ -7102,6 +7121,10 @@ function _benchUpdatePlan() {
   const metas = b.models.map(m => _benchModelIndex[`${m.upstream}:${m.model}`]).filter(Boolean);
   const ups = [...new Set(metas.map(m => m.upstream))];
   const route = ups.length ? ` → ${ups.join(' + ')}` : '';
+  // Which models, by name. A count cannot tell you that one of them is a 14-minute model you
+  // did not mean to select.
+  const names = (b.models || []).map(m => _benchShortModel(m.model)).filter(Boolean);
+  const who = names.length ? `${names.length} model${names.length > 1 ? 's' : ''}: ${names.join(', ')}` : '';
   const warns = [];
   const cold = metas.filter(m => !m.loaded);
   // vLLM can't load anything on demand — the server serves what it was launched with, so an
@@ -7167,7 +7190,8 @@ function _benchUpdatePlan() {
     iso = `<div style="color:#d9c37a;margin-top:2px">⏸ ${esc(always)}</div>`
         + `<div style="color:#f0a35a;margin-top:2px">⚠ other traffic keeps running — it will be measured along with the model</div>`;
   }
-  el.innerHTML = scale + esc(route) + warns.map(w =>
+  const whoLine = who ? `<div style="color:#9aa4b2;margin-top:2px">${esc(who)}</div>` : '';
+  el.innerHTML = scale + esc(route) + whoLine + warns.map(w =>
     `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('')
     + iso + grading;
 }
