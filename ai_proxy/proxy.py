@@ -12846,12 +12846,19 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
         # span backends — the same weights on LM Studio and on vLLM are two different cells.
         name = m.get("model") if isinstance(m, dict) else m
         up = (m.get("upstream") or "") if isinstance(m, dict) else ""
+        # server_context only means anything where the window is a launch argument. Expanding
+        # it across every model turned one preset into three identical cells per Ollama model,
+        # all of which failed at the gate with "ollama cannot change its context window" — 84
+        # failures out of 102 from a single tick box. An axis a backend cannot honour is not a
+        # failure for that backend, it is simply not an axis.
+        _prov = PROVIDERS.get(up) if up else None
+        my_servers = servers if (_prov is not None and _prov.resizable_context) else [None]
         for pt in prompts:
             for th in thinks:
                 for tp in temps:
                     for ca in caches:
                         for cc in concs:
-                            for sv in servers:
+                            for sv in my_servers:
                                 axes = {"model": name, "prompt_tokens": int(pt or 0),
                                         "thinking": str(th or "auto")}
                                 if up:

@@ -570,7 +570,7 @@ def test_every_sweepable_axis_survives_submission(client):
     conn.commit()
     conn.close()
 
-    payload = {"models": [{"model": "qwen3:4b", "upstream": "ollama"}], "runs": 1,
+    payload = {"models": [{"model": "ds4", "upstream": "llamacpp"}], "runs": 1,
                "prompt_tokens": [0, 1000], "thinking": ["off", "on"],
                "temperature": [0.0, 0.7], "cache": ["cold", "cached"],
                "concurrency": [1, 2], "server_context": [32768, 65536]}
@@ -594,7 +594,7 @@ def test_a_long_context_sweep_is_not_submitted_as_short_cells(client):
     conn.commit()
     conn.close()
     r = client.post("/__proxy/api/bench/run", json={
-        "models": [{"model": "qwen3:4b", "upstream": "ollama"}],
+        "models": [{"model": "ds4", "upstream": "llamacpp"}],
         "suite": "coding-v1", "prompt_tokens": 0, "cache": ["cold", "cached"],
         "server_context": [32768, 131072, 262144], "runs": 1})
     assert r.status_code == 200, r.text
@@ -677,3 +677,30 @@ def test_the_eta_reaches_the_history_row(client):
     conn.close()
     it = client.get("/__proxy/api/bench/runs").json()["items"][0]
     assert it["cells"]["eta_s"] > 0
+
+
+def test_the_window_axis_does_not_expand_where_it_cannot_apply(client):
+    """One tick of "Long context" produced 102 cells, 84 of which failed instantly with
+    "ollama cannot change its context window" — and the three per model would have been
+    identical anyway. An axis a backend cannot honour is not a failure for it, it is not an
+    axis for it."""
+    models = [{"model": "ds4", "upstream": "llamacpp"},
+              {"model": "qwen3:4b", "upstream": "ollama"},
+              {"model": "qwen3-coder-next", "upstream": "vllm"}]
+    cells = P._bench_expand_matrix(models, {"server_context": [32768, 131072, 262144],
+                                            "cache": ["cold", "cached"]})
+    per = {}
+    for c in cells:
+        per.setdefault(c["upstream"], []).append(c)
+    assert len(per["llamacpp"]) == 6, "the backend that can resize keeps the axis"
+    assert len(per["ollama"]) == 2, f"ollama got {len(per['ollama'])} cells, expected 2"
+    assert len(per["vllm"]) == 2, "vLLM bakes max_model_len into its container arguments"
+    assert all("server_context" not in c for c in per["ollama"])
+    assert sorted(c["server_context"] for c in per["llamacpp"]) == [
+        32768, 32768, 131072, 131072, 262144, 262144]
+
+
+def test_a_window_sweep_of_one_backend_is_unchanged(client):
+    cells = P._bench_expand_matrix([{"model": "ds4", "upstream": "llamacpp"}],
+                                   {"server_context": [32768, 262144]})
+    assert [c["server_context"] for c in cells] == [32768, 262144]
