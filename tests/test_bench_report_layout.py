@@ -356,3 +356,31 @@ def test_the_report_says_what_was_actually_tested(client):
 def test_the_method_section_is_absent_without_a_suite(client):
     html = _render([_run("a", graded=False), _run("b", graded=False)])
     assert "What was tested" not in html
+
+
+def test_a_graded_comparison_carries_the_trade_off_chart(client):
+    """A stray `scatter_html = ""` after the charts block once dropped the scatter from every
+    multi-cell report — silently, because nothing referenced it again before the f-string."""
+    runs = [_graded("a", "m1", "ollama", 1.0, 60, {"x": 1.0}),
+            _graded("b", "m2", "ollama", 0.5, 30, {"x": 0.0}),
+            _graded("c", "m3", "ollama", 0.8, 90, {"x": 0.5})]
+    html = _render(runs)
+    assert "The trade-off" in html
+    assert 'aria-label="Correctness against output rate"' in html
+    # The frontier and the hover names are what make it worth having.
+    assert "stroke-dasharray" in html
+    assert "<title>" in html.split("The trade-off")[-1].split("</svg>")[0]
+    # And it sits before the results table, not buried after the bars.
+    assert html.index("The trade-off") < html.index("<h2>Results</h2>")
+
+
+def test_bar_charts_stop_at_the_leaders(client):
+    """Three charts of 38 bars each was three thousand pixels of the table repeated."""
+    runs = [_graded(f"r{i}", f"model-{i}", "ollama", 0.9, 20 + i, {"x": 1.0})
+            for i in range(20)]
+    html = _render(runs)
+    bars = [s for s in re.findall(r"<svg.*?</svg>", html, re.S)
+            if "Decode rate" in s]
+    assert bars, "the decode ranking chart is gone"
+    assert bars[0].count("<rect") <= 12
+    assert "the full field is in the table" in bars[0]

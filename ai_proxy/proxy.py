@@ -10061,6 +10061,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     # conveys no scale, "best in column" marks everything, and "vs best" is always 1.0x. The
     # only real variation in a single cell is run-to-run spread, so show that instead.
     single = len(rows) == 1
+    scatter_html = ""          # filled by the multi-cell branch; referenced by its results
     if single:
         r0 = rows[0]
 
@@ -10327,10 +10328,11 @@ ordinary slowness rather than a misconfiguration.</p>
         if not varying and len(rows) > 1:
             inert = ('<p class="note warnbox">Every cell in this comparison used identical '
                      'settings, so the rows below differ only by run-to-run noise.</p>')
-        scatter_html = ""
-    # The finding, before the evidence. A comparison whose answer is only recoverable by
+        # The finding, before the evidence. A comparison whose answer is only recoverable by
         # scanning thirty-eight rows has buried it. Best quality first, and among equals the
         # quickest — the same order the table is now sorted in, so the lede names its top row.
+        # (scatter_html was assigned in the charts block above; a stray reset here once
+        # clobbered it and silently dropped the chart from every multi-cell report.)
         _lede = ""
         if len(rows) > 1 and rows[0].get("decode_p50"):
             _b, _bn = rows[0], axis_names[0]
