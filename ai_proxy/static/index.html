@@ -6907,11 +6907,11 @@ function _benchBindSelectAll() {
   const all = $('bench-sel-all'), none = $('bench-sel-none');
   const exp = $('bench-expand');
   if (exp) exp.onclick = () => {
-    // Sticky for the session: having the panel fold itself away again on the next poll, while
-    // someone is halfway through changing something, would be worse than never folding it.
-    _benchUserExpanded = true;
-    document.querySelector('.bench-form').style.display = '';
-    $('bench-collapsed').style.display = 'none';
+    // Sticky either way for the session: the panel must never fold itself away on the next
+    // poll while someone is halfway through changing something, and must never be stuck open.
+    _benchUserExpanded = !_benchUserExpanded;
+    document.querySelector('.bench-form').style.display = _benchUserExpanded ? '' : 'none';
+    exp.textContent = _benchUserExpanded ? 'Hide settings' : 'Change settings';
   };
   const ss = $('bench-suite-simple');
   if (ss) ss.addEventListener('change', _benchUpdatePlan);
@@ -7328,7 +7328,11 @@ function _benchRenderActive(it) {
   if (!it) {
     card.innerHTML = '';
     _benchMiniSetRunning(false);
-    if (!_benchUserExpanded) { form.style.display = ''; strip.style.display = 'none'; }
+    // Back to the ordinary layout, and the toggle forgets itself: the next run should start
+    // collapsed regardless of what was expanded during the last one.
+    form.style.display = '';
+    strip.style.display = 'none';
+    _benchUserExpanded = false;
     return;
   }
   _benchMiniSetRunning(true);
@@ -7363,13 +7367,16 @@ function _benchRenderActive(it) {
       </div>
     </div>`;
   _benchMiniRender();
-  if (!_benchUserExpanded) {
-    form.style.display = 'none';
-    strip.style.display = 'flex';
-    const models = (cfg.models || []).length || 1;
-    $('bench-collapsed-what').textContent =
-      `${models} model${models > 1 ? 's' : ''} · ${cfg.suite || 'speed only'} · ${cfg.runs || 1} run${(cfg.runs || 1) > 1 ? 's' : ''}`;
-  }
+  // The strip is always present while a run is live; only the form comes and goes. Hiding the
+  // strip on expand left no way back, because the strip held the only control that could undo
+  // it.
+  strip.style.display = 'flex';
+  form.style.display = _benchUserExpanded ? '' : 'none';
+  const models = (cfg.models || []).length || 1;
+  $('bench-collapsed-what').textContent =
+    `${models} model${models > 1 ? 's' : ''} · ${cfg.suite || 'speed only'} · ${cfg.runs || 1} run${(cfg.runs || 1) > 1 ? 's' : ''}`;
+  const btn = $('bench-expand');
+  if (btn) btn.textContent = _benchUserExpanded ? 'Hide settings' : 'Change settings';
 }
 
 let _benchUserExpanded = false;
