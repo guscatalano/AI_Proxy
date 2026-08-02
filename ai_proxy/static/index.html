@@ -684,7 +684,12 @@
   .bench-lead .q { color: #3f8f5f; }
   .bench-lead .q.mid { color: #d9c37a; }
   .bench-lead .q.low { color: #e08080; }
-  .bench-lead .more { color: #4d5765; font-size: 10.5px; padding-top: 5px; }
+  .bench-lead .more { color: #7a879a; font-size: 10.5px; padding-top: 7px; background: none;
+    border: none; cursor: pointer; font-family: inherit; padding-left: 0; text-align: left;
+    text-decoration: underline; text-underline-offset: 3px; }
+  .bench-lead .more:hover { color: #9aa4b2; }
+  /* Expanded, a 38-cell sweep would push the history off the screen, so it scrolls in place. */
+  .bench-lead .scroll { max-height: 260px; overflow-y: auto; }
   .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
   .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
     color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
@@ -7431,6 +7436,7 @@ function _benchRenderActive(it) {
 let _benchUserExpanded = false;
 let _benchMiniTiles = [];
 let _benchLeadRows = [];
+let _benchLeadAll = false;
 let _benchLeadTimer = null;
 let _benchLeadFor = '';
 
@@ -7447,9 +7453,9 @@ function _benchLeadRender() {
   // is good", and among the good ones, "which is quickest".
   rows.sort((a, b) => (b.perfect_rate ?? -1) - (a.perfect_rate ?? -1)
                    || (b.decode_p50 || 0) - (a.decode_p50 || 0));
-  const top = rows.slice(0, 6);
+  const top = _benchLeadAll ? rows : rows.slice(0, 6);
   host.innerHTML = `<h4>Standings — ${rows.length} cell${rows.length > 1 ? 's' : ''} in</h4>
-    <table><tbody>${top.map((r, i) => {
+    <div class="${_benchLeadAll ? 'scroll' : ''}"><table><tbody>${top.map((r, i) => {
       const bits = String(r.label || '').split(' · ').slice(1).filter(x => x && !x.startsWith('@'));
       const q = r.perfect_rate;
       const cls = q == null ? '' : (q >= 0.9 ? 'q' : q >= 0.6 ? 'q mid' : 'q low');
@@ -7460,8 +7466,15 @@ function _benchLeadRender() {
         ${graded ? `<td class="n ${cls}">${q == null ? '—' : Math.round(q * 100) + '%'}</td>` : ''}
         <td class="n">${(r.decode_p50 || 0).toFixed(1)} tok/s</td>
       </tr>`;
-    }).join('')}</tbody></table>
-    ${rows.length > top.length ? `<div class="more">+ ${rows.length - top.length} more — full table in the report when it finishes</div>` : ''}`;
+    }).join('')}</tbody></table></div>
+    ${rows.length > 6
+      ? `<button type="button" class="more" id="bench-lead-more">${
+          _benchLeadAll ? 'Show the top 6' : `See all ${rows.length} results`}</button>`
+      : ''}`;
+  const more = $('bench-lead-more');
+  // Rebound on every render because the table is replaced wholesale; a listener attached once
+  // would be lost the first time a cell finished.
+  if (more) more.onclick = () => { _benchLeadAll = !_benchLeadAll; _benchLeadRender(); };
 }
 
 async function _benchLeadPoll() {
@@ -7480,6 +7493,7 @@ function _benchLeadSetRunning(id) {
   if (id && _benchLeadFor !== id) {
     _benchLeadFor = id;
     _benchLeadRows = [];
+    _benchLeadAll = false;
     _benchLeadPoll();
   }
   if (id && !_benchLeadTimer) {
