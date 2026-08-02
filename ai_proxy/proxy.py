@@ -9004,6 +9004,46 @@ async def bench_run(request: Request):
             "matrix": is_matrix, "cells": len(cells)}
 
 
+def _bench_eta_s(cells: list, now: float) -> float | None:
+    """Seconds left in a sweep, from what it has already done.
+
+    Two costs, and the second is the one a naive estimate misses: a cell's own runtime, and the
+    gap before it starts. On a server_context sweep that gap is a backend restart and a full
+    model reload — minutes, sometimes longer than the cell itself — so an ETA built from cell
+    durations alone reads far too optimistic. Both are measured from this run rather than
+    assumed, so a slow box gets a slow estimate.
+    """
+    # `is not None`, not truthiness: a timestamp of 0 is a real time, and dropping those cells
+    # silently degrades the estimate to "no basis" rather than to a wrong number.
+    done = [c for c in cells if c["status"] == "done"
+            and c["started_ts"] is not None and c["finished_ts"] is not None]
+    if not done:
+        return None
+    durs = [c["finished_ts"] - c["started_ts"] for c in done]
+    mean_dur = sum(durs) / len(durs)
+    # Gap = time between one cell finishing and the next starting.
+    gaps = []
+    for prev, nxt in zip(cells, cells[1:]):
+        if (prev["finished_ts"] is not None and nxt["started_ts"] is not None
+                and nxt["started_ts"] > prev["finished_ts"]):
+            gaps.append(nxt["started_ts"] - prev["finished_ts"])
+    mean_gap = (sum(gaps) / len(gaps)) if gaps else 0.0
+    total = 0.0
+    for c in cells:
+        if c["status"] in ("done", "skipped", "failed"):
+            continue
+        if c["status"] == "running":
+            elapsed = now - (now if c["started_ts"] is None else c["started_ts"])
+            prog, want = (c["progress"] or 0), (c["progress_total"] or 0)
+            # Project from this cell's own pace once it has produced anything; before that its
+            # own history is all we have.
+            total += max(0.0, (elapsed * want / prog) - elapsed) if (prog and want) \
+                else max(0.0, mean_dur - elapsed)
+        else:
+            total += mean_dur + mean_gap
+    return round(total, 1) if total > 0 else None
+
+
 @app.get("/__proxy/api/bench/runs")
 async def bench_runs_list(request: Request, limit: int = 50, include_children: bool = False):
     """History, one entry per submission.
@@ -9048,6 +9088,18 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
             entry = cells.setdefault(c["parent_id"], {"total": 0})
             entry.setdefault("now", {"label": c["label"], "progress": c["progress"],
                                      "progress_total": c["progress_total"]})
+        # How much longer, measured from this run's own pace.
+        now_ts = time.time()
+        by_parent: dict = {}
+        for c in conn.execute(
+            f"SELECT parent_id, status, started_ts, finished_ts, progress, progress_total "
+            f"FROM bench_runs WHERE parent_id IN ({qs}) ORDER BY ts, rowid", ids,
+        ).fetchall():
+            by_parent.setdefault(c["parent_id"], []).append(dict(c))
+        for pid, kids in by_parent.items():
+            eta = _bench_eta_s(kids, now_ts)
+            if eta is not None and cells.get(pid):
+                cells[pid]["eta_s"] = eta
     conn.close()
     viewer = _client_ip(request)
     items = []

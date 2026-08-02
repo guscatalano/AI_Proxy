@@ -609,3 +609,70 @@ def test_a_long_context_sweep_is_not_submitted_as_short_cells(client):
     assert any("32k ctx" in l for l in labels), labels
     assert any("256k ctx" in l for l in labels), labels
     assert not all(l.endswith("short") for l in labels), "every cell came out short"
+
+
+# ---- ETA ---------------------------------------------------------------------------------
+
+def _cell(status, started, finished, prog=0, total=36):
+    return {"status": status, "started_ts": started, "finished_ts": finished,
+            "progress": prog, "progress_total": total}
+
+
+def test_eta_counts_the_gap_between_cells(client):
+    """The cost a naive estimate misses. On a server_context sweep the gap between cells is a
+    backend restart and a full model reload -- often longer than the cell itself -- so an ETA
+    built from cell durations alone reads far too optimistic."""
+    now = 10_000.0
+    cells = [_cell("done", 0, 400, 36),          # 400s of work
+             _cell("done", 800, 1200, 36),       # ...preceded by a 400s reload
+             _cell("pending", None, None)]
+    eta = P._bench_eta_s(cells, now)
+    assert eta is not None
+    assert 750 <= eta <= 850, f"expected ~800s (work + reload), got {eta}"
+
+
+def test_eta_projects_the_running_cell_from_its_own_pace(client):
+    now = 1_000.0
+    # Half done after 300s -> 300s left, and nothing pending.
+    cells = [_cell("running", 700, None, prog=18, total=36)]
+    # No completed cell yet, so there is no basis at all.
+    assert P._bench_eta_s(cells, now) is None
+    cells = [_cell("done", 0, 600, 36), _cell("running", 700, None, prog=18, total=36)]
+    eta = P._bench_eta_s(cells, now)
+    assert 250 <= eta <= 350, eta
+
+
+def test_a_finished_sweep_has_no_eta(client):
+    assert P._bench_eta_s([_cell("done", 0, 400, 36), _cell("done", 500, 900, 36)],
+                          10_000.0) is None
+
+
+def test_skipped_and_failed_cells_are_not_waited_for(client):
+    """A cell that already failed is not work still to come. Cells are laid out contiguously so
+    no gap is observed either way, leaving the count of remaining cells as the only difference."""
+    now = 10_000.0
+    two_pending = [_cell("done", 0, 400, 36),
+                   _cell("pending", None, None), _cell("pending", None, None)]
+    one_dead = [_cell("done", 0, 400, 36),
+                _cell("failed", 400, 500), _cell("pending", None, None)]
+    assert P._bench_eta_s(two_pending, now) == 800
+    assert P._bench_eta_s(one_dead, now) == 400
+
+
+def test_the_eta_reaches_the_history_row(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    now = time.time()
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status) "
+                 "VALUES ('b_p', ?, 'm', '{}', 'running')", (now - 900,))
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, "
+                 "started_ts, finished_ts, progress, progress_total) "
+                 "VALUES ('b_p1', ?, 'm', '{}', 'done', 'b_p', ?, ?, 36, 36)",
+                 (now - 900, now - 900, now - 500))
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, "
+                 "label, progress, progress_total) "
+                 "VALUES ('b_p2', ?, 'm', '{}', 'pending', 'b_p', 'cell 2', 0, 36)", (now - 900,))
+    conn.commit()
+    conn.close()
+    it = client.get("/__proxy/api/bench/runs").json()["items"][0]
+    assert it["cells"]["eta_s"] > 0

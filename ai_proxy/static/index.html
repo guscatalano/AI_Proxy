@@ -590,7 +590,17 @@
   .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #57d1e0; }
   .snav .cntx { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; color: #5f6675; }
   .snav-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-  .snav-pip.live { background: #68d391; box-shadow: 0 0 8px #68d391; animation: shell-pulse 1.6s infinite; }
+  /* The pip was a fixed green whether the box was idle or saturated: it said "the Live view
+     exists", not "something is happening". Tiers are the same thresholds and the same colours
+     the GPU readout inside the Live view already uses, so one colour means one thing in both
+     places. Idle is deliberately grey and still — an unmoving dot is information. */
+  .snav-pip.live { background: #68d391; box-shadow: 0 0 8px #68d391; animation: shell-pulse 1.6s infinite;
+                   transition: background .35s, box-shadow .35s; }
+  .snav-pip.live[data-load="idle"] { background: #454d5c; box-shadow: none; animation: none; }
+  .snav-pip.live[data-load="mid"]  { background: #f0c674; box-shadow: 0 0 9px #f0c674; animation-duration: 1s; }
+  .snav-pip.live[data-load="high"] { background: #f07178; box-shadow: 0 0 12px #f07178; animation-duration: .55s; }
+  .snav[data-load="mid"] .lbl2  { color: #f0c674; }
+  .snav[data-load="high"] .lbl2 { color: #f07178; }
   .snav-pip.badge { background: #f07178; box-shadow: 0 0 8px #f07178; display: none; }
   @keyframes shell-pulse { 50% { opacity: .35; } }
   .shell-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid #23262f; display: flex; flex-direction: column; gap: 8px; }
@@ -1221,6 +1231,18 @@ async function shellVitals() {
       tps = Math.round(tiles.reduce((a, t) => a + (t.tps || 0), 0));
     } catch {}
   }
+  // Live pip: colour and pulse rate by how many requests are actually in flight. `active` is
+  // already computed above for the vitals strip; it just had no other consumer.
+  try {
+    const tier = active >= 6 ? 'high' : active >= 3 ? 'mid' : active >= 1 ? 'low' : 'idle';
+    const pip = document.querySelector('.snav-pip.live');
+    const btn = document.querySelector('.snav[data-view="live"]');
+    if (pip) {
+      pip.dataset.load = tier;
+      pip.title = active ? `${active} request${active === 1 ? '' : 's'} in flight` : 'idle';
+    }
+    if (btn) btn.dataset.load = tier;
+  } catch {}
   // version once; error-rate (last 1h) refreshed every ~20s (perf is server-cached)
   // Re-checked on every vitals tick, not just once: the point is to notice a deploy that
   // happens while this tab is sitting open.
@@ -7160,12 +7182,24 @@ async function _benchRefreshHistory() {
   }
 }
 
+// Coarse on purpose: a bench ETA that reads "7m 42s" claims a precision the estimate does not
+// have, and watching seconds tick invites treating it as a promise.
+function _benchEta(sec) {
+  const m = Math.round(sec / 60);
+  if (m < 1) return 'under a minute';
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
 function _benchRowSig(it) {
   // The cell rollup belongs here: a sweep's row is otherwise only redrawn when the parent's
   // own counters move, so "3 done, 1 failed" would freeze while the matrix kept running.
   const c = it.cells || {}, n = c.now || {};
   return [it.status, it.progress, it.progress_total, it.error || '',
           c.total, c.done, c.failed, c.skipped, c.running, c.pending,
+          // Bucketed: the raw value moves every poll and would redraw the row each time.
+          c.eta_s === undefined ? '' : Math.round(c.eta_s / 60),
           n.label, n.progress, n.progress_total,
           _benchSelected.has(it.id) ? 1 : 0].join('|');
 }
@@ -7186,6 +7220,7 @@ function _benchRowHead(it) {
     if (cells.skipped) bits.push(`<span style="color:#d9c37a">${cells.skipped} skipped</span>`);
     const pend = (cells.pending || 0) + (cells.running || 0);
     if (pend) bits.push(`${pend} to go`);
+    if (cells.eta_s > 0) bits.push(`~${_benchEta(cells.eta_s)} left`);
     cellNote = ` · <span style="color:#888">${cells.total} cells: ${bits.join(', ')}</span>`;
     // Which cell is in flight. Without this the row sits at "0 done" for the length of a
     // whole cell, which on a graded 262k sweep is many minutes of looking stuck.
