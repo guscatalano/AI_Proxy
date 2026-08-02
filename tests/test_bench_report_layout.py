@@ -66,6 +66,21 @@ def test_the_ratio_sits_under_vs_best():
     assert "%" in cells[head.index("Fully correct")]
 
 
+def test_the_axes_are_the_identity_of_a_row():
+    """A Configuration column beside the axis columns restated them word for word: the row read
+    "cold · 32,000 | cold | 32,000 | ...". The axes are what names a cell."""
+    runs = [_run("a", prompt=32000), _run("b", prompt=131072)]
+    head, cells = _first_table(_render(runs))
+    assert "Configuration" not in head
+    assert head[0] in ("Cache", "Prompt")
+    assert cells[0] in ("cold", "32,000")
+
+
+def test_a_comparison_with_no_varying_axis_still_names_its_rows():
+    head, _ = _first_table(_render([_run("a"), _run("b")]))
+    assert head[0] == "Configuration"
+
+
 def test_settings_shared_by_every_cell_leave_the_table():
     # Model, quant, backend and thinking are identical across a single-model sweep; printing
     # them once is the difference between 7 columns and 17.
@@ -73,6 +88,7 @@ def test_settings_shared_by_every_cell_leave_the_table():
     head, _ = _first_table(_render(runs))
     for gone in ("Model", "Backend", "Think"):
         assert gone not in head, f"{gone} is the same in every row and still has a column"
+    assert len(head) <= 10, f"{len(head)} columns is a horizontal scrollbar, not a table"
     assert "Prompt" in head, "the axis that actually varies must be shown"
 
 

@@ -9496,7 +9496,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     # the ratio printed under "Fully correct" and each quality figure sat one column left of
     # its name.
     show_vs = len(rows) > 1
-    head = (["Configuration"] + [labels[k] for k in varying]
+    # No separate Configuration column when the axes are shown: it restated them word for word.
+    head = ((["Configuration"] if not varying else [labels[k] for k in varying])
             + ["TTFT p50", "Decode p50", "Tokens", "Total p50"]
             + (["Fully correct", "Cases"] if graded else [])
             + (["vs best"] if show_vs else [])
@@ -9512,8 +9513,11 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     for r, run, av, nm in zip(rows, runs, axis_vals, axis_names):
         cfg = run.get("config") or {}
         slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
-        cells = [f'<th scope="row" class="cfg">{_h(nm)}</th>']
-        cells += [f'<td class="ax">{_h(av.get(k) or "—")}</td>' for k in varying]
+        if varying:
+            cells = [f'<th scope="row" class="ax">{_h(av.get(varying[0]) or "—")}</th>']
+            cells += [f'<td class="ax">{_h(av.get(k) or "—")}</td>' for k in varying[1:]]
+        else:
+            cells = [f'<th scope="row" class="cfg">{_h(nm)}</th>']
         cells += [
             f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
@@ -9640,7 +9644,7 @@ everywhere except one task and a model mediocre throughout can share an overall 
             verdict = ("cache is working" if speedup and speedup >= 1.5 else
                        "no measurable reuse" if speedup else "—")
             trs.append(
-                f'<tr><th scope="row"><code>{_h(model)}</code></th>'
+                f'<tr><th scope="row"><code class="mdl">{_h(_bench_model_display(model))}</code></th>'
                 f'<td class="n">{fmt(ctx)}</td><td>{_h(think)}</td>'
                 f'<td class="n">{fmt(cold, 0, " ms")}</td>'
                 f'<td class="n">{fmt(cached, 0, " ms")}</td>'
@@ -9651,7 +9655,7 @@ everywhere except one task and a model mediocre throughout can share an overall 
 repeats one identical prompt after a priming request. A backend whose prefix caching is off or
 unsupported shows roughly the same first-token latency in both columns — which looks like
 ordinary slowness rather than a misconfiguration.</p>
-<table><thead><tr><th>Model</th><th>Context</th><th>Think</th><th>Cold TTFT</th>
+<table><thead><tr><th>Model</th><th class="n">Prompt</th><th>Think</th><th class="n">Cold TTFT</th>
 <th>Cached TTFT</th><th>Speed-up</th><th></th></tr></thead><tbody>{"".join(trs)}</tbody></table>"""
 
     # The warm-up in cached mode sends the prompt the measured runs will send, so its TTFT is
