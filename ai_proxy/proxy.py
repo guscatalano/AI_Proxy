@@ -8817,6 +8817,19 @@ async def bench_models():
     VRAM by the first request, so without a warm-up that load time lands inside the first
     measurement."""
     index = await _bench_model_index()
+    # What each model has historically cost per cell, so a sweep can be priced before it runs
+    # rather than discovered to be a three-hour job an hour in.
+    conn = db()
+    try:
+        cost = _bench_history_cost(conn)
+        measured = _bench_completed_cells(conn)
+    finally:
+        conn.close()
+    typical = (sorted(cost.values())[len(cost) // 2] if cost else None)
+    for meta in index.values():
+        meta["est_cell_s"] = cost.get(meta.get("model")) or typical
+        meta["measured_before"] = meta.get("model") in {
+            json.loads(k).get("model") for k in measured}
     items = [dict(meta, key=key) for key, meta in index.items()]
     items.sort(key=lambda i: (i["upstream"], not i["loaded"], i["model"]))
     # Per-backend rollup: what's reachable, how much of it is resident, and whether unloaded
@@ -8993,6 +9006,9 @@ async def bench_run(request: Request):
     sctx = keep("server_context", int)
     if sctx:
         config["server_context"] = sctx
+    # Reuse cells an earlier run already measured with identical settings. Off unless asked
+    # for: a benchmark that silently hands back old numbers is worse than a slow one.
+    config["resume"] = bool(payload.get("resume", False))
 
     # A matrix is any submission with more than one cell across the sweepable axes.
     cells = _bench_expand_matrix(models, config)
@@ -9037,6 +9053,52 @@ async def bench_run(request: Request):
         asyncio.create_task(_bench_execute(bench_id, request.app))
     return {"id": bench_id, "model": models[0]["model"], "config": config,
             "matrix": is_matrix, "cells": len(cells)}
+
+
+# Everything that changes what a cell measures. Two cells with the same signature would
+# produce the same numbers, which is what makes reuse safe — and what makes changing any
+# setting correctly force a re-measurement.
+_BENCH_SIG_KEYS = ("upstream", "suite", "runs", "max_tokens", "prompt_tokens", "server_context",
+                   "thinking", "temperature", "cache", "concurrency", "randomize", "warmup")
+
+
+def _bench_cell_sig(model: str, cfg: dict) -> str:
+    parts = {k: cfg.get(k) for k in _BENCH_SIG_KEYS}
+    parts["model"] = model
+    return json.dumps(parts, sort_keys=True, default=str)
+
+
+def _bench_completed_cells(conn, days: int = 30) -> dict:
+    """Signature -> the most recent completed run that measured it."""
+    out: dict = {}
+    rows = conn.execute(
+        "SELECT id, model, config_json, results_json, env_json, axes_json, label, "
+        "       started_ts, finished_ts, progress, progress_total "
+        "FROM bench_runs WHERE status='done' AND ts > ? ORDER BY ts ASC",
+        (time.time() - days * 86400,)).fetchall()
+    for r in rows:
+        try:
+            cfg = json.loads(r["config_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if cfg.get("models"):
+            continue          # a sweep parent measures nothing itself
+        out[_bench_cell_sig(r["model"], cfg)] = r      # later rows win: most recent
+    return out
+
+
+def _bench_history_cost(conn, days: int = 30) -> dict:
+    """Mean completed-cell seconds per model, so a sweep can be costed before it runs."""
+    rows = conn.execute(
+        "SELECT model, started_ts, finished_ts FROM bench_runs "
+        "WHERE status='done' AND started_ts IS NOT NULL AND finished_ts IS NOT NULL "
+        "AND ts > ? ORDER BY ts DESC LIMIT 500", (time.time() - days * 86400,)).fetchall()
+    agg: dict = {}
+    for r in rows:
+        d = r["finished_ts"] - r["started_ts"]
+        if d > 0:
+            agg.setdefault(r["model"], []).append(d)
+    return {m: round(sum(v) / len(v)) for m, v in agg.items()}
 
 
 def _bench_eta_s(cells: list, now: float) -> float | None:
@@ -12382,6 +12444,8 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     now = time.time()
     # Largest window any cell needs, and the widest concurrency it needs it at. Collected while
     # planning so the backend is sized once, before the first cell runs.
+    prior = _bench_completed_cells(conn) if cfg.get("resume") else {}
+    reused = 0
     need_ctx, need_par, need_up = 0, 1, ""
     ctx_axis_up = ""      # set when the sweep varies the window itself, per cell
     start_meta = None     # a configured-but-stopped backend this sweep needs
@@ -12444,6 +12508,29 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
             )
             skipped += 1
             continue
+        old = prior.get(_bench_cell_sig(axes["model"], child_cfg))
+        if old is not None:
+            # Copied rather than re-parented, so the run it came from keeps its own report
+            # intact. The copy records where the numbers came from — a measurement whose
+            # provenance is invisible is worse than no measurement.
+            try:
+                oenv = json.loads(old["env_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                oenv = {}
+            oenv["reused_from"] = old["id"]
+            oenv["reused_measured_at"] = old["finished_ts"]
+            conn.execute(
+                """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
+                                           parent_id, axes_json, label, results_json, env_json,
+                                           started_ts, finished_ts, progress, progress_total)
+                   VALUES (?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cid, now, axes["model"], json.dumps(child_cfg), creator_ip, parent_id,
+                 json.dumps(axes), _bench_cell_label(axes), old["results_json"],
+                 json.dumps(oenv), old["started_ts"], old["finished_ts"],
+                 old["progress"], old["progress_total"]),
+            )
+            reused += 1
+            continue
         conn.execute(
             """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
                                        parent_id, axes_json, label)
@@ -12456,7 +12543,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=?, "
         "results_json=? WHERE id=?",
         (time.time(), len(child_ids),
-         json.dumps({"children": child_ids, "skipped": skipped}), parent_id),
+         json.dumps({"children": child_ids, "skipped": skipped, "reused": reused}), parent_id),
     )
     conn.commit()
     conn.close()

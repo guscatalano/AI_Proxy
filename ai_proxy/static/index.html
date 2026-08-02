@@ -589,6 +589,11 @@
   .snav.on svg { opacity: 1; color: #57d1e0; }
   .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #57d1e0; }
   .snav .cntx { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; color: #5f6675; }
+  .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
+  .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
+    color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
+    padding: 2px 9px; cursor: pointer; }
+  .bench-selall button:hover { border-color: #3a4e6a; color: #e9edf4; }
   .snav-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; }
   /* The pip was a fixed green whether the box was idle or saturated: it said "the Live view
      exists", not "something is happening". Tiers are the same thresholds and the same colours
@@ -6553,6 +6558,11 @@ async function loadBench() {
             </div>
             <div class="bench-row stack">
               <label id="bench-model-label">Models</label>
+              <div class="bench-selall">
+                <button type="button" id="bench-sel-all">Select all</button>
+                <button type="button" id="bench-sel-none">None</button>
+                <span id="bench-sel-cost" class="bench-hint"></span>
+              </div>
               <div id="bench-model" class="bench-list" role="group" aria-labelledby="bench-model-label"></div>
               <div class="bench-legend">
                 <span><b style="color:#3f8f5f">●</b> in memory, ready to measure</span>
@@ -6630,6 +6640,10 @@ async function loadBench() {
               <input type="checkbox" id="bench-exclusive" checked>
               <span>Hold other clients<em>they queue until it finishes</em></span>
             </label>
+            <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run. Changing any setting changes the cell, so it is measured again. Off by default: a benchmark that quietly hands back old numbers is worse than a slow one.">
+              <input type="checkbox" id="bench-resume">
+              <span>Reuse completed cells<em>skip what an earlier run already measured with the same settings</em></span>
+            </label>
             <label class="bench-check" title="As above, and additionally blocks all proxied traffic with 503 for the duration. Stronger than holding clients, which only queues them.">
               <input type="checkbox" id="bench-quiesce">
               <span>Also block all traffic<em>panic mode for the duration, restored after</em></span>
@@ -6687,6 +6701,7 @@ async function loadBench() {
     try { _mode = localStorage.getItem('ai-proxy-bench-mode') || 'simple'; } catch {}
     _benchSetMode(_mode);
     _benchRenderAxes();
+    _benchBindSelectAll();
     await _benchPopulateModels();
   }
   await _benchRefreshHistory();
@@ -6774,6 +6789,39 @@ function _benchModelCount() {
   lab.innerHTML = `Models <span class="bench-hint"${hidden ? ' style="color:#f0a35a"' : ''}>${esc(legend)}</span>`;
 }
 
+// What the current selection would cost, from what these models have actually taken before.
+// A "test everything" run is hours, and finding that out an hour in is the failure this
+// prevents. Models never benchmarked fall back to the median of those that have.
+function _benchSelectionCost() {
+  const el = $('bench-sel-cost');
+  if (!el) return;
+  const picked = Array.from(_benchModelSel).map(k => _benchModelIndex[k]).filter(Boolean);
+  if (!picked.length) { el.textContent = ''; return; }
+  const b = _benchBody();
+  const perModel = Math.max(1, _benchPlanCounts(b).cells / Math.max(1, picked.length));
+  let secs = 0;
+  for (const m of picked) secs += (m.est_cell_s || 0) * perModel;
+  // Each backend beyond the first costs a stop and a full model load.
+  const switches = Math.max(0, new Set(picked.map(m => m.upstream)).size - 1);
+  secs += switches * 420;
+  if (!secs) { el.textContent = ''; return; }
+  const already = picked.filter(m => m.measured_before).length;
+  el.textContent = `≈ ${_benchEta(secs)}` + (switches ? ` · ${switches} backend switch${switches > 1 ? 'es' : ''}` : '')
+    + (already ? ` · ${already} measured before — "Reuse" skips them` : '');
+}
+
+function _benchBindSelectAll() {
+  const all = $('bench-sel-all'), none = $('bench-sel-none');
+  if (all) all.onclick = () => {
+    // Everything currently listed: with a backend filter on, "all" means all of what you can
+    // see, not a silent sweep of things scrolled out of view.
+    const items = _benchUpFilter ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels;
+    for (const m of items) _benchModelSel.add(m.key);
+    _benchRenderModels(); _benchUpdatePlan();
+  };
+  if (none) none.onclick = () => { _benchModelSel.clear(); _benchRenderModels(); _benchUpdatePlan(); };
+}
+
 function _benchRenderModels() {
   const host = $('bench-model');
   if (!host) return;
@@ -6819,6 +6867,7 @@ function _benchRenderModels() {
     }).join('');
   }).join('');
   _benchModelCount();
+  _benchSelectionCost();
   for (const cb of host.querySelectorAll('input[data-key]')) {
     cb.onchange = () => {
       if (cb.checked) _benchModelSel.add(cb.dataset.key);
@@ -6935,7 +6984,9 @@ function _benchPreset() {
   const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
   const base = _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
   const hold = $('bench-hold');
-  return Object.assign({}, base, { exclusive: !hold || hold.checked });
+  const res = $('bench-resume');
+  return Object.assign({}, base, { exclusive: !hold || hold.checked,
+                                   resume: !!(res && res.checked) });
 }
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
@@ -7012,6 +7063,7 @@ function _benchBody() {
     bypass_router: $('bench-bypass').checked,
     no_nudge: $('bench-nonudge').checked,
     warmup: $('bench-warmup').checked,
+    resume: !!($('bench-resume') || {}).checked,
   };
   if (temps) body.temperature = temps.length > 1 ? temps : temps[0];
   // No top-level `upstream`: each selected model already carries its own, which is what makes
