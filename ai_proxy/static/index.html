@@ -6543,8 +6543,15 @@ async function loadBench() {
               </div>
             </div>
             <div class="bench-adv bench-row stack">
-              <label id="bench-prompt-label">Prompt size <span class="bench-hint">— how much context to send</span></label>
+              <label id="bench-prompt-label">Prompt size <span class="bench-hint">— how many tokens each request sends</span></label>
               <div id="bench-prompt" class="bench-toggles" role="group" aria-labelledby="bench-prompt-label"></div>
+            </div>
+            <div class="bench-adv bench-row stack">
+              <label id="bench-serverctx-label">Server context <span class="bench-hint">— the window the backend is launched with, restarted per value</span></label>
+              <div id="bench-serverctx" class="bench-toggles" role="group" aria-labelledby="bench-serverctx-label"></div>
+              <div class="bench-legend">
+                <span>a different question from prompt size: does the model slow down merely because a larger KV cache is allocated? picking more than one restarts the backend between groups</span>
+              </div>
             </div>
             <div class="bench-adv bench-row stack">
               <label id="bench-thinking-label">Thinking <span class="bench-hint">— whether the model reasons before answering</span></label>
@@ -6811,6 +6818,10 @@ const _BENCH_PROMPT_SIZES = [
   ['0', 'short'], ['2000', '2K'], ['4000', '4K'], ['8000', '8K'], ['16000', '16K'],
   ['32000', '32K'], ['65536', '64K'], ['131072', '128K'], ['262144', '256K'],
 ];
+// The window llama.cpp is launched with, not the prompt. Empty selection = leave it alone.
+const _BENCH_SERVER_CTX = [
+  ['32768', '32K'], ['65536', '64K'], ['131072', '128K'], ['262144', '256K'],
+];
 const _BENCH_THINK_OPTS = [
   ['auto', 'auto', "Leave the proxy's per-model quirks in place — what production traffic sees"],
   ['off', 'off', 'enable_thinking=false plus reasoning_effort=none'],
@@ -6840,12 +6851,14 @@ function _benchRenderToggles(hostId, opts, sel) {
 
 function _benchRenderAxes() {
   _benchRenderToggles('bench-prompt', _BENCH_PROMPT_SIZES, _benchPromptSel);
+  _benchRenderToggles('bench-serverctx', _BENCH_SERVER_CTX, _benchServerCtxSel);
   _benchRenderToggles('bench-thinking', _BENCH_THINK_OPTS, _benchThinkSel);
 }
 
 let _benchModelSel = new Set();
 let _benchPromptSel = new Set(['0']);
 let _benchThinkSel = new Set(['auto']);
+let _benchServerCtxSel = new Set();
 let _benchModels = [], _benchUpstreams = [], _benchUpFilter = '';
 
 let _benchModelIndex = {};
@@ -6960,6 +6973,7 @@ function _benchBody() {
   if (_benchSimple()) return Object.assign({models}, _benchPreset());
   // Sorted so the sweep runs smallest-context-first and the cell order is predictable.
   const prompts = Array.from(_benchPromptSel).map(v => parseInt(v, 10) || 0).sort((a, b) => a - b);
+  const servers = Array.from(_benchServerCtxSel).map(v => parseInt(v, 10) || 0).filter(Boolean).sort((a, b) => a - b);
   const thinking = Array.from(_benchThinkSel);
   const temps = _benchTemps();
   const body = {
@@ -6967,6 +6981,8 @@ function _benchBody() {
     runs: parseInt($('bench-runs').value, 10) || 5,
     max_tokens: parseInt($('bench-maxtok').value, 10) || 256,
     prompt_tokens: prompts.length > 1 ? prompts : (prompts[0] || 0),
+    // Omitted entirely when nothing is picked, so the backend is left exactly as found.
+    server_context: servers.length > 1 ? servers : (servers[0] || undefined),
     thinking: thinking.length > 1 ? thinking : (thinking[0] || 'auto'),
     concurrency: parseInt($('bench-concur').value, 10) || 1,
     drain_seconds: parseFloat($('bench-drain').value) || 0,
@@ -7041,6 +7057,9 @@ function _benchUpdatePlan() {
   const stuck = tooSmall.filter(m => !canResize.has(m.upstream));
   if (stuck.length) {
     warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${stuck.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — the run will be refused rather than return empty completions`});
+  }
+  if (b.suite && biggest > 0) {
+    warns.push({level: 'bad', text: `⚠ prompt size does nothing with a graded suite — the suite sends its own task prompts, so every prompt-size cell measures the same thing. Use Server context to vary the window instead.`});
   }
   if (fixable.length) {
     warns.push({level: 'info', text: `↻ ${fixable.map(m => m.upstream).filter((v, i, a) => a.indexOf(v) === i).join(', ')} will be restarted at a larger window to fit ${biggest.toLocaleString()} tokens, then put back — this adds several minutes`});

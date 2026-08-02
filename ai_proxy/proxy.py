@@ -2132,7 +2132,8 @@ class Provider(SideService):
         """(tokens per slot, slot count) as currently served. (0, 1) when unknown."""
         return 0, 1
 
-    async def resize_context(self, per_slot: int, concurrency: int = 1) -> dict:
+    async def resize_context(self, per_slot: int, concurrency: int = 1,
+                             exact: bool = False) -> dict:
         """Relaunch serving at least `per_slot` tokens, with room for `concurrency` requests.
 
         Returns {ok, changed, detail, previous}. `previous` is whatever must be handed back to
@@ -2231,7 +2232,8 @@ class _LlamaCppProvider(_FnProvider):
         snap = await _llamacpp_snapshot(app.state.metrics_client)
         return int(snap.get("n_ctx") or 0), max(1, int(snap.get("parallel") or 1))
 
-    async def resize_context(self, per_slot: int, concurrency: int = 1) -> dict:
+    async def resize_context(self, per_slot: int, concurrency: int = 1,
+                             exact: bool = False) -> dict:
         """`--ctx-size` is the whole KV pool, divided across `--parallel` slots, so the window a
         single request actually gets is total/parallel. That makes lowering parallel the usual
         way to buy a bigger window: one slot of 36k costs less memory than four of 32k, not
@@ -2240,12 +2242,21 @@ class _LlamaCppProvider(_FnProvider):
         """
         per_slot, want_par = int(per_slot), max(1, int(concurrency))
         cur_slot, cur_par = await self.context_window()
-        if cur_slot >= per_slot and cur_par >= want_par:
+        fits = (cur_slot == per_slot and cur_par == want_par) if exact else (
+            cur_slot >= per_slot and cur_par >= want_par)
+        if fits:
             return {"ok": True, "changed": False, "previous": None,
                     "detail": f"already serving {cur_slot:,} per slot across {cur_par}",
                     "per_slot": cur_slot, "parallel": cur_par}
-        prev = ({"context_length": cur_slot * cur_par, "parallel": cur_par}
-                if cur_slot else None)
+        if not cur_slot:
+            # Without a readable current window there is no way back, and a bench that cannot
+            # undo its own change to the box must not make it. This is why a sweep once left
+            # llama.cpp at 291,784/1: the probe came back empty, the resize went ahead anyway,
+            # and the restore had nothing to restore to.
+            return {"ok": False, "changed": False, "previous": None,
+                    "detail": "could not read the current context window, so a resize could "
+                              "not be undone — refusing to change it"}
+        prev = {"context_length": cur_slot * cur_par, "parallel": cur_par}
         # Bounded, unlike load()'s 1800s default. The usual reason a resize never becomes ready
         # is that the pool did not fit in memory, and waiting half an hour to find that out —
         # before even starting the rollback — is the whole cost of the mistake.
@@ -9095,6 +9106,33 @@ async def bench_run_delete(bench_id: str, request: Request):
     return {"ok": True}
 
 
+def _bench_model_display(name: str) -> str:
+    """A model identifier short enough for a table cell.
+
+    llama.cpp names a model by its full path, and a split GGUF adds a shard suffix on top. The
+    raw string is wider than the table it sits in, every row repeats it twice, and because it
+    contains no spaces nothing can wrap it — one cell then forces the whole table sideways.
+    """
+    s = str(name or "").strip()
+    if not s:
+        return "?"
+    if "/" in s or "\\" in s:
+        s = re.split(r"[\\/]", s)[-1]
+    s = re.sub(r"\.gguf$", "", s, flags=re.I)
+    # "-00001-of-00003": one shard of a split file, never part of the model's identity.
+    s = re.sub(r"-\d{4,5}-of-\d{4,5}$", "", s)
+    return s or str(name)
+
+
+def _bench_label_display(label: str) -> str:
+    """Cell labels lead with the model, so they inherit the same problem. Shortened at render
+    time rather than at write time so runs recorded before this existed also read properly."""
+    parts = str(label or "").split(" · ")
+    if parts:
+        parts[0] = _bench_model_display(parts[0])
+    return " · ".join(parts)
+
+
 def _bench_fmt(v, digits=1, suffix=""):
     if v is None:
         return "—"
@@ -9117,6 +9155,8 @@ def _bench_report_row(run: dict) -> dict:
         "thinking": cfg.get("thinking"),
         "temperature": cfg.get("temperature"),
         "prompt_tokens": cfg.get("prompt_tokens"),
+        # What the server was serving, as distinct from what the run sent it.
+        "server_context": cfg.get("server_context") or (run.get("env") or {}).get("loaded_context"),
         "n_success": s.get("n_success"),
         "n_total": s.get("n_total"),
         "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
@@ -9217,6 +9257,12 @@ _REPORT_CSS = """
   thead tr.grp th.blank { background:var(--panel-2); }
   th.seam, td.seam { border-left:1px solid var(--border); }
   thead th.wrap { white-space:normal; max-width:96px; line-height:1.25; }
+  /* A model identifier has no spaces to wrap at, so one long name used to set the width of
+     every table on the page. Bound the two columns that carry names and let them break
+     anywhere; .tbl still scrolls if a row genuinely needs more room. */
+  th.cfg { max-width:30ch; white-space:normal; overflow-wrap:anywhere; line-height:1.35; }
+  code.mdl { max-width:26ch; display:inline-block; overflow-wrap:anywhere; line-height:1.35;
+             vertical-align:top; }
   /* Footnotes belong under the thing they qualify — above it they're just a wall to climb.
      A list, not paragraphs: four separate caveats set as prose read as one grey slab. */
   /* Sent before any query runs; a rule at the end of the stream hides it once the real
@@ -9323,7 +9369,7 @@ def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
     """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
     or printed. Charts here exist to make the ordering obvious at a glance; the table beside
     them carries the actual numbers."""
-    vals = [(r["label"], r.get(key)) for r in rows if r.get(key) is not None]
+    vals = [(_bench_label_display(r["label"]), r.get(key)) for r in rows if r.get(key) is not None]
     if not vals:
         return ""
     top = max(v for _n, v in vals) or 1
@@ -9385,10 +9431,10 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         return "—" if v is None else f"{v * 100:.0f}%"
 
     # Table -------------------------------------------------------------------------------
-    head = ["Configuration", "Model", "Quant", "Size", "Backend", "Think", "Cache", "Context",
-            "TTFT p50", "Decode p50", "Tokens", "Total p50", "vs best", "OK"]
+    head = ["Configuration", "Model", "Quant", "Size", "Backend", "Think", "Cache", "Prompt",
+            "Server ctx", "TTFT p50", "Decode p50", "Tokens", "Total p50", "vs best", "OK"]
     if graded:
-        head[12:12] = ["Fully correct", "Cases"]
+        head[13:13] = ["Fully correct", "Cases"]
     if len(rows) == 1:
         head.remove("vs best")
     # Slowdown against the fastest configuration in the set. A raw latency column doesn't make
@@ -9403,14 +9449,15 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         cfg = run.get("config") or {}
         slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
         cells = [
-            f'<th scope="row">{_h(r["label"])}</th>',
-            f'<td><code>{_h(r["served"] or r["model"])}</code></td>',
+            f'<th scope="row" class="cfg">{_h(_bench_label_display(r["label"]))}</th>',
+            f'<td><code class="mdl">{_h(_bench_model_display(r["served"] or r["model"]))}</code></td>',
             f'<td>{_h(r.get("quant") or "—")}</td>',
             f'<td class="n">{(str(round(r["size_mb"] / 1024, 1)) + " GB") if r.get("size_mb") else "—"}</td>',
             f'<td>{_h(cfg.get("upstream") or "—")}</td>',
             f'<td>{_h(r["thinking"] or "auto")}</td>',
             f'<td>{_h(r.get("cache") or "—")}</td>',
             f'<td class="n">{fmt(r["prompt_tokens"])}</td>',
+            f'<td class="n">{fmt(r.get("server_context"))}</td>',
             f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
             f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>',
@@ -9464,9 +9511,9 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         for r, run in zip(rows, runs):
             q = (((run.get("results") or {}).get("summary") or {}).get("quality") or {})
             for t in (q.get("tasks") or []):
-                tasks.setdefault(t["task"], {})[r["label"]] = t.get("perfect_rate")
+                tasks.setdefault(t["task"], {})[_bench_label_display(r["label"])] = t.get("perfect_rate")
         if tasks:
-            labels = [r["label"] for r in rows]
+            labels = [_bench_label_display(r["label"]) for r in rows]
             th = "".join(f"<th>{_h(l)}</th>" for l in labels)
             # With one configuration, a row per task is a column of identical 100%s. Only the
             # tasks that lost a case carry information, so list those and count the rest.
@@ -9561,7 +9608,7 @@ ordinary slowness rather than a misconfiguration.</p>
             cold_rows.append((r, cold_t, warm_t, cold_t / warm_t))
     if cold_rows:
         trs = "".join(
-            f'<tr><th scope="row">{_h(r["label"])}</th>'
+            f'<tr><th scope="row" class="cfg">{_h(_bench_label_display(r["label"]))}</th>'
             f'<td class="n">{fmt(r["prompt_tokens"])}</td>'
             f'<td class="n">{fmt(c, 0, " ms")}</td><td class="n">{fmt(w, 0, " ms")}</td>'
             f'<td class="n win">{fmt(ratio, 0, "x")}</td></tr>'
@@ -10427,17 +10474,18 @@ async def bench_report(request: Request, ids: str = "", format: str = "json"):
         return {"rows": rows, "env": [r.get("env") for r in runs]}
 
     graded = any(r.get("perfect_rate") is not None for r in rows)
-    head = ["Run", "Model", "Think", "Ctx", "TTFT p50", "Decode p50", "Total p50"]
+    head = ["Run", "Model", "Think", "Prompt", "Server ctx", "TTFT p50", "Decode p50", "Total p50"]
     if graded:
         head += ["Fully correct", "Cases"]
     lines = ["| " + " | ".join(head) + " |",
              "|" + "|".join(["---"] * len(head)) + "|"]
     for r in rows:
         cells = [
-            str(r["label"] or "—"),
-            str(r["served"] or r["model"] or "—"),
+            _bench_label_display(r["label"] or "—"),
+            _bench_model_display(r["served"] or r["model"] or "—"),
             str(r["thinking"] or "auto"),
             _bench_fmt(r["prompt_tokens"], 0),
+            _bench_fmt(r.get("server_context"), 0),
             _bench_fmt(r["ttft_p50"], 0, " ms"),
             _bench_fmt(r["decode_p50"], 1, " tok/s"),
             _bench_fmt(r["total_p50"], 0, " ms"),
@@ -11645,7 +11693,8 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
     return None
 
 
-async def _bench_fit_context(upstream: str, needed: int, concurrency: int) -> dict:
+async def _bench_fit_context(upstream: str, needed: int, concurrency: int,
+                             exact: bool = False) -> dict:
     """Make `upstream` serve at least `needed` tokens per slot, or say why it cannot.
 
     Returns {ok, detail, changed, restore}. `restore` is the token for _bench_restore_context,
@@ -11655,7 +11704,7 @@ async def _bench_fit_context(upstream: str, needed: int, concurrency: int) -> di
     if prov is None or not prov.resizable_context:
         return {"ok": False, "changed": False, "restore": None,
                 "detail": f"{upstream} cannot change its context window"}
-    res = await prov.resize_context(needed, concurrency)
+    res = await prov.resize_context(needed, concurrency, exact=exact)
     prev = res.get("previous")
     return {"ok": bool(res.get("ok")), "changed": bool(res.get("changed")),
             "detail": res.get("detail") or "",
@@ -11969,6 +12018,11 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
     # silently disabled looks merely slow, not misconfigured.
     caches = as_list(cfg.get("cache"), None)
     concs = as_list(cfg.get("concurrency"), 1)
+    # The window the *server* is launched with, as opposed to prompt_tokens, which is how much
+    # is sent. They are different questions — "is a model slower when it has a 262k KV pool
+    # allocated, even for a short prompt?" is this axis, and there was no way to ask it before.
+    # It is also the only axis whose value the bench must change on the box between cells.
+    servers = as_list(cfg.get("server_context"), None)
     cells = []
     for m in model_axis:
         # Entries may be bare names (older callers) or {model, upstream} pairs, so a sweep can
@@ -11980,26 +12034,39 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
                 for tp in temps:
                     for ca in caches:
                         for cc in concs:
-                            axes = {"model": name, "prompt_tokens": int(pt or 0),
-                                    "thinking": str(th or "auto")}
-                            if up:
-                                axes["upstream"] = up
-                            if tp is not None:
-                                axes["temperature"] = float(tp)
-                            if ca:
-                                axes["cache"] = str(ca)
-                            if int(cc or 1) != 1:
-                                axes["concurrency"] = int(cc)
-                            cells.append(axes)
+                            for sv in servers:
+                                axes = {"model": name, "prompt_tokens": int(pt or 0),
+                                        "thinking": str(th or "auto")}
+                                if up:
+                                    axes["upstream"] = up
+                                if tp is not None:
+                                    axes["temperature"] = float(tp)
+                                if ca:
+                                    axes["cache"] = str(ca)
+                                if int(cc or 1) != 1:
+                                    axes["concurrency"] = int(cc)
+                                if sv:
+                                    axes["server_context"] = int(sv)
+                                cells.append(axes)
+    # Each distinct server_context costs a restart and a full model reload, so run the cells
+    # that share one together. A stable sort keeps the order within each group, so the cache
+    # axis still sees cold before cached.
+    if any(c.get("server_context") for c in cells):
+        cells.sort(key=lambda c: c.get("server_context") or 0)
     return cells
 
 
 def _bench_cell_label(axes: dict) -> str:
-    bits = [str(axes.get("model") or "?")]
+    bits = [_bench_model_display(axes.get("model") or "?")]
     if axes.get("upstream"):
         bits.append(f"@{axes['upstream']}")
     pt = axes.get("prompt_tokens") or 0
-    bits.append(f"{int(pt) // 1000}k ctx" if pt >= 1000 else (f"{pt} ctx" if pt else "short"))
+    # "32k ctx" for a prompt size read as a context setting, which is exactly the confusion
+    # this axis pair caused. Prompts say "prompt", windows say "ctx".
+    bits.append(f"{int(pt) // 1000}k prompt" if pt >= 1000
+                else (f"{pt} prompt" if pt else "short"))
+    if axes.get("server_context"):
+        bits.append(f"{int(axes['server_context']) // 1024}k ctx")
     if axes.get("thinking") and axes["thinking"] != "auto":
         bits.append(f"think={axes['thinking']}")
     if axes.get("cache"):
@@ -12038,6 +12105,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     # Largest window any cell needs, and the widest concurrency it needs it at. Collected while
     # planning so the backend is sized once, before the first cell runs.
     need_ctx, need_par, need_up = 0, 1, ""
+    ctx_axis_up = ""      # set when the sweep varies the window itself, per cell
     for axes in cells:
         cid = "b_" + uuid.uuid4().hex[:12]
         child_cfg = dict(cfg)
@@ -12055,6 +12123,8 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
             # the mechanism, so a result column reads "cold / cached" not "randomize true/false".
             child_cfg["cache"] = axes["cache"]
             child_cfg["randomize"] = (axes["cache"] == "cold")
+        # The one axis a cell has to apply to the box itself, so the child owns it.
+        child_cfg["server_context"] = axes.get("server_context") or None
         # Always write the scalar, including the default. Copying it only when it differed left
         # every concurrency-1 cell holding the parent's [1, 4] list, and int() on a list raises.
         child_cfg["concurrency"] = axes.get("concurrency") or 1
@@ -12066,7 +12136,11 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
                   if window else None)
         cell_up = axes.get("upstream") or meta.get("upstream") or ""
         cell_prov = PROVIDERS.get(cell_up)
-        if budget and axes["prompt_tokens"] > budget and cell_prov is not None \
+        if axes.get("server_context"):
+            # The sweep is varying the window on purpose. Sizing it once here would flatten the
+            # axis into a constant — which is what it did to a prompt sweep that meant this.
+            ctx_axis_up = ctx_axis_up or cell_up
+        elif budget and axes["prompt_tokens"] > budget and cell_prov is not None \
                 and cell_prov.resizable_context:
             # Resizable: record what the sweep needs and let the cell run. Sizing once to the
             # largest cell rather than per-cell is both far cheaper (one restart, not 24) and
@@ -12127,6 +12201,15 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
                 await _bench_quiesce(False, quiesce_state)
             return
         ctx_restore = fit["restore"]
+    elif ctx_axis_up:
+        # Cells will each set their own window, so capture where to put it back *before* the
+        # first one changes it — there is no single "previous" to recover afterwards.
+        prov = PROVIDERS.get(ctx_axis_up)
+        if prov is not None and prov.resizable_context:
+            slot, par = await prov.context_window()
+            if slot:
+                ctx_restore = {"upstream": ctx_axis_up,
+                               "context_length": slot * par, "parallel": par}
     try:
       try:
         for i, cid in enumerate(child_ids, start=1):
@@ -12253,7 +12336,26 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # the whole matrix, and the metrics snapshot this reads from may not have caught up yet.
         ctx_restore = None
         window = model_meta.get("loaded_context") or model_meta.get("max_context")
-        if row["parent_id"] is None and window:
+        want_ctx = int(cfg.get("server_context") or 0)
+        if want_ctx:
+            # The window is this cell's variable, so set it exactly — including downwards, which
+            # the fit-to-prompt path never does. A parent sweep captured the original before its
+            # first cell ran and restores it at the end, so nothing is restored here.
+            fit = await _bench_fit_context(str(cfg.get("upstream") or ""), want_ctx,
+                                           concurrency, exact=True)
+            if not fit["ok"]:
+                _abort(f"could not set {cfg.get('upstream')} to a {want_ctx:,}-token "
+                       f"window: {fit['detail']}")
+                return
+            env["server_context"] = want_ctx
+            if row["parent_id"] is None:
+                ctx_restore = fit["restore"]
+            conn = db()
+            conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                         (json.dumps(env), bench_id))
+            conn.commit()
+            conn.close()
+        elif row["parent_id"] is None and window:
             needed = _bench_ctx_needed(prompt_tokens, max_tokens)
             if needed > int(window):
                 fit = await _bench_fit_context(str(cfg.get("upstream") or ""), needed,

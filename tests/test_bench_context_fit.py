@@ -489,3 +489,71 @@ def test_an_interrupted_bench_does_not_block_forever(client):
     conn.commit()
     conn.close()
     assert _submit(client).status_code == 200
+
+
+# ---- server_context: the window as an axis in its own right -----------------------------
+
+def test_server_context_is_its_own_axis(client):
+    """prompt_tokens is what a request sends; server_context is what the backend was launched
+    with. Conflating them is why a sweep of [32k, 131k, 262k] measured one thing six times."""
+    cells = P._bench_expand_matrix([{"model": "m", "upstream": "llamacpp"}],
+                                   {"server_context": [32768, 262144], "prompt_tokens": 0})
+    assert [c["server_context"] for c in cells] == [32768, 262144]
+
+
+def test_cells_are_grouped_so_each_window_is_set_once(client):
+    # Each distinct window costs a restart and a full model reload.
+    cells = P._bench_expand_matrix(
+        [{"model": "m", "upstream": "llamacpp"}],
+        {"server_context": [262144, 32768], "cache": ["cold", "cached"]})
+    ctxs = [c["server_context"] for c in cells]
+    assert ctxs == sorted(ctxs), "cells not grouped by window; that is a restart per cell"
+    # ...and the cache axis still runs cold before cached inside each group.
+    for ctx in (32768, 262144):
+        grp = [c["cache"] for c in cells if c["server_context"] == ctx]
+        assert grp == ["cold", "cached"], grp
+
+
+def test_the_label_distinguishes_prompt_from_window(client):
+    lab = P._bench_cell_label({"model": "/models/big/DeepSeek-V4-Flash-0731-UD-IQ2_XXS.gguf",
+                               "upstream": "llamacpp", "prompt_tokens": 32000,
+                               "server_context": 262144})
+    assert "32k prompt" in lab, "a prompt size labelled 'ctx' is what caused the confusion"
+    assert "256k ctx" in lab
+    assert "/models/" not in lab, "the full path makes every table unreadable"
+
+
+def test_a_model_path_is_shortened_for_display(client):
+    d = P._bench_model_display(
+        "/home/crimson/models/ds4-flash/UD-IQ2_XXS/"
+        "DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf")
+    assert d == "DeepSeek-V4-Flash-0731-UD-IQ2_XXS"
+
+
+def test_shortening_leaves_ordinary_names_alone(client):
+    for name in ("qwen3:4b", "ornith-nvfp4", "gpt-oss-120b"):
+        assert P._bench_model_display(name) == name
+
+
+def test_an_exact_resize_will_shrink_the_window(client, monkeypatch):
+    """Fitting a prompt only ever grows the window. An axis has to be able to set 32k when the
+    server is at 292k, or half the comparison is impossible."""
+    seen = _llamacpp(monkeypatch, n_ctx=291840, parallel=1)
+    res = asyncio.run(P.PROVIDERS["llamacpp"].resize_context(32768, 1, exact=True))
+    assert res["ok"] and res["changed"]
+    assert seen[0]["context_length"] == 32768
+
+    # Without exact=, the same call is a no-op because 291840 already "fits".
+    seen2 = _llamacpp(monkeypatch, n_ctx=291840, parallel=1)
+    assert asyncio.run(P.PROVIDERS["llamacpp"].resize_context(32768, 1))["changed"] is False
+    assert seen2 == []
+
+
+def test_a_resize_is_refused_when_the_current_window_cannot_be_read(client, monkeypatch):
+    """The bug that left llama.cpp at 291,784/1 overnight: the probe came back empty, the
+    resize went ahead anyway, and the restore had nothing to restore to."""
+    seen = _llamacpp(monkeypatch, n_ctx=0, parallel=1)
+    res = asyncio.run(P.PROVIDERS["llamacpp"].resize_context(65536, 1))
+    assert res["ok"] is False
+    assert "could not be undone" in res["detail"]
+    assert seen == [], "changed the box without knowing how to change it back"
