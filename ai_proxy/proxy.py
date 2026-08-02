@@ -12423,7 +12423,9 @@ async def _bench_start_backend(meta: dict, persist: bool = True,
     if bench_id:
         _bench_phase(bench_id, f"freeing memory for {upstream}")
     snap = await _bench_residency_snapshot()
-    freed = await _bench_free_gpu(snap, keep=meta.get("model") or "")
+    want = meta.get("size_mb")
+    freed = await _bench_free_gpu(snap, keep=meta.get("model") or "", bench_id=bench_id,
+                                  want_free_mb=(want * _BENCH_FIT_OVERHEAD) if want else 0)
     # Persisted before anything is started: a proxy restart between here and the restore would
     # otherwise leave the box stripped, with nothing recording what had been running. A cell
     # inside a sweep does not persist: the sweep already recorded the state before its first
@@ -12645,7 +12647,8 @@ def _free_mem_mb() -> float:
 
 
 async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
-                          timeout_s: float = 240.0, spare: str = "") -> dict:
+                          timeout_s: float = 240.0, spare: str = "",
+                          bench_id: str = "") -> dict:
     """Stop everything in the snapshot, then wait for the memory to actually come back.
 
     The waiting is the part that matters. `docker stop` returns as soon as the process is
@@ -12668,10 +12671,19 @@ async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
 
     before = _free_mem_mb()
     if want_free_mb:
+        # `docker stop` and `systemctl stop` return when the process is signalled, not when its
+        # memory is back. Unmapping ~90 GB takes appreciably longer, and starting the next model
+        # into a machine that is still handing memory back is how a 36 GB model ended up with 28
+        # GB resident and took 24 minutes a request. Wait for the memory, not for the signal.
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if _free_mem_mb() >= want_free_mb:
+            now_free = _free_mem_mb()
+            if now_free >= want_free_mb:
                 break
+            if bench_id:
+                _bench_phase(bench_id,
+                             f"waiting for memory to come back — {now_free / 1024:.0f} GB free, "
+                             f"need {want_free_mb / 1024:.0f} GB")
             await asyncio.sleep(2.0)
     else:
         # Even without a target, give the kernel a moment to finish reclaiming.
@@ -12679,6 +12691,7 @@ async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
     out["free_mb_before"] = before
     out["free_mb_after"] = _free_mem_mb()
     out["reached_target"] = (not want_free_mb) or out["free_mb_after"] >= want_free_mb
+    out["wanted_mb"] = want_free_mb or None
     return out
 
 
@@ -13216,12 +13229,26 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             if any(e.get("was_running") and e.get("name") != this_up
                    for e in (snap_now.get("backends") or [])):
                 _bench_phase(bench_id, f"stopping other backends to free memory for {this_up}")
+                # What this cell's model actually needs resident, so the wait has a target
+                # rather than a guess. Unknown size falls back to no target, which is the old
+                # behaviour and no worse.
+                _want = model_meta.get("size_mb")
+                _want = _want * _BENCH_FIT_OVERHEAD if _want else 0
                 # A standalone run owns the restore; inside a sweep the suite already recorded
                 # the box before its first cell and puts everything back at the end.
                 if row["parent_id"] is None:
                     resid_snap = snap_now
                     _save_pending_residency(snap_now)
-                await _bench_free_gpu(snap_now, keep=model, spare=this_up)
+                freed = await _bench_free_gpu(snap_now, keep=model, spare=this_up,
+                                              want_free_mb=_want, bench_id=bench_id)
+                env["freed_before_run"] = freed
+                if _want and not freed.get("reached_target"):
+                    # Not fatal — a model can run partly offloaded — but it is the difference
+                    # between a measurement and a measurement of memory pressure, so it has to
+                    # appear beside the numbers rather than be inferred from them later.
+                    env["memory_warning"] = (
+                        f"only {freed.get('free_mb_after', 0) / 1024:.0f} GB free after "
+                        f"stopping others; {_want / 1024:.0f} GB wanted")
         except Exception as e:
             print(f"[bench] freeing memory failed: {type(e).__name__}: {e}")
 

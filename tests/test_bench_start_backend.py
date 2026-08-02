@@ -63,7 +63,7 @@ def _quiet_residency(monkeypatch):
     async def snap():
         return {"backends": [], "ollama": []}
 
-    async def free(s, keep="", want_free_mb=0, timeout_s=240.0):
+    async def free(s, keep="", want_free_mb=0, timeout_s=240.0, **kw):
         return {"stopped": [], "evicted_ollama": []}
 
     async def restore(s):
@@ -118,7 +118,7 @@ def test_room_is_made_before_the_backend_starts(client, monkeypatch):
         order.append("snapshot")
         return {"backends": [{"name": "llamacpp", "was_running": True, "control": "unit"}]}
 
-    async def free(s, keep="", want_free_mb=0, timeout_s=240.0):
+    async def free(s, keep="", want_free_mb=0, timeout_s=240.0, **kw):
         order.append("free")
         return {"stopped": [{"name": "llamacpp"}]}
 
