@@ -673,6 +673,10 @@
   .bench-lead h4 { margin: 0 0 7px; font-size: 10px; letter-spacing: .12em; font-weight: 600;
     text-transform: uppercase; color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
   .bench-lead table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .bench-lead thead th { font-family: var(--mono, ui-monospace, monospace); font-size: 9.5px;
+    letter-spacing: .09em; text-transform: uppercase; color: #4d5765; font-weight: 500;
+    padding: 0 0 4px; text-align: right; white-space: nowrap; }
+  .bench-lead thead th:first-child, .bench-lead thead th:nth-child(2) { text-align: left; }
   .bench-lead td { padding: 3px 0; color: #c9d3e1; }
   .bench-lead td.n { text-align: right; font-family: var(--mono, ui-monospace, monospace);
     font-variant-numeric: tabular-nums; white-space: nowrap; padding-left: 10px; }
@@ -7495,8 +7499,16 @@ function _benchLeadRender() {
                    || (b.decode_p50 || 0) - (a.decode_p50 || 0));
   const multi = _benchBackendsIn(rows) > 1;
   const top = _benchLeadAll ? rows : rows.slice(0, 6);
+  // The columns were bare numbers: "100%" and "63.7 tok/s" with nothing saying what either
+  // measured. The rate is specifically output tokens after the first one — prefill excluded —
+  // which is not guessable from the figure.
   host.innerHTML = `<h4>Standings — ${rows.length} cell${rows.length > 1 ? 's' : ''} in</h4>
-    <div class="${_benchLeadAll ? 'scroll' : ''}"><table><tbody>${top.map((r, i) => {
+    <div class="${_benchLeadAll ? 'scroll' : ''}"><table>
+    <thead><tr><th></th><th></th>
+      ${graded ? '<th class="n" title="Share of tasks where every test case passed">correct</th>' : ''}
+      <th class="n" title="Output tokens per second, measured after the first token — prefill is not counted">output tok/s</th>
+    </tr></thead>
+    <tbody>${top.map((r, i) => {
       const bits = _benchCellBits(r.label, multi);
       const q = r.perfect_rate;
       const cls = q == null ? '' : (q >= 0.9 ? 'q' : q >= 0.6 ? 'q mid' : 'q low');
@@ -7600,7 +7612,7 @@ function _benchMiniRender() {
     const text = t.redacted
       ? '<i style="color:#4d5765">redacted for this viewer</i>'
       : esc((body || '').slice(-260)) + (streaming ? '<span class="caret"></span>' : '');
-    const rate = t.tps ? `${t.tps} tok/s` : (t.itps ? `${t.itps} tok/s in` : '');
+    const rate = t.tps ? `${t.tps} tok/s out` : (t.itps ? `${t.itps} tok/s in` : '');
     const pct = t.tps ? Math.max(4, Math.round(t.tps / peak * 100)) : 0;
     return `<div class="bench-tile ${esc(st)}">
       <div class="hd">
