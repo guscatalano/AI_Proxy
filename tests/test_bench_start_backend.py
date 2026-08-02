@@ -229,3 +229,55 @@ def test_an_eviction_failure_is_not_swallowed(client, monkeypatch, capsys):
     monkeypatch.setattr(P.httpx, "AsyncClient", lambda *a, **kw: _C())
     assert asyncio.run(P._bench_evict_ollama()) == []
     assert "eviction failed" in capsys.readouterr().out
+
+
+# ---- mixed-backend sweeps -----------------------------------------------------------------
+
+def test_a_stopped_llamacpp_still_offers_its_model(client, monkeypatch):
+    """Once the bench stopped llama.cpp to make room for vLLM, llama.cpp's own cells could not
+    resolve a model and failed preflight with "not serving anything". The unit is configured
+    with exactly one model; a stopped one has to be offered the way a stopped container is."""
+    cfg = dict(P.load_rules_config())
+    mc = dict(cfg.get("model_control") or {})
+    mc["llamacpp"] = {"unit": "llamacpp.service", "binary": "/x/llama-server",
+                      "model": "/models/ds4-flash-UD-IQ2_XXS.gguf"}
+    cfg["model_control"] = mc
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    monkeypatch.setattr(P, "_vllm_configs", _configs())
+    monkeypatch.setattr(P, "system_now", lambda: {"llamacpp": {"reachable": False}})
+
+    idx = asyncio.run(P._bench_model_index())
+    rec = idx.get("llamacpp:/models/ds4-flash-UD-IQ2_XXS.gguf")
+    assert rec, f"stopped llama.cpp offers nothing: {sorted(idx)}"
+    assert rec["startable"] is True and rec["loaded"] is False
+
+
+def test_cells_are_grouped_by_backend(client):
+    """Two backends rarely fit on one box, so each switch means stopping one and loading the
+    other. Interleaved, a mixed sweep pays that per cell -- and one ran llama.cpp's cell while
+    it was stopped for vLLM's."""
+    models = [{"model": "a", "upstream": "vllm"}, {"model": "b", "upstream": "llamacpp"}]
+    cells = P._bench_expand_matrix(models, {"cache": ["cold", "cached"]})
+    ups = [c["upstream"] for c in cells]
+    assert ups == sorted(ups), f"backends interleaved: {ups}"
+    # ...and the cache axis still runs in order inside each backend's group.
+    for u in ("llamacpp", "vllm"):
+        assert [c["cache"] for c in cells if c["upstream"] == u] == ["cold", "cached"]
+
+
+def test_a_cell_inside_a_sweep_does_not_overwrite_the_sweeps_snapshot(client, monkeypatch):
+    """The sweep records the box before its first cell. A cell's own snapshot is of the box
+    mid-run, so persisting it would restore whatever the previous cell happened to leave."""
+    saved = []
+    _quiet_residency(monkeypatch)
+    monkeypatch.setattr(P, "_save_pending_residency", lambda s: saved.append(s))
+
+    async def load(payload, name):
+        return {"ok": True, "started_container": "qwen-vllm", "ready": True}
+
+    monkeypatch.setattr(P.PROVIDERS["vllm"], "load", load)
+    res = asyncio.run(P._bench_start_backend({"upstream": "vllm", "container": "qwen-vllm"},
+                                             persist=False))
+    assert saved == [], "a cell overwrote the sweep's record of the original state"
+    assert res["restore"]["residency"] is None
+    assert res["restore"]["stop"] is True, "it still has to stop what it started"

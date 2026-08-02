@@ -8720,8 +8720,22 @@ async def _bench_model_index() -> dict:
                     loaded_context=lcp.get("n_ctx"),
                     checkpoint=lcp.get("model_path"),
                     parallel=lcp.get("parallel"))
-    except Exception:
-        pass
+        # A stopped llama.cpp offers no models at all, so once the bench stopped it to make room
+        # for vLLM, its own cells could not resolve a model and failed preflight. The unit is
+        # configured with exactly one model; offer that, the same way a stopped container is.
+        if not (lcp.get("reachable")):
+            lc = _llamacpp_cfg()
+            if lc.get("model"):
+                put(lc["model"], "llamacpp", False, startable=True,
+                    quant=_infer_quant(lc.get("model")), checkpoint=lc.get("model"))
+    except Exception as e:
+        # This once swallowed an UnboundLocalError and returned an empty picker: every backend
+        # showed zero models and the bench looked like it had lost the box. Falling back is
+        # right; doing it silently is not.
+        try:
+            print(f"[bench] model index build failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
     if index:
         return index
     # The snapshot comes from the background metrics collector, which hasn't necessarily run
@@ -11865,7 +11879,7 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
     return None
 
 
-async def _bench_start_backend(meta: dict) -> dict:
+async def _bench_start_backend(meta: dict, persist: bool = True) -> dict:
     """Make room, bring up the stopped backend the run needs, and say how to undo both.
 
     Freeing first is a precondition, not a courtesy. A fixed backend that cannot allocate never
@@ -11881,8 +11895,11 @@ async def _bench_start_backend(meta: dict) -> dict:
     snap = await _bench_residency_snapshot()
     freed = await _bench_free_gpu(snap, keep=meta.get("model") or "")
     # Persisted before anything is started: a proxy restart between here and the restore would
-    # otherwise leave the box stripped, with nothing recording what had been running.
-    _save_pending_residency(snap)
+    # otherwise leave the box stripped, with nothing recording what had been running. A cell
+    # inside a sweep does not persist: the sweep already recorded the state before its first
+    # cell, and this snapshot is of the box mid-run, which would restore the wrong thing.
+    if persist:
+        _save_pending_residency(snap)
     res = await prov.load({"container": container} if container else {},
                           meta.get("model") or "")
     ok, detail = _load_result(res)
@@ -11892,7 +11909,8 @@ async def _bench_start_backend(meta: dict) -> dict:
     # the memory it had just failed to get.
     started = ok or bool(isinstance(res, dict) and res.get("started_container"))
     return {"ok": ok, "started": started, "detail": detail, "freed": freed,
-            "restore": {"upstream": upstream, "stop": started, "residency": snap}}
+            "restore": {"upstream": upstream, "stop": started,
+                        "residency": snap if persist else None}}
 
 
 async def _bench_restore_backend(token: dict | None) -> dict | None:
@@ -12307,6 +12325,12 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
     # axis still sees cold before cached.
     if any(c.get("server_context") for c in cells):
         cells.sort(key=lambda c: c.get("server_context") or 0)
+    # Backend last, so it is the outermost grouping. Two backends rarely fit on one box at
+    # once, so every switch means stopping one and loading the other — interleaving them would
+    # pay that repeatedly, and a mixed sweep once ran llama.cpp's cell while it was stopped for
+    # vLLM's.
+    if len({c.get("upstream") for c in cells}) > 1:
+        cells.sort(key=lambda c: str(c.get("upstream") or ""))
     return cells
 
 
@@ -12443,22 +12467,13 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     quiesce_state = None
     if cfg.get("quiesce"):
         quiesce_state = await _bench_quiesce(True, keep="")
-    backend_restore = None
-    if start_meta is not None:
-        got = await _bench_start_backend(start_meta)
-        if not got["ok"]:
-            await _bench_restore_backend(got["restore"])
-            conn = db()
-            conn.execute(
-                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
-                (f"could not start {start_meta.get('upstream')} for "
-                 f"{start_meta.get('model')!r}: {got['detail']}", time.time(), parent_id))
-            conn.commit()
-            conn.close()
-            if quiesce_state is not None:
-                await _bench_quiesce(False, quiesce_state)
-            return
-        backend_restore = got["restore"]
+    # Record the box as it was before the first cell. Cells start and stop backends between
+    # themselves — a mixed sweep switches backends because two rarely fit at once — so the only
+    # snapshot worth restoring is the one taken before any of that happened.
+    orig_residency = None
+    if start_meta is not None or len({c.get("upstream") for c in cells}) > 1:
+        orig_residency = await _bench_residency_snapshot()
+        _save_pending_residency(orig_residency)
     ctx_restore = None
     if need_ctx:
         fit = await _bench_fit_context(need_up, need_ctx, need_par)
@@ -12516,7 +12531,11 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         if quiesce_state is not None:
             await _bench_quiesce(False, quiesce_state)
         await _bench_restore_context(ctx_restore)
-        await _bench_restore_backend(backend_restore)
+        if orig_residency is not None:
+            # Stop whatever the sweep left running, then put back exactly what it found.
+            await _bench_free_gpu(await _bench_residency_snapshot())
+            await _bench_restore_residency(orig_residency)
+            _save_pending_residency(None)
     conn = db()
     conn.execute(
         "UPDATE bench_runs SET status='done', finished_ts=?, results_json=? WHERE id=?",
@@ -12610,7 +12629,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Before the ready() poll and the window fit, both of which assume something is serving.
         backend_restore = None
         if model_meta.get("startable") and not model_meta.get("loaded"):
-            got = await _bench_start_backend(model_meta)
+            got = await _bench_start_backend(model_meta, persist=row["parent_id"] is None)
             if not got["ok"]:
                 await _bench_restore_backend(got["restore"])
                 _abort(f"could not start {cfg.get('upstream')} for {model!r}: {got['detail']}")
