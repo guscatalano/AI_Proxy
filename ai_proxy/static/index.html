@@ -6890,21 +6890,22 @@ const _BENCH_COMMON = {
 };
 const _BENCH_PRESETS = {
   quick: Object.assign({}, _BENCH_COMMON, {
-    prompt_tokens: 32000, thinking: 'off', cache: 'cached', concurrency: 1,
+    thinking: 'off', cache: 'cached', concurrency: 1,
   }),
   // The shape of a real comparison: context depth, what reasoning costs, whether the prompt
   // cache is doing anything, and how throughput holds up under load. One press instead of a
   // dozen submissions collated by hand afterwards.
   full: Object.assign({}, _BENCH_COMMON, {
-    prompt_tokens: [0, 8000, 32000],
     thinking: ['off', 'on'],
     cache: ['cold', 'cached'],
     concurrency: [1, 4],
   }),
-  // Depth only. Cold prefill at 128K–256K runs into minutes per request, so this drops the
-  // thinking and concurrency axes rather than multiplying them by it.
+  // Depth only, and for a graded suite depth means the window the server was launched with —
+  // the suite sends its own task prompts, so prompt size cannot vary anything. Each value costs
+  // a backend restart and a full model reload, which is why the thinking and concurrency axes
+  // are dropped rather than multiplied by it.
   long: Object.assign({}, _BENCH_COMMON, {
-    prompt_tokens: [32000, 131072, 262144],
+    server_context: [32768, 131072, 262144],
     thinking: 'off',
     cache: ['cold', 'cached'],
     concurrency: 1,
@@ -6976,11 +6977,15 @@ function _benchBody() {
   const servers = Array.from(_benchServerCtxSel).map(v => parseInt(v, 10) || 0).filter(Boolean).sort((a, b) => a - b);
   const thinking = Array.from(_benchThinkSel);
   const temps = _benchTemps();
+  // Read before the body: prompt size is conditional on it.
+  const suite = $('bench-suite').value;
   const body = {
     models,
     runs: parseInt($('bench-runs').value, 10) || 5,
     max_tokens: parseInt($('bench-maxtok').value, 10) || 256,
-    prompt_tokens: prompts.length > 1 ? prompts : (prompts[0] || 0),
+    // A graded suite sends its own task prompts, so prompt size has nothing to act on. Sent
+    // as 0 rather than dropped, so the run records that it was not an axis.
+    prompt_tokens: suite ? 0 : (prompts.length > 1 ? prompts : (prompts[0] || 0)),
     // Omitted entirely when nothing is picked, so the backend is left exactly as found.
     server_context: servers.length > 1 ? servers : (servers[0] || undefined),
     thinking: thinking.length > 1 ? thinking : (thinking[0] || 'auto'),
@@ -6997,7 +7002,6 @@ function _benchBody() {
   if (temps) body.temperature = temps.length > 1 ? temps : temps[0];
   // No top-level `upstream`: each selected model already carries its own, which is what makes
   // a mixed-backend sweep possible.
-  const suite = $('bench-suite').value;
   if (suite) body.suite = suite;
   return body;
 }
@@ -7009,6 +7013,7 @@ function _benchPlanCounts(b) {
   const cells = Math.max(1, (b.models || []).length) * n(b.prompt_tokens) * n(b.thinking) *
                 (b.temperature === undefined ? 1 : n(b.temperature)) *
                 (b.cache === undefined ? 1 : n(b.cache)) *
+                (b.server_context === undefined ? 1 : n(b.server_context)) *
                 (b.concurrency === undefined ? 1 : n(b.concurrency));
   const sel = $('bench-suite');
   const opt = b.suite && sel ? Array.from(sel.options).find(o => o.value === b.suite) : null;
@@ -7058,8 +7063,9 @@ function _benchUpdatePlan() {
   if (stuck.length) {
     warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${stuck.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — the run will be refused rather than return empty completions`});
   }
-  if (b.suite && biggest > 0) {
-    warns.push({level: 'bad', text: `⚠ prompt size does nothing with a graded suite — the suite sends its own task prompts, so every prompt-size cell measures the same thing. Use Server context to vary the window instead.`});
+  const svc = Array.isArray(b.server_context) ? b.server_context : (b.server_context ? [b.server_context] : []);
+  if (svc.length > 1) {
+    warns.push({level: 'info', text: `↻ ${svc.length} server-context values — the backend restarts and reloads once per value, which dominates the run time`});
   }
   if (fixable.length) {
     warns.push({level: 'info', text: `↻ ${fixable.map(m => m.upstream).filter((v, i, a) => a.indexOf(v) === i).join(', ')} will be restarted at a larger window to fit ${biggest.toLocaleString()} tokens, then put back — this adds several minutes`});
