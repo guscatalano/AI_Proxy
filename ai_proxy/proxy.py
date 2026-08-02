@@ -12309,7 +12309,7 @@ def _free_mem_mb() -> float:
 
 
 async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
-                          timeout_s: float = 240.0) -> dict:
+                          timeout_s: float = 240.0, spare: str = "") -> dict:
     """Stop everything in the snapshot, then wait for the memory to actually come back.
 
     The waiting is the part that matters. `docker stop` returns as soon as the process is
@@ -12321,6 +12321,8 @@ async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
     for entry in (snap.get("backends") or []):
         if not entry.get("was_running"):
             continue          # restoring must not start what was already down
+        if spare and entry["name"] == spare:
+            continue          # the backend about to be measured
         b = backend(entry["name"])
         if not b:
             continue
@@ -12859,6 +12861,27 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         if why:
             _abort(why)
             return
+        # Free the box for whatever this cell is about to measure — every cell, not only the
+        # ones that need a backend started. Wiring this to "am I starting something" was wrong:
+        # an Ollama cell starts nothing, so llama.cpp kept its ~90 GB and Ollama could fit only
+        # 28 of codellama:70b's 38, spilling the rest. One request took 24 minutes instead of
+        # ten seconds, and the number that came out measured memory pressure, not the model.
+        this_up = str(cfg.get("upstream") or "")
+        resid_snap = None
+        try:
+            snap_now = await _bench_residency_snapshot()
+            if any(e.get("was_running") and e.get("name") != this_up
+                   for e in (snap_now.get("backends") or [])):
+                _bench_phase(bench_id, f"stopping other backends to free memory for {this_up}")
+                # A standalone run owns the restore; inside a sweep the suite already recorded
+                # the box before its first cell and puts everything back at the end.
+                if row["parent_id"] is None:
+                    resid_snap = snap_now
+                    _save_pending_residency(snap_now)
+                await _bench_free_gpu(snap_now, keep=model, spare=this_up)
+        except Exception as e:
+            print(f"[bench] freeing memory failed: {type(e).__name__}: {e}")
+
         # Bring the backend up if the run needs a container that is configured but stopped.
         # Before the ready() poll and the window fit, both of which assume something is serving.
         backend_restore = None
@@ -13073,10 +13096,16 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             if evicted and row["parent_id"] is None:
                 _bench_phase(bench_id, "reloading the models it unloaded")
                 await _bench_reload_ollama(evicted)
-            if backend_restore or ctx_restore:
+            if backend_restore or ctx_restore or resid_snap:
                 _bench_phase(bench_id, "putting the backends back as they were")
             await _bench_restore_backend(backend_restore)
             restored = await _bench_restore_context(ctx_restore)
+            if resid_snap is not None:
+                try:
+                    await _bench_restore_residency(resid_snap)
+                    _save_pending_residency(None)
+                except Exception as e:
+                    print(f"[bench] restoring residency failed: {type(e).__name__}: {e}")
             if restored is not None:
                 conn = db()
                 row2 = conn.execute("SELECT env_json FROM bench_runs WHERE id=?",
