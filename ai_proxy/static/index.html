@@ -6547,8 +6547,8 @@ async function loadBench() {
             <input type="checkbox" id="bench-hold" checked>
             <span>Hold other proxy clients while it runs<em>they queue until it finishes — required for numbers that mean anything</em></span>
           </label>
-          <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run. Changing any setting changes the cell, so it is measured again. Worth ticking for anything long: a restart otherwise loses the whole run.">
-            <input type="checkbox" id="bench-resume-simple">
+          <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run, and say so in the report. Changing any setting changes the cell, so it is measured again. Untick to force a fresh measurement of everything.">
+            <input type="checkbox" id="bench-resume-simple" checked>
             <span>Reuse completed cells<em>skip what an earlier run already measured — a long run survives a restart</em></span>
           </label>
         </div>
@@ -6644,8 +6644,8 @@ async function loadBench() {
               <input type="checkbox" id="bench-exclusive" checked>
               <span>Hold other clients<em>they queue until it finishes</em></span>
             </label>
-            <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run. Changing any setting changes the cell, so it is measured again. Off by default: a benchmark that quietly hands back old numbers is worse than a slow one.">
-              <input type="checkbox" id="bench-resume">
+            <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run, and say so in the report. Changing any setting changes the cell, so it is measured again. Untick to force a fresh measurement of everything.">
+              <input type="checkbox" id="bench-resume" checked>
               <span>Reuse completed cells<em>skip what an earlier run already measured with the same settings</em></span>
             </label>
             <label class="bench-check" title="As above, and additionally blocks all proxied traffic with 503 for the duration. Stronger than holding clients, which only queues them.">

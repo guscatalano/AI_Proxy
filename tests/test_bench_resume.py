@@ -79,8 +79,10 @@ def test_history_prices_a_model_from_what_it_actually_took(client):
     assert 290 <= cost["slowpoke"] <= 310
 
 
-def test_reuse_is_off_unless_asked_for(client):
-    """A benchmark that quietly hands back old numbers is worse than a slow one."""
+def test_reuse_is_on_unless_turned_off(client):
+    """Default-on. The signature covers every setting that changes what a cell measures, so a
+    reused cell is one that would have produced the same numbers anyway — and three multi-hour
+    runs went out unprotected because this had to be remembered."""
     conn = P.db()
     conn.execute("DELETE FROM bench_runs")
     conn.commit()
@@ -88,6 +90,22 @@ def test_reuse_is_off_unless_asked_for(client):
     r = client.post("/__proxy/api/bench/run",
                     json={"models": [{"model": "qwen3:4b", "upstream": "ollama"}], "runs": 1})
     assert r.status_code == 200
+    conn = P.db()
+    cfg = json.loads(conn.execute("SELECT config_json FROM bench_runs WHERE id=?",
+                                  (r.json()["id"],)).fetchone()[0])
+    conn.close()
+    assert cfg["resume"] is True
+
+
+def test_reuse_can_still_be_turned_off(client):
+    """Forcing a fresh measurement of everything has to stay possible."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.commit()
+    conn.close()
+    r = client.post("/__proxy/api/bench/run",
+                    json={"models": [{"model": "qwen3:4b", "upstream": "ollama"}],
+                          "runs": 1, "resume": False})
     conn = P.db()
     cfg = json.loads(conn.execute("SELECT config_json FROM bench_runs WHERE id=?",
                                   (r.json()["id"],)).fetchone()[0])
@@ -273,7 +291,7 @@ def test_the_model_load_itself_reports_a_phase(client):
     import inspect
     src = inspect.getsource(P._bench_execute)
     i_warm = src.index("if warmup:")
-    i_load = src.index('_bench_phase(bench_id, f"loading {model} into memory"')
+    i_load = src.index('into memory"')
     assert i_load > i_warm, "the load phase must be set inside the warm-up branch"
     # ...and the clear must come after it, not before.
     i_clear = src.index("_bench_phase(bench_id, None)      # measuring from here")

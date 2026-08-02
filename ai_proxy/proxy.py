@@ -9122,9 +9122,12 @@ async def bench_run(request: Request):
     sctx = keep("server_context", int)
     if sctx:
         config["server_context"] = sctx
-    # Reuse cells an earlier run already measured with identical settings. Off unless asked
-    # for: a benchmark that silently hands back old numbers is worse than a slow one.
-    config["resume"] = bool(payload.get("resume", False))
+    # Reuse cells an earlier run already measured with identical settings. On unless told
+    # otherwise: the signature covers every setting that changes what a cell measures, so a
+    # reused cell is one that would have produced the same numbers, and the copy records where
+    # they came from. The narrow risk of a stale number is worth less than the repeated cost of
+    # forgetting — three multi-hour runs went out unprotected because this had to be asked for.
+    config["resume"] = bool(payload.get("resume", True))
 
     # A matrix is any submission with more than one cell across the sweepable axes.
     cells = _bench_expand_matrix(models, config)
@@ -12986,7 +12989,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     # 0 for minutes because the warm-up is deliberately not counted, so the
                     # run looks wedged exactly when it is doing the most work.
                     _sz = model_meta.get("size_mb")
-                    _bench_phase(bench_id, f"loading {model} into memory"
+                    _bench_phase(bench_id, f"loading {_bench_model_display(model)} into memory"
                                  + (f" ({_sz / 1024:.0f} GB)" if _sz else "")
                                  + " — warm-up, not measured")
                     # In cached mode the warm-up must send the prompt the measured runs will
@@ -13006,7 +13009,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     _bench_phase(bench_id, None)      # measuring from here; the counter moves
                 else:
                     warm = None
-                    _bench_phase(bench_id, f"loading {model} into memory — warm-up is off, so "
+                    _bench_phase(bench_id, f"loading {_bench_model_display(model)} into memory "
+                                           f"— warm-up is off, so "
                                            f"the first measurement carries it")
                 # Each unit is one request. Without a suite that's the synthetic prompt N times;
                 # with one it's every task × N repeats, so each task gets its own percentiles
