@@ -80,7 +80,9 @@ def test_snapshots_are_stored_as_one_blob_per_sample(client):
     # The INSERT no longer names backends, so adding one cannot desync its column list from
     # its value list — the failure that stopped telemetry for an hour.
     import inspect
-    src = inspect.getsource(P._collect_once)
+    # The INSERT moved off the event loop into its own function; the property is about the
+    # write, so follow it there rather than pinning where it happens to live.
+    src = inspect.getsource(P._collect_once) + inspect.getsource(P._write_metrics_sample)
     assert "backends_json" in src
     for legacy in ("ollama_json", "vllm_json", "llamacpp_json"):
         assert legacy not in src, f"{legacy} still written by hand"

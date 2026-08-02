@@ -2453,25 +2453,21 @@ def backend(name: str):
 _register_backends()
 
 
-async def _collect_once(app: FastAPI):
-    cpu = _cpu_pct()
-    mem = _mem_snapshot()
-    gpus = _gpu_snapshot()
-    # Probe whatever is registered. return_exceptions=True because one unreachable backend
-    # must not abort the whole sample — losing every metric because a single probe raised is
-    # how the collector became a single point of failure before.
-    entries = list(PROVIDERS.items()) + list(SIDE_SERVICES.items())
-    results = await asyncio.gather(
-        *(b.probe(app.state.metrics_client) for _n, b in entries),
-        return_exceptions=True,
-    )
-    backends = {}
-    for (name, _b), res in zip(entries, results):
-        if isinstance(res, BaseException):
-            backends[name] = {"reachable": False, "error": f"{type(res).__name__}: {res}"}
-        else:
-            backends[name] = res
-    ts = time.time()
+def _host_snapshot() -> tuple:
+    """CPU, load, memory and GPU — gathered together so it can be run off the event loop.
+
+    _gpu_snapshot shells out to nvidia-smi three times with a 3-second timeout each, so this is
+    up to nine seconds of blocking work. Called straight from the async collector it stopped the
+    proxy *accepting* connections for that long: the dashboard looked dead, requests piled up in
+    the socket's accept queue, and it cleared on its own once the box quietened down — which
+    made it look like load rather than a bug. nvidia-smi is slowest exactly when a benchmark is
+    hammering the GPU, so it failed when it was most likely to be watched.
+    """
+    return _cpu_pct(), _load_avg(), _mem_snapshot(), _gpu_snapshot()
+
+
+def _write_metrics_sample(ts: float, cpu, load, mem: dict, gpus: list, backends: dict) -> None:
+    """The sample write plus its retention deletes. Also blocking, also off-thread."""
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO system_metrics
@@ -2481,7 +2477,7 @@ async def _collect_once(app: FastAPI):
         (
             ts,
             cpu,
-            _load_avg(),
+            load,
             mem.get("total_mb"),
             mem.get("used_mb"),
             mem.get("avail_mb"),
@@ -2507,6 +2503,27 @@ async def _collect_once(app: FastAPI):
     conn.commit()
     conn.close()
     _maybe_sweep_archive(ts)
+
+
+async def _collect_once(app: FastAPI):
+    # Everything blocking goes to a thread; only the backend probes, which are genuinely async
+    # HTTP, run on the loop.
+    cpu, load, mem, gpus = await asyncio.to_thread(_host_snapshot)
+    # Probe whatever is registered. return_exceptions=True because one unreachable backend
+    # must not abort the whole sample — losing every metric because a single probe raised is
+    # how the collector became a single point of failure before.
+    entries = list(PROVIDERS.items()) + list(SIDE_SERVICES.items())
+    results = await asyncio.gather(
+        *(b.probe(app.state.metrics_client) for _n, b in entries),
+        return_exceptions=True,
+    )
+    backends = {}
+    for (name, _b), res in zip(entries, results):
+        if isinstance(res, BaseException):
+            backends[name] = {"reachable": False, "error": f"{type(res).__name__}: {res}"}
+        else:
+            backends[name] = res
+    await asyncio.to_thread(_write_metrics_sample, time.time(), cpu, load, mem, gpus, backends)
     # Artifact sweep: extract file/url/image touches from recent requests (off-thread so the
     # metrics loop never blocks on DB work). Dedup makes it idempotent.
     try:
