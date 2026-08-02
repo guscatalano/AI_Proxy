@@ -221,3 +221,75 @@ def test_the_columns_survive_a_cell_that_missed_them(client):
     b = _run("b", prompt=131072)          # no env at all
     head, cells = _first_table(_render([a, b]))
     assert len(head) == len(cells)
+
+
+# ---- a 38-cell sweep has to stay readable ---------------------------------------------------
+
+def _graded(bench_id, model, upstream, perfect, decode, tasks):
+    r = _run(bench_id, model=model, upstream=upstream)
+    q = r["results"]["summary"]["quality"]
+    q["perfect_rate"] = perfect
+    q["tasks"] = [{"task": t, "perfect_rate": v} for t, v in tasks.items()]
+    r["results"]["summary"]["decode_tps"]["p50"] = decode
+    return r
+
+
+def test_the_per_task_table_does_not_grow_a_column_per_cell(client):
+    """One column per cell put 38 columns and a 60-character heading in each; the table could
+    not render. Cells are rows everywhere; columns are for metrics."""
+    runs = [_graded(f"r{i}", f"model-{i}", "ollama", 0.9, 60 - i,
+                    {"calculator": 0.0 if i % 2 else 1.0, "binary_search": 1.0})
+            for i in range(12)]
+    html = _render(runs)
+    tbl = html.split("Per-task correctness")[-1]
+    head = [x for x in re.findall(r"<th[^>]*>(.*?)</th>", tbl.split("</thead>")[0], re.S)]
+    assert len(head) <= 4, f"{len(head)} columns in the per-task table"
+    # ...and the task nothing failed is summarised away rather than given a row of 100%s.
+    assert "binary_search" not in tbl.split("<tbody>")[1]
+    assert "calculator" in tbl
+
+
+def test_a_task_nobody_missed_is_not_given_a_row(client):
+    runs = [_graded(f"r{i}", f"m{i}", "ollama", 1.0, 60, {"easy": 1.0}) for i in range(4)]
+    html = _render(runs)
+    assert "separates nothing" in html
+
+
+def test_the_tier_table_puts_cells_in_rows(client):
+    runs = []
+    for i in range(8):
+        r = _graded(f"t{i}", f"m{i}", "ollama", 0.9, 50, {"x": 1.0})
+        r["results"]["summary"]["quality"]["tiers"] = {
+            "core": {"perfect_rate": 1.0}, "hard": {"perfect_rate": 0.5}}
+        runs.append(r)
+    html = _render(runs)
+    if "Correctness by tier" in html:
+        tbl = html.split("Correctness by tier")[-1]
+        head = re.findall(r"<th[^>]*>(.*?)</th>", tbl.split("</thead>")[0], re.S)
+        assert len(head) <= 4, f"{len(head)} columns in the tier table"
+
+
+def test_the_report_leads_with_the_answer(client):
+    """Thirty-eight rows in run order make the reader do the ranking by hand."""
+    runs = [_graded("a", "slow-but-right", "ollama", 1.0, 18.2, {"x": 1.0}),
+            _graded("b", "fast-but-wrong", "ollama", 0.3, 300.0, {"x": 0.0}),
+            _graded("c", "best", "ollama", 1.0, 63.7, {"x": 1.0})]
+    html = _render(runs)
+    lede = html.split("<h2>")[0]
+    assert "best" in lede and "leads" in lede
+    assert "63.7" in lede
+    head, cells = _first_table(html)
+    assert "best" in " ".join(cells), "the table is not sorted to match the lede"
+
+
+def test_a_field_only_some_backends_report_is_not_an_axis(client):
+    """Absent is not a value. Size counted as varying because one backend reports it, giving a
+    column of dashes with two real entries."""
+    a = _run("a", model="x", upstream="ollama")
+    b = _run("b", model="y", upstream="ollama")
+    a["results"]["summary"]["size_mb"] = None
+    rows = [P._bench_report_row(r) for r in (a, b)]
+    rows[0]["size_mb"] = 16800
+    rows[1]["size_mb"] = None
+    varying, _c, _v = P._bench_axis_split(rows, [a, b])
+    assert "size" not in varying

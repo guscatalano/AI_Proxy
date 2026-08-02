@@ -9633,6 +9633,10 @@ _REPORT_CSS = """
   /* Settings columns are context, not findings: keep them present but visually behind the
      measurements, so the eye lands on the numbers that answer the question. */
   td.ax { font-family:var(--mono); font-size:11.5px; color:var(--ink-faint); white-space:nowrap; }
+  /* The list of configurations that missed a task is the point of that row, so it wraps
+     rather than truncating — it is prose, not a figure. */
+  td.fails { font-size:11.5px; color:var(--ink-dim); white-space:normal; line-height:1.45;
+             overflow-wrap:anywhere; }
   .warnbox { border-left:3px solid var(--warn); background:var(--panel);
              padding:10px 14px; border-radius:0 8px 8px 0; color:var(--ink-dim); }
   /* Footnotes belong under the thing they qualify — above it they're just a wall to climb.
@@ -9817,7 +9821,11 @@ def _bench_axis_split(rows: list[dict], runs: list[dict]) -> tuple[list, dict, l
     if not vals:
         return [], {}, []
     keys = [k for k, _lbl in _BENCH_AXIS_LABELS]
-    varying = [k for k in keys if len({str(v.get(k)) for v in vals}) > 1]
+    def spread(k):
+        # Absent is not a value. A field only some backends report was being counted as an
+        # axis, giving a column of dashes with two real entries in it.
+        return {str(v[k]) for v in vals if v.get(k) not in (None, "")}
+    varying = [k for k in keys if len(spread(k)) > 1]
     constant = {k: vals[0][k] for k in keys
                 if k not in varying and vals[0].get(k) not in (None, "")}
     return varying, constant, vals
@@ -9855,6 +9863,15 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
 
     # Table -------------------------------------------------------------------------------
     varying, constant, axis_vals = _bench_axis_split(rows, runs)
+    # Best first. Run order is an implementation detail of the sweep, and a reader scanning
+    # thirty-eight rows for the winner is doing work the report should have done.
+    _order = sorted(range(len(rows)),
+                    key=lambda i: (-(rows[i].get("perfect_rate") if rows[i].get("perfect_rate")
+                                     is not None else -1),
+                                   -(rows[i].get("decode_p50") or 0)))
+    rows = [rows[i] for i in _order]
+    runs = [runs[i] for i in _order]
+    axis_vals = [axis_vals[i] for i in _order]
     axis_names = [_bench_cell_name(v, varying) for v in axis_vals]
     for _r, _nm in zip(rows, axis_names):
         _r["_name"] = _nm
@@ -9967,32 +9984,57 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                     task_summary = (f'<p class="note">All <b>{clean}</b> tasks fully correct on '
                                     "every run — nothing to single out.</p>")
                     trs = []
+                    th = ""
                 else:
                     task_summary = (f'<p class="note"><b>{clean}</b> of {len(items)} tasks were '
                                     "fully correct on every run; the ones that were not are "
                                     "listed below.</p>")
                     trs = [f'<tr><th scope="row"><code>{_h(t)}</code></th>'
                            f'<td class="n">{pct(per.get(lab))}</td></tr>' for t, per in imperfect]
+                    th = '<th>Task</th><th class="n">Perfect</th>' 
             else:
+                # One column per cell put 38 columns and a 60-character compound heading in
+                # each; the table could not render, let alone be read. Cells are rows here and
+                # everywhere else — columns are for metrics, and there are always few of those.
+                #
+                # Inverted as well as transposed: a task everything solved carries no
+                # information, so the useful axis is which cells failed which task.
                 task_summary = ""
                 trs = []
+                clean_tasks = []
                 for tname, per in items:
-                    tds = "".join(f'<td class="n">{pct(per.get(l))}</td>' for l in col_labels)
-                    trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
+                    failed = sorted(nm for nm in col_labels if (per.get(nm) or 0) < 1)
+                    if not failed:
+                        clean_tasks.append(tname)
+                        continue
+                    trs.append(
+                        f'<tr><th scope="row"><code>{_h(tname)}</code></th>'
+                        f'<td class="n">{len(col_labels) - len(failed)} of {len(col_labels)}</td>'
+                        f'<td class="fails">{_h(", ".join(failed))}</td></tr>')
+                if clean_tasks:
+                    task_summary = (
+                        f'<p class="note"><b>{len(clean_tasks)}</b> of {len(items)} tasks were '
+                        f"solved perfectly by every configuration and are not listed: "
+                        f"<code>{_h(', '.join(clean_tasks))}</code>. A task nothing fails "
+                        f"separates nothing.</p>")
+                th = ('<th>Task</th><th class="n">Perfect in</th>'
+                      '<th>Configurations that missed it</th>')
             tier_rows = ""
             if any(r.get("tiers") for r in rows):
-                names = {"core": "Core \u2014 any usable coding model clears these",
-                         "hard": "Hard \u2014 separates models that both pass the core tier"}
+                names = {"core": "Core", "hard": "Hard"}
+                tiers_present = [t for t in ("core", "hard")
+                                 if any((r.get("tiers") or {}).get(t) for r in rows)]
                 ttrs = []
-                for tier in ("core", "hard"):
-                    if not any((r.get("tiers") or {}).get(tier) for r in rows):
-                        continue
+                for r, nm in zip(rows, axis_names):
                     tds = "".join(
-                        f'<td class="n">{pct(((r.get("tiers") or {}).get(tier) or {}).get("perfect_rate"))}</td>'
-                        for r in rows)
-                    ttrs.append(f'<tr><th scope="row">{_h(names.get(tier, tier))}</th>{tds}</tr>')
-                tier_rows = ('<table><thead><tr><th>Tier</th>' + th + '</tr></thead><tbody>'
-                             + "".join(ttrs) + '</tbody></table>')
+                        f'<td class="n">{pct(((r.get("tiers") or {}).get(t) or {}).get("perfect_rate"))}</td>'
+                        for t in tiers_present)
+                    ttrs.append(f'<tr><th scope="row" class="cfg">{_h(nm)}</th>{tds}</tr>')
+                tier_head = "".join(f'<th class="n">{_h(names.get(t, t))}</th>'
+                                    for t in tiers_present)
+                tier_rows = ('<div class="tbl"><table><thead><tr><th>Configuration</th>'
+                             + tier_head + '</tr></thead><tbody>'
+                             + "".join(ttrs) + '</tbody></table></div>')
             # Runs recorded before the hard tier existed carry no tier data; an empty heading
             # with a paragraph explaining a table that isn't there is worse than no section.
             tier_html = ("<h2>Correctness by tier</h2>"
@@ -10004,7 +10046,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
 <p class="note">Share of responses that passed every case for that task. A model strong
 everywhere except one task and a model mediocre throughout can share an overall average.</p>
 {task_summary}
-{f'<div class="tbl"><table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>' if trs else ""}"""
+{f'<div class="tbl"><table><thead><tr>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>' if trs else ""}"""
 
     # Cold vs cached, paired by everything except the cache axis. This is the comparison that
     # exposes a backend serving every repeated prompt as a fresh prefill.
@@ -10055,7 +10097,7 @@ ordinary slowness rather than a misconfiguration.</p>
             f'<td class="n win">{fmt(ratio, 0, "x")}</td></tr>'
             for r, c, w, ratio in cold_rows)
         cold_html = (
-            "<h2>Prompt cache</h2>"
+            "<h2>Prompt cache — warm-up vs measured</h2>"
             '<p class="note">The warm-up sends the same prompt the measured runs use, so its '
             "first-token time is that prompt\u2019s <em>cold</em> prefill; everything after it is "
             "served warm. A backend whose prefix caching is off or unsupported shows no gap "
@@ -10123,7 +10165,29 @@ ordinary slowness rather than a misconfiguration.</p>
         if not varying and len(rows) > 1:
             inert = ('<p class="note warnbox">Every cell in this comparison used identical '
                      'settings, so the rows below differ only by run-to-run noise.</p>')
+        # The finding, before the evidence. A comparison whose answer is only recoverable by
+        # scanning thirty-eight rows has buried it. Best quality first, and among equals the
+        # quickest — the same order the table is now sorted in, so the lede names its top row.
+        _lede = ""
+        if len(rows) > 1 and rows[0].get("decode_p50"):
+            _b, _bn = rows[0], axis_names[0]
+            _q = _b.get("perfect_rate")
+            _tied = [n for r2, n in zip(rows, axis_names)
+                     if r2.get("perfect_rate") == _q and r2 is not _b]
+            _lede = f"""
+  <div class="hero">
+    <p class="lede"><b>{_h(_bn)}</b> leads: {
+      f'<b>{pct(_q)}</b> fully correct at ' if _q is not None else ''}<b>{
+      _fmt_n(_b.get("decode_p50"), 1)}</b> tok/s out{
+      f', {_fmt_n((_b.get("load_ms") or 0) / 1000, 0)} s to load' if _b.get("load_ms") else ''}.</p>
+    <p class="why">{
+      f'{len(_tied)} other configuration{"s" if len(_tied) != 1 else ""} scored the same and were slower. '
+      if _tied else ''}Ranked by correctness first, then output rate. {len(rows)} configurations
+      measured{f' across {len({v.get("backend") for v in axis_vals if v.get("backend")})} backends'
+      if len({v.get("backend") for v in axis_vals if v.get("backend")}) > 1 else ''}.</p>
+  </div>"""
         results = f"""
+  {_lede}
   {held}
   <h2>Results</h2>
   <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
