@@ -117,6 +117,16 @@ def test_no_full_paths_survive_into_the_page():
     assert "big-model" in html, "...but the model still has to be identifiable"
 
 
+def test_the_warm_up_footer_uses_short_names_too():
+    """The last place a raw path survived: six of them in one paragraph at the foot of the page."""
+    runs = [_run("a", prompt=32000), _run("b", prompt=131072)]
+    for r in runs:
+        r["results"]["summary"]["warmup_ms"] = 900_000.0
+    html = _render(runs)
+    assert "Warm-up" in html
+    assert "/m/big-model" not in html
+
+
 def test_a_single_run_still_renders():
     html = _render([_run("solo")])
     assert "Configuration" in html and "vs best" not in html

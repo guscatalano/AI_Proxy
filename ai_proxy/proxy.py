@@ -9685,7 +9685,8 @@ ordinary slowness rather than a misconfiguration.</p>
 
     warm = [(fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')
              if len(rows) == 1 else
-             f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}")
+             f"{r.get('_name') or r['label']}: "
+             f"{fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}")
             for r, run in zip(rows, runs)
             if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
 
