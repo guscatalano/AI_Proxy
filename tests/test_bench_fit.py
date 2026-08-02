@@ -75,3 +75,19 @@ def test_preflight_refuses_a_model_that_cannot_fit(client):
 def test_a_fitting_model_still_passes_preflight(client):
     meta = {"model": "ok", "upstream": "ollama", "loaded": True, "fits": True}
     assert P._bench_preflight("ok", meta, "ollama", {"ollama:ok": meta}) is None
+
+
+def test_the_size_is_read_from_the_shape_the_snapshot_actually_uses(client, monkeypatch):
+    """_ollama_snapshot flattens /api/tags into size_mb and parameter_size. Reading `size` and
+    `details` instead returned None for every model, so nothing was ever blocked and the check
+    looked like it worked."""
+    monkeypatch.setattr(P, "_mem_snapshot", lambda: {"total_mb": 121 * GB})
+    monkeypatch.setattr(P, "system_now", lambda: {
+        "ollama": {"tags": [{"name": "qwen3:235b-a22b", "size_mb": 135_580,
+                             "parameter_size": "235.1B"},
+                            {"name": "qwen3:4b", "size_mb": 2_355,
+                             "parameter_size": "4.0B"}]}})
+    idx = asyncio.run(P._bench_model_index())
+    assert idx["ollama:qwen3:235b-a22b"]["size_mb"] == 135_580, "size never reached the index"
+    assert idx["ollama:qwen3:235b-a22b"]["fits"] is False
+    assert idx["ollama:qwen3:4b"]["fits"] is True

@@ -8666,9 +8666,7 @@ async def _bench_model_index() -> dict:
         for t in (ollama.get("tags") or []):
             if isinstance(t, dict):
                 put(t.get("name"), "ollama", False,
-                    size_mb=round((t.get("size") or 0) / 1048576) or None,
-                    quant=((t.get("details") or {}).get("quantization_level")),
-                    params=((t.get("details") or {}).get("parameter_size")))
+                    size_mb=t.get("size_mb"), params=t.get("parameter_size"))
         for m in (ollama.get("ps") or []):
             if isinstance(m, dict):
                 put(m.get("name") or m.get("model"), "ollama", True,
