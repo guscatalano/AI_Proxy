@@ -12600,7 +12600,11 @@ async def _bench_env_snapshot() -> dict:
     or whether the GPU was already half-full when the run started."""
     env: dict = {"ts": time.time(), "proxy_version": __version__}
     try:
-        sysinfo = await system_now()
+        # system_now is sync so Starlette runs it in the threadpool; awaiting it raises
+        # TypeError into the blanket except below, and every run since has recorded an error
+        # string instead of the GPU, memory and engine state it exists to capture. Same
+        # mistake, same shape, second location — _bench_model_index had it too.
+        sysinfo = await asyncio.to_thread(system_now)
         gpus = sysinfo.get("gpus") or []
         env["gpus"] = [
             {"name": g.get("name"), "mem_used_mb": g.get("mem_used_mb"),
@@ -12622,6 +12626,12 @@ async def _bench_env_snapshot() -> dict:
                               if isinstance(m, dict)]
     except Exception as e:
         env["error"] = f"{type(e).__name__}: {e}"
+        # Not silent: this is the only record of what the machine looked like, and a run whose
+        # environment is missing is a number nobody can interpret later.
+        try:
+            print(f"[bench] environment snapshot failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
     return env
 
 

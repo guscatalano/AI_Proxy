@@ -333,3 +333,25 @@ def test_a_running_container_is_not_reported_as_dead(client, monkeypatch):
     monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
     monkeypatch.setattr(P, "_run_cmd", run)
     assert asyncio.run(P.PROVIDERS["vllm"].died()) is None
+
+
+def test_the_environment_snapshot_does_not_await_a_sync_function(client):
+    """system_now is sync so Starlette runs it in the threadpool. Awaiting it raised TypeError
+    into a blanket except, so every bench run recorded env['error'] instead of the GPU, memory
+    and engine state — which is why reports said "GPU: not reported" on a machine with a
+    perfectly detectable GB10. Same mistake _bench_model_index already had."""
+    import inspect
+    src = inspect.getsource(P._bench_env_snapshot)
+    assert "await system_now()" not in src
+    assert "to_thread(system_now)" in src
+
+
+def test_the_environment_snapshot_captures_the_gpu(client, monkeypatch):
+    monkeypatch.setattr(P, "system_now", lambda: {
+        "gpus": [{"name": "NVIDIA GB10", "mem_total_mb": 124610, "mem_used_mb": 170,
+                  "util_pct": 0}],
+        "mem": {"total_mb": 124610}})
+    env = asyncio.run(P._bench_env_snapshot())
+    assert "error" not in env, env.get("error")
+    assert env["gpus"][0]["name"] == "NVIDIA GB10"
+    assert env["gpus"][0]["mem_total_mb"] == 124610
