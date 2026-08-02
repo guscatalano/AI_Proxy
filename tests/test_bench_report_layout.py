@@ -241,7 +241,9 @@ def test_the_per_task_table_does_not_grow_a_column_per_cell(client):
                     {"calculator": 0.0 if i % 2 else 1.0, "binary_search": 1.0})
             for i in range(12)]
     html = _render(runs)
-    tbl = html.split("Per-task correctness")[-1]
+    # Just that table: the method section further down legitimately names every task.
+    after = html.split("Per-task correctness")[-1]
+    tbl = re.search(r"<table.*?</table>", after, re.S).group(0)
     head = [x for x in re.findall(r"<th[^>]*>(.*?)</th>", tbl.split("</thead>")[0], re.S)]
     assert len(head) <= 4, f"{len(head)} columns in the per-task table"
     # ...and the task nothing failed is summarised away rather than given a row of 100%s.
@@ -333,3 +335,21 @@ def test_a_metric_that_differs_keeps_its_column(client):
     b["results"]["summary"]["completion_tokens"] = {"mean": 900}
     head, _ = _first_table(_render([a, b]))
     assert "Tokens" in head
+
+
+def test_the_report_says_what_was_actually_tested(client):
+    """Six months on, nobody remembers what coding-v1 contained, and a number is only
+    interpretable if you know what produced it."""
+    runs = [_graded("a", "m1", "ollama", 1.0, 60, {"calculator": 1.0}),
+            _graded("b", "m2", "ollama", 0.5, 30, {"calculator": 0.0})]
+    html = _render(runs)
+    assert "What was tested" in html
+    assert "coding-v1" in html
+    assert "Fully correct" in html and "every" in html          # what the score means
+    assert "not a sandbox" in html                              # the honest caveat
+    assert "calculator" in html.split("What was tested")[-1]    # the task list
+
+
+def test_the_method_section_is_absent_without_a_suite(client):
+    html = _render([_run("a", graded=False), _run("b", graded=False)])
+    assert "What was tested" not in html

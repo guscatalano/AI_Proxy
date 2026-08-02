@@ -9741,6 +9741,104 @@ def _report_page(title: str, eyebrow: str, sub: str, meta: list, body: str) -> s
             + _report_foot())
 
 
+def _bench_pareto(points: list) -> set:
+    """Indices not beaten on both axes at once.
+
+    A configuration that is slower *and* less correct than another is strictly dominated: there
+    is no reason to run it, whatever you value. That set is the shortlist, and it is the one
+    thing a ranked bar chart cannot show — ranking one metric at a time hides the trade.
+    """
+    keep = set()
+    for i, (_n, x, y) in enumerate(points):
+        if not any(ox >= x and oy >= y and (ox > x or oy > y)
+                   for j, (_m, ox, oy) in enumerate(points) if j != i):
+            keep.add(i)
+    return keep
+
+
+def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
+    """Correctness against output rate, with the frontier drawn.
+
+    The bar charts rank one metric at a time, so the actual question — which of these is worth
+    running at all — takes three charts and a pencil. Here a dominated point is visibly below
+    and to the left of something better, and the frontier is the shortlist.
+
+    Log x because the range is genuinely two orders of magnitude on this hardware (5.7 tok/s to
+    309); linear would put every serious model in the left tenth of the plot.
+    """
+    pts = [(r.get("_name") or _bench_label_display(r.get("label") or ""),
+            float(r.get("decode_p50") or 0), (r.get("perfect_rate") or 0) * 100.0)
+           for r in rows
+           if r.get("decode_p50") and r.get("perfect_rate") is not None]
+    if len(pts) < 3:
+        return ""          # a scatter of two points is a table with extra steps
+
+    import math
+    pad_l, pad_r, pad_t, pad_b = 46, 14, 16, 38
+    x0, x1 = pad_l, width - pad_r
+    y0, y1 = pad_t, height - pad_b
+    lo = min(math.log10(max(p[1], 0.1)) for p in pts)
+    hi = max(math.log10(max(p[1], 0.1)) for p in pts)
+    if hi - lo < 0.05:
+        lo, hi = lo - 0.25, hi + 0.25
+    ylo = min(min(p[2] for p in pts), 100.0)
+    ylo = 0.0 if ylo < 40 else 40.0        # zoom in when everything is good, never mislead
+
+    def px(v):
+        return x0 + (math.log10(max(v, 0.1)) - lo) / (hi - lo) * (x1 - x0)
+
+    def py(v):
+        return y1 - (v - ylo) / max(100.0 - ylo, 1) * (y1 - y0)
+
+    front = _bench_pareto(pts)
+    out = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+           f'aria-label="Correctness against output rate">']
+    # Grid: horizontal only. Vertical lines on a log axis read as data.
+    step = 20 if ylo == 0 else 10
+    v = ylo
+    while v <= 100.001:
+        y = py(v)
+        out.append(f'<line x1="{x0}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" '
+                   f'stroke="currentColor" stroke-opacity=".12"/>')
+        out.append(f'<text x="{x0 - 7}" y="{y + 4:.1f}" class="ct" text-anchor="end">'
+                   f'{v:.0f}%</text>')
+        v += step
+    for tick in (1, 3, 10, 30, 100, 300, 1000):
+        if lo <= math.log10(tick) <= hi:
+            out.append(f'<text x="{px(tick):.1f}" y="{y1 + 16}" class="ct" '
+                       f'text-anchor="middle">{tick}</text>')
+    out.append(f'<text x="{(x0 + x1) / 2:.0f}" y="{height - 6}" class="ct" '
+               f'text-anchor="middle">output tokens/sec (log)</text>')
+
+    # The frontier as a staircase: from each frontier point you trade rate for correctness only
+    # by stepping, never smoothly, so a curve would be a fiction.
+    fp = sorted((pts[i] for i in front), key=lambda p: p[1])
+    if len(fp) > 1:
+        d = [f"M {px(fp[0][1]):.1f} {py(fp[0][2]):.1f}"]
+        for a, b in zip(fp, fp[1:]):
+            d.append(f"L {px(b[1]):.1f} {py(a[2]):.1f} L {px(b[1]):.1f} {py(b[2]):.1f}")
+        out.append(f'<path d="{" ".join(d)}" fill="none" stroke="var(--accent)" '
+                   f'stroke-opacity=".45" stroke-width="1.5" stroke-dasharray="4 3"/>')
+
+    labelled = 0
+    for i, (name, xv, yv) in enumerate(pts):
+        on = i in front
+        cx, cy = px(xv), py(yv)
+        out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4.5 if on else 3}" '
+                   f'fill="{"var(--accent)" if on else "currentColor"}" '
+                   f'fill-opacity="{1 if on else .28}"/>')
+        # Only the frontier is named. Thirty-eight labels is a smear, and the dominated points
+        # are precisely the ones nobody needs to identify.
+        if on and labelled < 8:
+            labelled += 1
+            anchor = "end" if cx > x1 - 90 else "start"
+            dx = -7 if anchor == "end" else 7
+            out.append(f'<text x="{cx + dx:.1f}" y="{cy + 3.5:.1f}" class="cl" '
+                       f'text-anchor="{anchor}">{_h(name[:34])}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
 def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
     """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
     or printed. Charts here exist to make the ordering obvious at a glance; the table beside
@@ -9967,7 +10065,14 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             + spread("Total", r0.get("total"), "ms")
             + '</tbody></table>')
     else:
-        charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
+        charts = ""
+        _sc = _bench_scatter_svg(rows) if graded else ""
+        if _sc:
+            charts += ('<p class="note">Correctness against output rate. A point below and to '
+                       'the left of another is beaten on both counts at once, so the dashed '
+                       'frontier is the shortlist — everything off it is dominated by '
+                       'something on it. Only the frontier is labelled.</p>' + _sc)
+        charts += _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
         charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
         if graded:
             qrows = [dict(r, q=(r["perfect_rate"] or 0) * 100) for r in rows]
@@ -10216,6 +10321,43 @@ ordinary slowness rather than a misconfiguration.</p>
   </table></div>
 """
 
+    # Method, last. A number is only interpretable if you know what produced it, and six
+    # months from now nobody remembers what coding-v1 contained.
+    method_html = ""
+    _suite_name = rows[0].get("suite") if rows else None
+    _suite = _BENCH_SUITES.get(_suite_name) if _suite_name else None
+    if _suite:
+        _tiers: dict = {}
+        for _t in _suite:
+            _tiers.setdefault(_t.get("tier") or "untiered", []).append(_t)
+        _blocks = "".join(
+            f'<div><p class="k">{_h(_tn.title())} — {len(_ts)} tasks, '
+            f'{sum(len(t["cases"]) for t in _ts)} cases</p>'
+            f'<p class="v">{_h(", ".join(t["id"] for t in _ts))}</p></div>'
+            for _tn, _ts in sorted(_tiers.items()))
+        _cfg0 = (runs[0].get("config") or {}) if runs else {}
+        method_html = f"""
+  <h2>What was tested</h2>
+  <p class="note">Every task asks for one named Python function. The model's answer is parsed
+  for a code block, the function is called with each case's arguments in a separate process
+  under a timeout, and the return value is compared with the expected one. <b>Fully correct</b>
+  counts only responses where <em>every</em> case for that task passed; <b>cases</b> is the
+  share of individual cases that passed, so a near-miss still scores there. A response with no
+  extractable code block scores zero — that measures instruction-following, not coding.</p>
+  <div class="spec">
+    <div><p class="k">Suite</p><p class="v">{_h(_suite_name)} — {len(_suite)} tasks,
+      {sum(len(t["cases"]) for t in _suite)} cases</p></div>
+    <div><p class="k">Repeats</p><p class="v">{_h(str(_cfg0.get("runs") or 1))} per task</p></div>
+    {_blocks}
+  </div>
+  <ul class="fn">
+    <li>Grading executes model-written code in a subprocess with a hard timeout, a scratch
+      working directory and a stripped environment. That contains accidents and runaway loops;
+      it is not a sandbox against deliberately hostile code.</li>
+    <li>Requests go through this proxy so every one is logged and attributed, and carry
+      <code>x-client-name: ai-proxy-bench</code>.</li>
+  </ul>"""
+
     body = f"""
   {results}
 
@@ -10227,6 +10369,8 @@ ordinary slowness rather than a misconfiguration.</p>
   {cold_html}
 
   {task_html}
+
+  {method_html}
 
   {"<h2>Warm-up</h2><p class='note'>Excluded from every measurement above. A large value is the model-load cost for a model that was not resident when the run started.</p><p class='note'>" + _h(" · ".join(warm)) + "</p>" if warm else ""}
 """
