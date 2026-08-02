@@ -667,6 +667,24 @@
   .bench-mini .idle { color: #6b7787; font-size: 11.5px; padding: 10px 0; text-align: center;
     border: 1px dashed #222a36; border-radius: 8px; }
   @media (prefers-reduced-motion: reduce) { .bench-tile .caret { animation: none; } }
+  /* Results so far. A four-hour sweep that shows nothing until it ends is a four-hour wait to
+     find out whether it was worth starting. */
+  .bench-lead { margin: 12px 0 0; border-top: 1px solid #222a36; padding-top: 10px; }
+  .bench-lead h4 { margin: 0 0 7px; font-size: 10px; letter-spacing: .12em; font-weight: 600;
+    text-transform: uppercase; color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-lead table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .bench-lead td { padding: 3px 0; color: #c9d3e1; }
+  .bench-lead td.n { text-align: right; font-family: var(--mono, ui-monospace, monospace);
+    font-variant-numeric: tabular-nums; white-space: nowrap; padding-left: 10px; }
+  .bench-lead .rk { color: #4d5765; font-family: var(--mono, ui-monospace, monospace);
+    width: 1.6em; }
+  .bench-lead .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 1px; width: 60%; }
+  .bench-lead .ax { color: #6b7787; }
+  .bench-lead .q { color: #3f8f5f; }
+  .bench-lead .q.mid { color: #d9c37a; }
+  .bench-lead .q.low { color: #e08080; }
+  .bench-lead .more { color: #4d5765; font-size: 10.5px; padding-top: 5px; }
   .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
   .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
     color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
@@ -7355,6 +7373,7 @@ function _benchRenderActive(it) {
   if (!it) {
     card.innerHTML = '';
     _benchMiniSetRunning(false);
+    _benchLeadSetRunning('');
     // Back to the ordinary layout, and the toggle forgets itself: the next run should start
     // collapsed regardless of what was expanded during the last one.
     form.style.display = '';
@@ -7363,6 +7382,7 @@ function _benchRenderActive(it) {
     return;
   }
   _benchMiniSetRunning(true);
+  _benchLeadSetRunning(it.id);
   const c = it.cells || {};
   const n = c.now || {};
   const cfg = it.config || {};
@@ -7388,12 +7408,14 @@ function _benchRenderActive(it) {
       ${it.phase && !n.phase ? `<p class="phase">⏳ ${esc(it.phase)}</p>` : ''}
       ${it.memory_warning ? `<p class="warn">⚠ measured under memory pressure — ${esc(it.memory_warning)}</p>` : ''}
       <div class="bench-mini" id="bench-mini"></div>
+      <div class="bench-lead" id="bench-lead"></div>
       <div class="foot">
         ${c.failed ? `<span style="color:#e08080">${c.failed} failed</span>` : ''}
         <a href="#" onclick="event.preventDefault();setView('live')" title="Watch the requests as they run">Live ↗</a>
       </div>
     </div>`;
   _benchMiniRender();
+  _benchLeadRender();
   // The strip is always present while a run is live; only the form comes and goes. Hiding the
   // strip on expand left no way back, because the strip held the only control that could undo
   // it.
@@ -7408,6 +7430,67 @@ function _benchRenderActive(it) {
 
 let _benchUserExpanded = false;
 let _benchMiniTiles = [];
+let _benchLeadRows = [];
+let _benchLeadTimer = null;
+let _benchLeadFor = '';
+
+// Cells that have finished already carry full results, and the report endpoint expands a
+// running parent to its children — so the standings exist long before the sweep does. Held
+// outside the card for the same reason as the tiles: the card is rebuilt on every history poll.
+function _benchLeadRender() {
+  const host = $('bench-lead');
+  if (!host) return;
+  const rows = (_benchLeadRows || []).filter(r => r.decode_p50 != null);
+  if (!rows.length) { host.innerHTML = ''; return; }
+  const graded = rows.some(r => r.perfect_rate != null);
+  // Quality first, speed as the tiebreak: the question a benchmark answers is "which of these
+  // is good", and among the good ones, "which is quickest".
+  rows.sort((a, b) => (b.perfect_rate ?? -1) - (a.perfect_rate ?? -1)
+                   || (b.decode_p50 || 0) - (a.decode_p50 || 0));
+  const top = rows.slice(0, 6);
+  host.innerHTML = `<h4>Standings — ${rows.length} cell${rows.length > 1 ? 's' : ''} in</h4>
+    <table><tbody>${top.map((r, i) => {
+      const bits = String(r.label || '').split(' · ').slice(1).filter(x => x && !x.startsWith('@'));
+      const q = r.perfect_rate;
+      const cls = q == null ? '' : (q >= 0.9 ? 'q' : q >= 0.6 ? 'q mid' : 'q low');
+      return `<tr>
+        <td class="rk">${i + 1}</td>
+        <td class="nm">${esc(_benchShortModel(r.model || ''))}
+          ${bits.length ? `<span class="ax">· ${esc(bits.join(' · '))}</span>` : ''}</td>
+        ${graded ? `<td class="n ${cls}">${q == null ? '—' : Math.round(q * 100) + '%'}</td>` : ''}
+        <td class="n">${(r.decode_p50 || 0).toFixed(1)} tok/s</td>
+      </tr>`;
+    }).join('')}</tbody></table>
+    ${rows.length > top.length ? `<div class="more">+ ${rows.length - top.length} more — full table in the report when it finishes</div>` : ''}`;
+}
+
+async function _benchLeadPoll() {
+  if (!_benchLeadFor) return;
+  try {
+    const r = await fetch('/__proxy/api/bench/report?format=json&ids=' + encodeURIComponent(_benchLeadFor));
+    const d = await r.json();
+    _benchLeadRows = d.rows || [];
+  } catch { /* leave the last standings up rather than blanking them */ }
+  _benchLeadRender();
+}
+
+function _benchLeadSetRunning(id) {
+  // Slower than the live strip on purpose: this rebuilds every child's summary server-side, and
+  // standings that change once a cell finishes do not need a two-second refresh.
+  if (id && _benchLeadFor !== id) {
+    _benchLeadFor = id;
+    _benchLeadRows = [];
+    _benchLeadPoll();
+  }
+  if (id && !_benchLeadTimer) {
+    _benchLeadTimer = setInterval(_benchLeadPoll, 15000);
+  } else if (!id && _benchLeadTimer) {
+    clearInterval(_benchLeadTimer);
+    _benchLeadTimer = null;
+    _benchLeadFor = '';
+    _benchLeadRows = [];
+  }
+}
 let _benchMiniTimer = null;
 
 // The card is rebuilt on every history poll, so the tiles are held outside it and repainted
