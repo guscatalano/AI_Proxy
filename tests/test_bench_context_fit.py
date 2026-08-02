@@ -404,8 +404,9 @@ def test_the_running_cell_is_visible_on_the_parent(client):
     conn.close()
 
     it = client.get("/__proxy/api/bench/runs").json()["items"][0]
-    assert it["cells"]["now"] == {"label": "ds4 · 131k ctx · cold",
-                                 "progress": 5, "progress_total": 12}
+    assert it["cells"]["now"]["label"] == "ds4 · 131k ctx · cold"
+    assert it["cells"]["now"]["progress"] == 5
+    assert it["cells"]["now"]["progress_total"] == 12
 
 
 def test_a_finished_sweep_has_no_running_cell(client):

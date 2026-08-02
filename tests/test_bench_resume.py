@@ -182,3 +182,62 @@ def test_without_resume_every_cell_runs(client, monkeypatch):
     conn.close()
     asyncio.run(P._bench_execute_suite("b_new2", P.app))
     assert len(ran) == 1, "reuse happened without being asked for"
+
+
+# ---- phases -------------------------------------------------------------------------------
+
+def test_a_phase_is_readable_while_the_step_is_still_running(client):
+    """The whole point is the minutes in between. A phase that only lands when the step
+    finishes describes the past."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status) "
+                 "VALUES ('b_ph', ?, 'm', '{}', 'running')", (time.time(),))
+    conn.commit()
+    # Deliberately left open: the writer must not depend on this caller committing.
+    P._bench_phase("b_ph", "starting vllm and waiting for it to serve")
+    got = conn.execute("SELECT phase FROM bench_runs WHERE id='b_ph'").fetchone()[0]
+    conn.close()
+    assert got == "starting vllm and waiting for it to serve"
+
+
+def test_the_phase_reaches_the_history_row(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status, phase) "
+                 "VALUES ('b_ph2', ?, 'm', '{}', 'running', 'freeing memory for vllm')",
+                 (time.time(),))
+    conn.commit()
+    conn.close()
+    it = client.get("/__proxy/api/bench/runs").json()["items"][0]
+    assert it["phase"] == "freeing memory for vllm"
+
+
+def test_a_sweeps_running_cell_carries_its_phase(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    now = time.time()
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status) "
+                 "VALUES ('b_pp', ?, 'm', '{}', 'running')", (now,))
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, "
+                 "label, progress, progress_total, phase) "
+                 "VALUES ('b_pc', ?, 'm', '{}', 'running', 'b_pp', 'cell', 0, 36, ?)",
+                 (now, "restarting llamacpp at a 291,840-token window and reloading its weights"))
+    conn.commit()
+    conn.close()
+    now_cell = client.get("/__proxy/api/bench/runs").json()["items"][0]["cells"]["now"]
+    assert "reloading its weights" in now_cell["phase"]
+
+
+def test_a_finished_run_stops_describing_a_step(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute("INSERT INTO bench_runs (id, ts, model, config_json, status, phase) "
+                 "VALUES ('b_ph3', ?, 'm', '{}', 'running', 'loading')", (time.time(),))
+    conn.commit()
+    conn.close()
+    P._bench_phase("b_ph3", None)
+    conn = P.db()
+    got = conn.execute("SELECT phase FROM bench_runs WHERE id='b_ph3'").fetchone()[0]
+    conn.close()
+    assert got is None

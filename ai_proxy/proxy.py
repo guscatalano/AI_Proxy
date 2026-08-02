@@ -358,7 +358,8 @@ CREATE TABLE IF NOT EXISTS bench_runs (
     parent_id TEXT,                      -- set on children of a matrix suite
     axes_json TEXT,                      -- the axis values this cell represents
     env_json TEXT,                       -- machine/engine snapshot taken at run time
-    label TEXT                            -- human-readable cell label
+    label TEXT,                           -- human-readable cell label
+    phase TEXT                            -- what it is doing between measurements
 );
 
 CREATE TABLE IF NOT EXISTS proxy_personalities (
@@ -468,6 +469,10 @@ MIGRATIONS = [
     "ALTER TABLE bench_runs ADD COLUMN axes_json TEXT",
     "ALTER TABLE bench_runs ADD COLUMN env_json TEXT",
     "ALTER TABLE bench_runs ADD COLUMN label TEXT",
+    # What the run is doing when it is not measuring. Stopping a backend, loading 90 GB of
+    # weights and waiting for a server to answer take minutes each, and all of them looked
+    # identical to a hang: a counter that does not move and nothing saying why.
+    "ALTER TABLE bench_runs ADD COLUMN phase TEXT",
     # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
     # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
     # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
@@ -9062,6 +9067,21 @@ _BENCH_SIG_KEYS = ("upstream", "suite", "runs", "max_tokens", "prompt_tokens", "
                    "thinking", "temperature", "cache", "concurrency", "randomize", "warmup")
 
 
+def _bench_phase(bench_id: str, text: str | None) -> None:
+    """Record what a run is doing right now, visible immediately.
+
+    Its own connection and commit on purpose: a phase that only lands when the step finishes
+    describes the past, and the whole point is the minutes in between.
+    """
+    try:
+        conn = db()
+        conn.execute("UPDATE bench_runs SET phase=? WHERE id=?", (text, bench_id))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
 def _bench_cell_sig(model: str, cfg: dict) -> str:
     parts = {k: cfg.get(k) for k in _BENCH_SIG_KEYS}
     parts["model"] = model
@@ -9154,7 +9174,7 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
     conn = db()
     rows = conn.execute(
         "SELECT id, ts, model, config_json, status, progress, progress_total, "
-        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label "
+        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label, phase "
         "FROM bench_runs "
         + ("" if include_children else "WHERE parent_id IS NULL ")
         + "ORDER BY ts DESC LIMIT ?",
@@ -9179,12 +9199,13 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
         # 0/6 for many minutes. That detail used to be visible because every cell had its own
         # history row; now that they are grouped, it has to come along with the group.
         for c in conn.execute(
-            f"SELECT parent_id, label, progress, progress_total FROM bench_runs "
+            f"SELECT parent_id, label, progress, progress_total, phase FROM bench_runs "
             f"WHERE parent_id IN ({qs}) AND status='running' ORDER BY ts, rowid", ids,
         ).fetchall():
             entry = cells.setdefault(c["parent_id"], {"total": 0})
             entry.setdefault("now", {"label": c["label"], "progress": c["progress"],
-                                     "progress_total": c["progress_total"]})
+                                     "progress_total": c["progress_total"],
+                                     "phase": c["phase"]})
         # How much longer, measured from this run's own pace.
         now_ts = time.time()
         by_parent: dict = {}
@@ -11941,7 +11962,8 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
     return None
 
 
-async def _bench_start_backend(meta: dict, persist: bool = True) -> dict:
+async def _bench_start_backend(meta: dict, persist: bool = True,
+                               bench_id: str = "") -> dict:
     """Make room, bring up the stopped backend the run needs, and say how to undo both.
 
     Freeing first is a precondition, not a courtesy. A fixed backend that cannot allocate never
@@ -11954,6 +11976,8 @@ async def _bench_start_backend(meta: dict, persist: bool = True) -> dict:
     if prov is None:
         return {"ok": False, "started": False, "restore": None,
                 "detail": f"unknown upstream {upstream!r}"}
+    if bench_id:
+        _bench_phase(bench_id, f"freeing memory for {upstream}")
     snap = await _bench_residency_snapshot()
     freed = await _bench_free_gpu(snap, keep=meta.get("model") or "")
     # Persisted before anything is started: a proxy restart between here and the restore would
@@ -11962,6 +11986,9 @@ async def _bench_start_backend(meta: dict, persist: bool = True) -> dict:
     # cell, and this snapshot is of the box mid-run, which would restore the wrong thing.
     if persist:
         _save_pending_residency(snap)
+    if bench_id:
+        _bench_phase(bench_id, f"starting {upstream} and waiting for it to serve "
+                               f"(a large model takes minutes)")
     res = await prov.load({"container": container} if container else {},
                           meta.get("model") or "")
     ok, detail = _load_result(res)
@@ -12002,7 +12029,7 @@ async def _bench_restore_backend(token: dict | None) -> dict | None:
 
 
 async def _bench_fit_context(upstream: str, needed: int, concurrency: int,
-                             exact: bool = False) -> dict:
+                             exact: bool = False, bench_id: str = "") -> dict:
     """Make `upstream` serve at least `needed` tokens per slot, or say why it cannot.
 
     Returns {ok, detail, changed, restore}. `restore` is the token for _bench_restore_context,
@@ -12012,6 +12039,9 @@ async def _bench_fit_context(upstream: str, needed: int, concurrency: int,
     if prov is None or not prov.resizable_context:
         return {"ok": False, "changed": False, "restore": None,
                 "detail": f"{upstream} cannot change its context window"}
+    if bench_id:
+        _bench_phase(bench_id, f"restarting {upstream} at a {needed:,}-token window "
+                               f"and reloading its weights")
     res = await prov.resize_context(needed, concurrency, exact=exact)
     prev = res.get("previous")
     return {"ok": bool(res.get("ok")), "changed": bool(res.get("changed")),
@@ -12563,7 +12593,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         _save_pending_residency(orig_residency)
     ctx_restore = None
     if need_ctx:
-        fit = await _bench_fit_context(need_up, need_ctx, need_par)
+        fit = await _bench_fit_context(need_up, need_ctx, need_par, bench_id=parent_id)
         if not fit["ok"]:
             conn = db()
             conn.execute(
@@ -12619,10 +12649,12 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
             await _bench_quiesce(False, quiesce_state)
         await _bench_restore_context(ctx_restore)
         if orig_residency is not None:
+            _bench_phase(parent_id, "putting the backends back as they were")
             # Stop whatever the sweep left running, then put back exactly what it found.
             await _bench_free_gpu(await _bench_residency_snapshot())
             await _bench_restore_residency(orig_residency)
             _save_pending_residency(None)
+            _bench_phase(parent_id, None)
     conn = db()
     conn.execute(
         "UPDATE bench_runs SET status='done', finished_ts=?, results_json=? WHERE id=?",
@@ -12716,7 +12748,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Before the ready() poll and the window fit, both of which assume something is serving.
         backend_restore = None
         if model_meta.get("startable") and not model_meta.get("loaded"):
-            got = await _bench_start_backend(model_meta, persist=row["parent_id"] is None)
+            got = await _bench_start_backend(model_meta, persist=row["parent_id"] is None,
+                                             bench_id=bench_id)
             if not got["ok"]:
                 await _bench_restore_backend(got["restore"])
                 _abort(f"could not start {cfg.get('upstream')} for {model!r}: {got['detail']}")
@@ -12741,7 +12774,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             # the fit-to-prompt path never does. A parent sweep captured the original before its
             # first cell ran and restores it at the end, so nothing is restored here.
             fit = await _bench_fit_context(str(cfg.get("upstream") or ""), want_ctx,
-                                           concurrency, exact=True)
+                                           concurrency, exact=True, bench_id=bench_id)
             if not fit["ok"]:
                 _abort(f"could not set {cfg.get('upstream')} to a {want_ctx:,}-token "
                        f"window: {fit['detail']}")
@@ -12758,7 +12791,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             needed = _bench_ctx_needed(prompt_tokens, max_tokens)
             if needed > int(window):
                 fit = await _bench_fit_context(str(cfg.get("upstream") or ""), needed,
-                                               concurrency)
+                                               concurrency, bench_id=bench_id)
                 if not fit["ok"]:
                     _abort(f"{prompt_tokens:,} prompt tokens need a {needed:,}-token window; "
                            f"{cfg.get('upstream')} serves {int(window):,} and {fit['detail']}")
@@ -12791,6 +12824,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # measured. That is not a preference, so it stopped being a checkbox.
         evicted = []
         if not cfg.get("quiesce"):        # quiesce already does this, and restores it
+            _bench_phase(bench_id, "unloading other Ollama models")
             evicted = await _bench_evict_ollama(keep=model)
             if evicted:
                 env["evicted_before_run"] = evicted
@@ -12799,6 +12833,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                              (json.dumps(env), bench_id))
                 conn.commit()
                 conn.close()
+        _bench_phase(bench_id, None)          # measuring: the counter speaks for itself
         try:
             base = f"http://127.0.0.1:{PROXY_PORT}"
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
@@ -12908,7 +12943,10 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             # GPU; unconditional, a three-minute bench would silently leave their daily driver
             # cold with nothing saying why.
             if evicted:
+                _bench_phase(bench_id, "reloading the models it unloaded")
                 await _bench_reload_ollama(evicted)
+            if backend_restore or ctx_restore:
+                _bench_phase(bench_id, "putting the backends back as they were")
             await _bench_restore_backend(backend_restore)
             restored = await _bench_restore_context(ctx_restore)
             if restored is not None:
@@ -12927,6 +12965,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             if gate_held:
                 _BENCH_TRAFFIC_OK.set()
                 _BENCH_EXCLUSIVE_DEADLINE = 0.0
+            # A finished row must not keep describing a step it is no longer doing.
+            _bench_phase(bench_id, None)
 
 
 # -------- Task queue (one-shots + cron/interval recurring) --------

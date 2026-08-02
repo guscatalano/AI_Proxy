@@ -7254,7 +7254,7 @@ function _benchRowSig(it) {
           c.total, c.done, c.failed, c.skipped, c.running, c.pending,
           // Bucketed: the raw value moves every poll and would redraw the row each time.
           c.eta_s === undefined ? '' : Math.round(c.eta_s / 60),
-          n.label, n.progress, n.progress_total,
+          n.label, n.progress, n.progress_total, n.phase, it.phase,
           _benchSelected.has(it.id) ? 1 : 0].join('|');
 }
 
@@ -7284,11 +7284,16 @@ function _benchRowHead(it) {
       // The label leads with the model path on llama.cpp runs; the axes are the useful part.
       const short = String(n.label || '').split(' · ').slice(1).join(' · ') || n.label || '';
       cellNote += `<div style="color:#7af;margin-top:2px">▸ ${esc(short)}${frac}</div>`;
+      // Loading 90 GB of weights looks exactly like a hang: a counter that does not move and
+      // nothing saying why. Say what it is doing instead.
+      if (n.phase) cellNote += `<div style="color:#d9c37a;margin-top:2px">⏳ ${esc(n.phase)}</div>`;
     }
   }
   if (it.status === 'running' || it.status === 'pending') {
     const total = it.progress_total || cfg.runs || 0;
-    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}${cellNote}`;
+    const own = (it.phase && !(cells && cells.now && cells.now.phase))
+      ? `<div style="color:#d9c37a;margin-top:2px">⏳ ${esc(it.phase)}</div>` : '';
+    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}${cellNote}${own}`;
   } else if (it.status === 'failed') {
     summaryLine = `<span style="color:#e08080">failed</span> · ${esc(it.error || '')}`;
   } else if (it.status === 'done') {
