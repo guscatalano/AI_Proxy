@@ -7032,7 +7032,11 @@ function _benchRenderModels() {
       // llama4 and qwen3.6 all report it and all code perfectly well. Stated as a fact, never
       // as a warning — a blanket "this will not code well" would have been wrong for five of
       // the six models on this box that carry the flag.
-      const meta = [it.quant, it.vision ? 'vision' : '',
+      // Same weights reachable through another engine: selecting both is the only controlled
+      // way to ask which engine is faster here, and it is otherwise findable only by noticing
+      // that two rows happen to be the same checkpoint.
+      const alsoOn = (it.also_on || []).length ? 'also on ' + it.also_on.join('/') : '';
+      const meta = [it.quant, it.vision ? 'vision' : '', alsoOn,
                     ctx(it.loaded_context || it.max_context)].filter(Boolean).join(' · ');
       // Three states, not two: loaded, startable (a configured container the proxy can bring
       // up), and merely catalogued. A stopped container used to look identical to a model that

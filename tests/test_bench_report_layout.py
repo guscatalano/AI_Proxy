@@ -154,3 +154,37 @@ def test_a_starved_cell_is_named_under_the_table(client):
 def test_a_clean_run_says_nothing_about_memory(client):
     html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
     assert "memory pressure" not in html
+
+
+def test_the_same_weights_on_two_engines_compare_as_one_model(client):
+    """Ollama names the default tag qwen3-coder-next:latest; the vLLM container serving the same
+    checkpoint calls it qwen3-coder-next. Compared as written, the report says model AND backend
+    both vary, and the difference cannot be attributed to either."""
+    a = _run("a", model="qwen3-coder-next:latest", upstream="ollama")
+    b = _run("b", model="qwen3-coder-next", upstream="vllm")
+    rows = [P._bench_report_row(r) for r in (a, b)]
+    varying, constant, _ = P._bench_axis_split(rows, [a, b])
+    assert varying == ["backend"], varying
+    assert constant["model"] == "qwen3-coder-next"
+
+
+def test_genuinely_different_tags_stay_apart(client):
+    """:latest means "the default"; :30b and :tuned are different weights and must not collapse."""
+    assert P._bench_model_identity("qwen3-coder:30b") == "qwen3-coder:30b"
+    assert P._bench_model_identity("qwen3-coder:tuned") == "qwen3-coder:tuned"
+    assert P._bench_model_identity("qwen3-coder-next:latest") == "qwen3-coder-next"
+    assert P._bench_model_identity(
+        "/m/DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf"
+    ) == "DeepSeek-V4-Flash-0731-UD-IQ2_XXS"
+
+
+def test_the_picker_says_where_else_a_model_can_run(client):
+    index = {
+        "ollama:qwen3-coder-next:latest": {"model": "qwen3-coder-next:latest", "upstream": "ollama"},
+        "vllm:qwen3-coder-next": {"model": "qwen3-coder-next", "upstream": "vllm"},
+        "ollama:gemma4:26b": {"model": "gemma4:26b", "upstream": "ollama"},
+    }
+    P._bench_annotate_engines(index)
+    assert index["ollama:qwen3-coder-next:latest"]["also_on"] == ["vllm"]
+    assert index["vllm:qwen3-coder-next"]["also_on"] == ["ollama"]
+    assert "also_on" not in index["ollama:gemma4:26b"]

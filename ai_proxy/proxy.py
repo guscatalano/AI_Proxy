@@ -8770,6 +8770,7 @@ async def _bench_model_index() -> dict:
             pass
     if index:
         _bench_annotate_fit(index)
+        _bench_annotate_engines(index)
         try:
             await _bench_annotate_caps(index, app.state.metrics_client)
         except Exception as e:
@@ -8835,6 +8836,7 @@ async def _bench_model_index() -> dict:
     # Same annotation on the cold-start path, or a model would be selectable on a freshly
     # restarted proxy and refused a minute later.
     _bench_annotate_fit(index)
+    _bench_annotate_engines(index)
     return index
 
 
@@ -8909,6 +8911,24 @@ async def _bench_annotate_caps(index: dict, client) -> None:
             rec["benchable"] = False
             rec["bench_detail"] = ("cannot answer a chat request — Ollama reports "
                                    f"{', '.join(got) or 'no capabilities'}")
+
+
+def _bench_annotate_engines(index: dict) -> None:
+    """Mark models the box can serve through more than one engine.
+
+    That pairing is the only controlled way to ask "is vLLM faster than Ollama here" — same
+    weights, everything else held — and until it is pointed out it is findable only by noticing
+    that two rows of the picker happen to be the same checkpoint.
+    """
+    by_id: dict = {}
+    for rec in index.values():
+        ident = _bench_model_identity(rec.get("model") or "")
+        if ident:
+            by_id.setdefault(ident, set()).add(rec.get("upstream"))
+    for rec in index.values():
+        ups = by_id.get(_bench_model_identity(rec.get("model") or "")) or set()
+        if len(ups) > 1:
+            rec["also_on"] = sorted(u for u in ups if u and u != rec.get("upstream"))
 
 
 def _bench_annotate_fit(index: dict) -> None:
@@ -9449,6 +9469,19 @@ def _bench_model_display(name: str) -> str:
     return s or str(name)
 
 
+def _bench_model_identity(name: str) -> str:
+    """The same weights under whatever each backend calls them.
+
+    Ollama names the default tag `qwen3-coder-next:latest`; the vLLM container serving the same
+    checkpoint calls it `qwen3-coder-next`. Compared as written, an engine comparison reads as
+    two different models on two different engines and the difference cannot be attributed to
+    either. Only the `:latest` tag is dropped — it means "the default", where `:30b` and
+    `:tuned` are genuinely different weights and must stay apart.
+    """
+    s = _bench_model_display(name)
+    return s[:-7] if s.endswith(":latest") else s
+
+
 def _bench_label_display(label: str) -> str:
     """Cell labels lead with the model, so they inherit the same problem. Shortened at render
     time rather than at write time so runs recorded before this existed also read properly."""
@@ -9750,7 +9783,9 @@ _BENCH_AXIS_LABELS = [
 def _bench_axis_values(r: dict, cfg: dict) -> dict:
     """Everything about a cell that is a *setting* rather than a measurement."""
     return {
-        "model": _bench_model_display(r.get("served") or r.get("model") or "?"),
+        # Identity, not display: two backends spelling the same checkpoint differently must
+        # collapse, or "which engine is faster" is unanswerable from the table.
+        "model": _bench_model_identity(r.get("served") or r.get("model") or "?"),
         "quant": r.get("quant"),
         "size": (f"{round(r['size_mb'] / 1024, 1)} GB" if r.get("size_mb") else None),
         "backend": cfg.get("upstream"),
