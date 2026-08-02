@@ -9881,15 +9881,25 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     # the graded pair was inserted before "vs best" in the header and after it in every row, so
     # the ratio printed under "Fully correct" and each quality figure sat one column left of
     # its name.
+    # Splitting the axes into columns is right for two or three and wrong for six: it cost
+    # more width than the metrics had, and the reader lost the numbers off the right edge.
+    # Past that, the compound name in one column reads better than six narrow ones.
+    split_axes = 0 < len(varying) <= 3
     show_vs = len(rows) > 1
     # Only when something was actually measured, so a run that loaded nothing does not sprout
     # columns of dashes.
     show_load = any(r.get("load_ms") for r in rows)
     show_res = any(r.get("resident_mb") for r in rows)
+    # A metric identical on every row is not a measurement, it is a property of the run. Reply
+    # length is 166 tokens for all 38 cells here, because they answered the same suite.
+    def _same(key):
+        vals = {r.get(key) for r in rows if r.get(key) is not None}
+        return len(vals) <= 1
+    show_tokens = not _same("mean_tokens")
     # No separate Configuration column when the axes are shown: it restated them word for word.
-    head = ((["Configuration"] if not varying else [labels[k] for k in varying])
+    head = ((["Configuration"] if not split_axes else [labels[k] for k in varying])
             + (["Load"] if show_load else []) + (["Resident"] if show_res else [])
-            + ["TTFT p50", "Decode p50", "Tokens", "Total p50"]
+            + ["TTFT p50", "Decode p50"] + (["Tokens"] if show_tokens else []) + ["Total p50"]
             + (["Fully correct", "Cases"] if graded else [])
             + (["vs best"] if show_vs else [])
             + ["OK"])
@@ -9904,7 +9914,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     for r, run, av, nm in zip(rows, runs, axis_vals, axis_names):
         cfg = run.get("config") or {}
         slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
-        if varying:
+        if split_axes:
             cells = [f'<th scope="row" class="ax">{_h(av.get(varying[0]) or "—")}</th>']
             cells += [f'<td class="ax">{_h(av.get(k) or "—")}</td>' for k in varying[1:]]
         else:
@@ -9918,9 +9928,10 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         cells += [
             f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
-            f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>',
-            f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>',
         ]
+        if show_tokens:
+            cells.append(f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>')
+        cells.append(f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>')
         if graded:
             cells.append(f'<td class="n{" win" if r["perfect_rate"] == best_q else ""}">{pct(r["perfect_rate"])}</td>')
             cells.append(f'<td class="n">{pct(r["case_pass_rate"])}</td>')
@@ -10146,6 +10157,9 @@ ordinary slowness rather than a misconfiguration.</p>
         shared = "".join(
             f'<div><p class="k">{_h(labels[k])}</p><p class="v">{_h(constant[k])}</p></div>'
             for k in [k for k, _l in _BENCH_AXIS_LABELS] if k in constant)
+        if not show_tokens and rows and rows[0].get("mean_tokens"):
+            shared += (f'<div><p class="k">Reply length</p>'
+                       f'<p class="v">{fmt(rows[0]["mean_tokens"], 0)} tok</p></div>')
         held = (f'<h2>Held constant</h2><div class="spec">{shared}</div>' if shared else "")
         # A sweep whose axes all collapsed measured one thing N times. Say so at the top rather
         # than leaving the reader to notice that every row matches.

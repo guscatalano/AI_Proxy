@@ -25,7 +25,7 @@ def _run(bench_id, *, prompt=32000, cache="cold", model="/m/big-model-00001-of-0
         "results": {"summary": {
             "n_success": 36, "n_total": 36, "served_models": [model],
             "ttft_ms": {"p50": 305.0}, "decode_tps": {"p50": 17.6},
-            "total_ms": {"p50": 8516.0}, "mean_tokens": {"p50": 166},
+            "total_ms": {"p50": 8516.0}, "completion_tokens": {"mean": 166},
             "quality": ({"perfect_rate": 0.94, "case_pass_rate": 0.93,
                          # Real per-task rows: the block that renders these reassigned a name
                          # the shared-settings block also used, and an empty list skipped it
@@ -293,3 +293,43 @@ def test_a_field_only_some_backends_report_is_not_an_axis(client):
     rows[1]["size_mb"] = None
     varying, _c, _v = P._bench_axis_split(rows, [a, b])
     assert "size" not in varying
+
+
+def test_many_axes_collapse_into_one_column(client):
+    """Six axis columns plus eight metrics pushed the numbers off the right edge. Past about
+    three axes the compound name reads better than six narrow columns."""
+    runs = []
+    for i in range(6):
+        r = _run(f"m{i}", model=f"model-{i}", upstream="ollama" if i % 2 else "vllm")
+        r["config"]["cache"] = "cold" if i % 2 else "cached"
+        r["config"]["thinking"] = "off" if i < 3 else "on"
+        r["config"]["server_context"] = 32768 * (1 + i % 3)
+        r["results"]["summary"]["quality"]["perfect_rate"] = 1.0 - i / 20
+        runs.append(r)
+    head, cells = _first_table(_render(runs))
+    assert head[0] == "Configuration", head
+    assert len(head) <= 10, f"{len(head)} columns is still a scrollbar"
+    assert len(head) == len(cells)
+
+
+def test_few_axes_still_get_their_own_columns(client):
+    head, _ = _first_table(_render([_run("a", cache="cold"), _run("b", cache="cached")]))
+    assert "Configuration" not in head
+    assert "Cache" in head
+
+
+def test_a_metric_identical_on_every_row_leaves_the_table(client):
+    """Reply length was 166 tokens on all 38 cells because they answered the same suite. That
+    is a property of the run, not a measurement, and it belongs stated once."""
+    runs = [_run("a", prompt=32000), _run("b", prompt=131072)]
+    html = _render(runs)
+    head, _ = _first_table(html)
+    assert "Tokens" not in head
+    assert "Reply length" in html.split("<h2>Results</h2>")[0]
+
+
+def test_a_metric_that_differs_keeps_its_column(client):
+    a, b = _run("a", prompt=32000), _run("b", prompt=131072)
+    b["results"]["summary"]["completion_tokens"] = {"mean": 900}
+    head, _ = _first_table(_render([a, b]))
+    assert "Tokens" in head
