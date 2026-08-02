@@ -58,8 +58,26 @@ def test_preflight_still_refuses_a_model_that_is_merely_absent(client):
     assert P._bench_preflight("qwen3-coder", {}, "vllm", idx) is not None
 
 
+def _quiet_residency(monkeypatch):
+    """Stub the free/restore handshake so these tests are about starting, not about docker."""
+    async def snap():
+        return {"backends": [], "ollama": []}
+
+    async def free(s, keep="", want_free_mb=0, timeout_s=240.0):
+        return {"stopped": [], "evicted_ollama": []}
+
+    async def restore(s):
+        return {"started": []}
+
+    monkeypatch.setattr(P, "_bench_residency_snapshot", snap)
+    monkeypatch.setattr(P, "_bench_free_gpu", free)
+    monkeypatch.setattr(P, "_bench_restore_residency", restore)
+    monkeypatch.setattr(P, "_save_pending_residency", lambda s: None)
+
+
 def test_starting_passes_the_container_through(client, monkeypatch):
     seen = []
+    _quiet_residency(monkeypatch)
 
     async def load(payload, name):
         seen.append(dict(payload))
@@ -70,17 +88,72 @@ def test_starting_passes_the_container_through(client, monkeypatch):
         {"model": "qwen3-coder", "upstream": "vllm", "container": "qwen-vllm"}))
     assert res["ok"] and res["started"]
     assert seen == [{"container": "qwen-vllm"}], "the wrong container would serve wrong numbers"
-    assert res["restore"] == {"upstream": "vllm"}
+    assert res["restore"]["upstream"] == "vllm" and res["restore"]["stop"] is True
 
 
-def test_a_failed_start_hands_back_no_restore(client, monkeypatch):
+def test_a_start_that_never_became_ready_is_still_stopped(client, monkeypatch):
+    """The bug that left a container crash-looping for thirteen minutes. vLLM's load starts the
+    container and *then* waits for readiness, so a timeout leaves it running -- and under
+    restart=unless-stopped it kept coming back to fight for the memory it had just failed to
+    get. "Did it work" and "was the box changed" are different questions."""
+    _quiet_residency(monkeypatch)
+
     async def load(payload, name):
-        return P.JSONResponse({"error": "no such container"}, status_code=404)
+        return {"ok": False, "started_container": "qwen-vllm", "ready": False,
+                "error": "container started but the server did not become ready in time"}
 
     monkeypatch.setattr(P.PROVIDERS["vllm"], "load", load)
-    res = asyncio.run(P._bench_start_backend({"upstream": "vllm", "container": "gone"}))
-    assert res["ok"] is False and res["restore"] is None
-    assert "no such container" in res["detail"]
+    res = asyncio.run(P._bench_start_backend({"upstream": "vllm", "container": "qwen-vllm"}))
+    assert res["ok"] is False
+    assert res["started"] is True
+    assert res["restore"]["stop"] is True, "nothing would ever stop the container"
+
+
+def test_room_is_made_before_the_backend_starts(client, monkeypatch):
+    """vLLM wants ~99 GB on a 121 GB box, so llama.cpp holding 90 GB means the start can only
+    ever time out -- and the symptom is indistinguishable from a slow load."""
+    order = []
+
+    async def snap():
+        order.append("snapshot")
+        return {"backends": [{"name": "llamacpp", "was_running": True, "control": "unit"}]}
+
+    async def free(s, keep="", want_free_mb=0, timeout_s=240.0):
+        order.append("free")
+        return {"stopped": [{"name": "llamacpp"}]}
+
+    async def load(payload, name):
+        order.append("start")
+        return {"ok": True, "started_container": "qwen-vllm", "ready": True}
+
+    monkeypatch.setattr(P, "_bench_residency_snapshot", snap)
+    monkeypatch.setattr(P, "_bench_free_gpu", free)
+    monkeypatch.setattr(P, "_save_pending_residency", lambda s: None)
+    monkeypatch.setattr(P.PROVIDERS["vllm"], "load", load)
+
+    res = asyncio.run(P._bench_start_backend({"upstream": "vllm", "container": "qwen-vllm"}))
+    assert order == ["snapshot", "free", "start"], order
+    assert res["restore"]["residency"]["backends"][0]["name"] == "llamacpp"
+
+
+def test_restore_stops_the_new_backend_before_reviving_the_old(client, monkeypatch):
+    """llama.cpp cannot reload 90 GB of weights until vLLM gives its memory back."""
+    order = []
+
+    async def stop():
+        order.append("stop-vllm")
+        return {"ok": True}
+
+    async def restore(s):
+        order.append("restore-residency")
+        return {"started": ["llamacpp"]}
+
+    monkeypatch.setattr(P.PROVIDERS["vllm"], "stop", stop)
+    monkeypatch.setattr(P, "_bench_restore_residency", restore)
+    monkeypatch.setattr(P, "_save_pending_residency", lambda s: None)
+    asyncio.run(P._bench_restore_backend(
+        {"upstream": "vllm", "stop": True, "residency": {"backends": []}}))
+    assert order == ["stop-vllm", "restore-residency"], order
 
 
 def test_what_the_bench_started_is_stopped_again(client, monkeypatch):
@@ -93,7 +166,8 @@ def test_what_the_bench_started_is_stopped_again(client, monkeypatch):
         return {"ok": True, "detail": "", "via": "docker"}
 
     monkeypatch.setattr(P.PROVIDERS["vllm"], "stop", stop)
-    assert asyncio.run(P._bench_restore_backend({"upstream": "vllm"}))["ok"] is True
+    res = asyncio.run(P._bench_restore_backend({"upstream": "vllm", "stop": True}))
+    assert res["stopped"]["ok"] is True
     assert stopped == [1]
 
 

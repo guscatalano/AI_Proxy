@@ -11866,37 +11866,59 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
 
 
 async def _bench_start_backend(meta: dict) -> dict:
-    """Bring up a stopped backend the run needs, and say how to put it back.
+    """Make room, bring up the stopped backend the run needs, and say how to undo both.
 
-    Returns {ok, detail, started, restore}. `restore` is non-None only when the bench actually
-    started something: a backend that was already up is the user's, not the bench's, and
-    stopping it afterwards would take away something they were using.
+    Freeing first is a precondition, not a courtesy. A fixed backend that cannot allocate never
+    becomes ready, and the symptom is indistinguishable from a slow load — vLLM wants ~99 GB on
+    a 121 GB box, so llama.cpp holding 90 GB of it means the start can only ever time out. It
+    did, for seven minutes, and read as "vLLM is broken".
     """
     upstream, container = meta.get("upstream") or "", meta.get("container")
     prov = PROVIDERS.get(upstream)
     if prov is None:
         return {"ok": False, "started": False, "restore": None,
                 "detail": f"unknown upstream {upstream!r}"}
-    payload = {"container": container} if container else {}
-    res = await prov.load(payload, meta.get("model") or "")
+    snap = await _bench_residency_snapshot()
+    freed = await _bench_free_gpu(snap, keep=meta.get("model") or "")
+    # Persisted before anything is started: a proxy restart between here and the restore would
+    # otherwise leave the box stripped, with nothing recording what had been running.
+    _save_pending_residency(snap)
+    res = await prov.load({"container": container} if container else {},
+                          meta.get("model") or "")
     ok, detail = _load_result(res)
-    return {"ok": ok, "started": ok, "detail": detail,
-            "restore": {"upstream": upstream} if ok else None}
+    # `ok` is "it is serving"; this is "the box was changed". vLLM's load starts the container
+    # and *then* waits for readiness, so a timeout leaves it running. Reporting nothing to undo
+    # left one crash-looping under restart=unless-stopped for thirteen minutes, competing for
+    # the memory it had just failed to get.
+    started = ok or bool(isinstance(res, dict) and res.get("started_container"))
+    return {"ok": ok, "started": started, "detail": detail, "freed": freed,
+            "restore": {"upstream": upstream, "stop": started, "residency": snap}}
 
 
 async def _bench_restore_backend(token: dict | None) -> dict | None:
-    """Stop what the bench started. vLLM holds ~99 GB whether or not anything is asking it, so
-    leaving it up after a run quietly takes the box away from whatever comes next."""
+    """Undo both halves, in order: stop what the bench started, then put back what it stopped.
+
+    Stopping first is deliberate — vLLM holds ~99 GB whether or not anything is asking it, and
+    llama.cpp cannot reload its weights until that memory comes back.
+    """
     if not token:
         return None
-    prov = PROVIDERS.get(token.get("upstream"))
-    if prov is None:
-        return None
-    try:
-        res = await prov.stop()
-    except Exception as e:
-        return {"ok": False, "detail": f"{type(e).__name__}: {e}"}
-    return {"ok": bool(res.get("ok")), "detail": res.get("detail")}
+    out: dict = {}
+    if token.get("stop"):
+        prov = PROVIDERS.get(token.get("upstream"))
+        if prov is not None:
+            try:
+                out["stopped"] = await prov.stop()
+            except Exception as e:
+                out["stopped"] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+    snap = token.get("residency")
+    if snap:
+        try:
+            out["residency"] = await _bench_restore_residency(snap)
+            _save_pending_residency(None)
+        except Exception as e:
+            out["residency"] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+    return out
 
 
 async def _bench_fit_context(upstream: str, needed: int, concurrency: int,
@@ -12425,6 +12447,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     if start_meta is not None:
         got = await _bench_start_backend(start_meta)
         if not got["ok"]:
+            await _bench_restore_backend(got["restore"])
             conn = db()
             conn.execute(
                 "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
@@ -12589,6 +12612,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         if model_meta.get("startable") and not model_meta.get("loaded"):
             got = await _bench_start_backend(model_meta)
             if not got["ok"]:
+                await _bench_restore_backend(got["restore"])
                 _abort(f"could not start {cfg.get('upstream')} for {model!r}: {got['detail']}")
                 return
             env["started_backend"] = model_meta.get("container") or cfg.get("upstream")
