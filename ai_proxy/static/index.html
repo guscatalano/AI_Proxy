@@ -625,21 +625,48 @@
   /* A mini live view inside the card. Not an iframe: the live view brings its own polling,
      theming and full-screen handling, and none of that belongs nested inside a status panel.
      The /live endpoint already returns everything this needs. */
-  .bench-mini { margin: 11px 0 0; border-top: 1px solid #222a36; padding-top: 9px; }
-  .bench-mini .row { display: flex; align-items: baseline; gap: 8px; font-size: 11.5px;
-    padding: 3px 0; color: #8b97a8; }
-  .bench-mini .st { font-family: var(--mono, ui-monospace, monospace); font-size: 9.5px;
-    letter-spacing: .08em; padding: 1px 5px; border-radius: 3px; flex: none;
-    border: 1px solid currentColor; }
-  .bench-mini .st.STREAMING { color: #57d1e0; }
-  .bench-mini .st.THINKING { color: #d9c37a; }
-  .bench-mini .st.VISION { color: #b58fe0; }
-  .bench-mini .st.DONE { color: #4d5765; }
-  .bench-mini .txt { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis;
-    white-space: nowrap; color: #c9d3e1; }
-  .bench-mini .num { font-family: var(--mono, ui-monospace, monospace); flex: none;
-    font-variant-numeric: tabular-nums; }
-  .bench-mini .idle { color: #6b7787; font-size: 11.5px; padding: 3px 0; }
+  /* The mini live view. Given room to be worth looking at: a one-line-per-request strip told
+     you a request existed, which the counters already did. What is actually interesting is the
+     text arriving, so that is what gets the space. */
+  .bench-mini { margin: 12px 0 0; border-top: 1px solid #222a36; padding-top: 11px;
+    display: grid; gap: 8px; }
+  .bench-tile { background: #0f131a; border: 1px solid #222a36; border-left: 3px solid #3f4a5a;
+    border-radius: 8px; padding: 9px 11px; display: grid; gap: 6px; min-width: 0; }
+  .bench-tile.STREAMING { border-left-color: #57d1e0; }
+  .bench-tile.THINKING { border-left-color: #d9c37a; }
+  .bench-tile.VISION { border-left-color: #b58fe0; }
+  .bench-tile.DONE { border-left-color: #3f8f5f; opacity: .62; }
+  .bench-tile .hd { display: flex; align-items: baseline; gap: 8px; font-size: 11px;
+    color: #8b97a8; min-width: 0; }
+  .bench-tile .who { font-family: var(--mono, ui-monospace, monospace); color: #c9d3e1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bench-tile .chip { font-family: var(--mono, ui-monospace, monospace); font-size: 9px;
+    letter-spacing: .1em; padding: 1px 6px; border-radius: 3px; border: 1px solid currentColor;
+    flex: none; }
+  .bench-tile.STREAMING .chip { color: #57d1e0; }
+  .bench-tile.THINKING .chip { color: #d9c37a; }
+  .bench-tile.VISION .chip { color: #b58fe0; }
+  .bench-tile.DONE .chip { color: #3f8f5f; }
+  .bench-tile .clock { margin-left: auto; font-family: var(--mono, ui-monospace, monospace);
+    font-variant-numeric: tabular-nums; flex: none; }
+  /* The text is the point, so it gets a real reading treatment rather than one clipped line. */
+  .bench-tile .body { font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px;
+    line-height: 1.5; color: #d7dee8; white-space: pre-wrap; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    word-break: break-word; min-height: 1.5em; }
+  .bench-tile .body.ask { color: #8b97a8; }
+  .bench-tile .caret { display: inline-block; width: 7px; background: #57d1e0; height: 1em;
+    vertical-align: text-bottom; animation: benchcaret 1.05s steps(1) infinite; }
+  @keyframes benchcaret { 50% { opacity: 0; } }
+  .bench-tile .rate { display: flex; align-items: center; gap: 7px; font-size: 10.5px;
+    color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-tile .rate .bar { flex: 1 1 auto; height: 3px; border-radius: 2px; background: #1b2430;
+    overflow: hidden; }
+  .bench-tile .rate .bar i { display: block; height: 100%; background: #2f8f9c;
+    transition: width .5s; }
+  .bench-mini .idle { color: #6b7787; font-size: 11.5px; padding: 10px 0; text-align: center;
+    border: 1px dashed #222a36; border-radius: 8px; }
+  @media (prefers-reduced-motion: reduce) { .bench-tile .caret { animation: none; } }
   .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
   .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
     color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
@@ -7389,25 +7416,40 @@ let _benchMiniTimer = null;
 function _benchMiniRender() {
   const host = $('bench-mini');
   if (!host) return;
-  const tiles = (_benchMiniTiles || []).slice(0, 3);
+  const tiles = (_benchMiniTiles || []).slice(0, 4);
   if (!tiles.length) {
-    host.innerHTML = '<div class="idle">no requests in flight</div>';
+    host.innerHTML = '<div class="idle">nothing in flight</div>';
     return;
   }
+  // Scale the rate bars against the fastest thing on screen rather than a fixed ceiling: a
+  // 300 tok/s model and a 6 tok/s one both need to look like they are doing something.
+  const peak = Math.max(...tiles.map(t => t.tps || 0), 1);
   host.innerHTML = tiles.map(t => {
     const st = t.done ? 'DONE' : (t.state || 'THINKING');
-    // Prompt while it is still reading, response once it is producing one: showing the prompt
-    // for a streaming request tells you nothing you did not already know.
-    const body = (t.done || t.state === 'STREAMING') ? (t.response || t.prompt) : (t.prompt || '');
-    const rate = t.tps ? `${t.tps} tok/s` : (t.itps ? `${t.itps} in/s` : '');
-    return `<div class="row">
-      <span class="st ${esc(st)}">${esc(st)}</span>
-      <span class="txt">${t.redacted ? '<i style="color:#6b7787">redacted</i>' : esc((body || '').slice(0, 160))}</span>
-      <span class="num">${esc(rate)}</span>
-      <span class="num" style="color:#6b7787">${((t.elapsed_ms || 0) / 1000).toFixed(1)}s</span>
+    const streaming = !t.done && st === 'STREAMING';
+    // Prompt while it is still reading, response once it is producing one. Mid-stream the
+    // prompt tells you nothing you did not already know.
+    const showResp = t.done || streaming;
+    const body = showResp ? (t.response || '') : (t.prompt || '');
+    const text = t.redacted
+      ? '<i style="color:#4d5765">redacted for this viewer</i>'
+      : esc((body || '').slice(-260)) + (streaming ? '<span class="caret"></span>' : '');
+    const rate = t.tps ? `${t.tps} tok/s` : (t.itps ? `${t.itps} tok/s in` : '');
+    const pct = t.tps ? Math.max(4, Math.round(t.tps / peak * 100)) : 0;
+    return `<div class="bench-tile ${esc(st)}">
+      <div class="hd">
+        <span class="chip">${esc(st)}</span>
+        <span class="who">${esc(_benchShortModel(t.model || '?'))}</span>
+        <span class="clock">${((t.elapsed_ms || 0) / 1000).toFixed(1)}s</span>
+      </div>
+      <div class="body${showResp ? '' : ' ask'}">${text || '<span style="color:#4d5765">…</span>'}</div>
+      ${rate ? `<div class="rate"><span>${esc(rate)}</span>
+        <span class="bar"><i style="width:${pct}%"></i></span>
+        <span>${t.otok || 0} tok</span></div>` : ''}
     </div>`;
   }).join('');
 }
+
 
 async function _benchMiniPoll() {
   try {
