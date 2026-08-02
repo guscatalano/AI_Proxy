@@ -557,3 +557,55 @@ def test_a_resize_is_refused_when_the_current_window_cannot_be_read(client, monk
     assert res["ok"] is False
     assert "could not be undone" in res["detail"]
     assert seen == [], "changed the box without knowing how to change it back"
+
+
+def test_every_sweepable_axis_survives_submission(client):
+    """The submit endpoint rebuilds config from an explicit whitelist, and the matrix expander
+    reads whatever it finds there. server_context was added to the expander and not the
+    whitelist, so the UI sent it, the server dropped it, and a 'long context' sweep ran as two
+    short cells with nothing anywhere saying why. This pins the two lists together."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.commit()
+    conn.close()
+
+    payload = {"models": [{"model": "qwen3:4b", "upstream": "ollama"}], "runs": 1,
+               "prompt_tokens": [0, 1000], "thinking": ["off", "on"],
+               "temperature": [0.0, 0.7], "cache": ["cold", "cached"],
+               "concurrency": [1, 2], "server_context": [32768, 65536]}
+    r = client.post("/__proxy/api/bench/run", json=payload)
+    assert r.status_code == 200, r.text
+
+    conn = P.db()
+    cfg = json.loads(conn.execute(
+        "SELECT config_json FROM bench_runs WHERE id=?", (r.json()["id"],)).fetchone()[0])
+    conn.close()
+    for axis in ("prompt_tokens", "thinking", "temperature", "cache", "concurrency",
+                 "server_context"):
+        assert isinstance(cfg.get(axis), list), f"{axis} did not survive submission"
+    # And the expander agrees: 2^6 combinations.
+    assert len(P._bench_expand_matrix(payload["models"], cfg)) == 64
+
+
+def test_a_long_context_sweep_is_not_submitted_as_short_cells(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.commit()
+    conn.close()
+    r = client.post("/__proxy/api/bench/run", json={
+        "models": [{"model": "qwen3:4b", "upstream": "ollama"}],
+        "suite": "coding-v1", "prompt_tokens": 0, "cache": ["cold", "cached"],
+        "server_context": [32768, 131072, 262144], "runs": 1})
+    assert r.status_code == 200, r.text
+    assert r.json()["cells"] == 6, "the window axis collapsed"
+
+    # Cells are written by a background task, so read the plan the parent stored rather than
+    # racing it.
+    conn = P.db()
+    cfg = json.loads(conn.execute(
+        "SELECT config_json FROM bench_runs WHERE id=?", (r.json()["id"],)).fetchone()[0])
+    conn.close()
+    labels = [P._bench_cell_label(c) for c in P._bench_expand_matrix(cfg["models"], cfg)]
+    assert any("32k ctx" in l for l in labels), labels
+    assert any("256k ctx" in l for l in labels), labels
+    assert not all(l.endswith("short") for l in labels), "every cell came out short"

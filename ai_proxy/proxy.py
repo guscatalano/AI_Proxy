@@ -8936,8 +8936,13 @@ async def bench_run(request: Request):
             config[key] = v
     if isinstance(payload.get("extra_body"), dict):
         config["extra_body"] = payload["extra_body"]
+    # The window the backend is launched with. Absent means "leave it as found", so it is only
+    # carried when actually asked for — an explicit None here would read as an axis of one.
+    sctx = keep("server_context", int)
+    if sctx:
+        config["server_context"] = sctx
 
-    # A matrix is any submission with more than one cell across the four sweepable axes.
+    # A matrix is any submission with more than one cell across the sweepable axes.
     cells = _bench_expand_matrix(models, config)
     is_matrix = len(cells) > 1
     bench_id = "b_" + uuid.uuid4().hex[:12]
