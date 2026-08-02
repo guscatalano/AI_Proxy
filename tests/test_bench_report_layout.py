@@ -188,3 +188,36 @@ def test_the_picker_says_where_else_a_model_can_run(client):
     assert index["ollama:qwen3-coder-next:latest"]["also_on"] == ["vllm"]
     assert index["vllm:qwen3-coder-next"]["also_on"] == ["ollama"]
     assert "also_on" not in index["ollama:gemma4:26b"]
+
+
+# ---- what it costs to have the model, not just to use it ------------------------------------
+
+def _with_env(run, **env):
+    run["env"].update(env)
+    return run
+
+
+def test_load_and_footprint_get_their_own_columns(client):
+    """A model that decodes quickly but takes seven minutes to load is a different proposition
+    from one ready in forty seconds, and the decode column cannot say so."""
+    a = _with_env(_run("a", prompt=32000), load_ms=41_000, resident_mb=18_600)
+    b = _with_env(_run("b", prompt=131072), load_ms=418_000, resident_mb=91_000)
+    head, cells = _first_table(_render([a, b]))
+    assert "Load" in head and "Resident" in head
+    assert cells[head.index("Load")] == "41 s"
+    assert cells[head.index("Resident")] == "18.2 GB"
+
+
+def test_a_run_that_loaded_nothing_grows_no_columns(client):
+    """Otherwise every speed-only comparison sprouts two columns of dashes."""
+    head, _ = _first_table(_render([_run("a", prompt=32000), _run("b", prompt=131072)]))
+    assert "Load" not in head and "Resident" not in head
+
+
+def test_the_columns_survive_a_cell_that_missed_them(client):
+    """One backend reports resident size per model and the others do not; a gap must not shift
+    every figure one column left."""
+    a = _with_env(_run("a", prompt=32000), load_ms=41_000, resident_mb=18_600)
+    b = _run("b", prompt=131072)          # no env at all
+    head, cells = _first_table(_render([a, b]))
+    assert len(head) == len(cells)

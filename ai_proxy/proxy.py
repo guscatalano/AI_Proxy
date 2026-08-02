@@ -9518,6 +9518,12 @@ def _bench_report_row(run: dict) -> dict:
         # A cell that ran short of memory still produced numbers; they are just numbers about
         # memory pressure. Carried through to the report so that is visible rather than inferred.
         "memory_warning": (run.get("env") or {}).get("memory_warning"),
+        # The cost of having the model, as distinct from the cost of using it. A model that
+        # decodes quickly but takes seven minutes to load is a different proposition from one
+        # ready in forty seconds, and the decode column cannot say so.
+        "load_ms": (run.get("env") or {}).get("load_ms"),
+        "unload_ms": (run.get("env") or {}).get("unload_ms"),
+        "resident_mb": (run.get("env") or {}).get("resident_mb"),
         "n_success": s.get("n_success"),
         "n_total": s.get("n_total"),
         "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
@@ -9859,8 +9865,13 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     # the ratio printed under "Fully correct" and each quality figure sat one column left of
     # its name.
     show_vs = len(rows) > 1
+    # Only when something was actually measured, so a run that loaded nothing does not sprout
+    # columns of dashes.
+    show_load = any(r.get("load_ms") for r in rows)
+    show_res = any(r.get("resident_mb") for r in rows)
     # No separate Configuration column when the axes are shown: it restated them word for word.
     head = ((["Configuration"] if not varying else [labels[k] for k in varying])
+            + (["Load"] if show_load else []) + (["Resident"] if show_res else [])
             + ["TTFT p50", "Decode p50", "Tokens", "Total p50"]
             + (["Fully correct", "Cases"] if graded else [])
             + (["vs best"] if show_vs else [])
@@ -9881,6 +9892,12 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             cells += [f'<td class="ax">{_h(av.get(k) or "—")}</td>' for k in varying[1:]]
         else:
             cells = [f'<th scope="row" class="cfg">{_h(nm)}</th>']
+        if show_load:
+            cells.append('<td class="n">%s</td>' % (
+                fmt((r.get("load_ms") or 0) / 1000, 0, " s") if r.get("load_ms") else "—"))
+        if show_res:
+            cells.append('<td class="n">%s</td>' % (
+                fmt((r.get("resident_mb") or 0) / 1024, 1, " GB") if r.get("resident_mb") else "—"))
         cells += [
             f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
             f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
@@ -12640,6 +12657,28 @@ async def _bench_evict_ollama(keep: str = "") -> list:
     return unloaded
 
 
+async def _bench_resident_mb(model: str, upstream: str) -> float | None:
+    """How much the model is actually holding, as opposed to how big it is on disk.
+
+    A 75 GB checkpoint with its KV cache allocated is a different number, and it is the one
+    that decides what else fits beside it. Ollama reports it per model; the others are inferred
+    from what the machine lost, which is why this is read after the model is up and before
+    anything else moves.
+    """
+    try:
+        if upstream == "ollama":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+            for m in (ps.get("models") or []):
+                if (m.get("name") or m.get("model")) == model:
+                    v = m.get("size_vram") or m.get("size")
+                    return round(v / 1048576) if v else None
+            return None
+    except (httpx.RequestError, ValueError, KeyError):
+        return None
+    return None
+
+
 async def _bench_reload_ollama(names: list) -> list:
     """Make previously-resident Ollama models resident again.
 
@@ -13389,8 +13428,10 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         evicted = []
         if not cfg.get("quiesce"):        # quiesce already does this, and restores it
             _bench_phase(bench_id, "unloading other Ollama models")
+            _t_ev = time.perf_counter()
             evicted = await _bench_evict_ollama(keep=model)
             if evicted:
+                env["unload_ms"] = round((time.perf_counter() - _t_ev) * 1000)
                 env["evicted_before_run"] = evicted
                 conn = db()
                 conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
@@ -13412,6 +13453,7 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     # 0 for minutes because the warm-up is deliberately not counted, so the
                     # run looks wedged exactly when it is doing the most work.
                     _sz = model_meta.get("size_mb")
+                    env["free_mb_before_load"] = _free_mem_mb()
                     _bench_phase(bench_id, f"loading {_bench_model_display(model)} into memory"
                                  + (f" ({_sz / 1024:.0f} GB)" if _sz else "")
                                  + " — warm-up, not measured")
@@ -13422,8 +13464,19 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     warm_prompt = (_bench_build_prompt(prompt_tokens, False, 1)
                                    if not randomize else _bench_build_prompt(0, True, 0))
                     warm_max = max_tokens if not randomize else 16
+                    _t_warm = time.perf_counter()
                     warm = await _bench_run_one(client, base, model, warm_max,
                                                 warm_prompt, 0, cfg=cfg)
+                    # The warm-up IS the cold load for an on-demand backend, and it is already
+                    # excluded from every measurement — so its duration is the load time, free.
+                    env["load_ms"] = round((time.perf_counter() - _t_warm) * 1000)
+                    env["free_mb_after_load"] = _free_mem_mb()
+                    _res = await _bench_resident_mb(model, str(cfg.get("upstream") or ""))
+                    if _res is None and env.get("free_mb_before_load") is not None:
+                        # Not reported per model: infer from what the machine lost while the
+                        # only thing happening was this model loading.
+                        _res = max(0, env["free_mb_before_load"] - env["free_mb_after_load"])
+                    env["resident_mb"] = _res
                     conn = db()
                     conn.execute("UPDATE bench_runs SET results_json=? WHERE id=?",
                                  (json.dumps({"rows": [], "warmup": warm}), bench_id))
