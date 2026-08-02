@@ -690,6 +690,21 @@
   .bench-lead .more:hover { color: #9aa4b2; }
   /* Expanded, a 38-cell sweep would push the history off the screen, so it scrolls in place. */
   .bench-lead .scroll { max-height: 260px; overflow-y: auto; }
+  /* The queue. The order was deterministic all along and simply invisible, which is a harder
+     thing to trust than a bad order you can see. */
+  .bench-queue { margin: 11px 0 0; border-top: 1px solid #222a36; padding-top: 10px; }
+  .bench-queue h4 { margin: 0 0 6px; font-size: 10px; letter-spacing: .12em; font-weight: 600;
+    text-transform: uppercase; color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-queue .rule { color: #4d5765; font-size: 10.5px; margin: 0 0 7px; }
+  .bench-queue ol { margin: 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+  .bench-queue li { display: flex; gap: 8px; font-size: 11.5px; color: #8b97a8;
+    font-family: var(--mono, ui-monospace, monospace); }
+  .bench-queue li .pos { color: #3f4a5a; width: 2em; text-align: right; flex: none; }
+  .bench-queue li .m { color: #c9d3e1; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .bench-queue li .ax { color: #6b7787; }
+  .bench-queue li.next .m { color: #57d1e0; }
+  .bench-queue .rest { color: #4d5765; font-size: 10.5px; padding-top: 5px; }
   .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
   .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
     color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
@@ -7414,6 +7429,7 @@ function _benchRenderActive(it) {
       ${it.memory_warning ? `<p class="warn">⚠ measured under memory pressure — ${esc(it.memory_warning)}</p>` : ''}
       <div class="bench-mini" id="bench-mini"></div>
       <div class="bench-lead" id="bench-lead"></div>
+      <div class="bench-queue" id="bench-queue"></div>
       <div class="foot">
         ${c.failed ? `<span style="color:#e08080">${c.failed} failed</span>` : ''}
         <a href="#" onclick="event.preventDefault();setView('live')" title="Watch the requests as they run">Live ↗</a>
@@ -7421,6 +7437,7 @@ function _benchRenderActive(it) {
     </div>`;
   _benchMiniRender();
   _benchLeadRender();
+  _benchQueueRender();
   // The strip is always present while a run is live; only the form comes and goes. Hiding the
   // strip on expand left no way back, because the strip held the only control that could undo
   // it.
@@ -7474,7 +7491,33 @@ function _benchLeadRender() {
   const more = $('bench-lead-more');
   // Rebound on every render because the table is replaced wholesale; a listener attached once
   // would be lost the first time a cell finished.
-  if (more) more.onclick = () => { _benchLeadAll = !_benchLeadAll; _benchLeadRender(); };
+  if (more) more.onclick = () => {
+    _benchLeadAll = !_benchLeadAll;
+    _benchLeadRender();
+    _benchQueueRender();
+  };
+}
+
+// What is coming, in the order it will actually happen. The rows arrive from the report in
+// run order, so the ones without results are the queue — no extra polling, and it cannot
+// disagree with what the runner will do because it is the same list.
+function _benchQueueRender() {
+  const host = $('bench-queue');
+  if (!host) return;
+  const pending = (_benchLeadRows || []).filter(r => r.decode_p50 == null);
+  if (!pending.length) { host.innerHTML = ''; return; }
+  const show = _benchLeadAll ? pending : pending.slice(0, 5);
+  host.innerHTML = `<h4>Up next — ${pending.length} to go</h4>
+    <p class="rule">backend, then context window, then model name, then cold before cached</p>
+    <ol>${show.map((r, i) => {
+      const bits = String(r.label || '').split(' · ').slice(1).filter(x => x && !x.startsWith('@'));
+      return `<li class="${i === 0 ? 'next' : ''}">
+        <span class="pos">${i + 1}</span>
+        <span class="m">${esc(_benchShortModel(r.model || ''))}</span>
+        <span class="ax">${esc(bits.join(' · '))}</span>
+      </li>`;
+    }).join('')}</ol>
+    ${pending.length > show.length ? `<div class="rest">+ ${pending.length - show.length} more</div>` : ''}`;
 }
 
 async function _benchLeadPoll() {
@@ -7485,6 +7528,7 @@ async function _benchLeadPoll() {
     _benchLeadRows = d.rows || [];
   } catch { /* leave the last standings up rather than blanking them */ }
   _benchLeadRender();
+  _benchQueueRender();
 }
 
 function _benchLeadSetRunning(id) {
