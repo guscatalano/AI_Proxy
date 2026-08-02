@@ -6825,7 +6825,8 @@ function _benchBindSelectAll() {
   if (all) all.onclick = () => {
     // Everything currently listed: with a backend filter on, "all" means all of what you can
     // see, not a silent sweep of things scrolled out of view.
-    const items = _benchUpFilter ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels;
+    const items = (_benchUpFilter ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels)
+      .filter(m => m.fits !== false);
     for (const m of items) _benchModelSel.add(m.key);
     _benchRenderModels(); _benchUpdatePlan();
   };
@@ -6851,7 +6852,8 @@ function _benchRenderModels() {
   // along into a sweep — which is how a run meant for one model spent fourteen minutes on
   // another. An empty selection is now a state the user can actually be in.
   if (!_benchModelSel.size && !_benchDefaulted && items.length) {
-    const first = items.find(i => i.loaded) || items[0];
+    const usable = items.filter(i => i.fits !== false);
+    const first = usable.find(i => i.loaded) || usable[0];
     if (first) _benchModelSel.add(first.key);
     _benchDefaulted = true;
   }
@@ -6876,6 +6878,17 @@ function _benchRenderModels() {
       const dot = {loaded: ['#3f8f5f', '●'], startable: ['#d9c37a', '◐'], cold: ['#4d5765', '○']}[st];
       const tip = {loaded: ' — loaded', startable: ' — stopped; the bench starts it',
                    cold: ' — not loaded'}[st];
+      // A model larger than the machine cannot be measured, so it is not offered. Shown rather
+      // than hidden, with the reason: a model missing from the list is indistinguishable from
+      // one that was never pulled.
+      if (it.fits === false) {
+        return `<label class="bench-list-row" style="opacity:.5;cursor:not-allowed" title="${esc(it.model)} — ${esc(it.fit_detail || 'too large for this machine')}">
+          <input type="checkbox" disabled>
+          <span class="dot" style="color:#7a4a4a">⊘</span>
+          <span class="nm" style="text-decoration:line-through">${esc(it.model)}</span>
+          <span class="meta" style="color:#a06868">${esc(it.fit_detail || "won't fit")}</span>
+        </label>`;
+      }
       return `<label class="bench-list-row${on ? ' on' : ''}" title="${esc(it.model)}${tip}">
         <input type="checkbox" data-key="${esc(it.key)}"${on ? ' checked' : ''}>
         <span class="dot" style="color:${dot[0]}">${dot[1]}</span>

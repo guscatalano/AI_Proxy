@@ -8665,7 +8665,10 @@ async def _bench_model_index() -> dict:
         ollama = sysinfo.get("ollama") or {}
         for t in (ollama.get("tags") or []):
             if isinstance(t, dict):
-                put(t.get("name"), "ollama", False)
+                put(t.get("name"), "ollama", False,
+                    size_mb=round((t.get("size") or 0) / 1048576) or None,
+                    quant=((t.get("details") or {}).get("quantization_level")),
+                    params=((t.get("details") or {}).get("parameter_size")))
         for m in (ollama.get("ps") or []):
             if isinstance(m, dict):
                 put(m.get("name") or m.get("model"), "ollama", True,
@@ -8728,6 +8731,18 @@ async def _bench_model_index() -> dict:
         # A stopped llama.cpp offers no models at all, so once the bench stopped it to make room
         # for vLLM, its own cells could not resolve a model and failed preflight. The unit is
         # configured with exactly one model; offer that, the same way a stopped container is.
+        lc_path = (_llamacpp_cfg() or {}).get("model")
+        if lc_path:
+            try:
+                # Split GGUFs: the first shard names the set, so size the whole set.
+                pat = re.sub(r"-\d{4,5}-of-\d{4,5}\.gguf$", "-*.gguf", lc_path)
+                shards = sorted(Path(lc_path).parent.glob(Path(pat).name)) or [Path(lc_path)]
+                total = sum(f.stat().st_size for f in shards if f.exists())
+                for rec in index.values():
+                    if rec.get("upstream") == "llamacpp" and total:
+                        rec.setdefault("size_mb", round(total / 1048576))
+            except OSError:
+                pass
         if not (lcp.get("reachable")):
             lc = _llamacpp_cfg()
             if lc.get("model"):
@@ -8742,6 +8757,7 @@ async def _bench_model_index() -> dict:
         except Exception:
             pass
     if index:
+        _bench_annotate_fit(index)
         return index
     # The snapshot comes from the background metrics collector, which hasn't necessarily run
     # yet on a freshly-started proxy — and a bench submitted in that window would silently get
@@ -8800,7 +8816,47 @@ async def _bench_model_index() -> dict:
                 await _probe(c, f"{LMSTUDIO_URL}/v1/models", _openai_models("lmstudio"))
     except Exception:
         pass
+    # Same annotation on the cold-start path, or a model would be selectable on a freshly
+    # restarted proxy and refused a minute later.
+    _bench_annotate_fit(index)
     return index
+
+
+# Weights are the floor, not the total: a runtime also needs a KV cache, activations and its
+# own footprint, and the OS needs room left to not fall over. Deliberately generous — refusing
+# a model that would have fit is a worse failure than letting a borderline one try and fail
+# with a real error.
+_BENCH_FIT_OVERHEAD = 1.15
+_BENCH_FIT_RESERVE_MB = 4096
+
+
+def _bench_fits(size_mb: float | None, total_mb: float | None) -> bool | None:
+    """Can this model be resident on this box at all? None when the size is unknown.
+
+    Unknown must not mean "no". vLLM checkpoints live inside a container and cannot be sized
+    from here, and silently hiding a model because it could not be measured would be
+    indistinguishable from the model not existing.
+    """
+    if not size_mb or not total_mb:
+        return None
+    return (size_mb * _BENCH_FIT_OVERHEAD) <= (total_mb - _BENCH_FIT_RESERVE_MB)
+
+
+def _bench_annotate_fit(index: dict) -> None:
+    """Mark entries the box cannot hold. Checked against total memory, not free memory: the
+    bench evicts everything before it measures, so what matters is capacity, not what happens
+    to be resident while someone is reading the picker."""
+    total_mb = (_mem_snapshot() or {}).get("total_mb")
+    for rec in index.values():
+        fits = _bench_fits(rec.get("size_mb"), total_mb)
+        if fits is None:
+            continue
+        rec["fits"] = fits
+        if not fits:
+            rec["fit_detail"] = (
+                f"{rec['size_mb'] / 1024:.1f} GB of weights needs about "
+                f"{rec['size_mb'] * _BENCH_FIT_OVERHEAD / 1024:.0f} GB resident; "
+                f"this machine has {total_mb / 1024:.0f} GB")
 
 
 def _bench_resolve_model(index: dict, model: str, upstream: str = "") -> dict:
@@ -11949,6 +12005,8 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
         return (f"no reachable backend serves {model!r}"
                 + (f" — reachable models: {', '.join(known[:8])}" if known else
                    " — no backend is reachable"))
+    if meta.get("fits") is False:
+        return f"{model!r} does not fit on this machine — {meta.get('fit_detail') or 'too large'}"
     if meta.get("startable") and not meta.get("loaded"):
         return None          # not running yet, but the bench knows how to start it
     if not meta:
