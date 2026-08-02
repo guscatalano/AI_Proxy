@@ -6870,7 +6870,12 @@ function _benchRenderModels() {
     return head + byUp[up].map(it => {
       const on = _benchModelSel.has(it.key);
       // Quant and window are the two facts you need beside a benchmark number.
-      const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(' · ');
+      // "vision" means it also accepts images, not that it is bad at text: gemma3, gemma4,
+      // llama4 and qwen3.6 all report it and all code perfectly well. Stated as a fact, never
+      // as a warning — a blanket "this will not code well" would have been wrong for five of
+      // the six models on this box that carry the flag.
+      const meta = [it.quant, it.vision ? 'vision' : '',
+                    ctx(it.loaded_context || it.max_context)].filter(Boolean).join(' · ');
       // Three states, not two: loaded, startable (a configured container the proxy can bring
       // up), and merely catalogued. A stopped container used to look identical to a model that
       // does not exist here.
@@ -7176,12 +7181,6 @@ function _benchUpdatePlan() {
   const svc = Array.isArray(b.server_context) ? b.server_context : (b.server_context ? [b.server_context] : []);
   if (svc.length > 1) {
     warns.push({level: 'info', text: `↻ ${svc.length} server-context values — the backend restarts and reloads once per value, which dominates the run time`});
-  }
-  const seeing = (b.models || [])
-    .map(m => _benchModelIndex[`${m.upstream}:${m.model}`])
-    .filter(m => m && m.vision).map(m => m.model);
-  if (b.suite && seeing.length) {
-    warns.push({level: 'bad', text: `⚠ ${seeing.join(', ')} is a vision model — it will produce a ${b.suite} score, but not a meaningful one. Speed measurements are still valid.`});
   }
   if (fixable.length) {
     warns.push({level: 'info', text: `↻ ${fixable.map(m => m.upstream).filter((v, i, a) => a.indexOf(v) === i).join(', ')} will be restarted at a larger window to fit ${biggest.toLocaleString()} tokens, then put back — this adds several minutes`});

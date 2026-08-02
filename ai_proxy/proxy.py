@@ -8869,11 +8869,13 @@ def _bench_fits(size_mb: float | None, total_mb: float | None) -> bool | None:
 async def _bench_annotate_caps(index: dict, client) -> None:
     """Mark what cannot answer a chat request at all, and what merely will not answer it well.
 
-    Two different judgements, deliberately kept apart. A model with no `completion` capability
-    — an embedding model — cannot produce a measurement under any configuration, so it is
-    refused the same way a model that does not fit is. A vision model *can*: it completes text,
-    and timing it is a perfectly good speed benchmark. Only its score on a coding suite is
-    meaningless, and that is a fact about the suite you chose, not about the model.
+    A model with no `completion` capability — an embedding model — cannot produce a measurement
+    under any configuration, so it is refused the same way a model that does not fit is.
+
+    `vision` is recorded and never acted on. It means the model also accepts images, not that
+    it is weak at text: gemma3, gemma4, llama4 and qwen3.6 all report it on this box and all
+    code perfectly well. There is no reliable signal separating "vision-first" from "multimodal
+    and strong at text", so that judgement stays with the person choosing the models.
     """
     names = [r.get("model") for r in index.values()
              if r.get("upstream") == "ollama" and r.get("model")]

@@ -140,3 +140,19 @@ def test_preflight_refuses_a_model_that_cannot_complete(client):
                                                 "Ollama reports embedding"}
     why = P._bench_preflight("nomic-embed", meta, "ollama", {"ollama:nomic-embed": meta})
     assert why and "cannot be benchmarked" in why
+
+
+def test_vision_is_recorded_but_never_acted_on(client, monkeypatch):
+    """Six models on this box report `vision`; five of them — gemma3, gemma4 x2, llama4,
+    qwen3.6 — are ordinary strong text models that also accept images. A blanket "this will not
+    code well" would have been wrong for all five."""
+    async def caps(client_, name):
+        return ["completion", "tools", "vision"]
+
+    monkeypatch.setattr(P, "_ollama_capabilities", caps)
+    index = {"ollama:gemma3:27b": {"model": "gemma3:27b", "upstream": "ollama"}}
+    asyncio.run(P._bench_annotate_caps(index, None))
+    rec = index["ollama:gemma3:27b"]
+    assert rec["vision"] is True
+    assert rec.get("benchable") is not False
+    assert P._bench_preflight("gemma3:27b", rec, "ollama", index) is None
