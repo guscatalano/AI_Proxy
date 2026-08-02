@@ -264,3 +264,24 @@ def test_a_sweep_always_records_what_was_resident(client):
     # No condition between the phase setup and the snapshot: it is taken unconditionally.
     assert "if start_meta is not None or len(" not in src[:i], \
         "the snapshot is still conditional on a backend switch"
+
+
+def test_the_model_load_itself_reports_a_phase(client):
+    """The one long step that had none. For Ollama the warm-up is where a 36 GB model is pulled
+    into memory, and the warm-up is deliberately not counted — so the unit counter sits at 0 for
+    minutes and the run looks wedged exactly when it is doing the most work."""
+    import inspect
+    src = inspect.getsource(P._bench_execute)
+    i_warm = src.index("if warmup:")
+    i_load = src.index('_bench_phase(bench_id, f"loading {model} into memory"')
+    assert i_load > i_warm, "the load phase must be set inside the warm-up branch"
+    # ...and the clear must come after it, not before.
+    i_clear = src.index("_bench_phase(bench_id, None)      # measuring from here")
+    assert i_clear > i_load, "the phase is cleared before the load can announce itself"
+
+
+def test_the_load_phase_names_the_size(client):
+    """"Loading" for four minutes is a mystery; "loading (36 GB)" is an explanation."""
+    import inspect
+    src = inspect.getsource(P._bench_execute)
+    assert '_sz / 1024:.0f} GB' in src

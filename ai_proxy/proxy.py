@@ -12948,7 +12948,6 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                              (json.dumps(env), bench_id))
                 conn.commit()
                 conn.close()
-        _bench_phase(bench_id, None)          # measuring: the counter speaks for itself
         try:
             base = f"http://127.0.0.1:{PROXY_PORT}"
             client = httpx.AsyncClient(timeout=httpx.Timeout(600.0))
@@ -12959,6 +12958,14 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 # large model) and the run's min/max are nonsense. The warm-up result is
                 # discarded, never scored, and never counted in the summary.
                 if warmup:
+                    # The load itself. For Ollama this is where a 36 GB model is pulled into
+                    # memory, and it was the one long step with no phase: the counter sits at
+                    # 0 for minutes because the warm-up is deliberately not counted, so the
+                    # run looks wedged exactly when it is doing the most work.
+                    _sz = model_meta.get("size_mb")
+                    _bench_phase(bench_id, f"loading {model} into memory"
+                                 + (f" ({_sz / 1024:.0f} GB)" if _sz else "")
+                                 + " — warm-up, not measured")
                     # In cached mode the warm-up must send the prompt the measured runs will
                     # send, otherwise it primes nothing and the first "cached" request is
                     # actually a cold prefill — which is exactly the confound this axis exists
@@ -12973,8 +12980,11 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                                  (json.dumps({"rows": [], "warmup": warm}), bench_id))
                     conn.commit()
                     conn.close()
+                    _bench_phase(bench_id, None)      # measuring from here; the counter moves
                 else:
                     warm = None
+                    _bench_phase(bench_id, f"loading {model} into memory — warm-up is off, so "
+                                           f"the first measurement carries it")
                 # Each unit is one request. Without a suite that's the synthetic prompt N times;
                 # with one it's every task × N repeats, so each task gets its own percentiles
                 # and a repeatable score.
