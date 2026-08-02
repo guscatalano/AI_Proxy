@@ -7071,6 +7071,27 @@ function _benchUpdatePlan() {
     + iso + grading;
 }
 
+// The server refuses a second submission outright; this is so the button says so before it is
+// pressed rather than after. Server-side stays authoritative — this is the same answer arriving
+// earlier, not a substitute for it.
+function _benchSetGoState(active) {
+  const btn = $('bench-go');
+  if (!btn) return;
+  if (active) {
+    btn.disabled = true;
+    btn.textContent = 'Benchmark running…';
+    btn.title = `${active.label || active.model} is still running — one bench at a time`;
+  } else if (btn.disabled) {
+    btn.disabled = false;
+    btn.textContent = 'Run benchmark';
+    btn.title = '';
+    // Clear a stale "already running" refusal so the panel does not accuse the user of
+    // something that stopped being true while they were reading it.
+    const errEl = $('bench-go-err');
+    if (errEl && /already running/.test(errEl.textContent)) errEl.textContent = '';
+  }
+}
+
 async function _benchSubmit() {
   const errEl = $('bench-go-err');
   errEl.textContent = '';
@@ -7108,6 +7129,7 @@ async function _benchRefreshHistory() {
     const empty = wrap.querySelector('[data-bench-empty]');
     if (empty) empty.remove();
     _benchSyncRows(wrap, items);
+    _benchSetGoState(items.find(i => i.status === 'running' || i.status === 'pending'));
   } catch (e) {
     wrap.innerHTML = `<div style="color:#f07178">${esc(e.message)}</div>`;
   }

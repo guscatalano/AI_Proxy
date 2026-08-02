@@ -414,3 +414,78 @@ def test_a_finished_sweep_has_no_running_cell(client):
     _sweep(conn, "b_sweep", ["done", "done"])
     conn.close()
     assert "now" not in client.get("/__proxy/api/bench/runs").json()["items"][0]["cells"]
+
+
+# ---- one bench at a time ----------------------------------------------------------------
+
+def _submit(client, model="qwen3:4b"):
+    return client.post("/__proxy/api/bench/run",
+                       json={"models": [{"model": model, "upstream": "ollama"}], "runs": 1})
+
+
+def test_a_second_bench_is_refused_while_one_runs(client):
+    """_BENCH_SEM would queue it instead. "Eventually" is the problem: a bench takes the box
+    exclusively, resizes context windows and evicts residents, so a run that starts an hour
+    later measures a machine configured by whatever ran before it — and nothing in its results
+    would say so."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status, label) "
+        "VALUES (?,?,?,'{}','running',?)",
+        ("b_busy", time.time(), "ds4-flash", "ds4 · 262k ctx"))
+    conn.commit()
+    conn.close()
+
+    r = _submit(client)
+    assert r.status_code == 409
+    d = r.json()
+    assert "already running" in d["error"]
+    assert "262k" in d["error"], "should name what is running"
+    assert d["running"]["id"] == "b_busy"
+
+    conn = P.db()
+    n = conn.execute("SELECT COUNT(*) c FROM bench_runs").fetchone()["c"]
+    conn.close()
+    assert n == 1, "the refused submission was queued anyway"
+
+
+def test_a_running_cell_blocks_even_if_its_parent_row_is_gone(client):
+    # A suite that failed mid-way can leave cells behind; they still own the box.
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status, parent_id, label) "
+        "VALUES (?,?,?,'{}','running',?,?)",
+        ("b_cell", time.time(), "ds4-flash", "b_gone", "cell 3"))
+    conn.commit()
+    conn.close()
+    assert _submit(client).status_code == 409
+
+
+def test_a_finished_bench_does_not_block(client):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) VALUES (?,?,?,'{}','done')",
+        ("b_old", time.time() - 600, "qwen3:4b"))
+    conn.commit()
+    conn.close()
+    assert _submit(client).status_code == 200
+
+
+def test_an_interrupted_bench_does_not_block_forever(client):
+    """The guard reads the same rows the restart-recovery clears, so a crash mid-bench cannot
+    leave the endpoint permanently refusing."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) "
+        "VALUES (?,?,?,'{}','running')", ("b_stranded", time.time() - 3600, "qwen3:4b"))
+    conn.commit()
+    # Exactly what startup recovery does.
+    conn.execute("UPDATE bench_runs SET status='failed', error='interrupted' "
+                 "WHERE status IN ('pending','running')")
+    conn.commit()
+    conn.close()
+    assert _submit(client).status_code == 200

@@ -8803,6 +8803,30 @@ async def bench_run(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
 
+    # One bench at a time, refused rather than queued. _BENCH_SEM already serialises execution,
+    # so a second submission would run eventually — but "eventually" is the problem: a bench
+    # takes the box exclusively, resizes context windows, evicts residents and gates other
+    # traffic. A run that starts an hour later measures a machine configured by whatever ran
+    # before it, and nothing in its results would say so. Stale rows cannot wedge this: a
+    # restart marks everything pending/running as interrupted on the way up.
+    conn = db()
+    busy = conn.execute(
+        "SELECT COALESCE(parent_id, id) root FROM bench_runs "
+        "WHERE status IN ('pending','running') ORDER BY ts LIMIT 1").fetchone()
+    active = conn.execute(
+        "SELECT id, model, label, status, ts, progress, progress_total FROM bench_runs "
+        "WHERE id=?", (busy["root"],)).fetchone() if busy else None
+    conn.close()
+    if busy:
+        d = dict(active) if active else {"id": busy["root"]}
+        return JSONResponse(
+            {"error": f"a bench is already running ({d.get('label') or d.get('model') or d['id']})"
+                      f" — wait for it to finish",
+             "running": {k: d.get(k) for k in
+                         ("id", "model", "label", "status", "progress", "progress_total")},
+             "started_ago_s": round(time.time() - (d.get("ts") or time.time()))},
+            status_code=409)
+
     # A model is identified by (name, upstream). Accepted forms, in order of preference:
     #   [{"model": "x", "upstream": "vllm"}]   explicit — what the UI sends
     #   ["vllm:x"]                              the index key
