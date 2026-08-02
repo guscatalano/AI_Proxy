@@ -12587,10 +12587,10 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     # Record the box as it was before the first cell. Cells start and stop backends between
     # themselves — a mixed sweep switches backends because two rarely fit at once — so the only
     # snapshot worth restoring is the one taken before any of that happened.
-    orig_residency = None
-    if start_meta is not None or len({c.get("upstream") for c in cells}) > 1:
-        orig_residency = await _bench_residency_snapshot()
-        _save_pending_residency(orig_residency)
+    # Unconditional: every cell evicts, and only this snapshot knows what was resident before
+    # the first one did. Taken here whether or not a backend switch is coming.
+    orig_residency = await _bench_residency_snapshot()
+    _save_pending_residency(orig_residency)
     ctx_restore = None
     if need_ctx:
         fit = await _bench_fit_context(need_up, need_ctx, need_par, bench_id=parent_id)
@@ -12649,7 +12649,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
             await _bench_quiesce(False, quiesce_state)
         await _bench_restore_context(ctx_restore)
         if orig_residency is not None:
-            _bench_phase(parent_id, "putting the backends back as they were")
+            _bench_phase(parent_id, "putting the backends and models back as they were")
             # Stop whatever the sweep left running, then put back exactly what it found.
             await _bench_free_gpu(await _bench_residency_snapshot())
             await _bench_restore_residency(orig_residency)
@@ -12942,7 +12942,10 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             # Reload what was evicted. Opt-in, this was the user's explicit choice to clear the
             # GPU; unconditional, a three-minute bench would silently leave their daily driver
             # cold with nothing saying why.
-            if evicted:
+            # Standalone runs put them back themselves. Inside a sweep the next cell is about
+            # to evict them again, so reloading here would be minutes of thrash per cell —
+            # the suite restores the whole set once, at the end.
+            if evicted and row["parent_id"] is None:
                 _bench_phase(bench_id, "reloading the models it unloaded")
                 await _bench_reload_ollama(evicted)
             if backend_restore or ctx_restore:

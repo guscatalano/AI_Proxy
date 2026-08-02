@@ -241,3 +241,26 @@ def test_a_finished_run_stops_describing_a_step(client):
     got = conn.execute("SELECT phase FROM bench_runs WHERE id='b_ph3'").fetchone()[0]
     conn.close()
     assert got is None
+
+
+# ---- eviction thrash ----------------------------------------------------------------------
+
+def test_a_sweep_cell_does_not_reload_what_the_next_cell_will_evict(client):
+    """Fifteen Ollama models, one cell each. Reloading per cell means cell 1 evicts fourteen,
+    measures, loads all fourteen back — so cell 2 can evict them again. Minutes of thrash per
+    cell, and they cannot all be resident anyway."""
+    import inspect
+    src = inspect.getsource(P._bench_execute)
+    assert 'if evicted and row["parent_id"] is None:' in src, \
+        "cells reload Ollama models the next cell is about to evict"
+
+
+def test_a_sweep_always_records_what_was_resident(client):
+    """Every cell evicts now, so only a snapshot taken before the first one knows what to put
+    back — whether or not the sweep also switches backends."""
+    import inspect
+    src = inspect.getsource(P._bench_execute_suite)
+    i = src.index("orig_residency = await _bench_residency_snapshot()")
+    # No condition between the phase setup and the snapshot: it is taken unconditionally.
+    assert "if start_meta is not None or len(" not in src[:i], \
+        "the snapshot is still conditional on a backend switch"
