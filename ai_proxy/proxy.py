@@ -14963,11 +14963,6 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         suite_name = str(cfg.get("suite") or "").strip()
         suite, _sk = _bench_suite_tasks(suite_name) if suite_name else (None, {})
         suite = suite or None
-        if _sk:
-            # Portability: a task whose tooling is absent on this machine is dropped from the
-            # run and recorded — never scored as zero, which would punish the model for the
-            # box. The report's method section reads this back.
-            env["skipped_languages"] = {k: v for k, v in sorted(_sk.items())}
         grade_timeout = max(1.0, min(float(cfg.get("grade_timeout", 10.0)), 60.0))
         warmup = bool(cfg.get("warmup", True))
         total_units = (len(suite) * runs) if suite else runs
@@ -14978,6 +14973,14 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         conn.commit()
         conn.close()
         env = await _bench_env_snapshot()
+        if _sk:
+            # Portability: a task whose tooling is absent on this machine is dropped from the
+            # run and recorded — never scored as zero, which would punish the model for the
+            # box. The report's method section reads this back. This must sit AFTER the env
+            # snapshot exists: it originally ran ten lines earlier and crashed every graded
+            # cell on any machine actually missing a toolchain — the exact machines the
+            # feature exists for — while passing everywhere the suite ran complete.
+            env["skipped_languages"] = {k: v for k, v in sorted(_sk.items())}
         # Resolve the backend from the model unless the user pinned one explicitly. Asking the
         # user to state both invites contradictions (an Ollama model aimed at vLLM just errors),
         # and the proxy already knows the answer.
