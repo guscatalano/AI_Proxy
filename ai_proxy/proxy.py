@@ -8617,7 +8617,8 @@ async def bench_suites():
         "suites": [
             {
                 "name": name,
-                "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"])}
+                "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"]),
+                           "lang": t.get("lang") or "python"}
                           for t in tasks],
                 "task_count": len(tasks),
                 "case_count": sum(len(t["cases"]) for t in tasks),
@@ -10774,9 +10775,10 @@ ordinary slowness rather than a misconfiguration.</p>
         _cfg0 = (runs[0].get("config") or {}) if runs else {}
         method_html = f"""
   <h2>What was tested</h2>
-  <p class="note">Every task asks for one named Python function. The model's answer is parsed
-  for a code block, the function is called with each case's arguments in a separate process
-  under a timeout, and the return value is compared with the expected one. <b>Fully correct</b>
+  <p class="note">Every task asks for one named function in the task's language — Python,
+  JavaScript run under node, or C compiled with gcc. The model's answer is parsed for a code
+  block in that language, the function is called with each case's arguments in a separate
+  process under a timeout, and the return value is compared with the expected one. <b>Fully correct</b>
   counts only responses where <em>every</em> case for that task passed; <b>cases</b> is the
   share of individual cases that passed, so a near-miss still scores there. A response with no
   extractable code block scores zero — that measures instruction-following, not coding.</p>
@@ -12095,6 +12097,100 @@ _BENCH_SUITES: dict[str, list[dict]] = {
     # looked correct.
     "coding-v2": [
         {
+            "id": "parse_query",
+            "tier": "hard",
+            "lang": "js",
+            "prompt": (
+                "Write a JavaScript function `parseQuery(qs)` that parses a URL query string "
+                "into a plain object.\n"
+                "Rules: a leading '?' is ignored. Pairs are separated by '&'; empty pairs are "
+                "skipped. Each pair splits on the FIRST '=' only — later '=' characters belong "
+                "to the value. A pair with no '=' maps the whole token to the empty string. "
+                "'+' means a space, then percent-escapes are decoded. When a key repeats, its "
+                "value becomes an array of all values in order. Return {} for an empty string."
+                "\nReturn only the function in a single ```js code block."
+            ),
+            "entry": "parseQuery",
+            "cases": [
+                {"args": ["a=1&b=2"], "expect": {"a": "1", "b": "2"}},
+                {"args": ["a=1&a=2&a=3"], "expect": {"a": ["1", "2", "3"]}},
+                {"args": ["q=hello+world%21"], "expect": {"q": "hello world!"}},
+                # No '=' at all: the token itself is the key.
+                {"args": ["flag&x=1"], "expect": {"flag": "", "x": "1"}},
+                {"args": ["?a=1"], "expect": {"a": "1"}},
+                {"args": [""], "expect": {}},
+                # Split on the FIRST '=': the value here is '%3D=' -> '=='.
+                {"args": ["a=%3D=&b"], "expect": {"a": "==", "b": ""}},
+            ],
+        },
+        {
+            "id": "group_ranges",
+            "tier": "core",
+            "lang": "js",
+            "prompt": (
+                "Write a JavaScript function `groupRanges(nums)` that formats a strictly "
+                "increasing array of integers as a compact range string.\n"
+                "Consecutive runs collapse to 'start-end'; isolated values stand alone; parts "
+                "join with ','. Two adjacent values are already a range ('1-2'). Negative "
+                "numbers keep their sign, so -3..-1 renders as '-3--1'. An empty array "
+                "returns ''.\nReturn only the function in a single ```js code block."
+            ),
+            "entry": "groupRanges",
+            "cases": [
+                {"args": [[1, 2, 3, 7, 9, 10, 11]], "expect": "1-3,7,9-11"},
+                {"args": [[5]], "expect": "5"},
+                {"args": [[]], "expect": ""},
+                # The sign trap: a negative run still joins with '-'.
+                {"args": [[-3, -2, -1, 0]], "expect": "-3-0"},
+                {"args": [[1, 3, 5]], "expect": "1,3,5"},
+                {"args": [[1, 2]], "expect": "1-2"},
+            ],
+        },
+        {
+            "id": "clamp_add",
+            "tier": "core",
+            "lang": "c",
+            "prompt": (
+                "Write a C function `int clamp_add(int a, int b)` returning a + b saturated "
+                "to the int range: results above INT_MAX return INT_MAX, below INT_MIN return "
+                "INT_MIN. The naive a + b overflows — do not rely on it. You may use any "
+                "standard headers; the harness already includes stdio.h, stdlib.h, string.h "
+                "and limits.h.\nReturn only the function in a single ```c code block."
+            ),
+            "entry": "clamp_add",
+            "cases": [
+                {"args": [100, 200], "expect": 300},
+                {"args": [2147483647, 1], "expect": 2147483647},
+                {"args": [-2147483648, -1], "expect": -2147483648},
+                {"args": [2000000000, 2000000000], "expect": 2147483647},
+                {"args": [-2000000000, -2000000000], "expect": -2147483648},
+                {"args": [-2147483648, 2147483647], "expect": -1},
+            ],
+        },
+        {
+            "id": "round_to",
+            "tier": "hard",
+            "lang": "c",
+            "prompt": (
+                "Write a C function `int round_to(int n, int m)` rounding n to the nearest "
+                "multiple of m (m > 0), with exact halves rounding AWAY from zero: 25 to the "
+                "nearest 10 is 30, and -25 is -30. Beware: C integer division truncates "
+                "toward zero, so the usual ((n + m/2) / m) * m is wrong for negative n.\n"
+                "Return only the function in a single ```c code block."
+            ),
+            "entry": "round_to",
+            "cases": [
+                {"args": [25, 10], "expect": 30},
+                {"args": [24, 10], "expect": 20},
+                # The truncation trap.
+                {"args": [-25, 10], "expect": -30},
+                {"args": [-24, 10], "expect": -20},
+                {"args": [7, 7], "expect": 7},
+                {"args": [-3, 5], "expect": -5},
+                {"args": [0, 3], "expect": 0},
+            ],
+        },
+        {
             "id": "semver_cmp",
             "tier": "core",
             "prompt": (
@@ -12676,20 +12772,34 @@ _BENCH_SUITES: dict[str, list[dict]] = {
     ],
 }
 
-_BENCH_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
+_BENCH_CODE_BLOCK_RE = re.compile(r"```([A-Za-z0-9+]*)[ \t]*\n(.*?)```", re.DOTALL)
+
+# What each grading language answers to in a fence tag, and the shape its unfenced code takes.
+_BENCH_LANGS = {
+    "python": {"tags": {"python", "py", ""}, "bare": re.compile(r"\bdef\s+\w+")},
+    "js": {"tags": {"js", "javascript", ""}, "bare": re.compile(r"\bfunction\s+\w+|=>")},
+    "c": {"tags": {"c", ""}, "bare": re.compile(r"\b(?:int|long|unsigned)\s+\w+\s*\(")},
+}
 
 
-def _bench_extract_code(text: str) -> str:
-    """Pull the Python out of a model response. Prefers fenced blocks (taking the longest, since
-    models often emit a short usage example alongside the real implementation); falls back to the
-    raw text when the model skipped the fence."""
+def _bench_extract_code(text: str, lang: str = "python") -> str:
+    """Pull the task's language out of a model response.
+
+    A polyglot answer often carries more than one fence — a Python usage example beside the
+    JavaScript being graded — so blocks tagged with the task's language win outright, untagged
+    blocks are the fallback, and a block tagged as some *other* language is never graded: a
+    Python function handed to node fails as a syntax error and reads as a broken
+    implementation rather than a mis-extraction.
+    """
+    cfg = _BENCH_LANGS.get(lang) or _BENCH_LANGS["python"]
     blocks = _BENCH_CODE_BLOCK_RE.findall(text or "")
-    if blocks:
-        return max(blocks, key=len)
-    # Unfenced fallback, but only when the text plausibly *is* code — otherwise prose gets
-    # handed to the compiler and the failure is reported as a SyntaxError, which reads like a
-    # broken implementation rather than "the model never wrote any code".
-    if "def " in (text or ""):
+    tagged = [b for t, b in blocks if t.lower() in cfg["tags"] and t]
+    if tagged:
+        return max(tagged, key=len)
+    untagged = [b for t, b in blocks if not t]
+    if untagged:
+        return max(untagged, key=len)
+    if not blocks and cfg["bare"].search(text or ""):
         return text
     return ""
 
@@ -12729,13 +12839,95 @@ print(json.dumps({"results": out}))
 '''
 
 
-def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float) -> dict:
+# Same protocol as the Python grader: payload on stdin, one JSON line out. eval twice in the
+# same scope — the model's declarations, then the entry name — because direct eval scopes
+# function declarations to the enclosing call, which is exactly what makes them reachable.
+_BENCH_JS_GRADER_SRC = (
+    'const ch=[];process.stdin.on("data",d=>ch.push(d));process.stdin.on("end",()=>{'
+    'const p=JSON.parse(ch.join(""));let out={results:[]};try{eval(p.code);'
+    'const fn=eval(p.entry);if(typeof fn!=="function")throw new Error("entry not defined: "+p.entry);'
+    'for(const c of p.cases){const r={};try{const got=fn(...c.args);'
+    'r.ok=JSON.stringify(got)===JSON.stringify(c.expect);'
+    'if(!r.ok)r.got=got===undefined?null:got;}catch(e){r.ok=false;r.err=String(e).slice(0,150)}'
+    'out.results.push(r)}}catch(e){out={fatal:String(e).slice(0,250)}}'
+    'console.log(JSON.stringify(out))});')
+
+
+def _bench_grade_c(code: str, entry: str, cases: list, timeout_s: float) -> dict:
+    """Compile-and-run grading for C, integer signatures only.
+
+    JSON-comparing arbitrary C values would need a serialiser the model would have to fight,
+    so C tasks keep an int contract and the harness is a generated main() that prints one
+    result per line. -fwrapv pins signed overflow to wraparound, so a naive implementation
+    fails deterministically instead of by undefined behaviour.
+    """
+    import shutil as _sh
+    gcc = _sh.which("gcc")
+    if not gcc:
+        return {"passed": 0, "total": len(cases), "error": "gcc is not installed on this host"}
+    calls = "".join(
+        '    printf("%d\\n", {e}({args}));\n'.replace("{e}", entry)
+        .replace("{args}", ", ".join(str(int(a)) for a in c["args"]))
+        for c in cases)
+    src = ("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
+           "#include <limits.h>\n\n" + code +
+           "\n\nint main(void) {\n" + calls + "    return 0;\n}\n")
+    workdir = tempfile.mkdtemp(prefix="bench_c_")
+    try:
+        cpath = os.path.join(workdir, "task.c")
+        epath = os.path.join(workdir, "task.exe")
+        with open(cpath, "w", encoding="utf-8") as f:
+            f.write(src)
+        env = {"PATH": os.environ.get("PATH", ""),
+               "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+        comp = subprocess.run([gcc, "-O0", "-fwrapv", cpath, "-o", epath],
+                              capture_output=True, text=True, timeout=20, env=env, cwd=workdir)
+        if comp.returncode != 0:
+            return {"passed": 0, "total": len(cases),
+                    "error": ("compile error: " + (comp.stderr or "")[-280:]).strip()}
+        run = subprocess.run([epath], capture_output=True, text=True,
+                             timeout=timeout_s, env=env, cwd=workdir)
+        got = (run.stdout or "").strip().splitlines()
+        results = []
+        for i, c in enumerate(cases):
+            ok = i < len(got) and got[i].strip() == str(int(c["expect"]))
+            r = {"ok": ok}
+            if not ok:
+                r["got"] = got[i].strip() if i < len(got) else None
+            results.append(r)
+        return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+                "cases": results}
+    except subprocess.TimeoutExpired:
+        return {"passed": 0, "total": len(cases), "error": f"timeout after {timeout_s}s"}
+    except Exception as e:
+        return {"passed": 0, "total": len(cases), "error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            import shutil as _sh2
+            _sh2.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
+                      lang: str = "python") -> dict:
     """Run one task's code against its cases in a subprocess. Blocking — call via to_thread."""
+    if lang == "c":
+        return _bench_grade_c(code, entry, cases, timeout_s)
     payload = json.dumps({"code": code, "entry": entry, "cases": cases})
     env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+    if lang == "js":
+        import shutil as _sh
+        node = _sh.which("node")
+        if not node:
+            return {"passed": 0, "total": len(cases),
+                    "error": "node is not installed on this host"}
+        cmd = [node, "-e", _BENCH_JS_GRADER_SRC]
+    else:
+        cmd = [sys.executable, "-I", "-c", _BENCH_GRADER_SRC]
     try:
         proc = subprocess.run(
-            [sys.executable, "-I", "-c", _BENCH_GRADER_SRC],
+            cmd,
             input=payload, capture_output=True, text=True,
             timeout=timeout_s, cwd=tempfile.gettempdir(), env=env,
         )
@@ -12760,11 +12952,13 @@ def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float) -> d
 
 async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
     """Grade one response against one task definition."""
-    code = _bench_extract_code(text)
+    lang = task.get("lang") or "python"
+    code = _bench_extract_code(text, lang)
     if not code.strip():
         return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
                 "score": 0.0, "error": "no code in response"}
-    res = await asyncio.to_thread(_bench_grade_sync, code, task["entry"], task["cases"], timeout_s)
+    res = await asyncio.to_thread(_bench_grade_sync, code, task["entry"], task["cases"],
+                                  timeout_s, lang)
     total = res.get("total") or len(task["cases"])
     res["task"] = task["id"]
     res["score"] = (res.get("passed", 0) / total) if total else 0.0

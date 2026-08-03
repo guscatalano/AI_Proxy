@@ -347,6 +347,47 @@ def tokenize_expr(s):
 '''
 
 
+REFERENCE["parse_query"] = '''
+function parseQuery(qs){ qs=String(qs||""); if(qs.startsWith("?"))qs=qs.slice(1);
+  const out={}; if(!qs)return out;
+  for(const part of qs.split("&")){ if(!part)continue;
+    const i=part.indexOf("="); const rk=i<0?part:part.slice(0,i);
+    const rv=i<0?"":part.slice(i+1);
+    const dec=x=>decodeURIComponent(x.replace(/[+]/g," "));
+    const k=dec(rk), v=dec(rv);
+    if(k in out){ if(Array.isArray(out[k]))out[k].push(v); else out[k]=[out[k],v]; }
+    else out[k]=v; }
+  return out; }
+'''
+
+REFERENCE["group_ranges"] = '''
+function groupRanges(nums){ if(!nums.length) return "";
+  const parts=[]; let s=nums[0], p=nums[0];
+  for(let i=1;i<=nums.length;i++){ const v=nums[i];
+    if(v===p+1){ p=v; continue; }
+    parts.push(s===p ? String(s) : s+"-"+p);
+    s=p=v; }
+  return parts.join(","); }
+'''
+
+REFERENCE["clamp_add"] = '''
+int clamp_add(int a, int b) {
+    long long s = (long long)a + (long long)b;
+    if (s > INT_MAX) return INT_MAX;
+    if (s < INT_MIN) return INT_MIN;
+    return (int)s;
+}
+'''
+
+REFERENCE["round_to"] = '''
+int round_to(int n, int m) {
+    int h = m / 2;
+    if (n >= 0) return ((n + h) / m) * m;
+    return -(((-n + h) / m) * m);
+}
+'''
+
+
 def _tasks():
     return {t["id"]: t for t in P._BENCH_SUITES["coding-v2"]}
 
@@ -357,14 +398,26 @@ def test_every_task_has_a_reference_solution():
         f"missing references: {set(_tasks()) - set(REFERENCE)}")
 
 
+def _runtime_missing(lang):
+    import shutil
+    if lang == "js":
+        return shutil.which("node") is None
+    if lang == "c":
+        return shutil.which("gcc") is None
+    return False
+
+
 @pytest.mark.parametrize("task_id", sorted(REFERENCE))
 def test_the_reference_solution_passes_every_case(task_id):
     """Run through the real grader, not a local call: this proves the cases are right *and*
-    that the grader can execute and score them."""
+    that the grader can execute and score them — in the task's own language."""
     task = _tasks()[task_id]
-    res = P._bench_grade_sync(REFERENCE[task_id], task["entry"], task["cases"], 20.0)
+    lang = task.get("lang") or "python"
+    if _runtime_missing(lang):
+        pytest.skip(f"{lang} runtime not on this host; validated where it is")
+    res = P._bench_grade_sync(REFERENCE[task_id], task["entry"], task["cases"], 20.0, lang)
     assert res.get("passed") == len(task["cases"]), (
-        f"{task_id}: {res.get('passed')}/{len(task['cases'])} — {res.get('failures') or res}")
+        f"{task_id}: {res.get('passed')}/{len(task['cases'])} — {res.get('cases') or res}")
 
 
 def test_the_suite_is_registered_and_selectable(client):
@@ -486,3 +539,76 @@ def test_the_obvious_wrong_answer_is_caught(task_id):
     res = P._bench_grade_sync(NAIVE[task_id], task["entry"], task["cases"], 20.0)
     assert res.get("passed", 0) < len(task["cases"]), (
         f"{task_id}: the naive implementation scored full marks — the task is not a trap")
+
+
+NAIVE["parse_query"] = (
+    "function parseQuery(qs){ const out={};"
+    "for(const p of String(qs).split('&')){ const [k,v]=p.split('=');"
+    "out[k]=v||''; } return out; }"
+)
+NAIVE["round_to"] = (
+    "int round_to(int n, int m) { return ((n + m / 2) / m) * m; }"
+)
+NAIVE["clamp_add"] = (
+    "int clamp_add(int a, int b) { return a + b; }"
+)
+
+
+@pytest.mark.parametrize("task_id", ["parse_query", "round_to", "clamp_add"])
+def test_the_new_languages_naive_answers_fail_too(task_id):
+    """Same discipline as the Python tasks: if the obvious wrong implementation scores full
+    marks, the task is a translation exercise, not a trap."""
+    task = _tasks()[task_id]
+    lang = task.get("lang") or "python"
+    if _runtime_missing(lang):
+        pytest.skip(f"{lang} runtime not on this host")
+    res = P._bench_grade_sync(NAIVE[task_id], task["entry"], task["cases"], 20.0, lang)
+    assert res.get("passed", 0) < len(task["cases"]), f"{task_id}: naive scored full marks"
+
+
+def test_extraction_prefers_the_tasks_language():
+    """A polyglot answer often shows a Python usage example beside the JavaScript being
+    graded; the longer block must not win on length when the shorter one is the right
+    language."""
+    text = (
+        "Here is a Python demo first:\n"
+        "```python\n# usage\nresult = parseQuery('a=1')\nprint(result)\n"
+        "# and more lines\n# to make this block longer\n# than the real one\n```\n"
+        "```js\nfunction parseQuery(qs){ return {}; }\n```\n"
+    )
+    got = P._bench_extract_code(text, "js")
+    assert "function parseQuery" in got and "usage" not in got
+
+
+def test_a_wrong_language_block_is_never_graded():
+    """A Python function handed to node fails as a syntax error, which reads as a broken
+    implementation rather than a mis-extraction. Better to report no code at all."""
+    text = "```python\ndef parseQuery(qs):\n    return {}\n```"
+    assert P._bench_extract_code(text, "js") == ""
+
+
+def test_js_runaway_code_is_contained():
+    import shutil
+    if shutil.which("node") is None:
+        pytest.skip("node not on this host")
+    res = P._bench_grade_sync("function f(){ while(true){} }", "f",
+                              [{"args": [], "expect": 1}], 3.0, "js")
+    assert res["passed"] == 0 and "timeout" in (res.get("error") or "")
+
+
+def test_c_compile_errors_are_reported_not_crashed():
+    import shutil
+    if shutil.which("gcc") is None:
+        pytest.skip("gcc not on this host")
+    res = P._bench_grade_sync("int clamp_add(int a, int b) { return a + ; }", "clamp_add",
+                              [{"args": [1, 2], "expect": 3}], 10.0, "c")
+    assert res["passed"] == 0 and "compile error" in (res.get("error") or "")
+
+
+def test_the_suite_declares_its_languages(client):
+    d = client.get("/__proxy/api/bench/suites").json()
+    v2 = next(s for s in d["suites"] if s["name"] == "coding-v2")
+    langs = {t["lang"] for t in v2["tasks"]}
+    assert langs == {"python", "js", "c"}
+    v1 = next(s for s in d["suites"] if s["name"] == "coding-v1")
+    assert {t["lang"] for t in v1["tasks"]} == {"python"}, "v1 must stay pure Python"
