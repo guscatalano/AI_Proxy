@@ -26,7 +26,13 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI, Request
 
-from ._version import __version__
+try:
+    from ._version import __version__
+except ImportError:
+    # Deployed as a flat script (scp proxy.py + systemd ExecStart python proxy.py) rather
+    # than as the installed package. The version string is cosmetic; refusing to boot the
+    # proxy over it took production down in a restart loop.
+    __version__ = "0.0.0+standalone"
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
@@ -14061,6 +14067,102 @@ def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str 
     return None
 
 
+# Ollama sizes its default context from TOTAL vram — 262,144 tokens on this box — and
+# multiplies it by OLLAMA_NUM_PARALLEL when it starts llama-server. Neither value is
+# queryable from outside, so they are mirrored here (override via model_control:
+# `ollama_server_ctx` / `ollama_num_parallel`, matching OLLAMA_CONTEXT_LENGTH /
+# OLLAMA_NUM_PARALLEL on the service). The KV bytes-per-element matches q8_0 (34/32).
+_BENCH_OLLAMA_DEFAULT_CTX = 262144
+_BENCH_OLLAMA_PARALLEL = 4
+_BENCH_KV_BYTES_PER_ELT = 1.0625
+
+
+def _bench_ollama_server_ctx(cfg: dict | None = None) -> tuple[int, int]:
+    """The per-slot context Ollama will actually load with, and the parallel slot count."""
+    mc = load_rules_config().get("model_control") or {}
+    per_slot = int((cfg or {}).get("server_context") or 0) \
+        or int(mc.get("ollama_server_ctx") or 0) or _BENCH_OLLAMA_DEFAULT_CTX
+    parallel = int(mc.get("ollama_num_parallel") or 0) or _BENCH_OLLAMA_PARALLEL
+    return per_slot, parallel
+
+
+def _bench_ollama_kv_mb(model_info: dict, tokens: int) -> float | None:
+    """Estimate the KV cache for `tokens` total context, in MB, from /api/show model_info.
+
+    Deliberately conservative: sliding-window layers cost less than this assumes (devstral-2
+    measures ~1.7× below the estimate), so an over-estimate can only block a model that was
+    going to be tight anyway — the failure mode this exists to prevent is the opposite one,
+    where a 108 GB allocation OOM-kills the whole Ollama service.
+    """
+    arch = model_info.get("general.architecture")
+    if not arch:
+        return None
+    def g(key):
+        v = model_info.get(f"{arch}.{key}")
+        # Per-layer lists appear on some archs; the max is the conservative read.
+        if isinstance(v, list):
+            v = max((x for x in v if isinstance(x, (int, float))), default=None)
+        return v
+    blocks = g("block_count")
+    if not blocks:
+        return None
+    lora = g("attention.kv_lora_rank")
+    if lora:
+        # MLA (deepseek-style) stores one compressed vector per layer per token, plus the
+        # decoupled rope key.
+        per_layer_elts = float(lora) + float(g("attention.key_length") or 64)
+    else:
+        heads_kv = g("attention.head_count_kv")
+        if not heads_kv:
+            return None
+        head = g("attention.head_count")
+        k_len = g("attention.key_length") or (
+            (g("embedding_length") or 0) / head if head else None)
+        v_len = g("attention.value_length") or k_len
+        if not k_len:
+            return None
+        per_layer_elts = float(heads_kv) * (float(k_len) + float(v_len))
+    return blocks * per_layer_elts * _BENCH_KV_BYTES_PER_ELT * tokens / (1024 * 1024)
+
+
+async def _bench_ollama_kv_preflight(model: str, meta: dict, cfg: dict) -> str | None:
+    """Why loading this model under Ollama's real context settings would OOM the box.
+
+    The weights-only fit check missed this entirely: devstral-2:123b fits its 65 GB of
+    weights easily, but Ollama's vram-based default context (262k × 4 slots) put a 108 GB
+    KV cache on top, and the OOM killer took down ollama.service in a load/kill/restart
+    loop while the cell burned all 87 of its requests on 502s. Checked before a single
+    request is sent, with the arithmetic in the message so the remedy is obvious.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
+            if r.status_code >= 400:
+                return None                      # unknown must not mean "no"
+            info = (r.json() or {}).get("model_info") or {}
+    except (httpx.RequestError, ValueError):
+        return None
+    per_slot, parallel = _bench_ollama_server_ctx(cfg)
+    model_ctx = info.get(f"{info.get('general.architecture')}.context_length")
+    if isinstance(model_ctx, (int, float)) and model_ctx:
+        per_slot = min(per_slot, int(model_ctx))  # ollama clamps to the training context
+    tokens = per_slot * parallel
+    kv_mb = _bench_ollama_kv_mb(info, tokens)
+    total_mb = (_mem_snapshot() or {}).get("total_mb")
+    size_mb = meta.get("size_mb")
+    if kv_mb is None or not total_mb or not size_mb:
+        return None
+    need = size_mb * _BENCH_FIT_OVERHEAD + kv_mb
+    cap = total_mb - _BENCH_FIT_RESERVE_MB
+    if need <= cap:
+        return None
+    return (f"{model!r} would OOM this box under Ollama's context settings: "
+            f"~{size_mb / 1024:.0f} GB weights + ~{kv_mb / 1024:.0f} GB KV cache at "
+            f"{per_slot:,} tokens × {parallel} parallel slots > {cap / 1024:.0f} GB usable. "
+            f"Set OLLAMA_CONTEXT_LENGTH on the ollama service (and mirror it in "
+            f"model_control.ollama_server_ctx) to bench this model.")
+
+
 async def _bench_start_backend(meta: dict, persist: bool = True,
                                bench_id: str = "") -> dict:
     """Make room, bring up the stopped backend the run needs, and say how to undo both.
@@ -14907,6 +15009,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Everything below this point costs real time and, under `exclusive`, blocks every other
         # proxy client. Refuse here rather than discovering it 54 empty completions later.
         why = _bench_preflight(model, model_meta, str(cfg.get("upstream") or ""), index)
+        if not why and str(cfg.get("upstream") or "") == "ollama":
+            why = await _bench_ollama_kv_preflight(model, model_meta, cfg)
         if why:
             _abort(why)
             return
@@ -15104,6 +15208,11 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     units = [(None, None)] * runs  # prompt built per-seq below (salting needs seq)
 
                 seq_counter = 0
+                consec_errors = 0
+                if warm and warm.get("error"):
+                    # A failed warm-up already counts toward the breaker: when the load
+                    # itself died, the measured requests are not going to fare better.
+                    consec_errors = 1
                 while seq_counter < len(units):
                     wave_size = min(concurrency, len(units) - seq_counter)
                     coros = []
@@ -15132,6 +15241,20 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                                 res["text"] = res["text"][:4000]
                     rows.extend(results)
                     seq_counter += wave_size
+                    # Circuit breaker: a cell whose backend is dead does not get to burn its
+                    # whole request budget discovering that. The devstral OOM loop sent 87
+                    # requests into a service the OOM killer was restarting, each one
+                    # re-triggering the fatal load; every row said the same thing. A handful
+                    # of consecutive failures with no success in between is that signature —
+                    # a merely slow or flaky backend produces successes in the mix and never
+                    # trips this.
+                    for res in results:
+                        consec_errors = consec_errors + 1 if res.get("error") else 0
+                    if consec_errors >= max(6, 2 * concurrency):
+                        raise RuntimeError(
+                            f"aborted after {consec_errors} consecutive failed requests "
+                            f"({seq_counter}/{len(units)} sent) — the backend is failing, "
+                            f"not slow — last: {str(rows[-1].get('error'))[:200]}")
                     # Persist progress incrementally so the UI can poll.
                     conn = db()
                     conn.execute(

@@ -350,3 +350,137 @@ def test_load_time_and_footprint_actually_reach_the_database(client, monkeypatch
     conn.close()
     assert env.get("load_ms") is not None, "load time never reached the database"
     assert env.get("resident_mb") == 2300.0, "resident footprint never reached the database"
+
+
+# ---- the devstral OOM loop: KV-aware preflight and the circuit breaker ----------------------
+
+DEVSTRAL_INFO = {
+    "general.architecture": "mistral3",
+    "mistral3.block_count": 88,
+    "mistral3.attention.head_count": 96,
+    "mistral3.attention.head_count_kv": 8,
+    "mistral3.attention.key_length": 128,
+    "mistral3.attention.value_length": 128,
+    "mistral3.context_length": 262144,
+    "mistral3.embedding_length": 12288,
+}
+
+
+def test_kv_estimate_matches_the_incident_arithmetic():
+    """devstral-2:123b at Ollama's vram-based default (262k × 4 slots) must estimate far past
+    what the box can hold, and the same model at a 32k override must clear it comfortably.
+    The estimate is deliberately conservative — sliding-window layers measure below it — so
+    the assertion is a band, not an exact figure."""
+    at_default = P._bench_ollama_kv_mb(DEVSTRAL_INFO, 262144 * 4)
+    assert at_default is not None and at_default > 100 * 1024, at_default
+    at_32k = P._bench_ollama_kv_mb(DEVSTRAL_INFO, 32768 * 4)
+    assert at_32k is not None and at_32k < 30 * 1024, at_32k
+    # The decision the preflight makes with these numbers, on this box:
+    total_mb, weights_mb = 121.7 * 1024, 65 * 1024
+    cap = total_mb - P._BENCH_FIT_RESERVE_MB
+    assert weights_mb * P._BENCH_FIT_OVERHEAD + at_default > cap
+    assert weights_mb * P._BENCH_FIT_OVERHEAD + at_32k <= cap
+
+
+def test_kv_estimate_handles_mla_and_refuses_to_guess():
+    mla = {"general.architecture": "deepseek2", "deepseek2.block_count": 60,
+           "deepseek2.attention.kv_lora_rank": 512, "deepseek2.attention.key_length": 192}
+    v = P._bench_ollama_kv_mb(mla, 131072)
+    # One compressed vector per layer per token — a fraction of full multi-head KV.
+    assert v is not None and v < 6 * 1024, v
+    assert P._bench_ollama_kv_mb({}, 131072) is None
+    assert P._bench_ollama_kv_mb({"general.architecture": "x"}, 131072) is None
+
+
+def _seed_cell(cfg_extra=None):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    cfg = {"upstream": "ollama", "runs": 30, "warmup": True, "resume": False}
+    cfg.update(cfg_extra or {})
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) VALUES (?,?,?,?,?)",
+        ("b_break", time.time(), "qwen3:4b", json.dumps(cfg), "pending"))
+    conn.commit()
+    conn.close()
+
+
+def _cell_row():
+    conn = P.db()
+    status, error, results = conn.execute(
+        "SELECT status, error, results_json FROM bench_runs WHERE id='b_break'").fetchone()
+    conn.close()
+    return status, error, json.loads(results or "{}")
+
+
+def _breaker_env(monkeypatch, run_one):
+    import asyncio
+    monkeypatch.setattr(P, "_bench_run_one", run_one)
+    monkeypatch.setattr(P, "_bench_model_index", lambda: asyncio.sleep(0, result={
+        "ollama:qwen3:4b": {"model": "qwen3:4b", "upstream": "ollama",
+                            "loaded": True, "size_mb": 2400}}))
+    monkeypatch.setattr(P, "_bench_evict_ollama", lambda keep="": asyncio.sleep(0, result=[]))
+    monkeypatch.setattr(P, "_bench_residency_snapshot",
+                        lambda: asyncio.sleep(0, result={"backends": []}))
+    monkeypatch.setattr(P, "_bench_ollama_kv_preflight",
+                        lambda model, meta, cfg: asyncio.sleep(0, result=None))
+
+
+def test_a_dead_backend_trips_the_breaker_instead_of_burning_the_budget(client, monkeypatch):
+    """The devstral cell sent all 87 requests into a service the OOM killer was restarting —
+    every row the same 502. A handful of consecutive failures with no success between them is
+    that signature, and the cell should fail with a reason, not complete with garbage."""
+    import asyncio
+    sent = {"n": 0}
+
+    async def dead(client_, base, model, max_tokens, prompt, seq, cfg=None, capture_text=False):
+        sent["n"] += 1
+        return {"seq": seq, "error": "HTTP 502: upstream unreachable", "total_ms": 5.0}
+
+    _breaker_env(monkeypatch, dead)
+    _seed_cell()
+    asyncio.run(P._bench_execute("b_break", P.app))
+    status, error, _ = _cell_row()
+    assert status == "failed"
+    assert "consecutive" in (error or ""), error
+    assert sent["n"] <= 10, f"breaker let {sent['n']} doomed requests through"
+
+
+def test_a_flaky_backend_does_not_trip_the_breaker(client, monkeypatch):
+    """Interleaved successes reset the count: flaky is a result, dead is a diagnosis."""
+    import asyncio
+    calls = {"n": 0}
+
+    async def flaky(client_, base, model, max_tokens, prompt, seq, cfg=None, capture_text=False):
+        calls["n"] += 1
+        if calls["n"] % 3 == 0:
+            return {"seq": seq, "error": "HTTP 502: hiccup", "total_ms": 5.0}
+        return {"seq": seq, "ttft_ms": 10.0, "ttfc_ms": 10.0, "total_ms": 50.0,
+                "completion_tokens": 5, "reasoning_tokens": None, "decode_tps": 100.0,
+                "error": None, "served_model": "qwen3:4b"}
+
+    _breaker_env(monkeypatch, flaky)
+    _seed_cell()
+    asyncio.run(P._bench_execute("b_break", P.app))
+    status, error, results = _cell_row()
+    assert status == "done", error
+    assert len(results.get("rows") or []) == 30
+
+
+def test_unfittable_kv_blocks_before_any_request(client, monkeypatch):
+    import asyncio
+    sent = {"n": 0}
+
+    async def counting(client_, base, model, max_tokens, prompt, seq, cfg=None,
+                       capture_text=False):
+        sent["n"] += 1
+        return {"seq": seq, "error": None, "total_ms": 5.0}
+
+    _breaker_env(monkeypatch, counting)
+    monkeypatch.setattr(
+        P, "_bench_ollama_kv_preflight",
+        lambda model, meta, cfg: asyncio.sleep(0, result="would OOM this box: test"))
+    _seed_cell()
+    asyncio.run(P._bench_execute("b_break", P.app))
+    status, error, _ = _cell_row()
+    assert status == "failed" and "OOM" in (error or "")
+    assert sent["n"] == 0, "preflight must refuse before the first request"
