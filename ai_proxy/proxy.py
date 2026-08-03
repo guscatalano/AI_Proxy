@@ -20,6 +20,7 @@ import ipaddress
 import math
 import datetime
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
@@ -8618,7 +8619,8 @@ async def bench_suites():
             {
                 "name": name,
                 "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"]),
-                           "lang": t.get("lang") or "python"}
+                           "lang": t.get("lang") or "python",
+                           "available": _bench_lang_available(t.get("lang") or "python")}
                           for t in tasks],
                 "task_count": len(tasks),
                 "case_count": sum(len(t["cases"]) for t in tasks),
@@ -10764,6 +10766,13 @@ ordinary slowness rather than a misconfiguration.</p>
     _suite_name = rows[0].get("suite") if rows else None
     _suite = _BENCH_SUITES.get(_suite_name) if _suite_name else None
     if _suite:
+        _skipped = (env.get("skipped_languages") or {}) if isinstance(env, dict) else {}
+        _skip_html = ""
+        if _skipped:
+            _skip_html = ('<p class="note warnbox">Skipped on this machine — toolchain not '
+                          'installed: ' + "; ".join(
+                              f"<b>{_h(k)}</b> ({_h(', '.join(v))})"
+                              for k, v in _skipped.items()) + ".</p>")
         _tiers: dict = {}
         for _t in _suite:
             _tiers.setdefault(_t.get("tier") or "untiered", []).append(_t)
@@ -10775,10 +10784,13 @@ ordinary slowness rather than a misconfiguration.</p>
         _cfg0 = (runs[0].get("config") or {}) if runs else {}
         method_html = f"""
   <h2>What was tested</h2>
-  <p class="note">Every task asks for one named function in the task's language — Python,
-  JavaScript run under node, or C compiled with gcc. The model's answer is parsed for a code
-  block in that language, the function is called with each case's arguments in a separate
-  process under a timeout, and the return value is compared with the expected one. <b>Fully correct</b>
+  <p class="note">Every task asks for one answer in the task's language — Python,
+  JavaScript under node, C and C++ under gcc, Rust, C#, or PHP, each run in a separate process
+  under a timeout with the return value compared against the expected one. HTML and CSS tasks
+  are graded structurally: the answer is parsed and checked against required structure
+  (bindings, attributes, declarations in the right context) — a claim about the markup, not
+  about how a browser renders it. Tasks whose toolchain is absent on the machine are skipped
+  and listed here, never scored as zero. <b>Fully correct</b>
   counts only responses where <em>every</em> case for that task passed; <b>cases</b> is the
   share of individual cases that passed, so a near-miss still scores there. A response with no
   extractable code block scores zero — that measures instruction-following, not coding.</p>
@@ -10788,6 +10800,7 @@ ordinary slowness rather than a misconfiguration.</p>
     <div><p class="k">Repeats</p><p class="v">{_h(str(_cfg0.get("runs") or 1))} per task</p></div>
     {_blocks}
   </div>
+  {_skip_html}
   <ul class="fn">
     <li>Grading executes model-written code in a subprocess with a hard timeout, a scratch
       working directory and a stripped environment. That contains accidents and runaway loops;
@@ -12191,6 +12204,286 @@ _BENCH_SUITES: dict[str, list[dict]] = {
             ],
         },
         {
+            "id": "count_words",
+            "tier": "core",
+            "lang": "c",
+            "prompt": (
+                "Write a C function `int count_words(const char *s)` counting words in s, "
+                "where a word is a maximal run of characters that are not spaces or tabs. "
+                "Leading, trailing and repeated separators are all legal. Return 0 for an "
+                "empty or all-separator string.\n"
+                "Return only the function in a single ```c code block."
+            ),
+            "entry": "count_words",
+            "cases": [
+                {"args": ["hello world"], "expect": 2},
+                {"args": ["  leading and trailing  "], "expect": 3},
+                {"args": ["a\tb\t\tc"], "expect": 3},
+                {"args": [""], "expect": 0},
+                {"args": ["   "], "expect": 0},
+                {"args": ["one"], "expect": 1},
+            ],
+        },
+        {
+            "id": "csv_escape",
+            "tier": "core",
+            "lang": "cpp",
+            "prompt": (
+                "Write a C++ function `std::string csv_escape(std::string field)` applying "
+                "RFC 4180 quoting: if the field contains a comma or a double quote, wrap it "
+                "in double quotes and double every interior quote; otherwise return it "
+                "unchanged. An empty field stays empty and unquoted.\n"
+                "Return only the function in a single ```cpp code block."
+            ),
+            "entry": "csv_escape",
+            "cases": [
+                {"args": ["plain"], "expect": "plain"},
+                {"args": ["a,b"], "expect": "\"a,b\""},
+                {"args": ["say \"hi\""], "expect": "\"say \"\"hi\"\"\""},
+                {"args": [""], "expect": ""},
+                {"args": ["both, \"q\""], "expect": "\"both, \"\"q\"\"\""},
+                {"args": ["no quotes needed"], "expect": "no quotes needed"},
+            ],
+        },
+        {
+            "id": "balanced_depth",
+            "tier": "hard",
+            "lang": "cpp",
+            "prompt": (
+                "Write a C++ function `int balanced_depth(const std::string& s)` returning "
+                "the maximum nesting depth of round brackets in s, or -1 if the brackets are "
+                "not balanced (a closer without an opener, or unclosed openers at the end). "
+                "Non-bracket characters are ignored. The empty string has depth 0.\n"
+                "Return only the function in a single ```cpp code block."
+            ),
+            "entry": "balanced_depth",
+            "cases": [
+                {"args": ["(a(b)c)"], "expect": 2},
+                {"args": ["()()()"], "expect": 1},
+                {"args": [""], "expect": 0},
+                {"args": [")("], "expect": -1},
+                {"args": ["(()"], "expect": -1},
+                {"args": ["x((y))z()"], "expect": 2},
+            ],
+        },
+        {
+            "id": "snake_to_camel",
+            "tier": "core",
+            "lang": "rust",
+            "prompt": (
+                "Write a Rust function `fn snake_to_camel(s: &str) -> String` converting "
+                "snake_case to camelCase: every underscore is removed, and the character "
+                "immediately after a run of underscores is uppercased if it is alphabetic "
+                "(a digit stays as it is). Leading and trailing underscores vanish; a "
+                "string with no underscores is unchanged.\n"
+                "Return only the function in a single ```rust code block."
+            ),
+            "entry": "snake_to_camel",
+            "cases": [
+                {"args": ["hello_world"], "expect": "helloWorld"},
+                {"args": ["already"], "expect": "already"},
+                {"args": ["a__b"], "expect": "aB"},
+                {"args": ["_leading"], "expect": "Leading"},
+                {"args": ["trailing_"], "expect": "trailing"},
+                {"args": ["x_1y"], "expect": "x1y"},
+            ],
+        },
+        {
+            "id": "mid_floor",
+            "tier": "hard",
+            "lang": "rust",
+            "prompt": (
+                "Write a Rust function `fn mid_floor(a: i64, b: i64) -> i64` returning the "
+                "mathematical floor of (a + b) / 2. Two traps: a + b can overflow i64, and "
+                "integer division truncates toward zero while floor rounds toward negative "
+                "infinity — floor((-3 + 0) / 2) is -2, not -1.\n"
+                "Return only the function in a single ```rust code block."
+            ),
+            "entry": "mid_floor",
+            "cases": [
+                {"args": [2, 6], "expect": 4},
+                {"args": [-3, 0], "expect": -2},
+                {"args": [9223372036854775807, 9223372036854775807],
+                 "expect": 9223372036854775807},
+                {"args": [-9223372036854775807, -9223372036854775807],
+                 "expect": -9223372036854775807},
+                {"args": [0, 0], "expect": 0},
+                {"args": [-1, -2], "expect": -2},
+            ],
+        },
+        {
+            "id": "clamp_mul",
+            "tier": "core",
+            "lang": "csharp",
+            "prompt": (
+                "Write a C# static class `Sol` containing exactly one method, "
+                "`public static int ClampMul(int a, int b)`, returning a * b saturated to the "
+                "int range: results above int.MaxValue return int.MaxValue, below "
+                "int.MinValue return int.MinValue. C# arithmetic is unchecked by default, so "
+                "the naive a * b silently wraps.\n"
+                "Return only the class in a single ```csharp code block."
+            ),
+            "entry": "Sol.ClampMul",
+            "cases": [
+                {"args": [7, 6], "expect": 42},
+                {"args": [100000, 100000], "expect": 2147483647},
+                {"args": [-100000, 100000], "expect": -2147483648},
+                {"args": [46341, 46341], "expect": 2147483647},
+                {"args": [-3, -4], "expect": 12},
+                {"args": [0, 2147483647], "expect": 0},
+            ],
+        },
+        {
+            "id": "ordinal",
+            "tier": "hard",
+            "lang": "csharp",
+            "prompt": (
+                "Write a C# static class `Sol` containing exactly one method, "
+                "`public static string Ordinal(int n)`, for n >= 0, appending the English "
+                "ordinal suffix: 1st, 2nd, 3rd, 4th … The teens are the trap: 11th, 12th and "
+                "13th take th despite ending in 1, 2, 3 — and so do 111, 112, 113.\n"
+                "Return only the class in a single ```csharp code block."
+            ),
+            "entry": "Sol.Ordinal",
+            "cases": [
+                {"args": [1], "expect": "1st"},
+                {"args": [2], "expect": "2nd"},
+                {"args": [3], "expect": "3rd"},
+                {"args": [4], "expect": "4th"},
+                {"args": [11], "expect": "11th"},
+                {"args": [12], "expect": "12th"},
+                {"args": [13], "expect": "13th"},
+                {"args": [21], "expect": "21st"},
+                {"args": [111], "expect": "111th"},
+                {"args": [102], "expect": "102nd"},
+            ],
+        },
+        {
+            "id": "slugify",
+            "tier": "core",
+            "lang": "php",
+            "prompt": (
+                "Write a PHP function `slugify(string $s): string` producing a URL slug: "
+                "lowercase, every maximal run of non-alphanumeric characters becomes a single "
+                "hyphen, and leading or trailing hyphens are trimmed. An input with nothing "
+                "alphanumeric returns the empty string.\n"
+                "Return only the function in a single ```php code block (no opening tag "
+                "needed)."
+            ),
+            "entry": "slugify",
+            "cases": [
+                {"args": ["Hello, World!"], "expect": "hello-world"},
+                {"args": ["  spaced   out  "], "expect": "spaced-out"},
+                {"args": ["a--b__c"], "expect": "a-b-c"},
+                {"args": ["!!!"], "expect": ""},
+                {"args": ["Already-Fine"], "expect": "already-fine"},
+                {"args": ["100% sure"], "expect": "100-sure"},
+            ],
+        },
+        {
+            "id": "pluck",
+            "tier": "hard",
+            "lang": "php",
+            "prompt": (
+                "Write a PHP function `pluck(array $rows, string $key): array` returning the "
+                "value of $key from each associative row, in order, skipping rows where the "
+                "key is ABSENT. The trap: a key present with a null value is kept as null — "
+                "isset() cannot tell those apart, array_key_exists() can.\n"
+                "Return only the function in a single ```php code block (no opening tag "
+                "needed)."
+            ),
+            "entry": "pluck",
+            "cases": [
+                {"args": [[{"a": 1}, {"a": 2}], "a"], "expect": [1, 2]},
+                {"args": [[{"a": 1}, {"b": 9}, {"a": 3}], "a"], "expect": [1, 3]},
+                {"args": [[{"a": None}, {"a": 5}], "a"], "expect": [None, 5]},
+                {"args": [[], "a"], "expect": []},
+                {"args": [[{"x": "y"}], "a"], "expect": []},
+            ],
+        },
+        {
+            "id": "login_form",
+            "tier": "core",
+            "lang": "html",
+            "prompt": (
+                "Write an HTML fragment (no document shell): a form that POSTs to /login "
+                "containing an email input and a password input, each with its own <label> "
+                "bound via for/id, both marked required, and a <button> reading exactly "
+                "'Sign in'.\nReturn only the fragment in a single ```html code block."
+            ),
+            "entry": "login_form",
+            "cases": [
+                {"op": "count", "sel": "form", "expect": 1},
+                {"op": "attr", "sel": "form", "name": "method", "expect": "post"},
+                {"op": "attr", "sel": "form", "name": "action", "expect": "/login"},
+                {"op": "count", "sel": "input[type=email][required]", "expect": 1},
+                {"op": "count", "sel": "input[type=password][required]", "expect": 1},
+                {"op": "labels_bound", "expect": 2},
+                {"op": "text", "sel": "button", "expect": "Sign in"},
+            ],
+        },
+        {
+            "id": "data_table",
+            "tier": "hard",
+            "lang": "html",
+            "prompt": (
+                "Write an HTML fragment: a table of quarterly revenue with a <caption> "
+                "reading exactly 'Quarterly revenue', a <thead> whose single row holds three "
+                "<th> cells each with scope=\"col\", and a <tbody> of exactly two rows of "
+                "three <td> cells. Cell contents are yours to choose.\n"
+                "Return only the fragment in a single ```html code block."
+            ),
+            "entry": "data_table",
+            "cases": [
+                {"op": "count", "sel": "table", "expect": 1},
+                {"op": "text", "sel": "caption", "expect": "Quarterly revenue"},
+                {"op": "count", "sel": "thead th", "expect": 3},
+                {"op": "count", "sel": "thead th[scope=col]", "expect": 3},
+                {"op": "count", "sel": "tbody tr", "expect": 2},
+                {"op": "count", "sel": "tbody td", "expect": 6},
+            ],
+        },
+        {
+            "id": "card_grid",
+            "tier": "core",
+            "lang": "css",
+            "prompt": (
+                "Write CSS: a .cards container laid out as a grid with columns "
+                "repeat(auto-fill, minmax(240px, 1fr)) and a 16px gap; and a .card rule with "
+                "border-radius 8px whose :hover state sets transform to translateY(-2px).\n"
+                "Return only the CSS in a single ```css code block."
+            ),
+            "entry": "card_grid",
+            "cases": [
+                {"op": "decl", "sel": ".cards", "prop": "display", "expect": "grid"},
+                {"op": "decl", "sel": ".cards", "prop": "grid-template-columns",
+                 "expect": "repeat(auto-fill, minmax(240px, 1fr))"},
+                {"op": "decl", "sel": ".cards", "prop": "gap", "expect": "16px"},
+                {"op": "decl", "sel": ".card", "prop": "border-radius", "expect": "8px"},
+                {"op": "decl", "sel": ".card:hover", "prop": "transform",
+                 "expect": "translateY(-2px)"},
+            ],
+        },
+        {
+            "id": "theme_vars",
+            "tier": "hard",
+            "lang": "css",
+            "prompt": (
+                "Write CSS implementing a two-theme token: :root defines --ink as #111111; "
+                "inside an @media (prefers-color-scheme: dark) block, :root redefines --ink "
+                "as #eeeeee; and body sets color to var(--ink). The trap is scope — the dark "
+                "value must live inside the media query, not beside it.\n"
+                "Return only the CSS in a single ```css code block."
+            ),
+            "entry": "theme_vars",
+            "cases": [
+                {"op": "decl", "sel": ":root", "prop": "--ink", "expect": "#111111"},
+                {"op": "decl", "sel": ":root", "prop": "--ink", "expect": "#eeeeee",
+                 "media": "prefers-color-scheme: dark"},
+                {"op": "decl", "sel": "body", "prop": "color", "expect": "var(--ink)"},
+            ],
+        },
+        {
             "id": "semver_cmp",
             "tier": "core",
             "prompt": (
@@ -12779,7 +13072,274 @@ _BENCH_LANGS = {
     "python": {"tags": {"python", "py", ""}, "bare": re.compile(r"\bdef\s+\w+")},
     "js": {"tags": {"js", "javascript", ""}, "bare": re.compile(r"\bfunction\s+\w+|=>")},
     "c": {"tags": {"c", ""}, "bare": re.compile(r"\b(?:int|long|unsigned)\s+\w+\s*\(")},
+    "cpp": {"tags": {"cpp", "c++", "cxx", ""},
+            "bare": re.compile(r"std::|\b(?:int|std::string)\s+\w+\s*\(")},
+    "rust": {"tags": {"rust", "rs", ""}, "bare": re.compile(r"\bfn\s+\w+")},
+    "csharp": {"tags": {"csharp", "cs", "c#", ""},
+               "bare": re.compile(r"\bpublic\s+static\b|\bclass\s+\w+")},
+    "php": {"tags": {"php", ""}, "bare": re.compile(r"<\?php|\bfunction\s+\w+")},
+    "html": {"tags": {"html", ""}, "bare": re.compile(r"<[a-zA-Z][^>]*>")},
+    "css": {"tags": {"css", ""}, "bare": re.compile(r"[.#:\w\s,>-]+\{[^}]*\}")},
 }
+
+# Toolchains may be user-local installs the service's PATH has never heard of.
+_BENCH_TOOL_DIRS = ("~/.cargo/bin", "~/.dotnet", "~/.local/php", "~/.local/bin")
+
+
+def _bench_tool(name: str):
+    import shutil as _sh
+    found = _sh.which(name)
+    if found:
+        return found
+    for d in _BENCH_TOOL_DIRS:
+        cand = os.path.expanduser(f"{d}/{name}")
+        if os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
+    return None
+
+
+def _bench_lit(v, lang: str) -> str:
+    """One argument as a source literal. JSON string escaping is valid in C, C++, Rust and C#
+    for the ASCII cases these tasks use, which is exactly why the cases stay ASCII."""
+    if isinstance(v, bool):
+        return {"c": "1" if v else "0"}.get(lang, "true" if v else "false")
+    if isinstance(v, (int, float)):
+        return str(v)
+    return json.dumps(v)
+
+
+
+
+def _bench_lang_available(lang: str) -> bool:
+    """Whether this machine can grade a language at all. Portability contract: a task whose
+    tooling is absent is SKIPPED — dropped from the run and recorded as such — never scored as
+    a zero, because a zero would punish the model for the box."""
+    if lang in ("python", "html", "css", None, ""):
+        return True
+    if lang == "js":
+        return _bench_tool("node") is not None
+    if lang in ("c",):
+        return _bench_tool("gcc") is not None
+    if lang == "cpp":
+        return _bench_tool("g++") is not None
+    if lang == "rust":
+        return _bench_tool("rustc") is not None
+    if lang == "csharp":
+        return (_bench_tool("dotnet") is not None
+                and os.path.isdir(os.path.expanduser("~/.cache/ai_proxy_cs")))
+    if lang == "php":
+        return _bench_tool("php") is not None
+    return False
+
+
+def _bench_suite_tasks(suite_name: str) -> tuple:
+    """The tasks this machine can actually grade, and the ones it cannot, by language."""
+    tasks = _BENCH_SUITES.get(suite_name) or []
+    runnable, skipped = [], {}
+    for t in tasks:
+        lang = t.get("lang") or "python"
+        if _bench_lang_available(lang):
+            runnable.append(t)
+        else:
+            skipped.setdefault(lang, []).append(t["id"])
+    return runnable, skipped
+
+
+class _BenchHTML(HTMLParser):
+    """Just enough DOM to check structure: tags, attributes, text, parentage."""
+
+    VOID = {"input", "br", "img", "meta", "hr", "link", "source", "wbr", "col", "area", "base"}
+
+    def __init__(self):
+        super().__init__()
+        self.root = {"tag": "#root", "attrs": {}, "children": [], "text": []}
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        node = {"tag": tag.lower(), "attrs": {k.lower(): ("" if v is None else v)
+                                              for k, v in attrs},
+                "children": [], "text": []}
+        self.stack[-1]["children"].append(node)
+        if tag.lower() not in self.VOID:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if tag.lower() not in self.VOID:
+            self.stack.pop()
+
+    def handle_endtag(self, tag):
+        for i in range(len(self.stack) - 1, 0, -1):
+            if self.stack[i]["tag"] == tag.lower():
+                del self.stack[i:]
+                break
+
+    def handle_data(self, data):
+        if data.strip():
+            self.stack[-1]["text"].append(data)
+
+
+def _bench_html_select(root: dict, selector: str) -> list:
+    """A deliberately small selector: tag, #id, .class, [attr] and [attr=value], compounded,
+    with descendant combination by whitespace. Enough to check structure; nothing more."""
+    def parse_simple(tok):
+        m = re.match(r"^([a-zA-Z][\w-]*|\*)?(#[\w-]+)?((?:\.[\w-]+)*)"
+                     r"((?:\[[^\]]+\])*)$", tok)
+        if not m:
+            return None
+        tag = (m.group(1) or "*").lower()
+        want_id = m.group(2)[1:] if m.group(2) else None
+        classes = [c for c in (m.group(3) or "").split(".") if c]
+        attrs = []
+        for am in re.finditer(r"\[([^\]=]+)(?:=([^\]]*))?\]", m.group(4) or ""):
+            attrs.append((am.group(1).strip().lower(),
+                          None if am.group(2) is None else am.group(2).strip("'\"")))
+        return tag, want_id, classes, attrs
+
+    def matches(node, simple):
+        tag, want_id, classes, attrs = simple
+        if tag != "*" and node["tag"] != tag:
+            return False
+        if want_id and node["attrs"].get("id") != want_id:
+            return False
+        node_classes = (node["attrs"].get("class") or "").split()
+        if any(c not in node_classes for c in classes):
+            return False
+        for name, val in attrs:
+            if name not in node["attrs"]:
+                return False
+            if val is not None and node["attrs"][name] != val:
+                return False
+        return True
+
+    def walk(node):
+        for ch in node["children"]:
+            yield ch
+            yield from walk(ch)
+
+    parts = [parse_simple(t) for t in selector.split()]
+    if any(p is None for p in parts):
+        return []
+    pools = [root]
+    for part in parts:
+        nxt = []
+        for scope in pools:
+            for n in walk(scope):
+                if matches(n, part) and n not in nxt:
+                    nxt.append(n)
+        pools = nxt
+    return pools
+
+
+def _bench_html_text(node: dict) -> str:
+    out = list(node["text"])
+
+    def rec(n):
+        for ch in n["children"]:
+            out.extend(ch["text"])
+            rec(ch)
+    rec(node)
+    return " ".join(" ".join(out).split())
+
+
+def _bench_check_html(code: str, cases: list) -> dict:
+    """Structural grading: the fragment is parsed and each case asserts one fact about it.
+    This checks the markup's structure — bindings, attributes, counts, text — not how a
+    browser would paint it, and the report's method section says exactly that."""
+    parser = _BenchHTML()
+    try:
+        parser.feed(code or "")
+    except Exception as e:
+        return {"passed": 0, "total": len(cases), "error": f"unparseable HTML: {e}"}
+    root = parser.root
+    results = []
+    for c in cases:
+        op = c.get("op")
+        ok, got = False, None
+        try:
+            if op == "count":
+                got = len(_bench_html_select(root, c["sel"]))
+                ok = got == c["expect"]
+            elif op == "attr":
+                m = _bench_html_select(root, c["sel"])
+                got = m[0]["attrs"].get(c["name"].lower()) if m else None
+                ok = got == c["expect"]
+            elif op == "text":
+                m = _bench_html_select(root, c["sel"])
+                got = _bench_html_text(m[0]) if m else None
+                ok = got == c["expect"]
+            elif op == "labels_bound":
+                ids = {n["attrs"].get("id") for n in _bench_html_select(root, "input")
+                       if n["attrs"].get("id")}
+                got = sum(1 for lb in _bench_html_select(root, "label")
+                          if lb["attrs"].get("for") in ids)
+                ok = got == c["expect"]
+        except Exception as e:
+            got = f"{type(e).__name__}: {e}"
+        r = {"ok": bool(ok)}
+        if not ok:
+            r["got"] = got
+        results.append(r)
+    return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+            "cases": results}
+
+
+def _bench_check_css(code: str, cases: list) -> dict:
+    """Structural CSS grading: rules are parsed (one level of @media supported), and each case
+    asserts that a selector declares a property with a value — in the right context. The last
+    matching declaration wins, which is the cascade's own rule for equal specificity."""
+    text = re.sub(r"/\*.*?\*/", "", code or "", flags=re.S)
+    rules = []          # (media_or_None, selector, prop, value) in source order
+
+    def parse_block(body, media):
+        for m in re.finditer(r"([^{}]+)\{([^{}]*)\}", body):
+            sel = " ".join(m.group(1).split()).lower()
+            for decl in m.group(2).split(";"):
+                if ":" in decl:
+                    prop, _, val = decl.partition(":")
+                    rules.append((media, sel, prop.strip().lower(),
+                                  " ".join(val.split()).lower()))
+
+    pos = 0
+    while pos < len(text):
+        at = text.find("@media", pos)
+        if at < 0:
+            parse_block(text[pos:], None)
+            break
+        parse_block(text[pos:at], None)
+        brace = text.find("{", at)
+        if brace < 0:
+            break
+        cond = " ".join(text[at + 6:brace].split()).lower()
+        depth, i = 1, brace + 1
+        while i < len(text) and depth:
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+            i += 1
+        parse_block(text[brace + 1:i - 1], cond)
+        pos = i
+
+    results = []
+    for c in cases:
+        sel = " ".join(c["sel"].split()).lower()
+        want_media = (c.get("media") or "").lower() or None
+        got = None
+        for media, rsel, prop, val in rules:
+            sels = [x.strip() for x in rsel.split(",")]
+            media_ok = (media is None) if want_media is None else \
+                (media is not None and want_media in media)
+            if media_ok and sel in sels and prop == c["prop"].lower():
+                got = val
+        want = " ".join(str(c["expect"]).split()).lower()
+        ok = got == want
+        r = {"ok": ok}
+        if not ok:
+            r["got"] = got
+        results.append(r)
+    return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+            "cases": results}
 
 
 def _bench_extract_code(text: str, lang: str = "python") -> str:
@@ -12909,11 +13469,170 @@ def _bench_grade_c(code: str, entry: str, cases: list, timeout_s: float) -> dict
             pass
 
 
+def _bench_grade_compiled(lang: str, code: str, entry: str, cases: list,
+                          timeout_s: float) -> dict:
+    """C++, Rust and C# share the C grader's shape: generate a main that prints one result per
+    line, compile, run, compare lines. Only the syntax of the harness differs."""
+    workdir = tempfile.mkdtemp(prefix=f"bench_{lang}_")
+    env = {"PATH": os.environ.get("PATH", ""),
+           "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+           "HOME": os.path.expanduser("~"),
+           "DOTNET_CLI_TELEMETRY_OPTOUT": "1", "DOTNET_NOLOGO": "1"}
+    try:
+        if lang == "cpp":
+            gxx = _bench_tool("g++")
+            if not gxx:
+                return {"passed": 0, "total": len(cases), "error": "g++ is not installed"}
+            calls = "".join(
+                f'    std::cout << {entry}({", ".join(_bench_lit(a, "cpp") for a in c["args"])})'
+                ' << "\n";\n' for c in cases)
+            src = ("#include <iostream>\n#include <string>\n#include <vector>\n"
+                   "#include <algorithm>\n#include <cstdint>\n#include <climits>\n\n"
+                   + code + "\n\nint main() {\n" + calls + "    return 0;\n}\n")
+            spath = os.path.join(workdir, "task.cpp")
+            epath = os.path.join(workdir, "task.exe")
+            comp_cmd = [gxx, "-std=c++17", "-O0", spath, "-o", epath]
+            run_cmd = [epath]
+        elif lang == "rust":
+            rustc = _bench_tool("rustc")
+            if not rustc:
+                return {"passed": 0, "total": len(cases), "error": "rustc is not installed"}
+            calls = "".join(
+                f'    println!("{{}}", {entry}({", ".join(_bench_lit(a, "rust") for a in c["args"])}));\n'
+                for c in cases)
+            src = ("#![allow(dead_code)]\n" + code
+                   + "\n\nfn main() {\n" + calls + "}\n")
+            spath = os.path.join(workdir, "task.rs")
+            epath = os.path.join(workdir, "task.exe")
+            comp_cmd = [rustc, "--edition", "2021", "-o", epath, spath]
+            run_cmd = [epath]
+        elif lang == "csharp":
+            dotnet = _bench_tool("dotnet")
+            runner = os.path.expanduser("~/.cache/ai_proxy_cs")
+            if not dotnet or not os.path.isdir(runner):
+                return {"passed": 0, "total": len(cases),
+                        "error": "the dotnet runner is not installed"}
+            calls = "".join(
+                f'        System.Console.WriteLine({entry}('
+                f'{", ".join(_bench_lit(a, "csharp") for a in c["args"])}));\n'
+                for c in cases)
+            src = (code + "\n\npublic static class Program {\n"
+                   "    public static void Main() {\n" + calls + "    }\n}\n")
+            spath = os.path.join(runner, "Program.cs")
+            comp_cmd = [dotnet, "build", "-v", "q", "--nologo", runner]
+            dll = os.path.join(runner, "bin", "Debug", "net8.0", "csrunner.dll")
+            run_cmd = [dotnet, dll]
+        else:
+            return {"passed": 0, "total": len(cases), "error": f"no compiler for {lang!r}"}
+
+        with open(spath, "w", encoding="utf-8") as f:
+            f.write(src)
+        comp = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=90,
+                              env=env, cwd=workdir)
+        if comp.returncode != 0:
+            msg = (comp.stderr or comp.stdout or "")[-300:]
+            return {"passed": 0, "total": len(cases),
+                    "error": ("compile error: " + msg).strip()}
+        run = subprocess.run(run_cmd, capture_output=True, text=True,
+                             timeout=timeout_s, env=env, cwd=workdir)
+        got = (run.stdout or "").strip().splitlines()
+        results = []
+        for i, c in enumerate(cases):
+            want = str(c["expect"]) if not isinstance(c["expect"], bool) else \
+                ("true" if c["expect"] else "false")
+            ok = i < len(got) and got[i].rstrip("\r") == want
+            r = {"ok": ok}
+            if not ok:
+                r["got"] = got[i].rstrip("\r") if i < len(got) else None
+            results.append(r)
+        return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+                "cases": results}
+    except subprocess.TimeoutExpired:
+        return {"passed": 0, "total": len(cases), "error": f"timeout after {timeout_s}s"}
+    except Exception as e:
+        return {"passed": 0, "total": len(cases), "error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            import shutil as _sh2
+            _sh2.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _bench_grade_php(code: str, entry: str, cases: list, timeout_s: float) -> dict:
+    """PHP grading over a JSON line protocol. Cases travel base64d so no quoting rules of any
+    of the three languages involved can interfere; results compare as parsed JSON, which is
+    what lets a case distinguish a missing key from an explicit null."""
+    php = _bench_tool("php")
+    if not php:
+        return {"passed": 0, "total": len(cases), "error": "php is not installed"}
+    import base64
+    body = code.strip()
+    if body.startswith("<?php"):
+        body = body[5:]
+    b64 = base64.b64encode(json.dumps([c["args"] for c in cases]).encode()).decode()
+    src = ("<?php\n" + body + "\n"
+           '$__cases = json_decode(base64_decode("' + b64 + '"), true);\n'
+           'foreach ($__cases as $__c) { echo json_encode(' + entry + '(...$__c)), "\n"; }\n')
+    workdir = tempfile.mkdtemp(prefix="bench_php_")
+    try:
+        spath = os.path.join(workdir, "task.php")
+        with open(spath, "w", encoding="utf-8") as f:
+            f.write(src)
+        env = {"PATH": os.environ.get("PATH", ""),
+               "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
+        run = subprocess.run([php, spath], capture_output=True, text=True,
+                             timeout=timeout_s, env=env, cwd=workdir)
+        got = (run.stdout or "").strip().splitlines()
+        if not got and run.stderr:
+            return {"passed": 0, "total": len(cases),
+                    "error": (run.stderr or "")[-300:].strip()}
+        results = []
+        for i, c in enumerate(cases):
+            ok = False
+            got_v = None
+            if i < len(got):
+                try:
+                    got_v = json.loads(got[i])
+                    ok = got_v == c["expect"]
+                except (json.JSONDecodeError, TypeError):
+                    got_v = got[i][:120]
+            r = {"ok": ok}
+            if not ok:
+                r["got"] = got_v
+            results.append(r)
+        return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+                "cases": results}
+    except subprocess.TimeoutExpired:
+        return {"passed": 0, "total": len(cases), "error": f"timeout after {timeout_s}s"}
+    except Exception as e:
+        return {"passed": 0, "total": len(cases), "error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            import shutil as _sh2
+            _sh2.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
                       lang: str = "python") -> dict:
-    """Run one task's code against its cases in a subprocess. Blocking — call via to_thread."""
+    """Run one task's code against its cases in a subprocess. Blocking — call via to_thread.
+
+    HTML and CSS are the exception: nothing executes, so they grade in-process — the answer is
+    parsed and checked against required structure. That is honest static grading, not a claim
+    about how the page renders.
+    """
     if lang == "c":
         return _bench_grade_c(code, entry, cases, timeout_s)
+    if lang in ("cpp", "rust", "csharp"):
+        return _bench_grade_compiled(lang, code, entry, cases, timeout_s)
+    if lang == "php":
+        return _bench_grade_php(code, entry, cases, timeout_s)
+    if lang == "html":
+        return _bench_check_html(code, cases)
+    if lang == "css":
+        return _bench_check_css(code, cases)
     payload = json.dumps({"code": code, "entry": entry, "cases": cases})
     env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
     if lang == "js":
@@ -14133,7 +14852,13 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Graded mode replaces the synthetic prompt with a suite of real tasks, one request
         # each, and scores the returned code. runs is then per-task rather than total.
         suite_name = str(cfg.get("suite") or "").strip()
-        suite = _BENCH_SUITES.get(suite_name) if suite_name else None
+        suite, _sk = _bench_suite_tasks(suite_name) if suite_name else (None, {})
+        suite = suite or None
+        if _sk:
+            # Portability: a task whose tooling is absent on this machine is dropped from the
+            # run and recorded — never scored as zero, which would punish the model for the
+            # box. The report's method section reads this back.
+            env["skipped_languages"] = {k: v for k, v in sorted(_sk.items())}
         grade_timeout = max(1.0, min(float(cfg.get("grade_timeout", 10.0)), 60.0))
         warmup = bool(cfg.get("warmup", True))
         total_units = (len(suite) * runs) if suite else runs

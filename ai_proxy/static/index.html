@@ -7163,7 +7163,7 @@ const _BENCH_COMMON = {
 };
 const _BENCH_PRESETS = {
   quick: Object.assign({}, _BENCH_COMMON, {
-    thinking: 'off', cache: 'cached', concurrency: 1,
+    thinking: 'off', cache: 'cached', concurrency: [1, 4],
   }),
   // The shape of a real comparison: context depth, what reasoning costs, whether the prompt
   // cache is doing anything, and how throughput holds up under load. One press instead of a
@@ -7181,7 +7181,7 @@ const _BENCH_PRESETS = {
     server_context: [32768, 131072, 262144],
     thinking: 'off',
     cache: ['cold', 'cached'],
-    concurrency: 1,
+    concurrency: [1, 4],
     runs: 2,
   }),
 };
@@ -7316,7 +7316,8 @@ function _benchUpdatePlan() {
   // Which models, by name. A count cannot tell you that one of them is a 14-minute model you
   // did not mean to select.
   const names = (b.models || []).map(m => _benchShortModel(m.model)).filter(Boolean);
-  const who = names.length ? `${names.length} model${names.length > 1 ? 's' : ''}: ${names.join(', ')}` : '';
+  const who = (names.length ? `${names.length} model${names.length > 1 ? 's' : ''}: ${names.join(', ')}` : '')
+    + (b.suite ? ` — graded by ${b.suite}` : ' — speed only, nothing graded');
   const warns = [];
   const cold = metas.filter(m => !m.loaded);
   // vLLM can't load anything on demand — the server serves what it was launched with, so an

@@ -609,6 +609,236 @@ def test_the_suite_declares_its_languages(client):
     d = client.get("/__proxy/api/bench/suites").json()
     v2 = next(s for s in d["suites"] if s["name"] == "coding-v2")
     langs = {t["lang"] for t in v2["tasks"]}
-    assert langs == {"python", "js", "c"}
+    assert langs == {"python", "js", "c", "cpp", "rust", "csharp", "php", "html", "css"}
     v1 = next(s for s in d["suites"] if s["name"] == "coding-v1")
     assert {t["lang"] for t in v1["tasks"]} == {"python"}, "v1 must stay pure Python"
+
+
+# ---- wave two: C++, Rust, C#, PHP, HTML, CSS ------------------------------------------------
+
+REFERENCE["count_words"] = '''
+int count_words(const char *s) {
+    int n = 0, in_word = 0;
+    for (; *s; s++) {
+        if (*s == ' ' || *s == '\\t') { in_word = 0; }
+        else { if (!in_word) n++; in_word = 1; }
+    }
+    return n;
+}
+'''
+
+REFERENCE["csv_escape"] = '''
+std::string csv_escape(std::string field) {
+    if (field.find(',') == std::string::npos && field.find('"') == std::string::npos)
+        return field;
+    std::string out = "\\"";
+    for (char c : field) { if (c == '"') out += "\\"\\""; else out += c; }
+    return out + "\\"";
+}
+'''
+
+REFERENCE["balanced_depth"] = '''
+int balanced_depth(const std::string& s) {
+    int depth = 0, best = 0;
+    for (char c : s) {
+        if (c == '(') { depth++; if (depth > best) best = depth; }
+        else if (c == ')') { depth--; if (depth < 0) return -1; }
+    }
+    return depth == 0 ? best : -1;
+}
+'''
+
+REFERENCE["snake_to_camel"] = '''
+fn snake_to_camel(s: &str) -> String {
+    let mut out = String::new();
+    let mut up = false;
+    for ch in s.chars() {
+        if ch == '_' { up = true; continue; }
+        if up && ch.is_alphabetic() {
+            out.extend(ch.to_uppercase());
+        } else {
+            out.push(ch);
+        }
+        up = false;
+    }
+    out
+}
+'''
+
+REFERENCE["mid_floor"] = '''
+fn mid_floor(a: i64, b: i64) -> i64 {
+    ((a as i128 + b as i128).div_euclid(2)) as i64
+}
+'''
+
+REFERENCE["clamp_mul"] = '''
+public static class Sol {
+    public static int ClampMul(int a, int b) {
+        long p = (long)a * (long)b;
+        if (p > int.MaxValue) return int.MaxValue;
+        if (p < int.MinValue) return int.MinValue;
+        return (int)p;
+    }
+}
+'''
+
+REFERENCE["ordinal"] = '''
+public static class Sol {
+    public static string Ordinal(int n) {
+        int h = n % 100;
+        if (h >= 11 && h <= 13) return n + "th";
+        switch (n % 10) {
+            case 1: return n + "st";
+            case 2: return n + "nd";
+            case 3: return n + "rd";
+            default: return n + "th";
+        }
+    }
+}
+'''
+
+REFERENCE["slugify"] = '''
+function slugify(string $s): string {
+    $s = strtolower($s);
+    $s = preg_replace('/[^a-z0-9]+/', '-', $s);
+    return trim($s, '-');
+}
+'''
+
+REFERENCE["pluck"] = '''
+function pluck(array $rows, string $key): array {
+    $out = [];
+    foreach ($rows as $row) {
+        if (array_key_exists($key, $row)) { $out[] = $row[$key]; }
+    }
+    return $out;
+}
+'''
+
+REFERENCE["login_form"] = '''
+<form method="post" action="/login">
+  <label for="em">Email</label>
+  <input type="email" id="em" name="email" required>
+  <label for="pw">Password</label>
+  <input type="password" id="pw" name="password" required>
+  <button type="submit">Sign in</button>
+</form>
+'''
+
+REFERENCE["data_table"] = '''
+<table>
+  <caption>Quarterly revenue</caption>
+  <thead><tr><th scope="col">Quarter</th><th scope="col">Revenue</th>
+  <th scope="col">Change</th></tr></thead>
+  <tbody>
+    <tr><td>Q1</td><td>1.2M</td><td>+4%</td></tr>
+    <tr><td>Q2</td><td>1.4M</td><td>+16%</td></tr>
+  </tbody>
+</table>
+'''
+
+REFERENCE["card_grid"] = '''
+.cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 16px;
+}
+.card { border-radius: 8px; }
+.card:hover { transform: translateY(-2px); }
+'''
+
+REFERENCE["theme_vars"] = '''
+:root { --ink: #111111; }
+@media (prefers-color-scheme: dark) {
+  :root { --ink: #eeeeee; }
+}
+body { color: var(--ink); }
+'''
+
+NAIVE["count_words"] = (
+    "int count_words(const char *s) { int n = 1; "
+    "for (; *s; s++) if (*s == ' ') n++; return n; }"
+)
+NAIVE["csv_escape"] = (
+    'std::string csv_escape(std::string field) { return "\\"" + field + "\\""; }'
+)
+NAIVE["balanced_depth"] = (
+    "int balanced_depth(const std::string& s) { int d = 0, best = 0; "
+    "for (char c : s) { if (c == '(') { d++; if (d > best) best = d; } "
+    "else if (c == ')') d--; } return best; }"
+)
+NAIVE["mid_floor"] = "fn mid_floor(a: i64, b: i64) -> i64 { (a + b) / 2 }"
+NAIVE["clamp_mul"] = ("public static class Sol { "
+                      "public static int ClampMul(int a, int b) { return a * b; } }")
+NAIVE["ordinal"] = ('public static class Sol { public static string Ordinal(int n) { '
+                    'switch (n % 10) { case 1: return n + "st"; case 2: return n + "nd"; '
+                    'case 3: return n + "rd"; default: return n + "th"; } } }')
+NAIVE["slugify"] = ("function slugify(string $s): string { "
+                    "return str_replace(' ', '-', strtolower($s)); }")
+NAIVE["pluck"] = ("function pluck(array $rows, string $key): array { $out = []; "
+                  "foreach ($rows as $r) { if (isset($r[$key])) $out[] = $r[$key]; } "
+                  "return $out; }")
+NAIVE["login_form"] = ('<form method="post" action="/login"><input type="email">'
+                       '<input type="password"><button>Sign in</button></form>')
+NAIVE["theme_vars"] = (":root { --ink: #111111; --ink: #eeeeee; } "
+                       "body { color: var(--ink); }")
+
+
+@pytest.mark.parametrize("task_id", ["count_words", "csv_escape", "balanced_depth",
+                                     "mid_floor", "clamp_mul", "ordinal", "slugify",
+                                     "pluck", "login_form", "theme_vars"])
+def test_wave_two_naive_answers_fail(task_id):
+    task = _tasks()[task_id]
+    lang = task.get("lang") or "python"
+    if _runtime_missing(lang):
+        pytest.skip(f"{lang} runtime not on this host")
+    res = P._bench_grade_sync(NAIVE[task_id], task["entry"], task["cases"], 30.0, lang)
+    assert res.get("passed", 0) < len(task["cases"]), f"{task_id}: naive scored full marks"
+
+
+def test_a_missing_toolchain_skips_tasks_rather_than_zeroing_them(monkeypatch):
+    """The portability contract: a box without PHP drops the PHP tasks from the run and
+    records the fact — it never scores them as zero, which would punish the model for the
+    machine it happened to be measured on."""
+    monkeypatch.setattr(P, "_bench_tool", lambda name: None)
+    runnable, skipped = P._bench_suite_tasks("coding-v2")
+    run_langs = {t.get("lang") or "python" for t in runnable}
+    assert run_langs == {"python", "html", "css"}, run_langs
+    assert set(skipped) == {"js", "c", "cpp", "rust", "csharp", "php"}
+    assert "slugify" in skipped["php"]
+    # coding-v1 is pure Python and never shrinks.
+    v1, v1skip = P._bench_suite_tasks("coding-v1")
+    assert len(v1) == 18 and v1skip == {}
+
+
+def test_the_suites_endpoint_reports_availability(client):
+    d = client.get("/__proxy/api/bench/suites").json()
+    v2 = next(s for s in d["suites"] if s["name"] == "coding-v2")
+    for t in v2["tasks"]:
+        assert isinstance(t["available"], bool)
+    # HTML and CSS need no toolchain, so they are available everywhere by construction.
+    assert all(t["available"] for t in v2["tasks"] if t["lang"] in ("html", "css"))
+
+
+def test_html_checker_is_structural_not_stringly():
+    """Attribute order, quoting style and whitespace must not matter — only structure."""
+    task = _tasks()["login_form"]
+    reordered = REFERENCE["login_form"].replace(
+        'type="email" id="em" name="email" required',
+        "required name='email' id='em' type='email'")
+    res = P._bench_check_html(reordered, task["cases"])
+    assert res["passed"] == res["total"], res
+
+
+def test_css_checker_honours_media_scope():
+    """The dark token outside its media query is the exact mistake the task exists to catch."""
+    task = _tasks()["theme_vars"]
+    good = P._bench_check_css(REFERENCE["theme_vars"], task["cases"])
+    assert good["passed"] == good["total"]
+    bad = P._bench_check_css(NAIVE["theme_vars"], task["cases"])
+    assert bad["passed"] < bad["total"]
+
+
+def test_the_suite_spans_nine_languages():
+    langs = {t.get("lang") or "python" for t in P._BENCH_SUITES["coding-v2"]}
+    assert langs == {"python", "js", "c", "cpp", "rust", "csharp", "php", "html", "css"}
