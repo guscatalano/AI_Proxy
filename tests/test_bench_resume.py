@@ -303,3 +303,50 @@ def test_the_load_phase_names_the_size(client):
     import inspect
     src = inspect.getsource(P._bench_execute)
     assert '_sz / 1024:.0f} GB' in src
+
+
+def test_load_time_and_footprint_actually_reach_the_database(client, monkeypatch):
+    """They were captured into the env dict and never persisted — and because the report only
+    renders Load/Resident when data exists, the loss was silent: a design meant to avoid
+    columns of dashes made missing data look like a layout choice. Caught when a user asked
+    'are we saving the load times?' and the live run said no."""
+    import asyncio
+
+    async def fake_run_one(client_, base, model, max_tokens, prompt, seq, cfg=None,
+                           capture_text=False):
+        return {"seq": seq, "ttft_ms": 10.0, "ttfc_ms": 10.0, "total_ms": 50.0,
+                "completion_tokens": 5, "reasoning_tokens": None, "decode_tps": 100.0,
+                "error": None, "served_model": "qwen3:4b"}
+
+    async def fake_index():
+        return {"ollama:qwen3:4b": {"model": "qwen3:4b", "upstream": "ollama",
+                                    "loaded": True, "size_mb": 2400}}
+
+    async def fake_resident(model, upstream):
+        return 2300.0
+
+    monkeypatch.setattr(P, "_bench_run_one", fake_run_one)
+    monkeypatch.setattr(P, "_bench_model_index", fake_index)
+    monkeypatch.setattr(P, "_bench_resident_mb", fake_resident)
+    monkeypatch.setattr(P, "_bench_evict_ollama", lambda keep="": asyncio.sleep(0, result=[]))
+    monkeypatch.setattr(P, "_bench_residency_snapshot",
+                        lambda: asyncio.sleep(0, result={"backends": []}))
+
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.execute(
+        "INSERT INTO bench_runs (id, ts, model, config_json, status) VALUES (?,?,?,?,?)",
+        ("b_load", time.time(), "qwen3:4b",
+         json.dumps({"upstream": "ollama", "runs": 1, "warmup": True, "resume": False}),
+         "pending"))
+    conn.commit()
+    conn.close()
+
+    asyncio.run(P._bench_execute("b_load", P.app))
+
+    conn = P.db()
+    env = json.loads(conn.execute("SELECT env_json FROM bench_runs WHERE id='b_load'")
+                     .fetchone()[0] or "{}")
+    conn.close()
+    assert env.get("load_ms") is not None, "load time never reached the database"
+    assert env.get("resident_mb") == 2300.0, "resident footprint never reached the database"

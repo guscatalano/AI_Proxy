@@ -15072,8 +15072,14 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         _res = max(0, env["free_mb_before_load"] - env["free_mb_after_load"])
                     env["resident_mb"] = _res
                     conn = db()
-                    conn.execute("UPDATE bench_runs SET results_json=? WHERE id=?",
-                                 (json.dumps({"rows": [], "warmup": warm}), bench_id))
+                    # env_json rides the write that already happens here. Without it, load_ms
+                    # and resident_mb were captured into a dict that never touched the
+                    # database again — and because the report only renders the Load and
+                    # Resident columns when data exists, the loss was silent: a design meant
+                    # to avoid columns of dashes made missing data look like a layout choice.
+                    conn.execute("UPDATE bench_runs SET results_json=?, env_json=? WHERE id=?",
+                                 (json.dumps({"rows": [], "warmup": warm}),
+                                  json.dumps(env), bench_id))
                     conn.commit()
                     conn.close()
                     _bench_phase(bench_id, None)      # measuring from here; the counter moves
