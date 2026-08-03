@@ -374,13 +374,109 @@ def test_a_graded_comparison_carries_the_trade_off_chart(client):
     assert html.index("The trade-off") < html.index("<h2>Results</h2>")
 
 
-def test_bar_charts_stop_at_the_leaders(client):
-    """Three charts of 38 bars each was three thousand pixels of the table repeated."""
+def test_the_speed_chart_is_seconds_and_stops_at_the_leaders(client):
+    """Tokens-per-second rankings became seconds-to-a-finished-answer: the only speed figure
+    in units a person feels, capped at the leaders with the table carrying the field."""
     runs = [_graded(f"r{i}", f"model-{i}", "ollama", 0.9, 20 + i, {"x": 1.0})
             for i in range(20)]
     html = _render(runs)
     bars = [s for s in re.findall(r"<svg.*?</svg>", html, re.S)
-            if "Decode rate" in s]
-    assert bars, "the decode ranking chart is gone"
+            if "Seconds to a complete answer" in s]
+    assert bars, "the answer-time chart is gone"
     assert bars[0].count("<rect") <= 12
     assert "the full field is in the table" in bars[0]
+    assert "SECONDS UNTIL THE FULL ANSWER" in bars[0]
+
+
+# ---- the whitepaper charts adapt to whatever the run contains -------------------------------
+
+def test_the_scatter_annotates_the_actual_winner(client):
+    """The annotations are computed, not remembered: a different run names a different model."""
+    runs = [_graded("a", "underdog:7b", "ollama", 1.0, 55.0, {"x": 1.0}),
+            _graded("b", "famous:70b", "ollama", 0.8, 20.0, {"x": 0.5}),
+            _graded("c", "third:1b", "ollama", 0.4, 30.0, {"x": 0.0})]
+    html = _render(runs)
+    sc = [s for s in re.findall(r"<svg.*?</svg>", html, re.S)
+          if "Correctness against output rate" in s][0]
+    assert "underdog:7b" in sc
+    assert "100% correct at 55 tok/s" in sc
+
+
+def test_the_fast_but_wrong_callout_only_fires_when_it_is_true(client):
+    fixture = [_graded("a", "steady", "ollama", 1.0, 50.0, {"x": 1.0}),
+               _graded("b", "midfield", "ollama", 0.9, 40.0, {"x": 1.0}),
+               _graded("c", "sprinter", "ollama", 0.2, 300.0, {"x": 0.0})]
+    sc = [s for s in re.findall(r"<svg.*?</svg>", _render(fixture), re.S)
+          if "Correctness against" in s][0]
+    assert "the winner" in sc and "wrong 80% of the time" in sc
+
+    # No configuration is dramatically faster than the winner: no callout, no stale story.
+    calm = [_graded("a", "steady", "ollama", 1.0, 50.0, {"x": 1.0}),
+            _graded("b", "close", "ollama", 0.9, 55.0, {"x": 1.0}),
+            _graded("c", "slower", "ollama", 0.8, 30.0, {"x": 0.5})]
+    sc2 = [s for s in re.findall(r"<svg.*?</svg>", _render(calm), re.S)
+           if "Correctness against" in s][0]
+    assert "the winner's speed" not in sc2
+
+
+def test_scorecards_lead_with_the_recommendation(client):
+    runs = [_graded("a", "pick-me:26b", "ollama", 1.0, 63.5, {"x": 1.0}),
+            _graded("b", "second", "ollama", 1.0, 50.0, {"x": 1.0}),
+            _graded("c", "fastwrong", "ollama", 0.1, 300.0, {"x": 0.0})]
+    html = _render(runs)
+    cards = html.split('class="cards"')[1].split("</div>\n")[0]
+    assert "Run this" in cards and "pick-me:26b" in cards
+    assert "Runner-up" in cards
+    assert "fooled" in cards and "fastwrong" in cards
+
+
+def test_the_fooled_card_stays_home_when_nothing_earns_it(client):
+    runs = [_graded("a", "best", "ollama", 1.0, 60.0, {"x": 1.0}),
+            _graded("b", "near", "ollama", 0.9, 55.0, {"x": 1.0})]
+    html = _render(runs)
+    assert "fooled" not in html
+
+
+def test_bubbles_need_sizes_and_note_the_absent(client):
+    """No sizes, no chart — a bubble chart of unknowns would be an invention. With sizes, the
+    section renders and says why some models are missing rather than plotting them at zero."""
+    runs = [_graded(f"m{i}", f"model-{i}", "ollama", 1.0 - i / 10, 60 - i, {"x": 1.0})
+            for i in range(4)]
+    assert "What memory buys" not in _render(runs)
+
+    def sized(rs):
+        rows = [P._bench_report_row(r) for r in rs]
+        for i, r in enumerate(rows):
+            r["size_mb"] = (i + 1) * 10_000
+        return P._bench_report_html(rs, rows)
+
+    html = sized(runs)
+    assert "What memory buys" in html
+    assert "are absent, not zero" in html
+
+
+def test_the_engine_section_appears_only_with_a_real_pair(client):
+    solo = [_graded("a", "m1", "ollama", 1.0, 60, {"x": 1.0}),
+            _graded("b", "m2", "ollama", 0.9, 50, {"x": 1.0})]
+    assert "Same weights, two engines" not in _render(solo)
+
+    paired = [_graded("a", "twin:latest", "ollama", 1.0, 60, {"x": 1.0}),
+              _graded("b", "twin", "vllm", 1.0, 62, {"x": 1.0}),
+              _graded("c", "other", "ollama", 0.9, 50, {"x": 1.0})]
+    for r in paired:
+        r["config"]["cache"] = "cold"
+    html = _render(paired)
+    assert "Same weights, two engines" in html
+    assert "TIME TO FIRST TOKEN" in html
+
+
+def test_cold_start_gets_a_chart_when_more_than_one_model_loaded(client):
+    runs = [_graded("a", "m1", "ollama", 1.0, 60, {"x": 1.0}),
+            _graded("b", "m2", "ollama", 0.9, 50, {"x": 1.0}),
+            _graded("c", "m3", "ollama", 0.8, 40, {"x": 1.0})]
+    for i, r in enumerate(runs):
+        r["results"]["summary"]["warmup_ms"] = (i + 1) * 40_000.0
+    html = _render(runs)
+    seg = html.split("Cold-start cost")[-1]
+    assert "Seconds of loading before the first useful token" in seg
+    assert seg.index("aria-label") < seg.index("<table")

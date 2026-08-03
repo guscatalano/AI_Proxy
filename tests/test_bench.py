@@ -543,20 +543,24 @@ def test_startup_fails_runs_left_queued_by_a_restart(tmp_path, monkeypatch):
 
 # ---- report theming / usage report ---------------------------------------------------------
 
-def test_reports_share_the_dashboard_theme():
-    """Reports are read next to the UI they came from; a different skin reads as a different
-    tool. Both report types render from one shell, dark by default with a light counterpart."""
+def test_reports_are_whitepapers_in_both_themes():
+    """Reports became documents rather than dashboard panels: paper-light by default, dark via
+    the viewer's OS preference, printable either way. Both report types share the one shell,
+    and the charts take their colours from the same tokens — including the label halo, which
+    strokes in --bg so text stays legible on top of data on either ground."""
     run = {"id": "b", "ts": 1785000000.0, "label": "m", "model": "m", "config": {}, "env": {},
            "results": {"summary": {"n_total": 1, "n_success": 1}}}
     bench = p._bench_report_html([run], [p._bench_report_row(run)])
     usage = p._stats_report_html({"overall": {"count": 0}}, {})
     for html in (bench, usage):
-        assert "--accent:#57d1e0" in html, "dashboard accent missing"
-        assert "prefers-color-scheme: light" in html, "no light counterpart"
+        assert "--bg:#FFFFFF" in html, "light paper default missing"
+        assert "prefers-color-scheme: dark" in html, "no dark counterpart"
+        assert "--bg:#121418" in html, "dark tokens missing"
         assert "@media print" in html, "not printable"
         # Self-contained: no external fetches of any kind.
         for external in ('src="http', 'href="http', "@import", "fonts.googleapis"):
             assert external not in html
+    assert 'stroke="var(--bg)"' in p._SVG_HALO, "halo must stroke in the page colour"
 
 
 def test_usage_report_survives_an_empty_database():

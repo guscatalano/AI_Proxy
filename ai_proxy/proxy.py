@@ -9561,25 +9561,32 @@ def _bench_report_row(run: dict) -> dict:
 # CSS variables with a light counterpart, because a dark page printed to PDF wastes a cartridge
 # and reads badly on paper; print forces the light set.
 _REPORT_CSS = """
+  /* Whitepaper tokens: light paper by default, dark via the viewer's OS preference. Charts
+     take their colours from these same variables, so one palette drives page and figures in
+     both themes — and the label halo strokes in --bg, which is what keeps text legible on
+     top of data whichever ground it sits on. */
   :root {
-    --bg:#0c0f15; --panel:#141922; --panel-2:#10141c; --border:#262d38;
-    --ink:#e9edf4; --ink-dim:#c9d3e1; --ink-faint:#8b97a8;
-    --accent:#57d1e0; --accent-deep:#2f8f9c; --good:#68d391; --warn:#f0c674; --bad:#f07178;
+    --bg:#FFFFFF; --panel:#FFFFFF; --panel-2:#F5F5F2; --border:#E4E4E1;
+    --ink:#121212; --ink-dim:#454B52; --ink-faint:#727272;
+    --accent:#C4321F; --accent-deep:#8F2416; --good:#1F7A47; --warn:#8A6D1F; --bad:#B3261E;
+    --ghost:#B9B9B9; --grid:#EBEBE8; --blue:#3E6FA8;
     --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
-    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-    color-scheme: dark;
+    --sans:"Helvetica Neue",Helvetica,Arial,system-ui,sans-serif;
+    --serif:Georgia,"Times New Roman",serif;
+    color-scheme: light;
   }
-  @media (prefers-color-scheme: light) {
+  @media (prefers-color-scheme: dark) {
     :root {
-      --bg:#eef1f5; --panel:#fff; --panel-2:#f4f6f9; --border:#d8dee7;
-      --ink:#1a1f28; --ink-dim:#3f4a5a; --ink-faint:#6b7688;
-      --accent:#14707e; --accent-deep:#0f5b66; --good:#0a7d4f; --warn:#8a6d1f; --bad:#b3261e;
-      color-scheme: light;
+      --bg:#121418; --panel:#15181D; --panel-2:#1B1F26; --border:#2A2F37;
+      --ink:#E8EAED; --ink-dim:#C4CAD2; --ink-faint:#98A0AA;
+      --accent:#E0604E; --accent-deep:#C4321F; --good:#5FBF8A; --warn:#D9C37A; --bad:#F07178;
+      --ghost:#565E6A; --grid:#242931; --blue:#7AA7DA;
+      color-scheme: dark;
     }
   }
   * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
-         line-height:1.6; padding:clamp(18px,4vw,44px) clamp(14px,4vw,34px);
+  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--serif);
+         font-size:16.5px; line-height:1.62; padding:clamp(18px,4vw,44px) clamp(14px,4vw,34px);
          -webkit-font-smoothing:antialiased; }
   .wrap { max-width:1040px; margin:0 auto; }
   .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.18em; text-transform:uppercase;
@@ -9587,9 +9594,9 @@ _REPORT_CSS = """
   h1 { font-size:clamp(22px,3.4vw,32px); line-height:1.1; margin:0 0 6px; letter-spacing:-.02em;
        font-weight:680; }
   .sub { color:var(--ink-faint); font-size:13px; margin:0 0 20px; }
-  h2 { font-size:12px; font-family:var(--mono); letter-spacing:.14em; text-transform:uppercase;
-       color:var(--ink-faint); margin:34px 0 12px; padding-bottom:9px;
-       border-bottom:1px solid var(--border); font-weight:600; }
+  h2 { font-size:20px; font-family:var(--serif); color:var(--ink); margin:38px 0 12px;
+       padding-top:12px; border-top:1px solid var(--ink); font-weight:700;
+       letter-spacing:-.01em; }
   .meta { display:flex; flex-wrap:wrap; gap:6px 24px; font-family:var(--mono); font-size:12px;
           color:var(--ink-faint); border-top:1px solid var(--border);
           border-bottom:1px solid var(--border); padding:10px 0; margin-bottom:6px; }
@@ -9606,7 +9613,8 @@ _REPORT_CSS = """
   .card .d { font-size:12px; color:var(--ink-faint); margin:7px 0 0; }
   .card.hi { border-color:var(--accent-deep); } .card.hi .v { color:var(--accent); }
   .tbl { overflow-x:auto; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
-  table { border-collapse:collapse; width:100%; font-size:12.5px; }
+  table { border-collapse:collapse; width:100%; font-size:12.5px;
+          font-family:var(--sans); }
   th, td { padding:7px 11px; text-align:left; border-bottom:1px solid var(--border); }
   thead th { font-family:var(--mono); font-size:10.5px; letter-spacing:.06em; text-transform:uppercase;
              color:var(--ink-faint); font-weight:500; background:var(--panel-2); }
@@ -9664,9 +9672,10 @@ _REPORT_CSS = """
   .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--accent-deep),var(--accent)); }
   svg { margin:4px 0 16px; display:block; }
   .ct { font-size:10.5px; fill:var(--ink-faint); font-weight:600; text-transform:uppercase;
-        letter-spacing:.6px; }
-  .cl { font-size:11.5px; fill:var(--ink-dim); }
-  .cv { font-size:11.5px; fill:var(--ink); font-weight:600; }
+        letter-spacing:.6px; font-family:var(--sans); }
+  .cl { font-size:11.5px; fill:var(--ink-dim); font-family:var(--sans); }
+  .cv { font-size:11.5px; fill:var(--ink); font-weight:600; font-family:var(--sans); }
+  .ann { font-size:12.5px; font-family:var(--sans); }
   /* The one loud element on the page. Everything else stays quiet so this reads first. */
   .hero { background:linear-gradient(180deg,var(--panel),var(--panel-2));
           border:1px solid var(--border); border-left:3px solid var(--accent);
@@ -9693,9 +9702,10 @@ _REPORT_CSS = """
   footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--border);
            color:var(--ink-faint); font-size:11.5px; }
   @media print {
-    :root { --bg:#fff; --panel:#fff; --panel-2:#f4f6f9; --border:#d8dee7;
-            --ink:#1a1f28; --ink-dim:#3f4a5a; --ink-faint:#6b7688;
-            --accent:#14707e; --accent-deep:#0f5b66; --good:#0a7d4f; --bad:#b3261e;
+    :root { --bg:#fff; --panel:#fff; --panel-2:#f5f5f2; --border:#e4e4e1;
+            --ink:#121212; --ink-dim:#454b52; --ink-faint:#727272;
+            --accent:#c4321f; --accent-deep:#8f2416; --good:#1f7a47; --bad:#b3261e;
+            --ghost:#b9b9b9; --grid:#ebebe8; --blue:#3e6fa8;
             color-scheme: light; }
     body { padding:0; }
     h2 { page-break-after:avoid; }
@@ -9741,6 +9751,284 @@ def _report_page(title: str, eyebrow: str, sub: str, meta: list, body: str) -> s
             + _report_foot())
 
 
+
+# A label that crosses a dot or a gridline is unreadable without this: a stroke in the page
+# colour painted under the glyphs. Strokes in var(--bg), so it works in both themes.
+_SVG_HALO = ('paint-order="stroke" stroke="var(--bg)" stroke-width="3.5" '
+             'stroke-linejoin="round"')
+
+
+def _bench_place_labels(cands: list, est: float = 6.6) -> list:
+    """Greedy label placement: sort by x; when a label would collide with one already on its
+    row, bump it up a row. Several dots on one line cannot be labelled without this — the
+    quadrant of 100%-correct models is exactly that shape."""
+    placed, out = [], []
+    for x, name in sorted(cands, key=lambda c: c[0]):
+        w = est * len(name) + 12
+        row = 0
+        while any(r == row and x - w / 2 < ox + ow / 2 for ox, ow, r in placed):
+            row += 1
+        placed.append((x, w, row))
+        out.append((x, row, name))
+    return out
+
+
+def _bench_size_by_model(rows: list) -> dict:
+    """On-disk size per model, looked up across all of a model's cells: sizes are recorded on
+    cold cells and the cell a chart wants is usually the cached one."""
+    out: dict = {}
+    for r in rows:
+        if r.get("size_mb"):
+            k = (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
+            out[k] = max(out.get(k, 0), r["size_mb"])
+    return out
+
+
+def _bench_best_per_model(rows: list) -> list:
+    """One representative cell per model — highest quality, then speed — for charts where a
+    dot per cell would drown the story in duplicates."""
+    best: dict = {}
+    for r in rows:
+        if not r.get("decode_p50"):
+            continue
+        k = (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
+        key = ((r.get("perfect_rate") or 0), r["decode_p50"])
+        if k not in best or key > ((best[k].get("perfect_rate") or 0), best[k]["decode_p50"]):
+            best[k] = r
+    return sorted(best.values(), key=lambda r: (-(r.get("perfect_rate") or 0),
+                                                -(r.get("decode_p50") or 0)))
+
+
+def _bench_bubbles_svg(rows: list, width: int = 820, height: int = 470) -> str:
+    """What memory buys: position is footprint against correctness, bubble area is speed.
+
+    Empty unless at least three models have a known size — a bubble chart of two points is a
+    sentence, and vLLM checkpoints (inside containers) legitimately cannot be sized.
+    """
+    sizes = _bench_size_by_model(rows)
+    bpm = [r for r in _bench_best_per_model(rows)
+           if sizes.get((r.get("_name") or "").split(" · ")[0])
+           and r.get("perfect_rate") is not None]
+    if len(bpm) < 3:
+        return ""
+    import math as _m
+    pad_l, pad_r, pad_t, pad_b = 46, 24, 72, 46
+    x0, x1, y0, y1 = pad_l, width - pad_r, pad_t, height - pad_b
+    gb_of = {id(r): sizes[(r.get("_name") or "").split(" · ")[0]] / 1024 for r in bpm}
+    xmax = max(gb_of.values()) * 1.12
+    smax = max(r["decode_p50"] for r in bpm)
+    winner = bpm[0]
+
+    def px(gb):
+        return x0 + gb / xmax * (x1 - x0)
+
+    def py(v):
+        return y1 - v / 100 * (y1 - y0)
+
+    o = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+         'aria-label="Memory spent against correctness bought">']
+    for v in (0, 25, 50, 75, 100):
+        o.append(f'<line x1="{x0}" y1="{py(v):.1f}" x2="{x1}" y2="{py(v):.1f}" '
+                 'stroke="var(--grid)"/>')
+        o.append(f'<text x="{x0-8}" y="{py(v)+4:.1f}" class="ct" text-anchor="end">{v}%</text>')
+    for gb in (10, 20, 40, 60, 80):
+        if gb < xmax:
+            o.append(f'<text x="{px(gb):.1f}" y="{y1+16}" class="ct" '
+                     f'text-anchor="middle">{gb}</text>')
+    o.append(f'<text x="{x0}" y="{height-6}" class="ct">GIGABYTES THE MODEL OCCUPIES → '
+             '<tspan fill="var(--ghost)">bubble area = output speed</tspan></text>')
+    groups: dict = {}
+    for r in sorted(bpm, key=lambda r: -gb_of[id(r)]):
+        gb = gb_of[id(r)]
+        qv = (r.get("perfect_rate") or 0) * 100
+        rad = 5 + 17 * _m.sqrt(r["decode_p50"] / smax)
+        col = ("var(--accent)" if r is winner
+               else "var(--blue)" if qv == 100 else "var(--ghost)")
+        nm = (r.get("_name") or "").split(" · ")[0]
+        o.append(f'<circle cx="{px(gb):.1f}" cy="{py(qv):.1f}" r="{rad:.1f}" fill="{col}" '
+                 f'opacity="{.92 if r is winner else .55}">'
+                 f'<title>{_h(nm)} — {gb:.1f} GB, {qv:.0f}%, '
+                 f'{r["decode_p50"]:,.1f} tok/s</title></circle>')
+        if r is winner or gb > xmax * 0.6 or (qv == 100 and gb > xmax * 0.35):
+            key = (round(gb), round(qv))
+            g = groups.setdefault(key, {"x": px(gb), "y": py(qv) - rad - 7, "names": [],
+                                        "win": False})
+            g["names"].append(nm[:22])
+            g["win"] = g["win"] or r is winner
+    for x, row, text in _bench_place_labels(
+            [(g["x"], " & ".join(sorted(set(g["names"]))) + (" — the buy" if g["win"] else ""))
+             for g in groups.values()], est=6.2):
+        gy = max(14, min(g["y"] for g in groups.values() if abs(g["x"] - x) < 1) - row * 15)
+        o.append(f'<text x="{x:.0f}" y="{gy:.0f}" class="cl" {_SVG_HALO} '
+                 f'text-anchor="middle">{_h(text)}</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _bench_answer_time_svg(rows: list, width: int = 820, limit: int = 12) -> str:
+    """Seconds until the complete answer has arrived — the wait a person actually feels,
+    which tokens-per-second only implies. One bar per model, correctness riding along."""
+    bpm = [r for r in _bench_best_per_model(rows) if r.get("total_p50")]
+    if len(bpm) < 2:
+        return ""
+    shown = sorted(bpm, key=lambda r: r["total_p50"])[:limit]
+    bar_h, gap, pad_l = 21, 8, 190
+    height = len(shown) * (bar_h + gap) + 34 + (16 if len(bpm) > len(shown) else 0)
+    top = max(r["total_p50"] for r in shown) / 1000
+    graded = any(r.get("perfect_rate") is not None for r in shown)
+    o = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+         'aria-label="Seconds to a complete answer">']
+    o.append(f'<text x="{pad_l}" y="12" class="ct">SECONDS UNTIL THE FULL ANSWER HAS '
+             'ARRIVED (median task) →</text>')
+    for i, r in enumerate(shown):
+        y = 24 + i * (bar_h + gap)
+        v = r["total_p50"] / 1000
+        w = max(2, v / top * (width - pad_l - 96))
+        q = r.get("perfect_rate")
+        col = ("var(--accent)" if r is bpm[0]
+               else "var(--ink)" if q == 1 else "var(--ghost)")
+        nm = (r.get("_name") or "").split(" · ")[0]
+        o.append(f'<text x="{pad_l-8}" y="{y+15}" class="cl" text-anchor="end">'
+                 f'{_h(nm[:24])}</text>')
+        o.append(f'<rect x="{pad_l}" y="{y}" width="{w:.0f}" height="{bar_h}" fill="{col}" '
+                 f'opacity="{1 if col != "var(--ghost)" else .6}"/>')
+        tail = f' <tspan fill="var(--ink-faint)">· {q * 100:.0f}%</tspan>' if graded and q is not None else ""
+        o.append(f'<text x="{pad_l+w+7:.0f}" y="{y+15}" class="cv" {_SVG_HALO}>'
+                 f'{v:.1f}s{tail}</text>')
+    if len(bpm) > len(shown):
+        o.append(f'<text x="{pad_l}" y="{height-5}" class="ct">top {len(shown)} of '
+                 f'{len(bpm)} models — the full field is in the table</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _bench_engine_pair_data(rows: list, runs: list) -> list:
+    """The same weights reachable through more than one engine, paired by cache state. This is
+    the only controlled engine comparison a run can contain, and most runs contain none."""
+    ident: dict = {}
+    for r, run in zip(rows, runs):
+        if not r.get("decode_p50"):
+            continue
+        up = (run.get("config") or {}).get("upstream") or ""
+        key = (_bench_model_identity(r.get("model") or ""), r.get("cache") or "-")
+        ident.setdefault(key, {})[up] = r
+    return sorted((k, v) for k, v in ident.items() if len(v) > 1)
+
+
+def _bench_engine_pairs_svg(pairs: list, width: int = 760) -> str:
+    if not pairs:
+        return ""
+    row_h, pad_l = 44, 230
+    height = len(pairs) * row_h + 58
+    allv = [r.get("ttft_p50") or 0 for _k, v in pairs for r in v.values()]
+    top = (max(allv) or 1) * 1.15
+    ups = sorted({u for _k, v in pairs for u in v})
+    colour = {u: ("var(--accent)" if i == 0 else "var(--blue)" if i == 1 else "var(--ghost)")
+              for i, u in enumerate(ups)}
+
+    def px(v):
+        return pad_l + v / top * (width - pad_l - 90)
+
+    o = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+         'aria-label="Same model, two engines">']
+    o.append(f'<text x="{pad_l}" y="14" class="ct">TIME TO FIRST TOKEN, MS →</text>')
+    for i, ((name, cache), v) in enumerate(pairs):
+        y = 36 + i * row_h
+        o.append(f'<text x="{pad_l-10}" y="{y+4}" class="cl" text-anchor="end">'
+                 f'{_h(name[:24])} <tspan fill="var(--ink-faint)">· {_h(cache)}</tspan></text>')
+        xs = {u: px(r.get("ttft_p50") or 0) for u, r in v.items()}
+        if len(xs) > 1:
+            a, b = min(xs.values()), max(xs.values())
+            o.append(f'<line x1="{a:.0f}" y1="{y}" x2="{b:.0f}" y2="{y}" '
+                     'stroke="var(--grid)" stroke-width="2"/>')
+        for u, x in xs.items():
+            o.append(f'<circle cx="{x:.0f}" cy="{y}" r="6" fill="{colour[u]}">'
+                     f'<title>{_h(u)}: {v[u].get("ttft_p50"):,.0f} ms</title></circle>')
+            o.append(f'<text x="{x:.0f}" y="{y-11}" class="cv" {_SVG_HALO} '
+                     f'text-anchor="middle">{v[u].get("ttft_p50"):,.0f}</text>')
+    lx, ly = pad_l, height - 10
+    for u in ups:
+        o.append(f'<circle cx="{lx}" cy="{ly-4}" r="5" fill="{colour[u]}"/>')
+        o.append(f'<text x="{lx+10}" y="{ly}" class="cl">{_h(u)}</text>')
+        lx += 26 + 7 * len(u)
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _bench_coldstart_svg(rows: list, width: int = 820, limit: int = 10) -> str:
+    """The switching tax as lollipops: seconds of loading before the first useful token."""
+    warm = sorted((r for r in rows if r.get("warmup_ms")),
+                  key=lambda r: -r["warmup_ms"])[:limit]
+    if len(warm) < 2:
+        return ""
+    row_h, pad_l = 27, 230
+    height = len(warm) * row_h + 36
+    top = warm[0]["warmup_ms"] / 1000
+
+    def px(v):
+        return pad_l + v / top * (width - pad_l - 70)
+
+    o = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
+         'aria-label="Seconds of loading before the first useful token">']
+    o.append(f'<text x="{pad_l}" y="12" class="ct">SECONDS TO LOAD BEFORE THE FIRST '
+             'USEFUL TOKEN →</text>')
+    for i, r in enumerate(warm):
+        y = 30 + i * row_h
+        v = r["warmup_ms"] / 1000
+        nm = r.get("_name") or _bench_label_display(r.get("label") or "")
+        o.append(f'<text x="{pad_l-10}" y="{y+4}" class="cl" text-anchor="end">'
+                 f'{_h(nm[:30])}</text>')
+        o.append(f'<line x1="{pad_l}" y1="{y}" x2="{px(v):.0f}" y2="{y}" '
+                 'stroke="var(--grid)" stroke-width="2"/>')
+        o.append(f'<circle cx="{px(v):.0f}" cy="{y}" r="6" '
+                 f'fill="{"var(--accent)" if i == 0 else "var(--blue)"}"/>')
+        o.append(f'<text x="{px(v)+11:.0f}" y="{y+4}" class="cv">{v:,.0f}s</text>')
+    o.append("</svg>")
+    return "".join(o)
+
+
+def _bench_scorecards(rows: list) -> str:
+    """The briefing cards: the recommendation and the traps, computed from whatever this run
+    actually contains — a different winner, no quality data, or no failures all render."""
+    ok = [r for r in rows if r.get("decode_p50")]
+    if len(ok) < 2:
+        return ""
+    graded = any(r.get("perfect_rate") is not None for r in ok)
+    bpm = _bench_best_per_model(rows)
+    win = bpm[0]
+    sizes = _bench_size_by_model(rows)
+
+    def nm(r):
+        return (r.get("_name") or "").split(" · ")[0]
+
+    def gbtxt(r):
+        gb = sizes.get(nm(r))
+        return f" · {gb / 1024:.1f} GB" if gb else ""
+
+    cards = []
+    qtxt = (f'{(win.get("perfect_rate") or 0) * 100:.0f}% correct · ' if graded else "")
+    cards.append(f'<div class="card hi"><p class="k">Run this</p><p class="v">{_h(nm(win))}</p>'
+                 f'<p class="d">{qtxt}{win["decode_p50"]:,.1f} tok/s'
+                 f'{gbtxt(win)} · answers in {win["total_p50"] / 1000:.1f}s</p></div>')
+    if len(bpm) > 1:
+        ru = bpm[1]
+        rq = (f'{(ru.get("perfect_rate") or 0) * 100:.0f}% · ' if graded else "")
+        cards.append(f'<div class="card"><p class="k">Runner-up</p><p class="v">{_h(nm(ru))}</p>'
+                     f'<p class="d">{rq}{ru["decode_p50"]:,.1f} tok/s{gbtxt(ru)}</p></div>')
+    fastest = max(ok, key=lambda r: r["decode_p50"])
+    if graded and fastest.get("perfect_rate") is not None             and fastest["decode_p50"] >= 2 * win["decode_p50"]             and fastest["perfect_rate"] < 0.6:
+        cards.append(f'<div class="card"><p class="k">Don\'t be fooled by</p>'
+                     f'<p class="v">{_h(nm(fastest))}</p>'
+                     f'<p class="d">{fastest["decode_p50"]:,.0f} tok/s and only '
+                     f'{fastest["perfect_rate"] * 100:.0f}% correct</p></div>')
+    n_fail = len(rows) - len(ok)
+    if n_fail:
+        cards.append(f'<div class="card"><p class="k">Not measured</p>'
+                     f'<p class="v">{n_fail} cell{"s" if n_fail > 1 else ""}</p>'
+                     f'<p class="d">listed in the table as failures, not omitted</p></div>')
+    return f'<div class="cards">{"".join(cards)}</div>'
+
+
 def _bench_pareto(points: list) -> set:
     """Indices not beaten on both axes at once.
 
@@ -9756,7 +10044,7 @@ def _bench_pareto(points: list) -> set:
     return keep
 
 
-def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
+def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
     """Correctness against output rate, with the frontier drawn.
 
     The bar charts rank one metric at a time, so the actual question — which of these is worth
@@ -9774,7 +10062,8 @@ def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
         return ""          # a scatter of two points is a table with extra steps
 
     import math
-    pad_l, pad_r, pad_t, pad_b = 46, 14, 16, 38
+    # The right-hand gutter belongs to the winner's annotation; the plot never enters it.
+    pad_l, pad_r, pad_t, pad_b = 46, 186, 20, 40
     x0, x1 = pad_l, width - pad_r
     y0, y1 = pad_t, height - pad_b
     lo = min(math.log10(max(p[1], 0.1)) for p in pts)
@@ -9800,8 +10089,8 @@ def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
         y = py(v)
         out.append(f'<line x1="{x0}" y1="{y:.1f}" x2="{x1}" y2="{y:.1f}" '
                    f'stroke="currentColor" stroke-opacity=".12"/>')
-        out.append(f'<text x="{x0 - 7}" y="{y + 4:.1f}" class="ct" text-anchor="end">'
-                   f'{v:.0f}%</text>')
+        out.append(f'<text x="{x0 - 7}" y="{y + 4:.1f}" class="ct" {_SVG_HALO} '
+                   f'text-anchor="end">{v:.0f}%</text>')
         v += step
     for tick in (1, 3, 10, 30, 100, 300, 1000):
         if lo <= math.log10(tick) <= hi:
@@ -9840,8 +10129,64 @@ def _bench_scatter_svg(rows: list, width: int = 680, height: int = 340) -> str:
             # distinguishes this cell from its siblings. The middle is shared context.
             _segs = name.split(" · ")
             short = _segs[0] if len(_segs) < 3 else f"{_segs[0]} · {_segs[-1]}"
-            out.append(f'<text x="{cx + dx:.1f}" y="{cy + 3.5:.1f}" class="cl" '
+            out.append(f'<text x="{cx + dx:.1f}" y="{cy + 3.5:.1f}" class="cl" {_SVG_HALO} '
                        f'text-anchor="{anchor}">{_h(short[:34])}</text>')
+
+    # The annotations are the findings, computed from this run rather than remembered from the
+    # last one: a different winner, a different trap, or no trap at all each render correctly.
+    def _clamp(v, a, b):
+        return max(a, min(b, v))
+
+    def _note(cx, cy, tx, ty, lines, colour="var(--ink)", anchor="start"):
+        tx = _clamp(tx, pad_l + 4, width - 10)
+        ty = _clamp(ty, y0 + 12, height - 14 - 17 * (len(lines) - 1))
+        edge = tx - 4 if anchor == "start" else tx + 4
+        out.append(f'<path d="M {cx:.0f} {cy:.0f} L {edge:.0f} {ty - 5:.0f}" '
+                   f'stroke="var(--ink-faint)" stroke-opacity=".55" fill="none" '
+                   f'stroke-width="1"/>')
+        for j, ln in enumerate(lines):
+            w = "700" if j == 0 else "400"
+            fill = colour if j == 0 else "var(--ink-faint)"
+            out.append(f'<text x="{tx:.0f}" y="{ty + j * 17:.0f}" class="ann" {_SVG_HALO} '
+                       f'text-anchor="{anchor}" font-weight="{w}" '
+                       f'fill="{fill}">{_h(ln)}</text>')
+
+    def _seg(nm):
+        return nm.split(" · ")[0]
+
+    win_i = max(range(len(pts)), key=lambda i: (pts[i][2], pts[i][1]))
+    wn, wx, wy = pts[win_i]
+    sizes = _bench_size_by_model(rows)
+    wgb = sizes.get(_seg(wn))
+    win_lines = [_seg(wn), f"{wy:.0f}% correct at {wx:,.0f} tok/s"]
+    if wgb:
+        win_lines.append(f"on {wgb / 1024:.1f} GB of memory")
+    _note(px(wx) + 8, py(wy), x1 + 16, py(wy) + 5, win_lines, "var(--accent)")
+
+    fast_i = max(range(len(pts)), key=lambda i: pts[i][1])
+    fn, fx, fy = pts[fast_i]
+    if fast_i != win_i and fx >= 2 * wx and fy < 60:
+        wrong = 1 - fy / 100
+        _note(px(fx) - 8, py(fy) + 6, px(fx) - 16, py(fy) + 52,
+              [_seg(fn), f"{fx / wx:,.0f}× the winner's speed —",
+               f"and wrong {wrong * 100:.0f}% of the time"], "var(--ink)", "end")
+
+    # The dominated giant: the largest sized model, if something at half its size or less
+    # matches its correctness and beats its speed.
+    giants = [(i, sizes[_seg(pts[i][0])]) for i in range(len(pts))
+              if _seg(pts[i][0]) in sizes]
+    if giants:
+        gi, ggb = max(giants, key=lambda t: t[1])
+        gn, gx, gy = pts[gi]
+        beats = [i for i, gb2 in giants
+                 if gb2 <= ggb / 2 and pts[i][2] >= gy and pts[i][1] >= gx and i != gi]
+        if gi not in (win_i, fast_i) and beats:
+            small = min(sizes[_seg(pts[i][0])] for i in beats)
+            _note(px(gx) - 6, py(gy) + 6, px(gx) - 14, py(gy) + 58,
+                  [f"{_seg(gn)} — {ggb / 1024:.0f} GB",
+                   "beaten on both axes by a model",
+                   f"{small / ggb:.0%} of its size"], "var(--ink)", "end")
+
     out.append("</svg>")
     return "".join(out)
 
@@ -10062,6 +10407,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     # only real variation in a single cell is run-to-run spread, so show that instead.
     single = len(rows) == 1
     scatter_html = ""          # filled by the multi-cell branch; referenced by its results
+    cards_html = mem_html = engine_html = ""   # likewise; a single run has none of them
     if single:
         r0 = rows[0]
 
@@ -10091,8 +10437,23 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 'A point below and to the left of another is beaten on both counts at once, so '
                 'the dashed frontier is the shortlist — everything off it is dominated by '
                 'something on it. Hover any point for its name.</p>' + _sc)
-        charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
-        charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
+        # Seconds to a complete answer replaces the tok/s and TTFT rankings: it is the
+        # only speed figure in units a person feels, and correctness rides on each bar.
+        charts = _bench_answer_time_svg(rows)
+        cards_html = _bench_scorecards(rows)
+        _mem = _bench_bubbles_svg(rows)
+        mem_html = ((
+            '<h2>What memory buys</h2>'
+            '<p class="note">Position is footprint against correctness; bubble area is output '
+            'speed. Models whose size cannot be read — vLLM checkpoints live inside their '
+            'containers — are absent, not zero.</p>' + _mem) if _mem else "")
+        _eng = _bench_engine_pairs_svg(_bench_engine_pair_data(rows, runs))
+        engine_html = ((
+            '<h2>Same weights, two engines</h2>'
+            '<p class="note">The only controlled engine comparison a run can contain: '
+            'identical weights reachable through more than one backend, paired by cache '
+            'state. When output rates tie, the wait for the first token is what an engine '
+            'buys.</p>' + _eng) if _eng else "")
 
     # Per-task quality --------------------------------------------------------------------
     task_html = ""
@@ -10353,6 +10714,7 @@ ordinary slowness rather than a misconfiguration.</p>
   </div>"""
         results = f"""
   {_lede}
+  {cards_html}
   {scatter_html}
   {held}
   <h2>Results</h2>
@@ -10408,8 +10770,12 @@ ordinary slowness rather than a misconfiguration.</p>
     body = f"""
   {results}
 
-  <h2>{"Consistency" if single else "Speed ranking"}</h2>
+  <h2>{"Consistency" if single else "Time to a finished answer"}</h2>
   {charts}
+
+  {mem_html}
+
+  {engine_html}
 
   {cache_html}
 
@@ -10419,7 +10785,7 @@ ordinary slowness rather than a misconfiguration.</p>
 
   {method_html}
 
-  {"<h2>Cold-start cost</h2><p class='note'>Time for the discarded warm-up request — the price of making the model resident, excluded from every measurement above.</p>" + (warm[0] if len(rows) > 1 else "<p class='note'>" + _h(warm[0]) + "</p>") if warm else ""}
+  {"<h2>Cold-start cost</h2><p class='note'>Time for the discarded warm-up request — the price of making the model resident, excluded from every measurement above.</p>" + _bench_coldstart_svg(rows) + (warm[0] if len(rows) > 1 else "<p class='note'>" + _h(warm[0]) + "</p>") if warm else ""}
 """
     return _report_page(
         title=f"Benchmark — {title}",
