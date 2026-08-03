@@ -13427,7 +13427,10 @@ def _bench_grade_c(code: str, entry: str, cases: list, timeout_s: float) -> dict
         return {"passed": 0, "total": len(cases), "error": "gcc is not installed on this host"}
     calls = "".join(
         '    printf("%d\\n", {e}({args}));\n'.replace("{e}", entry)
-        .replace("{args}", ", ".join(str(int(a)) for a in c["args"]))
+        # _bench_lit, not int(): count_words takes a const char*, and JSON string escaping
+        # is valid C for the ASCII these cases use. Caught by the on-box battery — the dev
+        # machine has no gcc, so the local tests skip C and could not see it.
+        .replace("{args}", ", ".join(_bench_lit(a, "c") for a in c["args"]))
         for c in cases)
     src = ("#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
            "#include <limits.h>\n\n" + code +
@@ -13485,7 +13488,7 @@ def _bench_grade_compiled(lang: str, code: str, entry: str, cases: list,
                 return {"passed": 0, "total": len(cases), "error": "g++ is not installed"}
             calls = "".join(
                 f'    std::cout << {entry}({", ".join(_bench_lit(a, "cpp") for a in c["args"])})'
-                ' << "\n";\n' for c in cases)
+                ' << "\\n";\n' for c in cases)
             src = ("#include <iostream>\n#include <string>\n#include <vector>\n"
                    "#include <algorithm>\n#include <cstdint>\n#include <climits>\n\n"
                    + code + "\n\nint main() {\n" + calls + "    return 0;\n}\n")
