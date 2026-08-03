@@ -798,3 +798,35 @@ def test_explicit_container_list_excludes_everything_else(monkeypatch):
     monkeypatch.setattr(p, "load_rules_config",
                         lambda: {"model_control": {"vllm_containers": ["qwen-vllm", "ornith-vllm"]}})
     assert {c["container"] for c in asyncio.run(p._vllm_configs())} == {"qwen-vllm", "ornith-vllm"}
+
+
+def test_vllm_container_prefers_the_running_one(monkeypatch):
+    """qwen-vllm and ornith-vllm are both configured for port 8001, one running at a time.
+    Returning the first match made "stop vLLM" target whichever sorted first — the bench once
+    stopped the already-exited container, reported success, and left the running one's ~45 GB
+    resident while a 123B model tried to load beside it."""
+    monkeypatch.setattr(p, "VLLM_URL", "http://localhost:8001")
+    monkeypatch.setattr(p, "_docker_bin", lambda: "docker")
+
+    async def fake_run(cmd, timeout, max_chars=200000):
+        if cmd[1] == "ps":
+            return 0, "qwen-vllm\nornith-vllm\n"
+        return 0, ('/qwen-vllm\tfalse\t{"8000/tcp":[{"HostPort":"8001"}]}\n'
+                   '/ornith-vllm\ttrue\t{"8000/tcp":[{"HostPort":"8001"}]}\n')
+
+    monkeypatch.setattr(p, "_run_cmd", fake_run)
+    assert asyncio.run(p._vllm_container()) == "ornith-vllm"
+
+
+def test_vllm_container_falls_back_to_first_configured_when_none_runs(monkeypatch):
+    monkeypatch.setattr(p, "VLLM_URL", "http://localhost:8001")
+    monkeypatch.setattr(p, "_docker_bin", lambda: "docker")
+
+    async def fake_run(cmd, timeout, max_chars=200000):
+        if cmd[1] == "ps":
+            return 0, "qwen-vllm\nornith-vllm\n"
+        return 0, ('/qwen-vllm\tfalse\t{"8000/tcp":[{"HostPort":"8001"}]}\n'
+                   '/ornith-vllm\tfalse\t{"8000/tcp":[{"HostPort":"8001"}]}\n')
+
+    monkeypatch.setattr(p, "_run_cmd", fake_run)
+    assert asyncio.run(p._vllm_container()) == "qwen-vllm"

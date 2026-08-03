@@ -134,10 +134,11 @@ def test_vllm_container_is_found_while_stopped(client, monkeypatch):
         if "ps" in args:
             return 0, "qwen-vllm\nornith-vllm\ndockpeek\n"
         if "inspect" in args:
-            # Exactly what a stopped container reports: bindings present, live ports absent.
-            return 0, ('/qwen-vllm\t{"8000/tcp":[{"HostIp":"","HostPort":"8001"}]}\n'
-                       '/ornith-vllm\t{"8000/tcp":[{"HostIp":"","HostPort":"8002"}]}\n'
-                       '/dockpeek\t{"8000/tcp":[{"HostIp":"","HostPort":"3420"}]}\n')
+            # Exactly what a stopped container reports: bindings present, live ports absent,
+            # State.Running false.
+            return 0, ('/qwen-vllm\tfalse\t{"8000/tcp":[{"HostIp":"","HostPort":"8001"}]}\n'
+                       '/ornith-vllm\tfalse\t{"8000/tcp":[{"HostIp":"","HostPort":"8002"}]}\n'
+                       '/dockpeek\tfalse\t{"8000/tcp":[{"HostIp":"","HostPort":"3420"}]}\n')
         return 1, ""
     monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
     monkeypatch.setattr(P, "_run_cmd", run)

@@ -7851,15 +7851,27 @@ async def _vllm_container() -> str | None:
     if code != 0 or not names.split():
         return None
     code, out = await _run_cmd(
-        [docker, "inspect", "--format", "{{.Name}}	{{json .HostConfig.PortBindings}}"]
+        [docker, "inspect", "--format",
+         "{{.Name}}	{{.State.Running}}	{{json .HostConfig.PortBindings}}"]
         + names.split(), 25.0, max_chars=8000)
     if code != 0:
         return None
+    # Several containers can be *configured* for the same port — spark keeps qwen-vllm and
+    # ornith-vllm side by side, only one running at a time. Returning the first match made
+    # "stop vLLM" target whichever happened to sort first: the bench once stopped the
+    # already-exited qwen-vllm, reported success, and left ornith-vllm's ~45 GB resident
+    # while a 123B model tried to load beside it. The running one is the one that holds
+    # memory, so it always wins; the first configured match is the fallback for "start it".
+    first = None
     for line in out.splitlines():
-        name, _, bindings = line.partition("	")
+        name, _, rest = line.partition("	")
+        running, _, bindings = rest.partition("	")
         if f'"HostPort":"{port}"' in bindings.replace(" ", ""):
-            return name.strip().lstrip("/")
-    return None
+            clean = name.strip().lstrip("/")
+            if running.strip() == "true":
+                return clean
+            first = first or clean
+    return first
 
 
 def _llamacpp_cfg() -> dict:
