@@ -493,3 +493,53 @@ def test_the_scatter_and_bubbles_name_both_axes(client):
     for aria in ("Correctness against output rate", "Memory spent against correctness bought"):
         svg = [s for s in re.findall(r"<svg.*?</svg>", html, re.S) if aria in s][0]
         assert "TASKS FULLY CORRECT" in svg, f"y-axis unnamed on {aria!r}"
+
+
+# ---- a concurrency sweep has to read as one --------------------------------------------------
+
+def _conc(bench_id, model, conc, decode, q=1.0):
+    r = _graded(bench_id, model, "ollama", q, decode, {"x": 1.0})
+    r["config"]["concurrency"] = conc
+    return r
+
+
+def test_concurrency_is_an_axis_when_it_varies(client):
+    """Concurrency 1 emitted None to keep single-level runs quiet, so a 1-vs-4 sweep never
+    registered as varying: twenty pairs of identically named rows above a Held-constant block
+    claiming Parallel 4 — false for half the table."""
+    runs = [_conc("a", "m1", 1, 60.0), _conc("b", "m1", 4, 41.0),
+            _conc("c", "m2", 1, 50.0), _conc("d", "m2", 4, 30.0)]
+    head, cells = _first_table(_render(runs))
+    assert "Parallel" in head, head
+    rows_html = _render(runs)
+    held = rows_html.split("<h2>Results</h2>")[0]
+    assert "Parallel" not in held.split("Held constant")[-1].split("</div>")[0]
+
+
+def test_uniform_concurrency_is_held_constant_not_hidden(client):
+    runs = [_conc("a", "m1", 4, 41.0), _conc("b", "m2", 4, 30.0)]
+    html = _render(runs)
+    assert "Parallel" not in _first_table(html)[0]
+    held = html.split("<h2>Results</h2>")[0]
+    assert "Parallel" in held
+
+
+def test_engine_pairs_never_mix_concurrency_levels(client):
+    """An engine comparison holds everything but the engine constant. Keyed on model and cache
+    alone, vLLM at concurrency 4 could pair against Ollama at concurrency 1 and present the
+    difference as the engine's."""
+    runs = []
+    for eng, model in (("ollama", "twin:latest"), ("vllm", "twin")):
+        for conc in (1, 4):
+            r = _graded(f"{eng}{conc}", model, eng, 1.0, 60.0, {"x": 1.0})
+            r["config"]["concurrency"] = conc
+            r["config"]["cache"] = "cached"
+            runs.append(r)
+    rows = [P._bench_report_row(r) for r in runs]
+    pairs = P._bench_engine_pair_data(rows, runs)
+    assert len(pairs) == 2, f"expected one pair per concurrency level, got {len(pairs)}"
+    for key, v in pairs:
+        assert len(key) > 2, "concurrency missing from the pair key"
+        concs = {(run.get("config") or {}).get("concurrency")
+                 for run in runs for u, r in v.items() if r is rows[runs.index(run)]}
+        assert len(concs) == 1, "a pair mixed concurrency levels"

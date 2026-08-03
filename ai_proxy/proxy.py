@@ -9938,7 +9938,8 @@ def _bench_engine_pair_data(rows: list, runs: list) -> list:
         if not r.get("decode_p50"):
             continue
         up = (run.get("config") or {}).get("upstream") or ""
-        key = (_bench_model_identity(r.get("model") or ""), r.get("cache") or "-")
+        key = (_bench_model_identity(r.get("model") or ""), r.get("cache") or "-",
+               (run.get("config") or {}).get("concurrency") or 1)
         ident.setdefault(key, {})[up] = r
     return sorted((k, v) for k, v in ident.items() if len(v) > 1)
 
@@ -9960,10 +9961,13 @@ def _bench_engine_pairs_svg(pairs: list, width: int = 760) -> str:
     o = [f'<svg viewBox="0 0 {width} {height}" width="100%" role="img" '
          'aria-label="Same model, two engines">']
     o.append(f'<text x="{pad_l}" y="14" class="ct">TIME TO FIRST TOKEN, MS →</text>')
-    for i, ((name, cache), v) in enumerate(pairs):
+    for i, (key, v) in enumerate(pairs):
+        name, cache = key[0], key[1]
+        conc = key[2] if len(key) > 2 else 1
         y = 36 + i * row_h
+        tail = f"· {cache}" + (f" · {conc}×" if conc != 1 else "")
         o.append(f'<text x="{pad_l-10}" y="{y+4}" class="cl" text-anchor="end">'
-                 f'{_h(name[:24])} <tspan fill="var(--ink-faint)">· {_h(cache)}</tspan></text>')
+                 f'{_h(name[:24])} <tspan fill="var(--ink-faint)">{_h(tail)}</tspan></text>')
         xs = {u: px(r.get("ttft_p50") or 0) for u, r in v.items()}
         if len(xs) > 1:
             a, b = min(xs.values()), max(xs.values())
@@ -10293,7 +10297,7 @@ def _bench_axis_values(r: dict, cfg: dict) -> dict:
         "prompt": (f"{r['prompt_tokens']:,}" if r.get("prompt_tokens") else None),
         "ctx": (f"{r['server_context']:,}" if r.get("server_context") else None),
         "temp": (str(r["temperature"]) if r.get("temperature") is not None else None),
-        "conc": (str(cfg["concurrency"]) if (cfg.get("concurrency") or 1) != 1 else None),
+        "conc": str(cfg.get("concurrency") or 1),
     }
 
 
