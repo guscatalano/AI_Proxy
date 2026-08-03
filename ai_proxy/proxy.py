@@ -9560,30 +9560,39 @@ def _bench_report_row(run: dict) -> dict:
 # next to the UI they came from, so a different skin reads as a different tool. Colour lives in
 # CSS variables with a light counterpart, because a dark page printed to PDF wastes a cartridge
 # and reads badly on paper; print forces the light set.
-_REPORT_CSS = """
-  /* Whitepaper tokens: light paper by default, dark via the viewer's OS preference. Charts
-     take their colours from these same variables, so one palette drives page and figures in
-     both themes — and the label halo strokes in --bg, which is what keeps text legible on
-     top of data whichever ground it sits on. */
-  :root {
+# One definition per theme. The viewer's OS preference applies a theme via the media query;
+# the toggle stamps data-theme on the root, which must win in both directions — so each block
+# is emitted twice from the same constant and the two application paths cannot drift.
+_REPORT_TOKENS_LIGHT = """
     --bg:#FFFFFF; --panel:#FFFFFF; --panel-2:#F5F5F2; --border:#E4E4E1;
     --ink:#121212; --ink-dim:#454B52; --ink-faint:#727272;
     --accent:#C4321F; --accent-deep:#8F2416; --good:#1F7A47; --warn:#8A6D1F; --bad:#B3261E;
     --ghost:#B9B9B9; --grid:#EBEBE8; --blue:#3E6FA8;
+    color-scheme: light;
+"""
+_REPORT_TOKENS_DARK = """
+    --bg:#121418; --panel:#15181D; --panel-2:#1B1F26; --border:#2A2F37;
+    --ink:#E8EAED; --ink-dim:#C4CAD2; --ink-faint:#98A0AA;
+    --accent:#E0604E; --accent-deep:#C4321F; --good:#5FBF8A; --warn:#D9C37A; --bad:#F07178;
+    --ghost:#565E6A; --grid:#242931; --blue:#7AA7DA;
+    color-scheme: dark;
+"""
+
+_REPORT_CSS = """
+  :root {
     --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
     --sans:"Helvetica Neue",Helvetica,Arial,system-ui,sans-serif;
     --serif:Georgia,"Times New Roman",serif;
-    color-scheme: light;
-  }
-  @media (prefers-color-scheme: dark) {
-    :root {
-      --bg:#121418; --panel:#15181D; --panel-2:#1B1F26; --border:#2A2F37;
-      --ink:#E8EAED; --ink-dim:#C4CAD2; --ink-faint:#98A0AA;
-      --accent:#E0604E; --accent-deep:#C4321F; --good:#5FBF8A; --warn:#D9C37A; --bad:#F07178;
-      --ghost:#565E6A; --grid:#242931; --blue:#7AA7DA;
-      color-scheme: dark;
-    }
-  }
+""" + _REPORT_TOKENS_LIGHT + """  }
+  @media (prefers-color-scheme: dark) { :root {""" + _REPORT_TOKENS_DARK + """  } }
+  :root[data-theme="dark"] {""" + _REPORT_TOKENS_DARK + """  }
+  :root[data-theme="light"] {""" + _REPORT_TOKENS_LIGHT + """  }
+  #themeflip { position:fixed; top:14px; right:14px; z-index:5; font-family:var(--sans);
+    font-size:12px; padding:5px 13px; border:1px solid var(--border); border-radius:999px;
+    background:var(--panel); color:var(--ink-dim); cursor:pointer; }
+  #themeflip:hover { color:var(--ink); border-color:var(--ink-faint); }
+  #themeflip:focus-visible { outline:2px solid var(--blue); outline-offset:2px; }
+  @media print { #themeflip { display:none; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--serif);
          font-size:16.5px; line-height:1.62; padding:clamp(18px,4vw,44px) clamp(14px,4vw,34px);
@@ -9719,7 +9728,21 @@ def _report_head(title: str, eyebrow: str) -> str:
     return (
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
         "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        f"<title>{_h(title)}</title><style>{_REPORT_CSS}</style></head><body><div class=\"wrap\">"
+        f"<title>{_h(title)}</title><style>{_REPORT_CSS}</style></head><body>"
+        # The one script on the page. Self-contained, so a saved copy keeps its toggle;
+        # localStorage remembers the choice, and with nothing stored the OS preference rules.
+        "<button id=\"themeflip\" type=\"button\" aria-label=\"Switch colour theme\"></button>"
+        "<script>(function(){var r=document.documentElement,k=\"ai-proxy-report-theme\","
+        "b=document.getElementById(\"themeflip\");"
+        "function eff(){return r.getAttribute(\"data-theme\")||"
+        "(window.matchMedia&&matchMedia(\"(prefers-color-scheme: dark)\").matches"
+        "?\"dark\":\"light\")}"
+        "function lab(){b.textContent=eff()===\"dark\"?\"\u2600 Light\":\"\u263e Dark\"}"
+        "try{var s=localStorage.getItem(k);if(s)r.setAttribute(\"data-theme\",s)}catch(e){}"
+        "b.addEventListener(\"click\",function(){var n=eff()===\"dark\"?\"light\":\"dark\";"
+        "r.setAttribute(\"data-theme\",n);try{localStorage.setItem(k,n)}catch(e){}lab()});"
+        "lab()})();</script>"
+        "<div class=\"wrap\">"
         f"<p class=\"eyebrow\">{_h(eyebrow)}</p>"
         f"<h1>{_h(title)}</h1>"
     )
@@ -9837,6 +9860,8 @@ def _bench_bubbles_svg(rows: list, width: int = 820, height: int = 470) -> str:
                      f'text-anchor="middle">{gb}</text>')
     o.append(f'<text x="{x0}" y="{height-6}" class="ct">GIGABYTES THE MODEL OCCUPIES → '
              '<tspan fill="var(--ghost)">bubble area = output speed</tspan></text>')
+    o.append(f'<text x="{x0}" y="{pad_t - 8}" class="ct" {_SVG_HALO}>'
+             f'TASKS FULLY CORRECT ↑</text>')
     groups: dict = {}
     for r in sorted(bpm, key=lambda r: -gb_of[id(r)]):
         gb = gb_of[id(r)]
@@ -10098,8 +10123,10 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
                        f'text-anchor="middle">{tick}</text>')
     out.append(f'<text x="{(x0 + x1) / 2:.0f}" y="{height - 6}" class="ct" '
                f'text-anchor="middle">output tokens/sec (log)</text>')
-    out.append(f'<text x="{x1 - 6}" y="{y0 + 4}" class="ct" text-anchor="end" '
+    out.append(f'<text x="{x1 - 6}" y="{y0 + 4}" class="ct" {_SVG_HALO} text-anchor="end" '
                f'fill="var(--accent)" fill-opacity=".8">better ↗</text>')
+    out.append(f'<text x="{x0}" y="{y0 - 6}" class="ct" {_SVG_HALO}>'
+               f'TASKS FULLY CORRECT ↑</text>')
 
     # The frontier as a staircase: from each frontier point you trade rate for correctness only
     # by stepping, never smoothly, so a curve would be a fiction.

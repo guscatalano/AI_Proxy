@@ -563,6 +563,20 @@ def test_reports_are_whitepapers_in_both_themes():
     assert 'stroke="var(--bg)"' in p._SVG_HALO, "halo must stroke in the page colour"
 
 
+def test_the_theme_toggle_and_the_media_query_cannot_disagree():
+    """The OS preference applies a theme via the media query; the button stamps data-theme,
+    which must win in both directions. Both paths are emitted from the same constants, and the
+    toggle ships as the page's one self-contained script."""
+    css = p._REPORT_CSS
+    assert css.count(p._REPORT_TOKENS_DARK) == 2, "media-query and data-theme dark drifted"
+    assert css.count(p._REPORT_TOKENS_LIGHT) == 2
+    assert ':root[data-theme="dark"]' in css and ':root[data-theme="light"]' in css
+    head = p._report_head("t", "e")
+    assert 'id="themeflip"' in head
+    assert "localStorage" in head
+    assert "prefers-color-scheme: dark" in head
+
+
 def test_usage_report_survives_an_empty_database():
     """A fresh install opening the report must not 500 on divide-by-zero or missing keys."""
     html = p._stats_report_html({"overall": {"count": 0, "prompt_tokens": 0,

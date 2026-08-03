@@ -480,3 +480,16 @@ def test_cold_start_gets_a_chart_when_more_than_one_model_loaded(client):
     seg = html.split("Cold-start cost")[-1]
     assert "Seconds of loading before the first useful token" in seg
     assert seg.index("aria-label") < seg.index("<table")
+
+
+def test_the_scatter_and_bubbles_name_both_axes(client):
+    """Bare percentages up an unlabelled axis: the x-axes were titled, the y-axes were not."""
+    runs = [_graded(f"m{i}", f"model-{i}", "ollama", 1.0 - i / 10, 60 - i, {"x": 1.0})
+            for i in range(4)]
+    rows = [P._bench_report_row(r) for r in runs]
+    for i, r in enumerate(rows):
+        r["size_mb"] = (i + 1) * 10_000
+    html = P._bench_report_html(runs, rows)
+    for aria in ("Correctness against output rate", "Memory spent against correctness bought"):
+        svg = [s for s in re.findall(r"<svg.*?</svg>", html, re.S) if aria in s][0]
+        assert "TASKS FULLY CORRECT" in svg, f"y-axis unnamed on {aria!r}"
