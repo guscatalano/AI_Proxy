@@ -1619,6 +1619,21 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+def _display_model_id(mid: str | None) -> str | None:
+    """llama-server can report a model's id as the full GGUF path (often under the user's home dir, sometimes
+    with a `-NNNNN-of-NNNNN` shard suffix). Surface just the model NAME: the filename without the directory,
+    the `.gguf` extension, and any shard suffix. The full path is kept in `model_path`, and llama.cpp routing
+    (one model per process) doesn't depend on this name, so cleaning it is display-only. An already-clean id
+    (no path/extension) is returned unchanged."""
+    if not mid:
+        return mid
+    base = os.path.basename(str(mid).replace("\\", "/"))
+    base = re.sub(r"-\d{4,5}-of-\d{4,5}\.gguf$", "", base, flags=re.IGNORECASE)
+    if base.lower().endswith(".gguf"):
+        base = base[:-5]
+    return base or mid
+
+
 async def _llamacpp_snapshot(client: httpx.AsyncClient) -> dict:
     """llama-server: /v1/models lists what it was launched with (one model per process), and
     /props carries the loaded context size and the model path — which is the only place the
@@ -1630,8 +1645,9 @@ async def _llamacpp_snapshot(client: httpx.AsyncClient) -> dict:
             return out
         out["reachable"] = True
         for m in (r.json().get("data") or []):
-            rec = {"id": m.get("id"), "state": "loaded", "arch": "llama.cpp",
-                   "quant": _infer_quant(m.get("id"))}
+            raw_id = m.get("id")
+            rec = {"id": _display_model_id(raw_id), "state": "loaded", "arch": "llama.cpp",
+                   "quant": _infer_quant(raw_id)}
             out["available"].append(rec)
             out["loaded"].append(rec)
     except (httpx.RequestError, ValueError):
@@ -9260,6 +9276,16 @@ def _bench_completed_cells(conn, days: int = 30) -> dict:
             continue
         if cfg.get("models"):
             continue          # a sweep parent measures nothing itself
+        try:
+            summary = (json.loads(r["results_json"] or "{}") or {}).get("summary") or {}
+        except (json.JSONDecodeError, TypeError):
+            summary = {}
+        if not summary.get("n_success"):
+            # "Done" is not "measured". A cell whose backend was OOM-cycling once finished
+            # with 87 identical 502 rows and status 'done' — and a resume then copied that
+            # garbage forward as if it were data. Zero successes means there is nothing here
+            # worth reusing; let the new sweep measure it for real.
+            continue
         out[_bench_cell_sig(r["model"], cfg)] = r      # later rows win: most recent
     return out
 

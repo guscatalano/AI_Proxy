@@ -484,3 +484,20 @@ def test_unfittable_kv_blocks_before_any_request(client, monkeypatch):
     status, error, _ = _cell_row()
     assert status == "failed" and "OOM" in (error or "")
     assert sent["n"] == 0, "preflight must refuse before the first request"
+
+
+def test_a_done_cell_with_zero_successes_is_not_reused(client):
+    """'Done' is not 'measured': the devstral OOM loop finished a cell with 87 identical 502
+    rows and status done, and a resume copied that garbage forward as real data."""
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    _done_cell(conn, "c_good", "m1", dict(_CFG))
+    _done_cell(conn, "c_junk", "m2", dict(_CFG),
+               results='{"summary": {"n_success": 0, "n_total": 87}}')
+    _done_cell(conn, "c_empty", "m3", dict(_CFG), results='{}')
+    prior = P._bench_completed_cells(conn)
+    conn.close()
+    sigs = set(prior)
+    assert P._bench_cell_sig("m1", dict(_CFG)) in sigs
+    assert P._bench_cell_sig("m2", dict(_CFG)) not in sigs, "all-failure cell got reused"
+    assert P._bench_cell_sig("m3", dict(_CFG)) not in sigs, "resultless cell got reused"

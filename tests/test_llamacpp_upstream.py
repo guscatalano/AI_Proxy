@@ -52,6 +52,18 @@ def test_snapshot_reports_the_served_model(client):
     assert "IQ2_XXS" in (snap["model_path"] or "")
 
 
+def test_model_id_is_the_name_not_the_home_dir_path(client):
+    # llama-server sometimes reports the model id as the full GGUF PATH (under the user's home dir, with a
+    # -NNNNN-of-NNNNN shard suffix). The snapshot must surface just the model NAME — not the path; the full
+    # path stays in model_path for quant/context inference.
+    p = r"C:\Users\crimson\models\DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf"
+    snap = asyncio.run(P._llamacpp_snapshot(_Client(
+        models={"data": [{"id": p}]}, props={"model_path": p})))
+    assert snap["loaded"][0]["id"] == "DeepSeek-V4-Flash-0731-UD-IQ2_XXS"
+    assert "crimson" not in snap["loaded"][0]["id"], "the model name must not leak the home directory"
+    assert "IQ2_XXS" in (snap["model_path"] or ""), "the full path is still available for quant/context"
+
+
 def test_quantisation_is_recovered_from_the_filename(client):
     # llama-server's API never states the quant; the path is the only place it appears.
     snap = asyncio.run(P._llamacpp_snapshot(_Client(
