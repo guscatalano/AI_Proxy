@@ -9877,6 +9877,12 @@ _REPORT_CSS = """
   details.fx ul { list-style:none; margin:8px 0 2px; padding:0; }
   details.fx li { margin:5px 0; font-size:12.5px; overflow-wrap:anywhere; }
   details.fx li code { color:var(--ink-dim); }
+  details.fxc { margin:4px 0 2px 14px; }
+  details.fxc summary { cursor:pointer; font-size:11.5px; color:var(--ink-faint); }
+  details.fxc pre { margin:6px 0 4px; padding:9px 12px; font-size:11.5px; line-height:1.45;
+                    background:var(--panel-2); border:1px solid var(--border);
+                    border-radius:6px; overflow:auto; max-height:340px;
+                    white-space:pre-wrap; overflow-wrap:anywhere; }
   .tdesc { display:block; font-family:var(--sans, inherit); font-weight:400;
            font-size:11.5px; color:var(--ink-faint); margin-top:1px; }
   /* Weighted standings: the two-segment bar IS the weighting made visible. */
@@ -10721,7 +10727,18 @@ def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
                         detail = _bench_case_text(tasks[t], i, c.get("got"))
                         break
             if detail:
-                out.setdefault(t, []).append({"cell": name, "detail": detail})
+                ex = {"cell": name, "detail": detail}
+                # The code that produced the failure, exactly as the grader extracted it.
+                # A wrong answer without the code is a verdict; with it, it's a diagnosis.
+                lang = tasks[t].get("lang") or "python"
+                code = _bench_extract_code(rr.get("text") or "", lang)
+                if code:
+                    ex["code"] = code[:1600] + ("\n… (truncated)" if len(code) > 1600 else "")
+                elif rr.get("text"):
+                    # No extractable block IS the failure mode for some responses; showing
+                    # the raw reply excerpt is the only way to see what happened.
+                    ex["raw"] = rr["text"][:600]
+                out.setdefault(t, []).append(ex)
     # Most-missed first; a handful of examples per task is illustration, not a log dump.
     return {t: v[:per_task] for t, v in
             sorted(out.items(), key=lambda kv: -len(kv[1]))}
@@ -10987,9 +11004,17 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 blocks = []
                 for t, exs in fx.items():
                     desc = _BENCH_TASK_DESC.get(t) or ""
-                    lis = "".join(
-                        f'<li><b>{_h(e["cell"])}</b> — <code>{_h(e["detail"])}</code></li>'
-                        for e in exs)
+                    lis = ""
+                    for e in exs:
+                        codeblk = ""
+                        if e.get("code"):
+                            codeblk = (f'<details class="fxc"><summary>the code it wrote'
+                                       f'</summary><pre>{_h(e["code"])}</pre></details>')
+                        elif e.get("raw"):
+                            codeblk = (f'<details class="fxc"><summary>no code block — raw '
+                                       f'reply</summary><pre>{_h(e["raw"])}</pre></details>')
+                        lis += (f'<li><b>{_h(e["cell"])}</b> — '
+                                f'<code>{_h(e["detail"])}</code>{codeblk}</li>')
                     blocks.append(
                         f'<details class="fx"><summary><code>{_h(t)}</code>'
                         f'<span> — {_h(desc)} · {len(exs)} example'
@@ -11240,6 +11265,32 @@ ordinary slowness rather than a misconfiguration.</p>
       <code>x-client-name: ai-proxy-bench</code>.</li>
   </ul>"""
 
+    # The machine, fully described. Facts recorded at run time win; static facts a snapshot
+    # missed (CPU model, kernel — they don't change) are filled from the host at render time
+    # and say so, the same honesty rule as the GPU backfill before it.
+    hw = _host_hw_facts()
+    hw_backfilled = not isinstance(env.get("hw"), dict)
+    if not hw_backfilled:
+        hw = {**hw, **env["hw"]}
+    _mem_gb = ((env.get("mem") or {}).get("total_mb") or 0) / 1024
+    _hw_rows = [
+        ("GPU", gpu_txt if gpu_txt != "not reported" else None),
+        ("Unified memory", f"{_mem_gb:.0f} GB" if _mem_gb else None),
+        ("CPU", hw.get("cpu_model")),
+        ("Cores", hw.get("cpu_cores")),
+        ("OS", hw.get("os")),
+        ("Kernel", hw.get("kernel")),
+        ("Ollama", env.get("ollama_version")),
+        ("Proxy", env.get("proxy_version")),
+    ]
+    hw_html = ('<h2>Hardware</h2><div class="spec">'
+               + "".join(f'<div><p class="k">{_h(k)}</p><p class="v">{_h(str(v))}</p></div>'
+                         for k, v in _hw_rows if v is not None)
+               + '</div>'
+               + ('<p class="note">CPU, OS and kernel read from the host at report time — '
+                  'this run predates their capture, and they do not change between runs.</p>'
+                  if hw_backfilled else ""))
+
     weighted_html = _bench_weighted_html(rows) if graded else ""
     body = f"""
   {results}
@@ -11258,6 +11309,8 @@ ordinary slowness rather than a misconfiguration.</p>
   {cold_html}
 
   {task_html}
+
+  {hw_html}
 
   {method_html}
 
@@ -14756,11 +14809,40 @@ async def _bench_restore_context(token: dict | None) -> dict | None:
             "parallel": token["parallel"]}
 
 
+def _host_hw_facts() -> dict:
+    """The static facts about this machine: CPU, cores, kernel, OS. Gathered at snapshot
+    time for new runs and at render time as a fallback for old ones — a CPU model does not
+    change between the two, which is what makes the fallback honest."""
+    import platform as _pf
+    facts: dict = {"cpu_cores": os.cpu_count(), "kernel": _pf.release(),
+                   "os": f"{_pf.system()} {_pf.machine()}", "python": _pf.python_version()}
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.lower().startswith(("model name", "hardware", "cpu part")):
+                    facts["cpu_model"] = line.split(":", 1)[1].strip()
+                    break
+    except OSError:
+        pass
+    try:
+        os_release = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace")
+        m = re.search(r'^PRETTY_NAME="?([^"\n]+)', os_release, re.M)
+        if m:
+            facts["os"] = f"{m.group(1)} ({_pf.machine()})"
+    except OSError:
+        pass
+    return facts
+
+
 async def _bench_env_snapshot() -> dict:
     """Machine + engine state at run time. Without this a number from three weeks ago is
     uninterpretable: you can't tell which quant was loaded, how much context it was serving,
     or whether the GPU was already half-full when the run started."""
     env: dict = {"ts": time.time(), "proxy_version": __version__}
+    try:
+        env["hw"] = _host_hw_facts()
+    except Exception:
+        pass
     try:
         # system_now is sync so Starlette runs it in the threadpool; awaiting it raises
         # TypeError into the blanket except below, and every run since has recorded an error
@@ -14780,6 +14862,7 @@ async def _bench_env_snapshot() -> dict:
             for m in (ollama.get("ps") or []) if isinstance(m, dict)
         ]
         env["ollama_config"] = ollama.get("config")
+        env["ollama_version"] = ollama.get("version")
         lms = sysinfo.get("lmstudio") or {}
         env["lmstudio_loaded"] = [m.get("id") for m in (lms.get("models") or [])
                                   if isinstance(m, dict)]

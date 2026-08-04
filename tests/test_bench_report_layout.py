@@ -677,3 +677,53 @@ def test_failure_examples_surface_grader_errors_verbatim(client):
     ]
     html = _render(runs)
     assert "compile error: missing terminating" in html
+
+
+def test_failure_examples_include_the_code_that_failed(client):
+    runs = [_graded("a", "m1", "ollama", 0.9, 30, {"roman": 0.5})]
+    runs[0]["results"]["rows"] = [
+        {"seq": 1, "task": "roman",
+         "text": "Here you go:\n```python\ndef to_roman(n):\n    return 'IIII'\n```",
+         "grade": {"passed": 5, "total": 6,
+                   "cases": [{"ok": True}] * 3 + [{"ok": False, "got": "IIII"}]
+                            + [{"ok": True}] * 2}},
+    ]
+    html = _render(runs)
+    sect = html.split("What the failures actually looked like")[-1]
+    assert "the code it wrote" in sect
+    assert "return &#x27;IIII&#x27;" in sect or "return 'IIII'" in sect, \
+        "the graded code must appear, escaped, inside the example"
+
+
+def test_a_reply_with_no_code_block_shows_the_raw_reply(client):
+    runs = [_graded("a", "m1", "ollama", 0.5, 30, {"roman": 0.0})]
+    runs[0]["results"]["rows"] = [
+        {"seq": 1, "task": "roman",
+         "text": "I would be happy to help! First, let me explain Roman numerals...",
+         "grade": {"passed": 0, "total": 6, "error": "no python code block in the response"}},
+    ]
+    html = _render(runs)
+    sect = html.split("What the failures actually looked like")[-1]
+    assert "no code block — raw reply" in sect
+    assert "happy to help" in sect
+
+
+def test_the_hardware_section_names_the_machine(client):
+    runs = [_run("a", prompt=32000), _run("b", prompt=131072)]
+    runs[0]["env"] = {"gpus": [{"name": "NVIDIA GB10", "mem_total_mb": 124610}],
+                      "mem": {"total_mb": 124610},
+                      "hw": {"cpu_model": "Grace C1", "cpu_cores": 20,
+                             "os": "Ubuntu 24.04 (aarch64)", "kernel": "6.8.0"},
+                      "ollama_version": "0.32.5", "proxy_version": "0.2.0"}
+    html = _render(runs)
+    sect = html.split("<h2>Hardware</h2>")[-1]
+    for fact in ("NVIDIA GB10", "122 GB", "Grace C1", "20", "Ubuntu 24.04", "6.8.0", "0.32.5"):
+        assert fact in sect, f"hardware section missing {fact}"
+    assert "read from the host at report time" not in sect, \
+        "run-time facts must not carry the backfill caveat"
+
+
+def test_old_runs_backfill_static_hardware_with_a_caveat(client):
+    html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
+    assert "<h2>Hardware</h2>" in html
+    assert "read from the host at report time" in html
