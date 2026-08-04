@@ -6764,7 +6764,7 @@ async function loadBench() {
             </div>
             <div class="bench-row stack">
               <label for="bench-maxtok">Max tokens <span class="bench-hint">— cap per response</span></label>
-              <input id="bench-maxtok" type="number" value="256" min="16" max="8192">
+              <input id="bench-maxtok" type="number" value="" placeholder="auto — 1024 graded, 256 speed-only" min="16" max="8192">
             </div>
             <div class="bench-row stack">
               <label for="bench-concur">Concurrency <span class="bench-hint">— parallel requests per cell</span></label>
@@ -7183,7 +7183,7 @@ function _benchTemps() {
 // both were produced the same way, and picking sizes by hand each time guarantees they weren't.
 const _BENCH_COMMON = {
   runs: 3,
-  max_tokens: 512,
+  max_tokens: 1024,
   suite: 'coding-v1',
   warmup: true,
   bypass_router: true,
@@ -7293,7 +7293,7 @@ function _benchBody() {
   const body = {
     models,
     runs: parseInt($('bench-runs').value, 10) || 5,
-    max_tokens: parseInt($('bench-maxtok').value, 10) || 256,
+    max_tokens: parseInt($('bench-maxtok').value, 10) || undefined,
     // A graded suite sends its own task prompts, so prompt size has nothing to act on. Sent
     // as 0 rather than dropped, so the run records that it was not an axis.
     prompt_tokens: suite ? 0 : (prompts.length > 1 ? prompts : (prompts[0] || 0)),
