@@ -9773,6 +9773,14 @@ _REPORT_CSS = """
   .tl { list-style:none; margin:4px 0 0; padding:0; column-width:330px; column-gap:26px; }
   .tl li { margin:2px 0; font-size:12.5px; break-inside:avoid; }
   .tl span { color:var(--ink-faint); }
+  /* Failure examples: collapsed by default — evidence on demand, not a wall of stack traces. */
+  details.fx { margin:7px 0; border:1px solid var(--border); border-radius:8px;
+               padding:8px 12px; background:var(--panel); }
+  details.fx summary { cursor:pointer; font-size:13px; }
+  details.fx summary span { color:var(--ink-faint); }
+  details.fx ul { list-style:none; margin:8px 0 2px; padding:0; }
+  details.fx li { margin:5px 0; font-size:12.5px; overflow-wrap:anywhere; }
+  details.fx li code { color:var(--ink-dim); }
   .tdesc { display:block; font-family:var(--sans, inherit); font-weight:400;
            font-size:11.5px; color:var(--ink-faint); margin-top:1px; }
   /* Weighted standings: the two-segment bar IS the weighting made visible. */
@@ -10565,6 +10573,64 @@ def _bench_cell_name(v: dict, varying: list) -> str:
     return " · ".join(bits) or str(v.get("model") or "run")
 
 
+def _bench_case_text(task: dict, idx: int, got) -> str:
+    """One failing case as a sentence: the call that was made, what came back, what should
+    have. Function tasks render as a call; HTML/CSS tasks render as the structural check."""
+    cases = task.get("cases") or []
+    c = cases[idx] if idx < len(cases) else {}
+    gtxt = json.dumps(got) if not isinstance(got, str) or len(got) < 60 else json.dumps(got[:60] + "…")
+    if "args" in c:
+        call = f'{task["entry"]}({", ".join(json.dumps(a) for a in c["args"])})'
+        return f'{call} → {gtxt}, expected {json.dumps(c.get("expect"))}'
+    if "op" in c:                       # HTML structural check
+        what = {"count": f'count of "{c.get("sel")}"',
+                "attr": f'{c.get("name")} of "{c.get("sel")}"',
+                "text": f'text of "{c.get("sel")}"',
+                "labels_bound": "labels bound to inputs"}.get(c["op"], c["op"])
+        return f'{what} → {gtxt}, expected {json.dumps(c.get("expect"))}'
+    if "prop" in c:                     # CSS declaration check
+        scope = f' inside @media {c["media"]}' if c.get("media") else ""
+        return (f'{c.get("sel")} {{ {c["prop"]} }}{scope} → {gtxt}, '
+                f'expected {json.dumps(c.get("expect"))}')
+    return f'case {idx + 1} → {gtxt}'
+
+
+def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
+    """task id → concrete failures, one per configuration: the first failing case with what
+    came back, or the grader's error (compile failure, timeout, no code block). This is the
+    difference between "87%" and knowing the model writes ordinals like 111st."""
+    suite_name = next((r.get("suite") for r in rows if r.get("suite")), None)
+    tasks = {t["id"]: t for t in (_BENCH_SUITES.get(suite_name) or [])}
+    if not tasks:
+        return {}
+    out: dict = {}
+    seen: set = set()
+    for run, row in zip(runs, rows):
+        name = (row.get("_name") or _bench_label_display(row.get("label") or ""))
+        for rr in ((run.get("results") or {}).get("rows") or []):
+            t, g = rr.get("task"), rr.get("grade")
+            if not t or not isinstance(g, dict) or t not in tasks:
+                continue
+            if (g.get("passed") or 0) >= (g.get("total") or 0):
+                continue
+            if (t, name) in seen:       # one example per configuration per task
+                continue
+            seen.add((t, name))
+            if g.get("error"):
+                detail = str(g["error"])[:180]
+            else:
+                detail = None
+                for i, c in enumerate(g.get("cases") or []):
+                    if not c.get("ok"):
+                        detail = _bench_case_text(tasks[t], i, c.get("got"))
+                        break
+            if detail:
+                out.setdefault(t, []).append({"cell": name, "detail": detail})
+    # Most-missed first; a handful of examples per task is illustration, not a log dump.
+    return {t: v[:per_task] for t, v in
+            sorted(out.items(), key=lambda kv: -len(kv[1]))}
+
+
 def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
 
@@ -10819,11 +10885,32 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                          "saturates for anything capable, which is exactly why the hard tier "
                          "exists. Compare two models on the hard row when both score 100% on "
                          "core.</p>" + tier_rows) if tier_rows else ""
+            fx = _bench_failure_examples(runs, rows)
+            fx_html = ""
+            if fx:
+                blocks = []
+                for t, exs in fx.items():
+                    desc = _BENCH_TASK_DESC.get(t) or ""
+                    lis = "".join(
+                        f'<li><b>{_h(e["cell"])}</b> — <code>{_h(e["detail"])}</code></li>'
+                        for e in exs)
+                    blocks.append(
+                        f'<details class="fx"><summary><code>{_h(t)}</code>'
+                        f'<span> — {_h(desc)} · {len(exs)} example'
+                        f'{"s" if len(exs) > 1 else ""}</span></summary>'
+                        f'<ul>{lis}</ul></details>')
+                fx_html = ('<h3>What the failures actually looked like</h3>'
+                           '<p class="note">The first failing case per configuration: the '
+                           'call that was made, what came back, and what should have — or '
+                           'the compile error or timeout that stopped it. This is what a '
+                           'percentage point of correctness is made of.</p>'
+                           + "".join(blocks))
             task_html = tier_html + f"""<h2>Per-task correctness</h2>
 <p class="note">Share of responses that passed every case for that task. A model strong
 everywhere except one task and a model mediocre throughout can share an overall average.</p>
 {task_summary}
-{f'<div class="tbl"><table><thead><tr>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>' if trs else ""}"""
+{f'<div class="tbl"><table><thead><tr>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>' if trs else ""}
+{fx_html}"""
 
     # Cold vs cached, paired by everything except the cache axis. This is the comparison that
     # exposes a backend serving every repeated prompt as a fresh prefill.

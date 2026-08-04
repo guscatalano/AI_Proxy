@@ -645,3 +645,35 @@ def test_the_scorecard_verdict_is_the_weighted_one(client):
     for card in re.findall(r'<p class="k">(?:Run this[^<]*|Runner-up)</p>.*?<p class="d">([^<]*)</p>',
                            html, re.S):
         assert "score" in card, "every ranked card carries its score"
+
+
+# ---- failure examples: what a percentage point is made of ------------------------------------
+
+def test_failure_examples_show_the_call_and_expected_vs_got(client):
+    runs = [_graded("a", "m1", "ollama", 0.9, 30, {"roman": 0.5}),
+            _graded("b", "m2", "ollama", 1.0, 40, {"roman": 1.0})]
+    runs[0]["results"]["rows"] = [
+        {"seq": 1, "task": "roman",
+         "grade": {"passed": 5, "total": 6,
+                   "cases": [{"ok": True}] * 3 + [{"ok": False, "got": "IIII"}]
+                            + [{"ok": True}] * 2}},
+        {"seq": 2, "task": "roman", "grade": {"passed": 6, "total": 6}},
+    ]
+    runs[1]["results"]["rows"] = []
+    html = _render(runs)
+    assert "What the failures actually looked like" in html
+    sect = html.split("What the failures actually looked like")[-1]
+    assert "IIII" in sect and "expected" in sect, "got and expected must both appear"
+    assert "to_roman(" in sect, "the failing call is reconstructed from the suite's own case"
+    assert "m2" not in sect.split("</details>")[0], "clean configurations are not examples"
+
+
+def test_failure_examples_surface_grader_errors_verbatim(client):
+    runs = [_graded("a", "m1", "ollama", 0.5, 30, {"csv_escape": 0.0})]
+    runs[0]["config"]["suite"] = "coding-v2"
+    runs[0]["results"]["rows"] = [
+        {"seq": 1, "task": "csv_escape",
+         "grade": {"passed": 0, "total": 6, "error": "compile error: missing terminating"}},
+    ]
+    html = _render(runs)
+    assert "compile error: missing terminating" in html
