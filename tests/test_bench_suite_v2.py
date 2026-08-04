@@ -800,7 +800,8 @@ def test_a_missing_toolchain_skips_tasks_rather_than_zeroing_them(monkeypatch):
     """The portability contract: a box without PHP drops the PHP tasks from the run and
     records the fact — it never scores them as zero, which would punish the model for the
     machine it happened to be measured on."""
-    monkeypatch.setattr(P, "_bench_tool", lambda name: None)
+    from ai_proxy import bench_graders as G
+    monkeypatch.setattr(G, "_bench_tool", lambda name: None)
     runnable, skipped = P._bench_suite_tasks("coding-v2")
     run_langs = {t.get("lang") or "python" for t in runnable}
     assert run_langs == {"python", "html", "css"}, run_langs

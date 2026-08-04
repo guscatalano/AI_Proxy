@@ -80,7 +80,8 @@ def test_missing_toolchains_are_recorded_not_fatal(client, monkeypatch):
     """coding-v2 on a box with no compilers: the cell must run its Python/HTML/CSS tasks and
     write the skipped languages into env for the report's method section."""
     _fakes(monkeypatch)
-    monkeypatch.setattr(P, "_bench_tool", lambda name: None)
+    from ai_proxy import bench_graders as G
+    monkeypatch.setattr(G, "_bench_tool", lambda name: None)
     _seed({"upstream": "ollama", "runs": 1, "warmup": True, "resume": False,
            "suite": "coding-v2", "cache": "cached", "exclusive": False})
     asyncio.run(P._bench_execute("b_env", P.app))

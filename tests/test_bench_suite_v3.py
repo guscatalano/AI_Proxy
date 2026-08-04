@@ -467,12 +467,13 @@ def test_graded_suite_defaults_carry_more_tokens(client):
 def test_a_present_but_broken_toolchain_reads_as_unavailable(monkeypatch):
     """A rustc with no linker compiles nothing. 'Available' must mean the grader end-to-end,
     or every task in that language zeroes on the box instead of skipping."""
-    monkeypatch.setattr(P, "_bench_tool", lambda name: "/fake/" + name)
-    monkeypatch.setattr(P, "_bench_grade_sync",
+    from ai_proxy import bench_graders as G
+    monkeypatch.setattr(G, "_bench_tool", lambda name: "/fake/" + name)
+    monkeypatch.setattr(G, "_bench_grade_sync",
                         lambda *a, **k: {"passed": 0, "total": 1, "error": "link failed"})
-    monkeypatch.setitem(P.__dict__, "_BENCH_TOOLCHAIN_OK", {})
-    assert P._bench_lang_available("rust") is False
-    monkeypatch.setattr(P, "_bench_grade_sync",
+    monkeypatch.setattr(G, "_BENCH_TOOLCHAIN_OK", {})
+    assert G._bench_lang_available("rust") is False
+    monkeypatch.setattr(G, "_bench_grade_sync",
                         lambda *a, **k: {"passed": 1, "total": 1})
-    monkeypatch.setitem(P.__dict__, "_BENCH_TOOLCHAIN_OK", {})
-    assert P._bench_lang_available("rust") is True
+    monkeypatch.setattr(G, "_BENCH_TOOLCHAIN_OK", {})
+    assert G._bench_lang_available("rust") is True
