@@ -10147,11 +10147,17 @@ def _bench_engine_pairs_svg(pairs: list, width: int = 760) -> str:
             o.append(f'<circle cx="{x:.0f}" cy="{y}" r="6" fill="{colour[u]}">'
                      f'<title>{_h(u)}: {v[u].get("ttft_p50"):,.0f} ms</title></circle>')
             # Two dots nearly on top of each other put both centred values through each
-            # other; push the values outward to the sides of the pair instead.
+            # other; push the values outward to the sides of the pair instead. A pair close
+            # to the left edge has no left side — its value would print through the row
+            # label — so that one drops below its dot instead.
             if crowded and idx in (0, len(xs_sorted) - 1):
-                anchor = "end" if idx == 0 else "start"
-                tx = x - 9 if idx == 0 else x + 9
-                ty = y + 4
+                val_txt = f'{v[u].get("ttft_p50"):,.0f}'
+                if idx == 0 and (x - 9 - 6.6 * len(val_txt)) < pad_l + 4:
+                    anchor, tx, ty = "middle", x, y + 19
+                else:
+                    anchor = "end" if idx == 0 else "start"
+                    tx = x - 9 if idx == 0 else x + 9
+                    ty = y + 4
             else:
                 anchor, tx, ty = "middle", x, y - 11
             o.append(f'<text x="{tx:.0f}" y="{ty}" class="cv" {_SVG_HALO} '
