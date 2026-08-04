@@ -9251,9 +9251,13 @@ async def bench_run(request: Request):
             return v
         return cast(v) if cast else v
 
+    # Graded runs default to a budget the long tasks can actually finish in. 512 cut verbose
+    # models off mid-function on semver_cmp-class tasks — the failure examples then read as
+    # broken code when the truth was an empty tank. An explicit max_tokens still wins.
+    _mt_default = 1024 if str(payload.get("suite") or "").strip() else 256
     config = {
         "runs": int(payload.get("runs", 5) or 5),
-        "max_tokens": int(payload.get("max_tokens", 256) or 256),
+        "max_tokens": int(payload.get("max_tokens", _mt_default) or _mt_default),
         "prompt_tokens": keep("prompt_tokens") if isinstance(payload.get("prompt_tokens"), list)
                          else int(payload.get("prompt_tokens", 0) or 0),
         "concurrency": (payload["concurrency"] if isinstance(payload.get("concurrency"), list)
@@ -10698,6 +10702,11 @@ def _bench_case_text(task: dict, idx: int, got) -> str:
         scope = f' inside @media {c["media"]}' if c.get("media") else ""
         return (f'{c.get("sel")} {{ {c["prop"]} }}{scope} → {gtxt}, '
                 f'expected {json.dumps(c.get("expect"))}')
+    if "setup" in c:                    # SQL: the query ran against this case's data
+        return f'query returned {gtxt}, expected {json.dumps(c.get("expect"))}'
+    if "stdin" in c:                    # bash: stdin in, stdout compared
+        stdin_short = (c.get("stdin") or "").replace("\n", "⏎")[:48]
+        return f'stdin "{stdin_short}" → {gtxt}, expected {json.dumps(c.get("expect"))}'
     return f'case {idx + 1} → {gtxt}'
 
 
@@ -12611,10 +12620,15 @@ _BENCH_LANGS = {
     "php": {"tags": {"php", ""}, "bare": re.compile(r"<\?php|\bfunction\s+\w+")},
     "html": {"tags": {"html", ""}, "bare": re.compile(r"<[a-zA-Z][^>]*>")},
     "css": {"tags": {"css", ""}, "bare": re.compile(r"[.#:\w\s,>-]+\{[^}]*\}")},
+    "go": {"tags": {"go", "golang", ""}, "bare": re.compile(r"\bfunc\s+\w+")},
+    "sql": {"tags": {"sql", "sqlite", ""}, "bare": re.compile(r"(?i)\bselect\b")},
+    "bash": {"tags": {"bash", "sh", "shell", ""},
+             "bare": re.compile(r"^#!|\b(?:awk|sed|sort|uniq|while\s+read)\b")},
 }
 
 # Toolchains may be user-local installs the service's PATH has never heard of.
-_BENCH_TOOL_DIRS = ("~/.cargo/bin", "~/.dotnet", "~/.local/php", "~/.local/bin")
+_BENCH_TOOL_DIRS = ("~/.cargo/bin", "~/.dotnet", "~/.local/php", "~/.local/bin",
+                    "~/.local/go/bin")
 
 
 def _bench_tool(name: str):
@@ -12646,26 +12660,46 @@ def _bench_lit(v, lang: str) -> str:
 # task was built around is the whole reason it is in the suite.
 
 
+# Hello-world programs per language, run once through the REAL grader to prove the toolchain
+# works end to end. A binary on PATH is not a working toolchain — a rustc with no linker
+# compiles nothing, and "available" would have zeroed every rust task on that box instead of
+# skipping them, which is exactly what the portability contract forbids.
+_BENCH_TOOLCHAIN_PROBES = {
+    "js": ("function probe() { return 7; }", "probe"),
+    "c": ("int probe(void) { return 7; }", "probe"),
+    "cpp": ("int probe(const std::string& s) { return (int)s.size() + 6; }", "probe"),
+    "rust": ("fn probe() -> i64 { 7 }", "probe"),
+    "csharp": ("public static class Sol { public static int Probe() { return 7; } }",
+               "Sol.Probe"),
+    "php": ("function probe(): int { return 7; }", "probe"),
+    "go": ("func Probe() int { return 7 }", "Probe"),
+}
+_BENCH_TOOLCHAIN_OK: dict = {}
+
+
 def _bench_lang_available(lang: str) -> bool:
-    """Whether this machine can grade a language at all. Portability contract: a task whose
-    tooling is absent is SKIPPED — dropped from the run and recorded as such — never scored as
-    a zero, because a zero would punish the model for the box."""
-    if lang in ("python", "html", "css", None, ""):
-        return True
-    if lang == "js":
-        return _bench_tool("node") is not None
-    if lang in ("c",):
-        return _bench_tool("gcc") is not None
-    if lang == "cpp":
-        return _bench_tool("g++") is not None
-    if lang == "rust":
-        return _bench_tool("rustc") is not None
-    if lang == "csharp":
-        return (_bench_tool("dotnet") is not None
-                and os.path.isdir(os.path.expanduser("~/.cache/ai_proxy_cs")))
-    if lang == "php":
-        return _bench_tool("php") is not None
-    return False
+    """Whether this machine can grade a language — verified, not inferred. Portability
+    contract: a task whose tooling is absent or broken is SKIPPED — dropped from the run and
+    recorded as such — never scored as a zero, because a zero would punish the model for the
+    box. The probe result is cached for the life of the process."""
+    if lang in ("python", "html", "css", "sql", None, ""):
+        return True                    # stdlib-only grading; nothing to probe
+    tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
+            "php": "php", "bash": "bash", "go": "go"}.get(lang)
+    if tool is None or _bench_tool(tool) is None:
+        return False
+    if lang == "csharp" and not os.path.isdir(os.path.expanduser("~/.cache/ai_proxy_cs")):
+        return False
+    if lang not in _BENCH_TOOLCHAIN_OK:
+        if lang == "bash":
+            res = _bench_grade_bash("echo 7", [{"stdin": "", "expect": "7"}], 20.0)
+        else:
+            code, entry = _BENCH_TOOLCHAIN_PROBES[lang]
+            args_case = [{"args": ["x"], "expect": 7}] if lang == "cpp" \
+                else [{"args": [], "expect": 7}]
+            res = _bench_grade_sync(code, entry, args_case, 30.0, lang)
+        _BENCH_TOOLCHAIN_OK[lang] = (res.get("passed") == res.get("total"))
+    return _BENCH_TOOLCHAIN_OK[lang]
 
 
 def _bench_suite_tasks(suite_name: str) -> tuple:
@@ -13072,6 +13106,25 @@ def _bench_grade_compiled(lang: str, code: str, entry: str, cases: list,
             comp_cmd = [dotnet, "build", "-v", "q", "--nologo", runner]
             dll = os.path.join(runner, "bin", "Debug", "net8.0", "csrunner.dll")
             run_cmd = [dotnet, dll]
+        elif lang == "go":
+            gobin = _bench_tool("go")
+            if not gobin:
+                return {"passed": 0, "total": len(cases), "error": "go is not installed"}
+            # The harness aliases fmt so a model that imports fmt itself doesn't collide,
+            # and a model that pasted its own `package main` line loses it rather than
+            # failing on a duplicate declaration.
+            body = re.sub(r"^\s*package\s+\w+\s*$", "", code, count=1, flags=re.M)
+            calls = "".join(
+                f'    __fmt.Println({entry}({", ".join(_bench_lit(a, "go") for a in c["args"])}))\n'
+                for c in cases)
+            src = ('package main\n\nimport __fmt "fmt"\n\n' + body
+                   + "\n\nfunc main() {\n" + calls + "}\n")
+            spath = os.path.join(workdir, "task.go")
+            epath = os.path.join(workdir, "task.exe")
+            env["GOCACHE"] = os.path.join(workdir, "gocache")
+            env["GOPATH"] = os.path.join(workdir, "gopath")
+            comp_cmd = [gobin, "build", "-o", epath, spath]
+            run_cmd = [epath]
         else:
             return {"passed": 0, "total": len(cases), "error": f"no compiler for {lang!r}"}
 
@@ -13085,7 +13138,10 @@ def _bench_grade_compiled(lang: str, code: str, entry: str, cases: list,
                     "error": ("compile error: " + msg).strip()}
         run = subprocess.run(run_cmd, capture_output=True, text=True,
                              timeout=timeout_s, env=env, cwd=workdir)
-        got = (run.stdout or "").strip().splitlines()
+        # splitlines on the raw output, not on .strip() of it: stripping ate trailing empty
+        # lines, so a function correctly returning "" lost its output line and every case
+        # after an empty result shifted — rust_kv_get's empty-string sentinel found this.
+        got = (run.stdout or "").splitlines()
         results = []
         for i, c in enumerate(cases):
             want = str(c["expect"]) if not isinstance(c["expect"], bool) else \
@@ -13165,6 +13221,77 @@ def _bench_grade_php(code: str, entry: str, cases: list, timeout_s: float) -> di
             pass
 
 
+def _bench_grade_sql(code: str, cases: list) -> dict:
+    """SQL grading on the stdlib sqlite3 — the one language that needs no toolchain at all.
+
+    Each case carries its own `setup` script (schema + data) and the expected rows. A fresh
+    in-memory database per case means no state leaks between cases, and rows compare as
+    lists so column order and row order are both part of the contract."""
+    import sqlite3 as _sq
+    sql = (code or "").strip().rstrip(";")
+    results = []
+    for c in cases:
+        ok, got = False, None
+        try:
+            conn = _sq.connect(":memory:")
+            conn.executescript(c.get("setup") or "")
+            got = [list(r) for r in conn.execute(sql).fetchall()]
+            ok = got == c.get("expect")
+            conn.close()
+        except _sq.Error as e:
+            got = f"{type(e).__name__}: {e}"
+        r = {"ok": bool(ok)}
+        if not ok:
+            r["got"] = got
+        results.append(r)
+    return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+            "cases": results}
+
+
+def _bench_grade_bash(code: str, cases: list, timeout_s: float) -> dict:
+    """Bash grading: the script gets each case's stdin and must print the expected stdout.
+    Pure text-in text-out — no filesystem contract, so nothing to sandbox beyond the same
+    subprocess + timeout every other language gets."""
+    bash = _bench_tool("bash")
+    if not bash:
+        return {"passed": 0, "total": len(cases), "error": "bash is not installed"}
+    workdir = tempfile.mkdtemp(prefix="bench_bash_")
+    try:
+        spath = os.path.join(workdir, "task.sh")
+        with open(spath, "w", encoding="utf-8", newline="\n") as f:
+            f.write(code or "")
+        env = {"PATH": os.environ.get("PATH", ""),
+               "SYSTEMROOT": os.environ.get("SYSTEMROOT", ""),
+               "LC_ALL": "C"}          # sorting must not depend on the box's locale
+        results = []
+        for c in cases:
+            ok, got = False, None
+            try:
+                run = subprocess.run([bash, spath], input=c.get("stdin") or "",
+                                     capture_output=True, text=True,
+                                     timeout=timeout_s, env=env, cwd=workdir)
+                got = (run.stdout or "").rstrip("\n")
+                if run.returncode != 0 and not got:
+                    got = (run.stderr or f"exit {run.returncode}")[-160:]
+                ok = got == str(c.get("expect")).rstrip("\n")
+            except subprocess.TimeoutExpired:
+                got = f"timeout after {timeout_s}s"
+            r = {"ok": bool(ok)}
+            if not ok:
+                r["got"] = got
+            results.append(r)
+        return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+                "cases": results}
+    except Exception as e:
+        return {"passed": 0, "total": len(cases), "error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            import shutil as _sh2
+            _sh2.rmtree(workdir, ignore_errors=True)
+        except Exception:
+            pass
+
+
 def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
                       lang: str = "python") -> dict:
     """Run one task's code against its cases in a subprocess. Blocking — call via to_thread.
@@ -13175,7 +13302,7 @@ def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
     """
     if lang == "c":
         return _bench_grade_c(code, entry, cases, timeout_s)
-    if lang in ("cpp", "rust", "csharp"):
+    if lang in ("cpp", "rust", "csharp", "go"):
         return _bench_grade_compiled(lang, code, entry, cases, timeout_s)
     if lang == "php":
         return _bench_grade_php(code, entry, cases, timeout_s)
@@ -13183,6 +13310,10 @@ def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
         return _bench_check_html(code, cases)
     if lang == "css":
         return _bench_check_css(code, cases)
+    if lang == "sql":
+        return _bench_grade_sql(code, cases)
+    if lang == "bash":
+        return _bench_grade_bash(code, cases, timeout_s)
     payload = json.dumps({"code": code, "entry": entry, "cases": cases})
     env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
     if lang == "js":
