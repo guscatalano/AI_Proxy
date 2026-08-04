@@ -9762,11 +9762,17 @@ _REPORT_CSS = """
   section { min-width:0; }
   footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--border);
            color:var(--ink-faint); font-size:11.5px; }
-  /* The task catalogue in the method section: id + one line on what it tests. */
+  /* The task catalogue in the method section: id + one line on what it tests. Full width,
+     below the spec grid — a wall of 29 descriptions inside one grid cell dwarfed the
+     one-word cells beside it. */
+  .catalog { margin-top:10px; }
+  .catalog .tierblk { background:var(--panel); border:1px solid var(--border);
+                      border-radius:10px; padding:11px 14px; margin-top:8px; }
+  .catalog .k { font-family:var(--mono); font-size:10px; letter-spacing:.1em;
+                text-transform:uppercase; color:var(--ink-faint); margin:0 0 6px; }
   .tl { list-style:none; margin:4px 0 0; padding:0; column-width:330px; column-gap:26px; }
   .tl li { margin:2px 0; font-size:12.5px; break-inside:avoid; }
   .tl span { color:var(--ink-faint); }
-  .tierblk { break-inside:avoid; }
   .tdesc { display:block; font-family:var(--sans, inherit); font-weight:400;
            font-size:11.5px; color:var(--ink-faint); margin-top:1px; }
   /* Weighted standings: the two-segment bar IS the weighting made visible. */
@@ -10211,11 +10217,23 @@ def _bench_scorecards(rows: list) -> str:
         return ""
     graded = any(r.get("perfect_rate") is not None for r in ok)
     bpm = _bench_best_per_model(rows)
-    win = bpm[0]
     sizes = _bench_size_by_model(rows)
 
     def nm(r):
-        return (r.get("_name") or "").split(" · ")[0]
+        return (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
+
+    # The recommendation IS the weighted ranking, not raw correctness: quality-first crowned
+    # a model 1 point more correct at half the speed. Same data, same default weights, same
+    # order as the Weighted standings section below — one verdict, stated twice.
+    wdata = _bench_weighted_data(rows) if graded else []
+    scores: dict = {}
+    if wdata:
+        ranked = _bench_weighted_rows(wdata, _BENCH_WEIGHT_DEFAULT / 100.0)
+        scores = {e["m"]: sc for e, sc, _q, _s in ranked}
+        by_name = {nm(r): r for r in bpm}
+        ordered = [by_name[e["m"]] for e, _sc, _q, _s in ranked if e["m"] in by_name]
+        bpm = ordered or bpm
+    win = bpm[0]
 
     def gbtxt(r):
         gb = sizes.get(nm(r))
@@ -10227,10 +10245,14 @@ def _bench_scorecards(rows: list) -> str:
         # measurements of a different model.
         q = (f'{(r.get("perfect_rate") or 0) * 100:.0f}% correct · ' if graded else "")
         t = (f' · answers in {r["total_p50"] / 1000:.1f}s' if r.get("total_p50") else "")
-        return f'{q}{r["decode_p50"]:,.1f} tok/s{gbtxt(r)}{t}'
+        s = (f' · score {scores[nm(r)] * 100:.0f}' if nm(r) in scores else "")
+        return f'{q}{r["decode_p50"]:,.1f} tok/s{gbtxt(r)}{t}{s}'
 
+    wtag = (f' — {100 - _BENCH_WEIGHT_DEFAULT}/{_BENCH_WEIGHT_DEFAULT} weighted'
+            if scores else "")
     cards = []
-    cards.append(f'<div class="card hi"><p class="k">Run this</p><p class="v">{_h(nm(win))}</p>'
+    cards.append(f'<div class="card hi"><p class="k">Run this{wtag}</p>'
+                 f'<p class="v">{_h(nm(win))}</p>'
                  f'<p class="d">{dline(win)}</p></div>')
     if len(bpm) > 1:
         ru = bpm[1]
@@ -11018,11 +11040,14 @@ ordinary slowness rather than a misconfiguration.</p>
   share of individual cases that passed, so a near-miss still scores there. A response with no
   extractable code block scores zero — that measures instruction-following, not coding.</p>
   <div class="spec">
-    <div><p class="k">Suite</p><p class="v">{_h(_suite_name)} — {len(_suite)} tasks,
-      {sum(len(t["cases"]) for t in _suite)} cases</p></div>
+    <div><p class="k">Suite</p><p class="v">{_h(_suite_name)}</p></div>
+    <div><p class="k">Tasks</p><p class="v">{len(_suite)}</p></div>
+    <div><p class="k">Cases</p><p class="v">{sum(len(t["cases"]) for t in _suite)}</p></div>
     <div><p class="k">Repeats</p><p class="v">{_h(str(_cfg0.get("runs") or 1))} per task</p></div>
-    {_blocks}
+    <div><p class="k">Languages</p><p class="v">{len({t.get("lang") or "python"
+      for t in _suite})}</p></div>
   </div>
+  <div class="catalog">{_blocks}</div>
   {_skip_html}
   <ul class="fn">
     <li>Grading executes model-written code in a subprocess with a hard timeout, a scratch

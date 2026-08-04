@@ -577,7 +577,7 @@ def test_weighted_section_declares_its_weights(client):
 
 def test_scorecard_stat_lines_match_between_cards(client):
     html = _render(_wfield())
-    cards = re.findall(r'<div class="card[^"]*"><p class="k">(Run this|Runner-up)</p>.*?'
+    cards = re.findall(r'<div class="card[^"]*"><p class="k">(Run this|Runner-up)[^<]*</p>.*?'
                        r'<p class="d">(.*?)</p>', html, re.S)
     lines = dict(cards)
     assert "Run this" in lines and "Runner-up" in lines
@@ -632,3 +632,16 @@ def test_scatter_labels_do_not_collide_in_a_crowded_field(client):
     svg = P._bench_scatter_svg(rows)
     hits = _svg_text_collisions(svg)
     assert not hits, f"overlapping chart text: {hits[:4]}"
+
+
+def test_the_scorecard_verdict_is_the_weighted_one(client):
+    """"Run this" and the Weighted standings must agree — one verdict, stated twice. Raw
+    correctness crowned the model 1 point better at half the speed."""
+    html = _render(_wfield())
+    win = re.search(r'Run this[^<]*</p><p class="v">([^<]+)</p>', html)
+    assert win and win.group(1) == "fastclose", win and win.group(1)
+    assert re.search(r'Run this — \d+/\d+ weighted', html), \
+        "the card must say it is a weighted verdict"
+    for card in re.findall(r'<p class="k">(?:Run this[^<]*|Runner-up)</p>.*?<p class="d">([^<]*)</p>',
+                           html, re.S):
+        assert "score" in card, "every ranked card carries its score"
