@@ -153,3 +153,29 @@ def test_vllm_container_is_found_while_stopped(client, monkeypatch):
 def test_info_advertises_the_slot(client):
     d = client.get("/__proxy/api/info").json()
     assert d.get("llamacpp") == P.LLAMACPP_URL
+
+
+def test_a_running_llamacpp_keys_the_index_by_its_checkpoint_path(client, monkeypatch):
+    """The stopped fallback keys on the configured PATH and sweeps submit that path. When the
+    display id was cleaned for the System tab, a running llama.cpp stopped matching its own
+    cells: eleven server-context cells failed preflight in zero seconds each with
+    "does not serve <path> — it has <clean name>"."""
+    import asyncio
+    path = "/models/DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf"
+
+    def fake_sysinfo():
+        return {"llamacpp": {"available": [{"id": "DeepSeek-V4-Flash-0731-UD-IQ2_XXS"}],
+                             "model_path": path, "n_ctx": 32768, "parallel": 1},
+                "ollama": {}, "lmstudio": {}, "vllm": {}}
+
+    monkeypatch.setattr(P, "system_now", fake_sysinfo)
+    monkeypatch.setattr(P, "_llamacpp_cfg", lambda: {"model": path})
+    async def no_containers():
+        return []
+    monkeypatch.setattr(P, "_vllm_configs", no_containers)
+    index = asyncio.run(P._bench_model_index())
+    key = f"llamacpp:{path}"
+    assert key in index, sorted(k for k in index if k.startswith("llamacpp"))
+    assert index[key]["loaded"] is True
+    meta = P._bench_resolve_model(index, path, "llamacpp")
+    assert meta and meta.get("loaded"), "the sweep's own model string must resolve while up"

@@ -8884,7 +8884,12 @@ async def _bench_model_index() -> dict:
         lcp = sysinfo.get("llamacpp") or {}
         for m in (lcp.get("available") or []):
             if isinstance(m, dict):
-                put(m.get("id"), "llamacpp", True,
+                # Identity is the checkpoint PATH, not the snapshot's display id. The stopped
+                # fallback below keys on the configured path, and sweeps submit that path — so
+                # when the display id was cleaned for the System tab, a running llama.cpp
+                # stopped matching its own cells: preflight said "does not serve <path> — it
+                # has <clean name>" and eleven server-context cells died in zero seconds each.
+                put(lcp.get("model_path") or m.get("id"), "llamacpp", True,
                     arch=m.get("arch"), quant=m.get("quant"),
                     max_context=m.get("max_context_length") or lcp.get("n_ctx"),
                     loaded_context=lcp.get("n_ctx"),
