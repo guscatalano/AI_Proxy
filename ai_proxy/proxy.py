@@ -1552,6 +1552,43 @@ def _model_parallelism(runtime: str, arch: str | None = None, name: str | None =
     return {"parallel": None, "reason": "unknown runtime"}
 
 
+# Latest released Ollama, from GitHub, cached for an hour: the System tab polls its snapshot
+# every few seconds and the answer changes a few times a month.
+_OLLAMA_LATEST: dict = {"ts": 0.0, "version": None}
+
+
+async def _ollama_latest_version(client: httpx.AsyncClient) -> str | None:
+    now = time.time()
+    if now - _OLLAMA_LATEST["ts"] < 3600:
+        return _OLLAMA_LATEST["version"]
+    try:
+        r = await client.get("https://api.github.com/repos/ollama/ollama/releases/latest",
+                             timeout=8.0)
+        if r.status_code == 200:
+            tag = str((r.json() or {}).get("tag_name") or "").lstrip("v") or None
+            _OLLAMA_LATEST.update(ts=now, version=tag)
+            return tag
+    except (httpx.RequestError, ValueError):
+        pass
+    _OLLAMA_LATEST["ts"] = now      # a failed probe also waits an hour before retrying
+    return _OLLAMA_LATEST["version"]
+
+
+def _ollama_update_cmd() -> list | None:
+    """The command that updates Ollama, if this deployment has set one up.
+
+    The proxy's user cannot run the installer directly — it needs root — so the contract is a
+    root-owned script the sudoers file allows without a password, e.g.:
+        /usr/local/sbin/ollama-update  containing  `curl -fsSL https://ollama.com/install.sh | sh`
+        sudoers: crimson ALL=(root) NOPASSWD: /usr/local/sbin/ollama-update
+    Configured via model_control.ollama_update_cmd (a list); absent means the button hides.
+    """
+    cmd = (load_rules_config().get("model_control") or {}).get("ollama_update_cmd")
+    if isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd):
+        return cmd
+    return None
+
+
 async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
     out: dict = {"reachable": False, "ps": [], "tags": [], "env": {}, "env_source": None,
                  "pid": None, "version": None, "recommended_version": OLLAMA_RECOMMENDED_VERSION,
@@ -1577,6 +1614,12 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
         pass
     if out["version"] and OLLAMA_RECOMMENDED_VERSION:
         out["outdated"] = _semver_tuple(out["version"]) < _semver_tuple(OLLAMA_RECOMMENDED_VERSION)
+    latest = await _ollama_latest_version(client)
+    out["latest_version"] = latest
+    out["update_available"] = bool(
+        out["version"] and latest
+        and _semver_tuple(latest) > _semver_tuple(out["version"]))
+    out["update_configured"] = bool(_ollama_update_cmd())
     try:
         r = await client.get(f"{OLLAMA_URL}/api/ps")
         if r.status_code == 200:
@@ -8145,6 +8188,59 @@ async def control_service(name: str, request: Request):
     # A unit that reports active has been forked, not necessarily made ready — ComfyUI takes
     # a while to load. The caller polls the backend's own probe for readiness.
     return {"ok": True, "action": action, "state": await _service_state(svc)}
+
+
+@app.post("/__proxy/api/control/ollama/update")
+async def control_ollama_update():
+    """Update Ollama in place, from the proxy.
+
+    Refuses while a bench is running — the installer restarts the service, which would turn
+    every in-flight cell into a page of 502s attributed to whatever model was being measured.
+    Requires a root-owned updater script this deployment's sudoers allows without a password
+    (see _ollama_update_cmd); the proxy's own user has no business running installers as root.
+    """
+    cmd = _ollama_update_cmd()
+    if not cmd:
+        return JSONResponse(
+            {"error": "no updater configured — set model_control.ollama_update_cmd to a "
+                      "command the proxy may run without a password, e.g. "
+                      '["sudo", "-n", "/usr/local/sbin/ollama-update"]'},
+            status_code=501)
+    conn = db()
+    busy = conn.execute(
+        "SELECT COUNT(*) FROM bench_runs WHERE status IN ('running', 'pending')").fetchone()[0]
+    conn.close()
+    if busy:
+        return JSONResponse(
+            {"error": "a benchmark is running — updating restarts Ollama and would corrupt "
+                      "it. Try again when it finishes."}, status_code=409)
+
+    async def _version() -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as c:
+                r = await c.get(f"{OLLAMA_URL}/api/version")
+                return (r.json() or {}).get("version") if r.status_code == 200 else None
+        except (httpx.RequestError, ValueError):
+            return None
+
+    before = await _version()
+    code, out = await _run_cmd(cmd, 900.0, max_chars=2000, keep_tail=True)
+    if code != 0:
+        return JSONResponse({"error": f"updater exited {code}: {out[:500]}",
+                             "version_before": before}, status_code=502)
+    # The installer restarts the service; give it a moment to come back before reporting.
+    # If Ollama wasn't answering before the update there is nothing to wait out.
+    after = None
+    for i in range(30 if before else 1):
+        after = await _version()
+        if after:
+            break
+        await asyncio.sleep(2)
+    _OLLAMA_LATEST["ts"] = 0.0          # the next snapshot re-checks what "latest" means now
+    return {"ok": True, "version_before": before, "version_after": after,
+            "changed": bool(before and after and before != after),
+            "note": None if after else "updater succeeded but Ollama has not answered yet",
+            "output": out[-800:]}
 
 
 @app.get("/__proxy/api/control/models/vllm")

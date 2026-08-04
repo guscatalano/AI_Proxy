@@ -4550,6 +4550,26 @@ async function toggleRule(name, enabled) {
   loadAudit();
 }
 
+async function updateOllama(btn) {
+  if (!confirm('Update Ollama now? The service restarts, so loaded models unload and ' +
+               'in-flight requests fail. Benchmarks block this automatically.')) return;
+  btn.disabled = true; btn.textContent = 'Updating…';
+  try {
+    const r = await fetch('/__proxy/api/control/ollama/update', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || ('update failed (' + r.status + ')')); return; }
+    alert(d.changed
+      ? `Updated: v${d.version_before} → v${d.version_after}`
+      : `Updater ran (v${d.version_before || '?'} → v${d.version_after || '?'})` +
+        (d.note ? ` — ${d.note}` : ''));
+    loadSystem();
+  } catch (e) {
+    alert('update failed: ' + e);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Update Ollama';
+  }
+}
+
 function ollamaConfigSection(ollama) {
   const env = ollama.env || {};
   const keys = Object.keys(env).sort();
@@ -4562,6 +4582,14 @@ function ollamaConfigSection(ollama) {
         ? `<span style="background:#4a4020;color:#f0c674;border:1px solid #6a5a3a;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)} · upgrade ≥ v${esc(ollama.recommended_version || '')} recommended</span>`
         : `<span style="background:#1e3a26;color:#68d391;border:1px solid #2e5a36;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)}</span>`)
     : '';
+  // "An update exists" and "this proxy can apply it" are separate facts: the pill shows
+  // whenever GitHub has something newer; the button only when an updater command is set up.
+  const updatePill = ollama.update_available
+    ? `<span style="background:#243a4a;color:#7cc7f0;border:1px solid #33566b;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.latest_version)} available</span>`
+    : '';
+  const updateBtn = (ollama.update_available && ollama.update_configured)
+    ? `<button onclick="event.preventDefault();updateOllama(this)" style="background:#262d38;border:1px solid #33566b;color:#7cc7f0;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer">Update Ollama</button>`
+    : '';
   const meta = [
     ollama.pid ? 'pid ' + ollama.pid : null,
     ollama.env_source ? 'from ' + ollama.env_source : null,
@@ -4570,7 +4598,7 @@ function ollamaConfigSection(ollama) {
     <details class="stats-section" open>
       <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
         <span style="color:#888;font-size:10px;width:10px">▾</span>
-        <h2 style="margin:0">Ollama Server Config ${versionLabel} <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
+        <h2 style="margin:0">Ollama Server Config ${versionLabel} ${updatePill} ${updateBtn} <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
       </summary>
       <table style="width:100%">
         <thead><tr><th>Variable</th><th>Value</th></tr></thead>
@@ -6796,7 +6824,7 @@ async function loadBench() {
       </div>
       <div id="bench-compare-bar" style="display:none;background:#12141b;border:1px solid #2a3e5a;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;align-items:center;gap:8px">
         <span style="flex:1" id="bench-compare-label"></span>
-        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Compare ↔</button>
+        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Report ↗</button>
         <button id="bench-compare-clear" style="background:#262d38;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Clear</button>
       </div>
       <div id="bench-compare-view"></div>
@@ -6812,7 +6840,13 @@ async function loadBench() {
       .forEach(id => { const el = $(id); if (el) el.addEventListener('change', _benchUpdatePlan); });
     const tempEl = $('bench-temp');
     if (tempEl) tempEl.addEventListener('input', _benchUpdatePlan);
-    $('bench-compare-btn').onclick = _benchRenderCompare;
+    // The selection opens the report — the same whitepaper as any run, over the selected
+    // ids. The old in-page A/B comparison view rendered broken and is retired.
+    $('bench-compare-btn').onclick = () => {
+      if (!_benchSelected.size) return;
+      window.open('/__proxy/api/bench/report?format=html&ids='
+                  + encodeURIComponent([..._benchSelected].join(',')), '_blank');
+    };
     $('bench-compare-clear').onclick = () => { _benchSelected.clear(); _benchUpdateCompareBar(); loadBench(); };
     for (const b of document.querySelectorAll('.bench-mode')) {
       b.onclick = () => _benchSetMode(b.dataset.mode);
@@ -7946,9 +7980,10 @@ function _benchUpdateCompareBar() {
   const bar = $('bench-compare-bar');
   if (_benchSelected.size === 0) { bar.style.display = 'none'; return; }
   bar.style.display = 'flex';
-  $('bench-compare-label').textContent = `${_benchSelected.size} selected for comparison`;
-  // Two runs get a delta column; more than two get a ranked table. One is never useful.
-  $('bench-compare-btn').disabled = _benchSelected.size < 2;
+  $('bench-compare-label').textContent =
+    `${_benchSelected.size} selected — one report over all of them`;
+  // Even a single selection is a valid report; it is the same page a finished run links to.
+  $('bench-compare-btn').disabled = _benchSelected.size < 1;
 }
 
 async function _benchRenderCompare() {
