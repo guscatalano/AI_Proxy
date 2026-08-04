@@ -10727,6 +10727,8 @@ def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
                         detail = _bench_case_text(tasks[t], i, c.get("got"))
                         break
             if detail:
+                if g.get("truncated"):
+                    detail = f"hit the token cap mid-answer — {detail}"
                 ex = {"cell": name, "detail": detail}
                 # The code that produced the failure, exactly as the grader extracted it.
                 # A wrong answer without the code is a verdict; with it, it's a diagnosis.
@@ -13904,6 +13906,17 @@ def _bench_extract_code(text: str, lang: str = "python") -> str:
     untagged = [b for t, b in blocks if not t]
     if untagged:
         return max(untagged, key=len)
+    # An OPENED fence that never closes is what a response cut off at the token limit looks
+    # like. Grading everything after the fence keeps the diagnosis honest: the code fails on
+    # its real truncation point, not on the fence line itself — 67 rows once read
+    # "SyntaxError: invalid syntax (line 1)" when the model had written a perfect opening.
+    if not blocks:
+        m = re.search(r"```([A-Za-z0-9+]*)[ \t]*\n(.*)\Z", text or "", re.DOTALL)
+        if m:
+            tag = m.group(1).lower()
+            if tag in cfg["tags"]:
+                return m.group(2)
+            return ""      # a fence for some other language: never grade it as this one
     if not blocks and cfg["bare"].search(text or ""):
         return text
     return ""
@@ -15823,6 +15836,14 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                             if not res.get("error"):
                                 res["grade"] = await _bench_grade(res.get("text") or "", task,
                                                                   grade_timeout)
+                                # A failing grade on a response that used its whole token
+                                # budget is a different diagnosis from wrong code, and the
+                                # report must say which one it is.
+                                g = res["grade"]
+                                if (isinstance(g, dict)
+                                        and (g.get("passed") or 0) < (g.get("total") or 1)
+                                        and (res.get("completion_tokens") or 0) >= max_tokens):
+                                    g["truncated"] = True
                             # The full response can be megabytes across a suite; the grade is
                             # the durable artifact, so keep only a readable excerpt.
                             if "text" in res:

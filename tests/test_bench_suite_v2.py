@@ -842,3 +842,32 @@ def test_css_checker_honours_media_scope():
 def test_the_suite_spans_nine_languages():
     langs = {t.get("lang") or "python" for t in P._BENCH_SUITES["coding-v2"]}
     assert langs == {"python", "js", "c", "cpp", "rust", "csharp", "php", "html", "css"}
+
+
+def test_an_unterminated_fence_grades_the_code_not_the_fence():
+    """A response cut off at the token limit has an opening fence and no closing one. Grading
+    the whole text fed '```python' to the interpreter: 67 rows read "SyntaxError line 1" when
+    the model had written a perfect opening."""
+    cut = "```python\ndef f(x):\n    return x + 1\n"          # no closing fence
+    got = P._bench_extract_code(cut, "python")
+    assert got.startswith("def f"), got
+    assert "```" not in got
+    # A fence for a DIFFERENT language never grades as this one, terminated or not.
+    assert P._bench_extract_code("```javascript\nfunction f() {}\n", "python") == ""
+    # Terminated blocks still win over the truncation fallback.
+    both = "```python\ndef a():\n    return 1\n```\ntext\n```python\ndef b(:"
+    assert "def a" in P._bench_extract_code(both, "python")
+
+
+def test_a_truncated_failing_grade_says_so_in_the_examples():
+    from test_bench_report_layout import _graded, _render
+    runs = [_graded("a", "m1", "ollama", 0.5, 30, {"semver_cmp": 0.0})]
+    runs[0]["config"]["suite"] = "coding-v2"
+    runs[0]["results"]["rows"] = [
+        {"seq": 1, "task": "semver_cmp", "completion_tokens": 512,
+         "text": "```python\ndef semver_cmp(a, b):\n    part",
+         "grade": {"passed": 0, "total": 8, "truncated": True,
+                   "error": "SyntaxError: invalid syntax (<model>, line 2)"}},
+    ]
+    html = _render(runs)
+    assert "hit the token cap mid-answer" in html
