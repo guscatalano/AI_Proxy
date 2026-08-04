@@ -369,7 +369,8 @@ def test_a_graded_comparison_carries_the_trade_off_chart(client):
     assert 'aria-label="Correctness against output rate"' in html
     # The frontier and the hover names are what make it worth having.
     assert "stroke-dasharray" in html
-    assert "<title>" in html.split("The trade-off")[-1].split("</svg>")[0]
+    # Anchor on the chart's own h2 — "The trade-off — explore" now also exists further down.
+    assert "<title>" in html.split("<h2>The trade-off</h2>")[-1].split("</svg>")[0]
     # And it sits before the results table, not buried after the bars.
     assert html.index("The trade-off") < html.index("<h2>Results</h2>")
 
