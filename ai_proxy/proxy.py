@@ -10733,6 +10733,10 @@ def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
                 lang = tasks[t].get("lang") or "python"
                 code = _bench_extract_code(rr.get("text") or "", lang)
                 if code:
+                    # Stored replies are truncated at 4 KB, which can cut a closing fence;
+                    # the extractor then falls back to the whole text, opening fence and
+                    # all. The grader saw the untruncated reply, so only display needs this.
+                    code = re.sub(r"^```[\w+]*[ \t]*\n", "", code)
                     ex["code"] = code[:1600] + ("\n… (truncated)" if len(code) > 1600 else "")
                 elif rr.get("text"):
                     # No extractable block IS the failure mode for some responses; showing
@@ -14824,6 +14828,17 @@ def _host_hw_facts() -> dict:
                     break
     except OSError:
         pass
+    if not facts.get("cpu_model") or facts["cpu_model"].startswith("0x"):
+        # ARM /proc/cpuinfo gives a hex part code ("0xd87"), which names nothing. lscpu
+        # resolves it to the actual core ("Cortex-X925"); the hex stays as the fallback.
+        try:
+            out = subprocess.run(["lscpu"], capture_output=True, text=True,
+                                 timeout=5).stdout
+            m = re.search(r"^Model name:\s*(.+)$", out, re.M)
+            if m and m.group(1).strip() != "-":
+                facts["cpu_model"] = m.group(1).strip()
+        except (OSError, subprocess.SubprocessError):
+            pass
     try:
         os_release = Path("/etc/os-release").read_text(encoding="utf-8", errors="replace")
         m = re.search(r'^PRETTY_NAME="?([^"\n]+)', os_release, re.M)
