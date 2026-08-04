@@ -543,3 +543,92 @@ def test_engine_pairs_never_mix_concurrency_levels(client):
         concs = {(run.get("config") or {}).get("concurrency")
                  for run in runs for u, r in v.items() if r is rows[runs.index(run)]}
         assert len(concs) == 1, "a pair mixed concurrency levels"
+
+
+# ---- weighted standings: the trade-off made explicit -----------------------------------------
+
+def _wfield():
+    """The user's own example: 1 point more correct does not buy half the speed."""
+    return [_graded("a", "slowbetter", "ollama", 0.87, 17.7, {"x": 0.9}),
+            _graded("b", "fastclose", "ollama", 0.86, 36.0, {"x": 0.9}),
+            _graded("c", "third", "ollama", 0.50, 20.0, {"x": 0.5})]
+
+
+def test_weighted_standings_rank_speed_adjusted(client):
+    data = P._bench_weighted_data([P._bench_report_row(r) for r in _wfield()])
+    ranked = P._bench_weighted_rows(data, P._BENCH_WEIGHT_DEFAULT / 100.0)
+    assert ranked[0][0]["m"] == "fastclose", \
+        "at 70/30 the model 1 point behind at twice the speed must lead"
+    quality_only = P._bench_weighted_rows(data, 0.0)
+    assert quality_only[0][0]["m"] == "slowbetter", "at w=0 correctness alone must rule"
+
+
+def test_weighted_section_declares_its_weights(client):
+    html = _render(_wfield())
+    assert "Weighted standings" in html
+    assert "% × correctness +" in html and "% × relative speed" in html, \
+        "the formula must be printed, not implied"
+    assert 'id="wrange"' in html and 'type="range"' in html, "the weighting must be adjustable"
+    assert f'value="{P._BENCH_WEIGHT_DEFAULT}"' in html
+    body = html.split('id="wbody"')[1]
+    assert body.index("fastclose") < body.index("slowbetter"), \
+        "the server-rendered default order must already be speed-adjusted"
+
+
+def test_scorecard_stat_lines_match_between_cards(client):
+    html = _render(_wfield())
+    cards = re.findall(r'<div class="card[^"]*"><p class="k">(Run this|Runner-up)</p>.*?'
+                       r'<p class="d">(.*?)</p>', html, re.S)
+    lines = dict(cards)
+    assert "Run this" in lines and "Runner-up" in lines
+    for k in lines:
+        assert "% correct" in lines[k], f"{k} must label its correctness"
+        assert "answers in" in lines[k], f"{k} must state time to an answer"
+
+
+# ---- task descriptions: the id alone says nothing --------------------------------------------
+
+def test_the_method_section_describes_every_task(client):
+    html = _render(_wfield())
+    sect = html.split("What was tested")[-1]
+    assert '<ul class="tl">' in sect
+    assert P._BENCH_TASK_DESC["binary_search"] in sect
+
+
+def test_imperfect_tasks_carry_their_description(client):
+    runs = [_graded("a", "m1", "ollama", 0.5, 30, {"roman": 0.5, "binary_search": 1.0}),
+            _graded("b", "m2", "ollama", 0.6, 40, {"roman": 0.7, "binary_search": 1.0})]
+    html = _render(runs)
+    sect = html.split("Per-task correctness")[-1].split("What was tested")[0]
+    assert P._BENCH_TASK_DESC["roman"] in sect
+
+
+# ---- chart labels must not print through each other ------------------------------------------
+
+def _svg_text_collisions(svg):
+    boxes = []
+    for m in re.finditer(r'<text x="([\d.]+)" y="([\d.]+)"([^>]*)>(.*?)</text>', svg):
+        x, y, attrs, txt = float(m[1]), float(m[2]), m[3], re.sub(r"<[^>]+>", "", m[4])
+        anchor = (re.search(r'text-anchor="(\w+)"', attrs) or (None, "start"))[1]
+        w = 6.6 * len(txt)
+        x0 = x - w if anchor == "end" else x - w / 2 if anchor == "middle" else x
+        boxes.append((x0, y, x0 + w, txt))
+    hits = []
+    for i in range(len(boxes)):
+        for j in range(i + 1, len(boxes)):
+            a, b = boxes[i], boxes[j]
+            if a[3] and b[3] and abs(a[1] - b[1]) < 11 and a[0] < b[2] and b[0] < a[2]:
+                hits.append((a[3], b[3]))
+    return hits
+
+
+def test_scatter_labels_do_not_collide_in_a_crowded_field(client):
+    """Twenty models with half of them sharing the top band is the real shape of a full sweep;
+    the labels must dodge, drop, or defer to the annotations — never overprint."""
+    runs = [_graded(f"r{i}", f"model-with-a-name-{i}", "ollama",
+                    1.0 if i < 6 else 0.85 + (i % 5) * 0.02, 12 + i * 9, {"x": 1.0})
+            for i in range(16)]
+    rows = [P._bench_report_row(r) for r in runs]
+    svg = P._bench_scatter_svg(rows)
+    hits = _svg_text_collisions(svg)
+    assert not hits, f"overlapping chart text: {hits[:4]}"

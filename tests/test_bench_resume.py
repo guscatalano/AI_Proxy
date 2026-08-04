@@ -501,3 +501,42 @@ def test_a_done_cell_with_zero_successes_is_not_reused(client):
     assert P._bench_cell_sig("m1", dict(_CFG)) in sigs
     assert P._bench_cell_sig("m2", dict(_CFG)) not in sigs, "all-failure cell got reused"
     assert P._bench_cell_sig("m3", dict(_CFG)) not in sigs, "resultless cell got reused"
+
+
+def test_residency_snapshot_records_and_restores_the_exact_container(client, monkeypatch):
+    """Two containers configured for one port means "vllm was running" is not enough to put
+    the box back: a restore that rediscovers by port starts whichever sorts first, and the
+    sweep that measured Ornith all afternoon handed the box back running qwen instead."""
+    import asyncio
+
+    class FakeVllm:
+        name, control = "vllm", "docker"
+
+        async def state(self):
+            return {"running": True, "container": "ornith-vllm"}
+
+    started = {}
+
+    class FakeVllmDown(FakeVllm):
+        async def state(self):
+            return {"running": False, "container": None}
+
+        async def start(self, container=None):
+            started["container"] = container
+            return {"ok": True}
+
+        async def ready(self, t):
+            return True
+
+    monkeypatch.setattr(P, "PROVIDERS", {"vllm": FakeVllm()})
+    monkeypatch.setattr(P, "SIDE_SERVICES", {})
+    snap = asyncio.run(P._bench_residency_snapshot())
+    entry = next(e for e in snap["backends"] if e["name"] == "vllm")
+    assert entry["was_running"] and entry.get("container") == "ornith-vllm"
+
+    down = FakeVllmDown()
+    monkeypatch.setattr(P, "PROVIDERS", {"vllm": down})
+    monkeypatch.setattr(P, "backend", lambda name: down if name == "vllm" else None)
+    asyncio.run(P._bench_restore_residency({"backends": [entry], "ollama": []}))
+    assert started.get("container") == "ornith-vllm", \
+        "restore must start the container the snapshot recorded, not rediscover by port"

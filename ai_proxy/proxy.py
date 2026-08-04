@@ -2066,9 +2066,13 @@ class SideService:
         """Everything needed to render a control: running, and why not if not."""
         return {"running": False, "control": self.control}
 
-    async def start(self) -> dict:
-        """Bring it up. Returns {ok, detail}; readiness is a separate question."""
-        return await _control_backend(self, "start")
+    async def start(self, container: str | None = None) -> dict:
+        """Bring it up. Returns {ok, detail}; readiness is a separate question.
+
+        `container` names the specific docker container to start, for backends where several
+        are configured for the same port. Restore paths pass the one their snapshot recorded;
+        without it, discovery falls back to the first configured match."""
+        return await _control_backend(self, "start", container=container)
 
     async def stop(self) -> dict:
         return await _control_backend(self, "stop")
@@ -2438,7 +2442,7 @@ class _FnSideService(SideService):
         return {"running": None, "control": self.control}
 
 
-async def _control_backend(b, action: str) -> dict:
+async def _control_backend(b, action: str, container: str | None = None) -> dict:
     """The three start/stop mechanisms, in one place.
 
     They were previously re-derived from the backend's name at every call site — the residency
@@ -2453,7 +2457,7 @@ async def _control_backend(b, action: str) -> dict:
                                    env=_systemctl_env(svc))
         return {"ok": code == 0, "detail": out[:300], "via": "systemctl"}
     if b.control == "docker":
-        container = await _vllm_container()
+        container = container or await _vllm_container()
         if not container:
             return {"ok": False, "detail": "no container publishing this backend's port"}
         docker_action = "start" if action == "start" else "stop"
@@ -8654,6 +8658,7 @@ async def bench_suites():
                 "name": name,
                 "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"]),
                            "lang": t.get("lang") or "python",
+                           "desc": _BENCH_TASK_DESC.get(t["id"]) or "",
                            "available": _bench_lang_available(t.get("lang") or "python")}
                           for t in tasks],
                 "task_count": len(tasks),
@@ -9757,6 +9762,26 @@ _REPORT_CSS = """
   section { min-width:0; }
   footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--border);
            color:var(--ink-faint); font-size:11.5px; }
+  /* The task catalogue in the method section: id + one line on what it tests. */
+  .tl { list-style:none; margin:4px 0 0; padding:0; column-width:330px; column-gap:26px; }
+  .tl li { margin:2px 0; font-size:12.5px; break-inside:avoid; }
+  .tl span { color:var(--ink-faint); }
+  .tierblk { break-inside:avoid; }
+  .tdesc { display:block; font-family:var(--sans, inherit); font-weight:400;
+           font-size:11.5px; color:var(--ink-faint); margin-top:1px; }
+  /* Weighted standings: the two-segment bar IS the weighting made visible. */
+  .wslider { display:flex; align-items:center; gap:12px; margin:10px 0 4px;
+             font-size:12px; color:var(--ink-faint); }
+  .wslider input { flex:0 1 260px; accent-color:var(--accent); }
+  .wslider b { color:var(--ink); font-variant-numeric:tabular-nums; }
+  .wbar { display:inline-block; width:150px; height:11px; border-radius:3px;
+          background:var(--panel-2); overflow:hidden; vertical-align:middle; }
+  .wbar i { display:inline-block; height:100%; float:left; }
+  .wbar .q { background:var(--accent); }
+  .wbar .s { background:var(--blue); }
+  .wtab td b { font-variant-numeric:tabular-nums; margin-left:8px; }
+  .wkey i { display:inline-block; width:10px; height:10px; border-radius:2px;
+            vertical-align:-1px; margin-right:4px; }
   @media print {
     :root { --bg:#fff; --panel:#fff; --panel-2:#f5f5f2; --border:#e4e4e1;
             --ink:#121212; --ink-dim:#454b52; --ink-faint:#727272;
@@ -9826,6 +9851,93 @@ def _report_page(title: str, eyebrow: str, sub: str, meta: list, body: str) -> s
 # colour painted under the glyphs. Strokes in var(--bg), so it works in both themes.
 _SVG_HALO = ('paint-order="stroke" stroke="var(--bg)" stroke-width="3.5" '
              'stroke-linejoin="round"')
+
+
+_BENCH_WEIGHT_DEFAULT = 30      # % of the score that is speed; the rest is correctness
+
+
+def _bench_weighted_data(rows: list) -> list:
+    """One entry per model — its best cell's correctness and decode rate, speed normalised to
+    the fastest model in the field so the two axes share a 0..1 scale."""
+    bpm = [r for r in _bench_best_per_model(rows)
+           if r.get("decode_p50") and r.get("perfect_rate") is not None]
+    if len(bpm) < 3:
+        return []
+    dmax = max(r["decode_p50"] for r in bpm)
+    return [{"m": (r.get("_name") or _bench_label_display(r.get("label") or "")
+                   ).split(" · ")[0],
+             "q": round(r["perfect_rate"], 4),
+             "d": round(r["decode_p50"], 1),
+             "s": round(r["decode_p50"] / dmax, 4)} for r in bpm]
+
+
+def _bench_weighted_rows(data: list, w: float) -> list:
+    """(entry, score, q_share, s_share) sorted by score. Mirrored exactly by the page's JS —
+    the server renders the default so the section survives with scripts off."""
+    out = []
+    for e in data:
+        qc, sc = (1 - w) * e["q"], w * e["s"]
+        out.append((e, qc + sc, qc, sc))
+    return sorted(out, key=lambda t: -t[1])
+
+
+def _bench_weighted_html(rows: list) -> str:
+    """A ranking that says out loud what it trades: N% correctness, M% relative speed.
+
+    The raw table sorts by correctness alone, which crowns a model 1 point more correct and
+    half the speed — an exchange nobody would actually make. The weights are printed in the
+    heading, drawn as the two segments of every score bar, and adjustable live; there is no
+    hidden judgement to disagree with, only a slider."""
+    data = _bench_weighted_data(rows)
+    if not data:
+        return ""
+    w = _BENCH_WEIGHT_DEFAULT / 100.0
+    dmax = max(e["d"] for e in data)
+    fastest = next(e["m"] for e in data if e["d"] == dmax)
+    trs = []
+    for rank, (e, score, qc, sc) in enumerate(_bench_weighted_rows(data, w), start=1):
+        trs.append(
+            f'<tr><td class="n">{rank}</td>'
+            f'<th scope="row"><code class="mdl">{_h(e["m"])}</code></th>'
+            f'<td class="n">{e["q"] * 100:.0f}%</td>'
+            f'<td class="n">{e["d"]:,.1f}</td>'
+            f'<td><div class="wbar"><i class="q" style="width:{qc * 100:.1f}%"></i>'
+            f'<i class="s" style="width:{sc * 100:.1f}%"></i></div>'
+            f'<b>{score * 100:.0f}</b></td></tr>')
+    payload = json.dumps(data)
+    return f"""<h2>Weighted standings</h2>
+<p class="note">Correctness alone is not a ranking — one point of correctness is not worth half
+the speed. Each model's best cell scores
+<b><span id="wq">{100 - _BENCH_WEIGHT_DEFAULT}</span>% × correctness +
+<span id="ws">{_BENCH_WEIGHT_DEFAULT}</span>% × relative speed</b>, where relative speed is
+decode rate against the fastest model in this report ({_h(fastest)}, {dmax:,.1f} tok/s = 1.0).
+The bar is the weighting made visible:
+<span class="wkey"><i style="background:var(--accent)"></i>correctness</span> ·
+<span class="wkey"><i style="background:var(--blue)"></i>speed</span>.
+Drag to change what you value; the ranking recomputes.</p>
+<div class="wslider"><span>all correctness</span>
+<input id="wrange" type="range" min="0" max="100" step="5"
+ value="{_BENCH_WEIGHT_DEFAULT}" aria-label="Speed weight percent">
+<span>all speed</span><b id="wshow">{100 - _BENCH_WEIGHT_DEFAULT} / {_BENCH_WEIGHT_DEFAULT}</b></div>
+<div class="tbl"><table class="wtab"><thead><tr><th class="n">#</th><th>Model</th>
+<th class="n">Correct</th><th class="n">tok/s</th><th>Score</th></tr></thead>
+<tbody id="wbody">{"".join(trs)}</tbody></table></div>
+<script>(function(){{var D={payload};
+var r=document.getElementById("wrange"),b=document.getElementById("wbody");
+function esc(t){{var d=document.createElement("i");d.textContent=t;return d.innerHTML}}
+function render(){{var w=r.value/100;
+document.getElementById("wq").textContent=Math.round(100-w*100);
+document.getElementById("ws").textContent=Math.round(w*100);
+document.getElementById("wshow").textContent=Math.round(100-w*100)+" / "+Math.round(w*100);
+var rows=D.map(function(e){{var qc=(1-w)*e.q,sc=w*e.s;
+return{{e:e,score:qc+sc,qc:qc,sc:sc}}}}).sort(function(a,c){{return c.score-a.score}});
+b.innerHTML=rows.map(function(t,i){{
+return '<tr><td class="n">'+(i+1)+'</td><th scope="row"><code class="mdl">'+esc(t.e.m)
++'</code></th><td class="n">'+Math.round(t.e.q*100)+'%</td><td class="n">'
++t.e.d.toLocaleString()+'</td><td><div class="wbar"><i class="q" style="width:'
++(t.qc*100).toFixed(1)+'%"></i><i class="s" style="width:'+(t.sc*100).toFixed(1)
++'%"></i></div><b>'+Math.round(t.score*100)+'</b></td></tr>'}}).join("")}}
+r.addEventListener("input",render)}})();</script>"""
 
 
 def _bench_place_labels(cands: list, est: float = 6.6) -> list:
@@ -9927,12 +10039,24 @@ def _bench_bubbles_svg(rows: list, width: int = 820, height: int = 470) -> str:
                                         "win": False})
             g["names"].append(nm[:22])
             g["win"] = g["win"] or r is winner
-    for x, row, text in _bench_place_labels(
-            [(g["x"], " & ".join(sorted(set(g["names"]))) + (" — the buy" if g["win"] else ""))
-             for g in groups.values()], est=6.2):
-        gy = max(14, min(g["y"] for g in groups.values() if abs(g["x"] - x) < 1) - row * 15)
-        o.append(f'<text x="{x:.0f}" y="{gy:.0f}" class="cl" {_SVG_HALO} '
-                 f'text-anchor="middle">{_h(text)}</text>')
+    # Real-box collision, not row bumping: labels anchor to bubbles at different heights, so
+    # "same row" is meaningless — devstral's label sat straight through the winner's until the
+    # boxes themselves were compared.
+    placed: list = []
+    for x, base_y, text in sorted(
+            ((g["x"], g["y"], " & ".join(sorted(set(g["names"])))
+              + (" — the buy" if g["win"] else "")) for g in groups.values()),
+            key=lambda c: c[0]):
+        w = 6.2 * len(text)
+        bx0 = x - w / 2
+        for dy in (0, -15, 15, -30, 30):
+            ly = max(14, base_y + dy)
+            if not any(abs(ly - py_) < 13 and bx0 < p1 and p0 < bx0 + w
+                       for p0, p1, py_ in placed):
+                placed.append((bx0, bx0 + w, ly))
+                o.append(f'<text x="{x:.0f}" y="{ly:.0f}" class="cl" {_SVG_HALO} '
+                         f'text-anchor="middle">{_h(text)}</text>')
+                break
     o.append("</svg>")
     return "".join(o)
 
@@ -10017,11 +10141,21 @@ def _bench_engine_pairs_svg(pairs: list, width: int = 760) -> str:
             a, b = min(xs.values()), max(xs.values())
             o.append(f'<line x1="{a:.0f}" y1="{y}" x2="{b:.0f}" y2="{y}" '
                      'stroke="var(--grid)" stroke-width="2"/>')
-        for u, x in xs.items():
+        xs_sorted = sorted(xs.items(), key=lambda kv: kv[1])
+        crowded = len(xs_sorted) > 1 and xs_sorted[-1][1] - xs_sorted[0][1] < 46
+        for idx, (u, x) in enumerate(xs_sorted):
             o.append(f'<circle cx="{x:.0f}" cy="{y}" r="6" fill="{colour[u]}">'
                      f'<title>{_h(u)}: {v[u].get("ttft_p50"):,.0f} ms</title></circle>')
-            o.append(f'<text x="{x:.0f}" y="{y-11}" class="cv" {_SVG_HALO} '
-                     f'text-anchor="middle">{v[u].get("ttft_p50"):,.0f}</text>')
+            # Two dots nearly on top of each other put both centred values through each
+            # other; push the values outward to the sides of the pair instead.
+            if crowded and idx in (0, len(xs_sorted) - 1):
+                anchor = "end" if idx == 0 else "start"
+                tx = x - 9 if idx == 0 else x + 9
+                ty = y + 4
+            else:
+                anchor, tx, ty = "middle", x, y - 11
+            o.append(f'<text x="{tx:.0f}" y="{ty}" class="cv" {_SVG_HALO} '
+                     f'text-anchor="{anchor}">{v[u].get("ttft_p50"):,.0f}</text>')
     lx, ly = pad_l, height - 10
     for u in ups:
         o.append(f'<circle cx="{lx}" cy="{ly-4}" r="5" fill="{colour[u]}"/>')
@@ -10081,16 +10215,21 @@ def _bench_scorecards(rows: list) -> str:
         gb = sizes.get(nm(r))
         return f" · {gb / 1024:.1f} GB" if gb else ""
 
+    def dline(r):
+        # One format for every card's stat line. The runner-up used to drop "answers in Ns"
+        # and shorten "% correct" to "%", which read as different data rather than the same
+        # measurements of a different model.
+        q = (f'{(r.get("perfect_rate") or 0) * 100:.0f}% correct · ' if graded else "")
+        t = (f' · answers in {r["total_p50"] / 1000:.1f}s' if r.get("total_p50") else "")
+        return f'{q}{r["decode_p50"]:,.1f} tok/s{gbtxt(r)}{t}'
+
     cards = []
-    qtxt = (f'{(win.get("perfect_rate") or 0) * 100:.0f}% correct · ' if graded else "")
     cards.append(f'<div class="card hi"><p class="k">Run this</p><p class="v">{_h(nm(win))}</p>'
-                 f'<p class="d">{qtxt}{win["decode_p50"]:,.1f} tok/s'
-                 f'{gbtxt(win)} · answers in {win["total_p50"] / 1000:.1f}s</p></div>')
+                 f'<p class="d">{dline(win)}</p></div>')
     if len(bpm) > 1:
         ru = bpm[1]
-        rq = (f'{(ru.get("perfect_rate") or 0) * 100:.0f}% · ' if graded else "")
         cards.append(f'<div class="card"><p class="k">Runner-up</p><p class="v">{_h(nm(ru))}</p>'
-                     f'<p class="d">{rq}{ru["decode_p50"]:,.1f} tok/s{gbtxt(ru)}</p></div>')
+                     f'<p class="d">{dline(ru)}</p></div>')
     fastest = max(ok, key=lambda r: r["decode_p50"])
     if graded and fastest.get("perfect_rate") is not None             and fastest["decode_p50"] >= 2 * win["decode_p50"]             and fastest["perfect_rate"] < 0.6:
         cards.append(f'<div class="card"><p class="k">Don\'t be fooled by</p>'
@@ -10189,27 +10328,6 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
         out.append(f'<path d="{" ".join(d)}" fill="none" stroke="var(--accent)" '
                    f'stroke-opacity=".45" stroke-width="1.5" stroke-dasharray="4 3"/>')
 
-    labelled = 0
-    for i, (name, xv, yv) in enumerate(pts):
-        on = i in front
-        cx, cy = px(xv), py(yv)
-        out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4.5 if on else 3}" '
-                   f'fill="{"var(--accent)" if on else "currentColor"}" '
-                   f'fill-opacity="{1 if on else .28}">'
-                   f'<title>{_h(name)} — {yv:.0f}% correct at {xv:.1f} tok/s</title></circle>')
-        # Only the frontier is named. Thirty-eight labels is a smear, and the dominated points
-        # are precisely the ones nobody needs to identify.
-        if on and labelled < 8:
-            labelled += 1
-            anchor = "end" if cx > x1 - 90 else "start"
-            dx = -7 if anchor == "end" else 7
-            # First and last segment of the compound name: the model, and the axis value that
-            # distinguishes this cell from its siblings. The middle is shared context.
-            _segs = name.split(" · ")
-            short = _segs[0] if len(_segs) < 3 else f"{_segs[0]} · {_segs[-1]}"
-            out.append(f'<text x="{cx + dx:.1f}" y="{cy + 3.5:.1f}" class="cl" {_SVG_HALO} '
-                       f'text-anchor="{anchor}">{_h(short[:34])}</text>')
-
     # The annotations are the findings, computed from this run rather than remembered from the
     # last one: a different winner, a different trap, or no trap at all each render correctly.
     def _clamp(v, a, b):
@@ -10217,7 +10335,9 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
 
     def _note(cx, cy, tx, ty, lines, colour="var(--ink)", anchor="start"):
         tx = _clamp(tx, pad_l + 4, width - 10)
-        ty = _clamp(ty, y0 + 12, height - 14 - 17 * (len(lines) - 1))
+        # Never below the plot: the x-axis tick row lives at y1+16, and an annotation clamped
+        # into it printed "and wrong 95% of the time" straight through the "100" tick.
+        ty = _clamp(ty, y0 + 12, y1 - 8 - 17 * (len(lines) - 1))
         edge = tx - 4 if anchor == "start" else tx + 4
         out.append(f'<path d="M {cx:.0f} {cy:.0f} L {edge:.0f} {ty - 5:.0f}" '
                    f'stroke="var(--ink-faint)" stroke-opacity=".55" fill="none" '
@@ -10232,18 +10352,68 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
     def _seg(nm):
         return nm.split(" · ")[0]
 
+    # Decide which points get a full annotation BEFORE labelling: an annotated point also
+    # carrying its frontier label printed its own name twice, once through the other.
     win_i = max(range(len(pts)), key=lambda i: (pts[i][2], pts[i][1]))
     wn, wx, wy = pts[win_i]
     sizes = _bench_size_by_model(rows)
-    wgb = sizes.get(_seg(wn))
+    fast_i = max(range(len(pts)), key=lambda i: pts[i][1])
+    fn, fx, fy = pts[fast_i]
+    show_fast = fast_i != win_i and fx >= 2 * wx and fy < 60
+    giants = [(i, sizes[_seg(pts[i][0])]) for i in range(len(pts))
+              if _seg(pts[i][0]) in sizes]
+    gi = ggb = None
+    show_giant = False
+    if giants:
+        gi, ggb = max(giants, key=lambda t: t[1])
+        gn, gx, gy = pts[gi]
+        beats = [i for i, gb2 in giants
+                 if gb2 <= ggb / 2 and pts[i][2] >= gy and pts[i][1] >= gx and i != gi]
+        show_giant = gi not in (win_i, fast_i) and bool(beats)
+    annotated = {win_i} | ({fast_i} if show_fast else set()) \
+        | ({gi} if show_giant else set())
+
+    labelled = 0
+    placed_boxes: list = []       # (x0, x1, y) of every label already on the plot
+    for i, (name, xv, yv) in enumerate(pts):
+        on = i in front
+        cx, cy = px(xv), py(yv)
+        out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4.5 if on else 3}" '
+                   f'fill="{"var(--accent)" if on else "currentColor"}" '
+                   f'fill-opacity="{1 if on else .28}">'
+                   f'<title>{_h(name)} — {yv:.0f}% correct at {xv:.1f} tok/s</title></circle>')
+        # Only the frontier is named. Thirty-eight labels is a smear, and the dominated points
+        # are precisely the ones nobody needs to identify.
+        if on and i not in annotated and labelled < 8:
+            anchor = "end" if cx > x1 - 90 else "start"
+            dx = -7 if anchor == "end" else 7
+            # First and last segment of the compound name: the model, and the axis value that
+            # distinguishes this cell from its siblings. The middle is shared context.
+            _segs = name.split(" · ")
+            short = (_segs[0] if len(_segs) < 3 else f"{_segs[0]} · {_segs[-1]}")[:34]
+            est_w = 6.6 * len(short)
+            lx0 = cx + dx - (est_w if anchor == "end" else 0)
+            # Frontier points cluster in the top band, so labels at dot height collide with
+            # their neighbours. Try the dot row first, then rows above and below; a label
+            # with no free row is dropped — its tooltip still identifies the point.
+            for dy in (0, -13, 13, -26, 26):
+                ly = cy + 3.5 + dy
+                if y0 + 8 < ly < y1 - 2 and not any(
+                        abs(ly - py_) < 12 and lx0 < px1 and px0 < lx0 + est_w
+                        for px0, px1, py_ in placed_boxes):
+                    placed_boxes.append((lx0, lx0 + est_w, ly))
+                    labelled += 1
+                    out.append(f'<text x="{cx + dx:.1f}" y="{ly:.1f}" class="cl" {_SVG_HALO} '
+                               f'text-anchor="{anchor}">{_h(short)}</text>')
+                    break
+
     win_lines = [_seg(wn), f"{wy:.0f}% correct at {wx:,.0f} tok/s"]
+    wgb = sizes.get(_seg(wn))
     if wgb:
         win_lines.append(f"on {wgb / 1024:.1f} GB of memory")
     _note(px(wx) + 8, py(wy), x1 + 16, py(wy) + 5, win_lines, "var(--accent)")
 
-    fast_i = max(range(len(pts)), key=lambda i: pts[i][1])
-    fn, fx, fy = pts[fast_i]
-    if fast_i != win_i and fx >= 2 * wx and fy < 60:
+    if show_fast:
         wrong = 1 - fy / 100
         _note(px(fx) - 8, py(fy) + 6, px(fx) - 16, py(fy) + 52,
               [_seg(fn), f"{fx / wx:,.0f}× the winner's speed —",
@@ -10251,19 +10421,12 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
 
     # The dominated giant: the largest sized model, if something at half its size or less
     # matches its correctness and beats its speed.
-    giants = [(i, sizes[_seg(pts[i][0])]) for i in range(len(pts))
-              if _seg(pts[i][0]) in sizes]
-    if giants:
-        gi, ggb = max(giants, key=lambda t: t[1])
-        gn, gx, gy = pts[gi]
-        beats = [i for i, gb2 in giants
-                 if gb2 <= ggb / 2 and pts[i][2] >= gy and pts[i][1] >= gx and i != gi]
-        if gi not in (win_i, fast_i) and beats:
-            small = min(sizes[_seg(pts[i][0])] for i in beats)
-            _note(px(gx) - 6, py(gy) + 6, px(gx) - 14, py(gy) + 58,
-                  [f"{_seg(gn)} — {ggb / 1024:.0f} GB",
-                   "beaten on both axes by a model",
-                   f"{small / ggb:.0%} of its size"], "var(--ink)", "end")
+    if show_giant:
+        small = min(sizes[_seg(pts[i][0])] for i in beats)
+        _note(px(gx) - 6, py(gy) + 6, px(gx) - 14, py(gy) + 58,
+              [f"{_seg(gn)} — {ggb / 1024:.0f} GB",
+               "beaten on both axes by a model",
+               f"{small / ggb:.0%} of its size"], "var(--ink)", "end")
 
     out.append("</svg>")
     return "".join(out)
@@ -10560,9 +10723,10 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                     task_summary = (f'<p class="note"><b>{clean}</b> of {len(items)} tasks were '
                                     "fully correct on every run; the ones that were not are "
                                     "listed below.</p>")
-                    trs = [f'<tr><th scope="row"><code>{_h(t)}</code></th>'
+                    trs = [f'<tr><th scope="row"><code>{_h(t)}</code>'
+                           f'<span class="tdesc">{_h(_BENCH_TASK_DESC.get(t) or "")}</span></th>'
                            f'<td class="n">{pct(per.get(lab))}</td></tr>' for t, per in imperfect]
-                    th = '<th>Task</th><th class="n">Perfect</th>' 
+                    th = '<th>Task</th><th class="n">Perfect</th>'
             else:
                 # One column per cell put 38 columns and a 60-character compound heading in
                 # each; the table could not render, let alone be read. Cells are rows here and
@@ -10579,7 +10743,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                         clean_tasks.append(tname)
                         continue
                     trs.append(
-                        f'<tr><th scope="row"><code>{_h(tname)}</code></th>'
+                        f'<tr><th scope="row"><code>{_h(tname)}</code>'
+                        f'<span class="tdesc">{_h(_BENCH_TASK_DESC.get(tname) or "")}</span></th>'
                         f'<td class="n">{len(col_labels) - len(failed)} of {len(col_labels)}</td>'
                         f'<td class="fails">{_h(", ".join(failed))}</td></tr>')
                 if clean_tasks:
@@ -10825,9 +10990,13 @@ ordinary slowness rather than a misconfiguration.</p>
         for _t in _suite:
             _tiers.setdefault(_t.get("tier") or "untiered", []).append(_t)
         _blocks = "".join(
-            f'<div><p class="k">{_h(_tn.title())} — {len(_ts)} tasks, '
+            f'<div class="tierblk"><p class="k">{_h(_tn.title())} — {len(_ts)} tasks, '
             f'{sum(len(t["cases"]) for t in _ts)} cases</p>'
-            f'<p class="v">{_h(", ".join(t["id"] for t in _ts))}</p></div>'
+            '<ul class="tl">' + "".join(
+                f'<li><code>{_h(t["id"])}</code> <span>'
+                f'{_h(_BENCH_TASK_DESC.get(t["id"]) or "")}'
+                f'{" · " + _h(t["lang"]) if t.get("lang") and t["lang"] != "python" else ""}'
+                f'</span></li>' for t in _ts) + '</ul></div>'
             for _tn, _ts in sorted(_tiers.items()))
         _cfg0 = (runs[0].get("config") or {}) if runs else {}
         method_html = f"""
@@ -10857,8 +11026,11 @@ ordinary slowness rather than a misconfiguration.</p>
       <code>x-client-name: ai-proxy-bench</code>.</li>
   </ul>"""
 
+    weighted_html = _bench_weighted_html(rows) if graded else ""
     body = f"""
   {results}
+
+  {weighted_html}
 
   <h2>{"Consistency" if single else "Time to a finished answer"}</h2>
   {charts}
@@ -13158,6 +13330,60 @@ def _bench_lit(v, lang: str) -> str:
 
 
 
+# One line per task saying what it actually tests, shown in the report's method section and
+# beside per-task results. The id alone ("mid_floor") tells a reader nothing; the trap the
+# task was built around is the whole reason it is in the suite.
+_BENCH_TASK_DESC = {
+    "binary_search": "Find a value's index in a sorted list",
+    "merge_intervals": "Merge overlapping intervals",
+    "word_freq": "Top-n most common words with tie rules",
+    "roman": "Integer to Roman numeral",
+    "balanced": "Bracket matching for () [] {}",
+    "flatten": "Flatten arbitrarily nested lists",
+    "two_sum": "Indices of the pair summing to a target",
+    "lru_cache_sim": "Simulate an LRU cache's get/put sequence",
+    "group_anagrams": "Group words that are anagrams",
+    "run_length": "Run-length encode a string",
+    "compare_versions": "Compare dotted version strings",
+    "spiral": "Matrix in clockwise spiral order",
+    "edit_distance": "Levenshtein distance",
+    "lis_length": "Longest strictly increasing subsequence",
+    "simplify_path": "Canonicalise a Unix path with . and ..",
+    "calculator": "Arithmetic with precedence, no eval",
+    "word_break": "Segment a string into dictionary words",
+    "topo_sort": "Topological sort of a dependency graph",
+    "parse_query": "Parse a URL query string into an object",
+    "group_ranges": "Collapse consecutive integers into range strings",
+    "clamp_add": "Saturating int addition — overflow trap",
+    "round_to": "Round to nearest multiple, halves away from zero",
+    "count_words": "Count words split on spaces and tabs",
+    "csv_escape": "RFC 4180 CSV field quoting",
+    "balanced_depth": "Max bracket nesting depth, -1 if unbalanced",
+    "snake_to_camel": "snake_case to camelCase — digits stop capitalisation",
+    "mid_floor": "Floor midpoint of two i64s — overflow and negatives",
+    "clamp_mul": "Saturating int multiplication",
+    "ordinal": "English ordinal suffix — the 11th/12th/13th trap",
+    "slugify": "URL slug: symbol runs become one hyphen",
+    "pluck": "Column from associative rows — null vs missing key",
+    "login_form": "Login form with labels bound to their inputs",
+    "data_table": "Revenue table with caption and scoped headers",
+    "card_grid": "Responsive auto-fill card grid",
+    "theme_vars": "Dark-mode token inside a media query",
+    "semver_cmp": "Semantic versions incl. pre-release precedence",
+    "csv_line": "Split one CSV record honouring quotes",
+    "glob_match": "Glob matching with ? and *",
+    "roman_strict": "Roman to int, rejecting non-canonical forms",
+    "topo_lex": "Smallest topological order, None on cycle",
+    "lru_ops": "LRU cache with eviction order",
+    "justify": "Full text justification",
+    "path_norm": "Normalise a POSIX path with . and ..",
+    "json_pointer": "Resolve an RFC 6901 JSON Pointer",
+    "base_convert": "Integer between bases 2-36 with validation",
+    "interval_intersect": "Intersect two interval lists",
+    "tokenize_expr": "Tokenise arithmetic, None on invalid input",
+}
+
+
 def _bench_lang_available(lang: str) -> bool:
     """Whether this machine can grade a language at all. Portability contract: a task whose
     tooling is absent is SKIPPED — dropped from the run and recorded as such — never scored as
@@ -14445,16 +14671,24 @@ async def _bench_residency_snapshot() -> dict:
         try:
             st = await b.state()
             running = st.get("running")
+            container = st.get("container") if b.control == "docker" else None
+            if b.control == "docker" and not container:
+                container = await _vllm_container()
             if running is None and b.control == "docker":
                 # docker's state() reports the container, not whether it is up.
-                container = st.get("container")
                 if container:
                     code, out = await _run_cmd(
                         [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
                         15.0, max_chars=100)
                     running = code == 0 and out.strip().lower() == "true"
-            snap["backends"].append({"name": name, "was_running": bool(running),
-                                     "control": b.control})
+            entry = {"name": name, "was_running": bool(running), "control": b.control}
+            if container:
+                # WHICH container matters, not just that "vllm was up": several can be
+                # configured for the same port (qwen-vllm / ornith-vllm), and a restore
+                # that rediscovers by port starts whichever sorts first — the sweep that
+                # measured Ornith all afternoon handed the box back running qwen instead.
+                entry["container"] = container
+            snap["backends"].append(entry)
         except Exception as e:
             snap.setdefault("errors", []).append(f"{name}: {type(e).__name__}: {e}")
     # Ollama holds models rather than a process the proxy starts, so it is recorded separately.
@@ -14536,7 +14770,8 @@ async def _bench_restore_residency(snap: dict) -> dict:
         b = backend(entry["name"])
         if not b:
             continue
-        started = await b.start()
+        started = await b.start(container=entry.get("container")) \
+            if entry.get("container") else await b.start()
         # Started is not serving. vLLM measured ~9 minutes to reload its weights, and reporting
         # "restored" while the daily driver still refuses connections is worse than silence.
         # Started is not serving; ask the backend itself rather than mapping names to waiters.
