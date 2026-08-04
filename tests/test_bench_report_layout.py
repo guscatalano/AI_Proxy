@@ -727,3 +727,39 @@ def test_old_runs_backfill_static_hardware_with_a_caveat(client):
     html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
     assert "<h2>Hardware</h2>" in html
     assert "read from the host at report time" in html
+
+
+# ---- the interactive layer: enhancement, never replacement -----------------------------------
+
+def test_marks_carry_their_model_identity(client):
+    html = _render(_wfield())
+    assert html.count('data-m="') > 10, "charts and tables must tag their model marks"
+    assert 'data-m="fastclose"' in html
+
+
+def test_the_report_embeds_its_dataset_and_layer(client):
+    html = _render(_wfield())
+    assert 'id="report-data"' in html and '"rows":' in html
+    assert "linked highlighting" in html or "setHL" in html
+    assert 'classList.add("ix-on")' in html
+
+
+def test_d3_is_inlined_not_fetched(client):
+    html = _render(_wfield())
+    assert "<script src=" not in html, "the report must stay a single offline file"
+    if P._d3_source():
+        assert "https://d3js.org v7" in html
+        assert 'id="ix-scatter"' in html
+
+
+def test_print_hides_the_interactive_extras(client):
+    html = _render(_wfield())
+    assert ".ix-only, .ixtip, tr.drill { display:none !important; }" in html
+
+
+def test_per_task_rows_are_clickable_with_data(client):
+    runs = [_graded("a", "m1", "ollama", 0.5, 30, {"roman": 0.5, "binary_search": 1.0}),
+            _graded("b", "m2", "ollama", 0.6, 40, {"roman": 0.7, "binary_search": 1.0})]
+    html = _render(runs)
+    assert 'class="taskrow" data-task="roman"' in html
+    assert '"tasks":' in html.split('id="report-data"')[1][:20000]

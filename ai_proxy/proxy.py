@@ -9619,6 +9619,7 @@ async def bench_run_delete(bench_id: str, request: Request):
 # without the app. Re-bound under the old names for callers and tests.
 _host_hw_facts = _bench_report_mod._host_hw_facts
 _fmt_n = _bench_report_mod._fmt_n
+_d3_source = _bench_report_mod._d3_source
 _bench_model_display = _bench_report_mod._bench_model_display
 _bench_model_identity = _bench_report_mod._bench_model_identity
 _bench_label_display = _bench_report_mod._bench_label_display

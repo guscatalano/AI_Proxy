@@ -108,6 +108,27 @@ def _bench_fmt(v, digits=1, suffix=""):
     return f"{v}{suffix}"
 
 
+_D3_CACHE: dict = {}
+
+
+def _d3_source() -> str:
+    """The vendored d3 bundle, inlined so the report stays a single offline file. An absent
+    vendor file degrades gracefully: highlighting and the animated re-rank are vanilla JS,
+    and the d3-only extras simply do not build."""
+    if "src" not in _D3_CACHE:
+        try:
+            _D3_CACHE["src"] = (Path(__file__).parent / "static"
+                                / "d3.v7.min.js").read_text(encoding="utf-8")
+        except OSError:
+            _D3_CACHE["src"] = ""
+    return _D3_CACHE["src"]
+
+
+# The interactive layer. Screen-only enhancements over the server-rendered truth: the static
+# SVGs and tables remain the print/PDF/no-JS version, and everything here degrades to them.
+_REPORT_IX_JS = '\n(function () {\n  var root = document.documentElement;\n  root.classList.add("ix-on");\n  var dataEl = document.getElementById("report-data");\n  var DATA = null;\n  try { DATA = dataEl ? JSON.parse(dataEl.textContent) : null; } catch (e) {}\n\n  // ---- linked highlighting: hover a model anywhere, see it everywhere ----\n  var marks = Array.prototype.slice.call(document.querySelectorAll("[data-m]"));\n  function setHL(m) {\n    if (m == null) {\n      root.classList.remove("hl");\n      marks.forEach(function (e) { e.classList.remove("lit"); });\n      return;\n    }\n    root.classList.add("hl");\n    marks.forEach(function (e) { e.classList.toggle("lit", e.getAttribute("data-m") === m); });\n  }\n  document.addEventListener("mouseover", function (ev) {\n    var t = ev.target.closest ? ev.target.closest("[data-m]") : null;\n    if (t) setHL(t.getAttribute("data-m"));\n  });\n  document.addEventListener("mouseout", function (ev) {\n    var t = ev.target.closest ? ev.target.closest("[data-m]") : null;\n    if (t) setHL(null);\n  });\n\n  // ---- shared tooltip ----\n  var tip = document.createElement("div");\n  tip.className = "ixtip";\n  tip.style.opacity = 0;\n  document.body.appendChild(tip);\n  function showTip(html, x, y) {\n    tip.innerHTML = html;\n    tip.style.left = Math.min(x + 14, window.innerWidth - 250) + "px";\n    tip.style.top = (y + 12) + "px";\n    tip.style.opacity = 1;\n  }\n  function hideTip() { tip.style.opacity = 0; }\n\n  // ---- explorable scatter (d3): brush to zoom, double-click resets ----\n  if (window.d3 && DATA && DATA.rows && DATA.rows.length > 2) {\n    var host = document.getElementById("ix-scatter");\n    if (host) {\n      var pts = DATA.rows.filter(function (r) { return r.d && r.q != null; });\n      var W = 860, H = 460, mL = 54, mR = 24, mT = 16, mB = 44;\n      var svg = d3.select(host).append("svg")\n        .attr("viewBox", "0 0 " + W + " " + H).attr("width", "100%");\n      var xExt = d3.extent(pts, function (r) { return r.d; });\n      var yMin = Math.min(40, d3.min(pts, function (r) { return r.q; }));\n      var X0 = [xExt[0] * 0.8, xExt[1] * 1.3], Y0 = [yMin, 100.5];\n      var x = d3.scaleLog().domain(X0).range([mL, W - mR]);\n      var y = d3.scaleLinear().domain(Y0).range([H - mB, mT]);\n      var gGrid = svg.append("g"), gDots = svg.append("g");\n      svg.append("text").attr("x", (mL + W - mR) / 2).attr("y", H - 8)\n        .attr("class", "ct").attr("text-anchor", "middle")\n        .text("output tokens/sec (log) \\u2014 drag a box to zoom, double-click to reset");\n      svg.append("text").attr("x", mL).attr("y", mT - 4).attr("class", "ct")\n        .text("TASKS FULLY CORRECT \\u2191");\n      function redraw(animate) {\n        var gt = gGrid.selectAll("g.tick-y").data(y.ticks(6), String);\n        gt.exit().remove();\n        var ge = gt.enter().append("g").attr("class", "tick-y");\n        ge.append("line");\n        ge.append("text");\n        gGrid.selectAll("g.tick-y").each(function (v) {\n          var g = d3.select(this);\n          g.select("line").attr("x1", mL).attr("x2", W - mR)\n            .attr("y1", y(v)).attr("y2", y(v))\n            .attr("stroke", "currentColor").attr("stroke-opacity", 0.1);\n          g.select("text").attr("x", mL - 7).attr("y", y(v) + 4)\n            .attr("class", "ct").attr("text-anchor", "end").text(Math.round(v) + "%");\n        });\n        var sel = gDots.selectAll("circle").data(pts, function (r) { return r.name; });\n        sel = sel.enter().append("circle")\n          .attr("r", 4.5).attr("fill", "var(--accent)").attr("fill-opacity", 0.75)\n          .attr("data-m", function (r) { return r.m; })\n          .on("mousemove", function (ev, r) {\n            showTip("<b>" + r.name + "</b><br>" + r.q.toFixed(0) + "% correct \\u00b7 "\n                    + r.d.toFixed(1) + " tok/s" + (r.t ? " \\u00b7 answers in "\n                    + (r.t / 1000).toFixed(1) + "s" : ""), ev.clientX, ev.clientY);\n          })\n          .on("mouseleave", hideTip)\n          .merge(sel);\n        (animate ? sel.transition().duration(350) : sel)\n          .attr("cx", function (r) { return x(r.d); })\n          .attr("cy", function (r) { return y(r.q); })\n          .attr("display", function (r) {\n            var dx = x(r.d), dy = y(r.q);\n            return (dx < mL || dx > W - mR || dy < mT || dy > H - mB) ? "none" : null;\n          });\n      }\n      var brush = d3.brush().extent([[mL, mT], [W - mR, H - mB]])\n        .on("end", function (ev) {\n          if (!ev.selection) return;\n          var s0 = ev.selection;\n          x.domain([x.invert(s0[0][0]), x.invert(s0[1][0])]);\n          y.domain([y.invert(s0[1][1]), y.invert(s0[0][1])]);\n          svg.select(".brush").call(brush.move, null);\n          redraw(true);\n        });\n      svg.append("g").attr("class", "brush").call(brush);\n      svg.on("dblclick", function () { x.domain(X0); y.domain(Y0); redraw(true); });\n      redraw(false);\n    }\n  }\n\n  // ---- per-task drill-down: click a missed task, see every configuration ----\n  Array.prototype.forEach.call(document.querySelectorAll("tr.taskrow"), function (tr) {\n    tr.addEventListener("click", function () {\n      var tid = tr.getAttribute("data-task");\n      var open = tr.nextElementSibling && tr.nextElementSibling.classList.contains("drill");\n      Array.prototype.forEach.call(document.querySelectorAll("tr.drill"),\n                                   function (d) { d.remove(); });\n      if (open || !DATA || !DATA.tasks || !DATA.tasks[tid]) return;\n      var info = DATA.tasks[tid];\n      var d = document.createElement("tr");\n      d.className = "drill";\n      var td = document.createElement("td");\n      td.colSpan = tr.children.length;\n      d.appendChild(td);\n      tr.parentNode.insertBefore(d, tr.nextSibling);\n      var W = 720, H = 30 + 12 * 5, mL = 12, mR = 44;\n      var html = ["<p class=\\"k\\">" + tid + " \\u2014 " + (info.desc || "") +\n                  " \\u00b7 share of runs fully correct, per configuration</p>"];\n      html.push("<svg viewBox=\\"0 0 " + W + " " + H + "\\" width=\\"100%\\">");\n      info.rates.forEach(function (pair, i) {\n        var cx = mL + (pair[1] || 0) * (W - mL - mR);\n        var cy = 16 + (i % 5) * 12;\n        var m = String(pair[0]).split(" \\u00b7 ")[0];\n        html.push("<circle cx=\\"" + cx.toFixed(1) + "\\" cy=\\"" + cy + "\\" r=\\"5\\" " +\n                  "fill=\\"var(--accent)\\" fill-opacity=\\"0.65\\" data-m=\\"" + m + "\\">" +\n                  "<title>" + pair[0] + " \\u2014 " +\n                  Math.round((pair[1] || 0) * 100) + "%</title></circle>");\n      });\n      html.push("<text x=\\"" + mL + "\\" y=\\"" + (H - 4) + "\\" class=\\"ct\\">0%</text>");\n      html.push("<text x=\\"" + (W - mR) + "\\" y=\\"" + (H - 4) +\n                "\\" class=\\"ct\\">100%</text>");\n      html.push("</svg>");\n      td.innerHTML = html.join("");\n    });\n  });\n})();\n'
+
+
 def _bench_report_row(run: dict) -> dict:
     """Flatten one run into the fields a comparison table needs."""
     res = run.get("results") or {}
@@ -359,7 +380,22 @@ _REPORT_CSS = """
   .wtab td b { font-variant-numeric:tabular-nums; margin-left:8px; }
   .wkey i { display:inline-block; width:10px; height:10px; border-radius:2px;
             vertical-align:-1px; margin-right:4px; }
+  /* Interactive layer: dim everything but the hovered model; screen-only extras. */
+  html.hl [data-m] { opacity:.22; transition:opacity .12s; }
+  html.hl [data-m].lit { opacity:1; }
+  tr.taskrow { cursor:pointer; }
+  tr.taskrow:hover th code { text-decoration:underline; }
+  tr.drill td { background:var(--panel); padding:10px 14px; }
+  tr.drill .k { font-family:var(--mono); font-size:10.5px; letter-spacing:.08em;
+                text-transform:uppercase; color:var(--ink-faint); margin:0 0 6px; }
+  .ixtip { position:fixed; pointer-events:none; background:var(--panel);
+           border:1px solid var(--border); border-radius:6px; padding:6px 10px;
+           font-size:12px; line-height:1.5; z-index:60; max-width:240px;
+           box-shadow:0 6px 18px rgba(0,0,0,.28); transition:opacity .12s; }
+  #ix-scatter svg { display:block; }
+  .brush .selection { stroke:var(--accent); fill:var(--accent); fill-opacity:.07; }
   @media print {
+    .ix-only, .ixtip, tr.drill { display:none !important; }
     :root { --bg:#fff; --panel:#fff; --panel-2:#f5f5f2; --border:#e4e4e1;
             --ink:#121212; --ink-dim:#454b52; --ink-faint:#727272;
             --accent:#c4321f; --accent-deep:#8f2416; --good:#1f7a47; --bad:#b3261e;
@@ -474,7 +510,7 @@ def _bench_weighted_html(rows: list) -> str:
     trs = []
     for rank, (e, score, qc, sc) in enumerate(_bench_weighted_rows(data, w), start=1):
         trs.append(
-            f'<tr><td class="n">{rank}</td>'
+            f'<tr data-m="{_h(e["m"])}"><td class="n">{rank}</td>'
             f'<th scope="row"><code class="mdl">{_h(e["m"])}</code></th>'
             f'<td class="n">{e["q"] * 100:.0f}%</td>'
             f'<td class="n">{e["d"]:,.1f}</td>'
@@ -508,12 +544,20 @@ document.getElementById("ws").textContent=Math.round(w*100);
 document.getElementById("wshow").textContent=Math.round(100-w*100)+" / "+Math.round(w*100);
 var rows=D.map(function(e){{var qc=(1-w)*e.q,sc=w*e.s;
 return{{e:e,score:qc+sc,qc:qc,sc:sc}}}}).sort(function(a,c){{return c.score-a.score}});
+var prev={{}};Array.prototype.forEach.call(b.children,function(tr){{
+prev[tr.getAttribute("data-m")]=tr.getBoundingClientRect().top}});
 b.innerHTML=rows.map(function(t,i){{
-return '<tr><td class="n">'+(i+1)+'</td><th scope="row"><code class="mdl">'+esc(t.e.m)
+return '<tr data-m="'+esc(t.e.m)+'"><td class="n">'+(i+1)+'</td><th scope="row"><code class="mdl">'+esc(t.e.m)
 +'</code></th><td class="n">'+Math.round(t.e.q*100)+'%</td><td class="n">'
 +t.e.d.toLocaleString()+'</td><td><div class="wbar"><i class="q" style="width:'
 +(t.qc*100).toFixed(1)+'%"></i><i class="s" style="width:'+(t.sc*100).toFixed(1)
-+'%"></i></div><b>'+Math.round(t.score*100)+'</b></td></tr>'}}).join("")}}
++'%"></i></div><b>'+Math.round(t.score*100)+'</b></td></tr>'}}).join("");
+Array.prototype.forEach.call(b.children,function(tr){{
+var m=tr.getAttribute("data-m");if(!(m in prev))return;
+var d=prev[m]-tr.getBoundingClientRect().top;if(!d)return;
+tr.style.transform="translateY("+d+"px)";tr.style.transition="none";
+requestAnimationFrame(function(){{tr.style.transition="transform .35s ease";
+tr.style.transform=""}})}})}}
 r.addEventListener("input",render)}})();</script>"""
 
 
@@ -607,6 +651,7 @@ def _bench_bubbles_svg(rows: list, width: int = 820, height: int = 470) -> str:
                else "var(--blue)" if qv == 100 else "var(--ghost)")
         nm = (r.get("_name") or "").split(" · ")[0]
         o.append(f'<circle cx="{px(gb):.1f}" cy="{py(qv):.1f}" r="{rad:.1f}" fill="{col}" '
+                 f'data-m="{_h(nm)}" '
                  f'opacity="{.92 if r is winner else .55}">'
                  f'<title>{_h(nm)} — {gb:.1f} GB, {qv:.0f}%, '
                  f'{r["decode_p50"]:,.1f} tok/s</title></circle>')
@@ -721,7 +766,8 @@ def _bench_engine_pairs_svg(pairs: list, width: int = 760) -> str:
         xs_sorted = sorted(xs.items(), key=lambda kv: kv[1])
         crowded = len(xs_sorted) > 1 and xs_sorted[-1][1] - xs_sorted[0][1] < 46
         for idx, (u, x) in enumerate(xs_sorted):
-            o.append(f'<circle cx="{x:.0f}" cy="{y}" r="6" fill="{colour[u]}">'
+            o.append(f'<circle cx="{x:.0f}" cy="{y}" r="6" fill="{colour[u]}" '
+                     f'data-m="{_h(name)}">'
                      f'<title>{_h(u)}: {v[u].get("ttft_p50"):,.0f} ms</title></circle>')
             # Two dots nearly on top of each other put both centred values through each
             # other; push the values outward to the sides of the pair instead. A pair close
@@ -978,6 +1024,7 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
         on = i in front
         cx, cy = px(xv), py(yv)
         out.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="{4.5 if on else 3}" '
+                   f'data-m="{_h(_seg(name))}" '
                    f'fill="{"var(--accent)" if on else "currentColor"}" '
                    f'fill-opacity="{1 if on else .28}">'
                    f'<title>{_h(name)} — {yv:.0f}% correct at {xv:.1f} tok/s</title></circle>')
@@ -1003,6 +1050,7 @@ def _bench_scatter_svg(rows: list, width: int = 840, height: int = 440) -> str:
                     placed_boxes.append((lx0, lx0 + est_w, ly))
                     labelled += 1
                     out.append(f'<text x="{cx + dx:.1f}" y="{ly:.1f}" class="cl" {_SVG_HALO} '
+                               f'data-m="{_h(_seg(name))}" '
                                f'text-anchor="{anchor}">{_h(short)}</text>')
                     break
 
@@ -1066,8 +1114,10 @@ def _bench_bar_svg(rows, key, label, unit, better="high", width=680, limit=12):
         y = 26 + i * (bar_h + gap)
         w = max(2, int((v / top) * (width - pad_l - 60)))
         fill = "#57d1e0" if v == best else "#33566b"
-        parts.append(f'<text x="0" y="{y + 14}" class="cl">{_h(elide(name))}</text>')
-        parts.append(f'<rect x="{pad_l}" y="{y}" width="{w}" height="{bar_h}" rx="3" fill="{fill}"/>')
+        _m = _h(name.split(" · ")[0])
+        parts.append(f'<text x="0" y="{y + 14}" class="cl" data-m="{_m}">{_h(elide(name))}</text>')
+        parts.append(f'<rect x="{pad_l}" y="{y}" width="{w}" height="{bar_h}" rx="3" '
+                     f'fill="{fill}" data-m="{_m}"/>')
         parts.append(f'<text x="{pad_l + w + 6}" y="{y + 14}" class="cv">{v:,.1f}</text>')
     if total_n > len(vals):
         parts.append(f'<text x="0" y="{height - 5}" class="ct">'
@@ -1254,6 +1304,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     axis_names = [_bench_cell_name(v, varying) for v in axis_vals]
     for _r, _nm in zip(rows, axis_names):
         _r["_name"] = _nm
+    _ds_tasks: dict = {}
     labels = dict(_BENCH_AXIS_LABELS)
     # Built in the same order the body appends its cells, from the same two conditions. They
     # used to be assembled separately — head by slice-index, body by append — and had drifted:
@@ -1295,9 +1346,11 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
         slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
         if split_axes:
             cells = [f'<th scope="row" class="ax">{_h(av.get(varying[0]) or "—")}</th>']
+            _row_m = _h((r.get("_name") or nm or "").split(" · ")[0])
             cells += [f'<td class="ax">{_h(av.get(k) or "—")}</td>' for k in varying[1:]]
         else:
             cells = [f'<th scope="row" class="cfg">{_h(nm)}</th>']
+            _row_m = _h((r.get("_name") or nm or "").split(" · ")[0])
         if show_load:
             cells.append('<td class="n">%s</td>' % (
                 fmt((r.get("load_ms") or 0) / 1000, 0, " s") if r.get("load_ms") else "—"))
@@ -1320,7 +1373,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 f'{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>')
         ok = r["n_success"] == r["n_total"]
         cells.append(f'<td class="n {"ok" if ok else "bad"}">{r["n_success"]}/{r["n_total"]}</td>')
-        body_rows.append("<tr>" + "".join(cells) + "</tr>")
+        body_rows.append(f'<tr data-m="{_row_m}">' + "".join(cells) + "</tr>")
 
     # One configuration has nothing to compare against: a chart with a single full-width bar
     # conveys no scale, "best in column" marks everything, and "vs best" is always 1.0x. The
@@ -1384,6 +1437,11 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             for t in (q.get("tasks") or []):
                 tasks.setdefault(t["task"], {})[nm] = t.get("perfect_rate")
         if tasks:
+            for _tid, _per in tasks.items():
+                _ds_tasks[_tid] = {"desc": TASK_DESC.get(_tid) or "",
+                                   "rates": sorted(_per.items(),
+                                                   key=lambda kv: kv[1] if kv[1] is not None
+                                                   else -1)}
             col_labels = list(axis_names)
             th = "".join(f"<th>{_h(l)}</th>" for l in col_labels)
             # With one configuration, a row per task is a column of identical 100%s. Only the
@@ -1402,7 +1460,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                     task_summary = (f'<p class="note"><b>{clean}</b> of {len(items)} tasks were '
                                     "fully correct on every run; the ones that were not are "
                                     "listed below.</p>")
-                    trs = [f'<tr><th scope="row"><code>{_h(t)}</code>'
+                    trs = [f'<tr class="taskrow" data-task="{_h(t)}">'
+                           f'<th scope="row"><code>{_h(t)}</code>'
                            f'<span class="tdesc">{_h(TASK_DESC.get(t) or "")}</span></th>'
                            f'<td class="n">{pct(per.get(lab))}</td></tr>' for t, per in imperfect]
                     th = '<th>Task</th><th class="n">Perfect</th>'
@@ -1422,7 +1481,8 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                         clean_tasks.append(tname)
                         continue
                     trs.append(
-                        f'<tr><th scope="row"><code>{_h(tname)}</code>'
+                        f'<tr class="taskrow" data-task="{_h(tname)}">'
+                        f'<th scope="row"><code>{_h(tname)}</code>'
                         f'<span class="tdesc">{_h(TASK_DESC.get(tname) or "")}</span></th>'
                         f'<td class="n">{len(col_labels) - len(failed)} of {len(col_labels)}</td>'
                         f'<td class="fails">{_h(", ".join(failed))}</td></tr>')
@@ -1788,6 +1848,28 @@ ordinary slowness rather than a misconfiguration.</p>
 
   {"<h2>Cold-start cost</h2><p class='note'>Time for the discarded warm-up request — the price of making the model resident, excluded from every measurement above.</p>" + _bench_coldstart_svg(rows) + (warm[0] if len(rows) > 1 else "<p class='note'>" + _h(warm[0]) + "</p>") if warm else ""}
 """
+    _ds_rows = [{"name": (r.get("_name") or _bench_label_display(r.get("label") or "")),
+                 "m": (r.get("_name") or _bench_label_display(r.get("label") or "")
+                       ).split(" · ")[0],
+                 "d": r.get("decode_p50"), "q": (r.get("perfect_rate") or 0) * 100
+                 if r.get("perfect_rate") is not None else None,
+                 "t": r.get("total_p50"), "c": r.get("concurrency")}
+                for r in rows if r.get("decode_p50")]
+    _ds_json = json.dumps({"rows": _ds_rows, "tasks": _ds_tasks}).replace("</", "<\\/")
+    _explore = ""
+    if graded and len(_ds_rows) > 2 and _d3_source():
+        _explore = (
+            '<div class="ix-only"><h2>The trade-off — explore</h2>'
+            '<p class="note">Screen-only companion to the annotated chart above: hover a dot '
+            'for its numbers, drag a box to zoom into the crowded band, double-click to '
+            'reset. Hovering a model anywhere on this page highlights it everywhere. The '
+            'printed report keeps the annotated version.</p>'
+            '<div id="ix-scatter"></div></div>')
+    body += (
+        _explore
+        + f'<script id="report-data" type="application/json">{_ds_json}</script>'
+        + (f"<script>{_d3_source()}</script>" if _d3_source() else "")
+        + f"<script>{_REPORT_IX_JS}</script>")
     return _report_page(
         title=f"Benchmark — {title}",
         eyebrow="AI Proxy · benchmark",
