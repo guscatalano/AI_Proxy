@@ -179,3 +179,36 @@ def test_a_running_llamacpp_keys_the_index_by_its_checkpoint_path(client, monkey
     assert index[key]["loaded"] is True
     meta = P._bench_resolve_model(index, path, "llamacpp")
     assert meta and meta.get("loaded"), "the sweep's own model string must resolve while up"
+
+
+def test_a_booting_vllm_container_is_startable_not_invisible(client, monkeypatch):
+    """qwen-vllm spent minutes loading shards; the container scan skipped every RUNNING
+    container, so a booting model was neither loaded nor startable — its cells failed
+    preflight in one second ("does not serve — it has ornith-nvfp4") instead of taking the
+    start-and-wait path a stopped container gets."""
+    def fake_now():
+        return {"ollama": {}, "lmstudio": {}, "llamacpp": {},
+                "vllm": {"reachable": False, "available": []}}
+
+    async def configs():
+        return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "running": True,
+                 "serves_port": True},
+                {"container": "ornith-vllm", "model": "ornith-nvfp4", "running": False,
+                 "serves_port": True}]
+
+    monkeypatch.setattr(P, "system_now", fake_now)
+    monkeypatch.setattr(P, "_vllm_configs", configs)
+    monkeypatch.setattr(P, "_llamacpp_cfg", lambda: {})
+    idx = asyncio.run(P._bench_model_index())
+    meta = P._bench_resolve_model(idx, "qwen3-coder-next", "vllm")
+    assert meta and meta.get("startable"), "a booting container must offer the wait path"
+    assert meta.get("container") == "qwen-vllm"
+    # And once the live probe answers for it, the running container is no longer 'startable'.
+    def fake_now_ready():
+        return {"ollama": {}, "lmstudio": {}, "llamacpp": {},
+                "vllm": {"reachable": True,
+                         "available": [{"id": "qwen3-coder-next", "state": "loaded"}]}}
+    monkeypatch.setattr(P, "system_now", fake_now_ready)
+    idx2 = asyncio.run(P._bench_model_index())
+    meta2 = P._bench_resolve_model(idx2, "qwen3-coder-next", "vllm")
+    assert meta2.get("loaded") is True and not meta2.get("startable")

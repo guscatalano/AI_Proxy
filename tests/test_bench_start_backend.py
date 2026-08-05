@@ -42,9 +42,21 @@ def test_a_container_on_the_wrong_port_is_not_offered(client, monkeypatch):
 
 
 def test_a_running_container_is_not_duplicated_as_startable(client, monkeypatch):
+    """'Running' excludes the startable entry only when the live probe actually answers for
+    its model. A running-but-still-booting container must stay visible (qwen-vllm spent
+    minutes loading shards and its cells died at preflight); a genuinely serving one must
+    not appear twice."""
     monkeypatch.setattr(P, "_vllm_configs", _configs(running=True))
+    monkeypatch.setattr(P, "system_now", lambda: {
+        "vllm": {"reachable": True,
+                 "available": [{"id": "qwen3-coder", "state": "loaded"}]}})
+    idx = asyncio.run(P._bench_model_index())
+    rec = idx.get("vllm:qwen3-coder")
+    assert rec and rec["loaded"] is True and not rec.get("startable")
+    # And while booting (live probe silent), the same running container IS offered.
     monkeypatch.setattr(P, "system_now", lambda: {})
-    assert "vllm:qwen3-coder" not in asyncio.run(P._bench_model_index())
+    booting = asyncio.run(P._bench_model_index()).get("vllm:qwen3-coder")
+    assert booting and booting["startable"] is True and booting["loaded"] is False
 
 
 def test_preflight_allows_a_startable_model(client):

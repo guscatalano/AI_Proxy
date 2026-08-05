@@ -8866,8 +8866,17 @@ async def _bench_model_index() -> dict:
         # come back, and hope you picked the right one. The proxy already knows how to start it
         # and what it would serve, so offer it here and let the bench do it.
         try:
+            # A container may be RUNNING but not yet serving — vLLM spends minutes loading
+            # shards. Skipping every running container made a booting model vanish from the
+            # index entirely: not loaded, not startable, so its cells failed preflight in one
+            # second ("does not serve — it has <the other twin>") instead of using the same
+            # start-and-wait path a stopped container gets. Only a container whose model the
+            # live probe actually answered for is excluded here.
+            _live_ready = {m.get("id") for m in (vll.get("available") or [])}
             for c in await _vllm_configs():
-                if c.get("running") or not c.get("serves_port") or not c.get("model"):
+                if not c.get("serves_port") or not c.get("model"):
+                    continue
+                if c.get("running") and c["model"] in _live_ready:
                     continue
                 put(c["model"], "vllm", False, startable=True, container=c["container"],
                     quant=c.get("quant"), checkpoint=c.get("checkpoint"),
