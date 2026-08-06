@@ -1187,31 +1187,195 @@ def _bench_cell_name(v: dict, varying: list) -> str:
     return " · ".join(bits) or str(v.get("model") or "run")
 
 
-def _bench_case_text(task: dict, idx: int, got) -> str:
-    """One failing case as a sentence: the call that was made, what came back, what should
-    have. Function tasks render as a call; HTML/CSS tasks render as the structural check."""
+def _bench_case_parts(task: dict, idx: int) -> tuple:
+    """(what-was-asked, expected) for one case — the vocabulary both the failure examples and
+    the grading browser share. Function tasks render as a call; HTML/CSS as the structural
+    check; SQL and bash by their inputs."""
     cases = task.get("cases") or []
     c = cases[idx] if idx < len(cases) else {}
-    gtxt = json.dumps(got) if not isinstance(got, str) or len(got) < 60 else json.dumps(got[:60] + "…")
+    exp = json.dumps(c.get("expect"))
     if "args" in c:
-        call = f'{task["entry"]}({", ".join(json.dumps(a) for a in c["args"])})'
-        return f'{call} → {gtxt}, expected {json.dumps(c.get("expect"))}'
+        return f'{task["entry"]}({", ".join(json.dumps(a) for a in c["args"])})', exp
     if "op" in c:                       # HTML structural check
         what = {"count": f'count of "{c.get("sel")}"',
                 "attr": f'{c.get("name")} of "{c.get("sel")}"',
                 "text": f'text of "{c.get("sel")}"',
                 "labels_bound": "labels bound to inputs"}.get(c["op"], c["op"])
-        return f'{what} → {gtxt}, expected {json.dumps(c.get("expect"))}'
+        return what, exp
     if "prop" in c:                     # CSS declaration check
         scope = f' inside @media {c["media"]}' if c.get("media") else ""
-        return (f'{c.get("sel")} {{ {c["prop"]} }}{scope} → {gtxt}, '
-                f'expected {json.dumps(c.get("expect"))}')
+        return f'{c.get("sel")} {{ {c["prop"]} }}{scope}', exp
     if "setup" in c:                    # SQL: the query ran against this case's data
-        return f'query returned {gtxt}, expected {json.dumps(c.get("expect"))}'
+        return "query result", exp
     if "stdin" in c:                    # bash: stdin in, stdout compared
         stdin_short = (c.get("stdin") or "").replace("\n", "⏎")[:48]
-        return f'stdin "{stdin_short}" → {gtxt}, expected {json.dumps(c.get("expect"))}'
-    return f'case {idx + 1} → {gtxt}'
+        return f'stdin "{stdin_short}"', exp
+    return f"case {idx + 1}", exp
+
+
+def _bench_case_text(task: dict, idx: int, got) -> str:
+    """One failing case as a sentence: what was asked, what came back, what should have."""
+    call, exp = _bench_case_parts(task, idx)
+    gtxt = json.dumps(got) if not isinstance(got, str) or len(got) < 60 else json.dumps(got[:60] + "…")
+    return f"{call} → {gtxt}, expected {exp}"
+
+
+# ---- The grading browser: every request, every case, statically ------------------------------
+
+_GRADES_CSS = """
+  .greq { border:1px solid var(--border); border-radius:9px; background:var(--panel);
+          padding:10px 14px; margin:8px 0; }
+  .greq summary { cursor:pointer; font-size:13px; }
+  .greq summary b.bad { color:var(--bad); }
+  .greq summary b.ok { color:var(--good); }
+  .gcase { list-style:none; margin:8px 0 2px; padding:0; }
+  .gcase li { margin:3px 0; font-size:12.5px; font-family:var(--mono);
+              overflow-wrap:anywhere; }
+  .gcase .mark { display:inline-block; width:1.2em; }
+  .gcase li.bad .mark { color:var(--bad); }
+  .gcase li.ok .mark { color:var(--good); }
+  .gcase li.bad { background:color-mix(in srgb, var(--bad) 7%, transparent);
+                  border-radius:4px; padding:2px 6px; }
+  .gresp pre { margin:6px 0 4px; padding:9px 12px; font-size:11.5px; line-height:1.45;
+               background:var(--panel-2); border:1px solid var(--border); border-radius:6px;
+               overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+  .gtoc { columns:2; column-gap:26px; margin:8px 0 20px; font-size:13px; }
+  .gtoc a { color:var(--ink-dim); text-decoration:none; }
+  .gtoc a:hover { text-decoration:underline; }
+  .gtoc .fx { color:var(--bad); font-weight:600; }
+  .gprompt pre { white-space:pre-wrap; font-size:12px; background:var(--panel-2);
+                 padding:9px 12px; border-radius:6px; border:1px solid var(--border); }
+"""
+
+
+def _bench_grades_html(run: dict) -> str:
+    """One cell, fully accounted for: every request, its full graded response, and every case
+    with what was asked, what was expected, and what came back. Static HTML — native
+    <details> for collapsing, no scripts — so it can be saved, printed, and browsed offline.
+    This page is the answer to "it scored 89% — what exactly is the other 11% and WHY?"."""
+    cfg = run.get("config") or {}
+    res = run.get("results") or {}
+    rows = res.get("rows") or []
+    suite_name = str(cfg.get("suite") or "")
+    tasks = {t["id"]: t for t in (SUITES.get(suite_name) or [])}
+    label = _bench_label_display(run.get("label") or run.get("model") or run.get("id") or "")
+
+    by_task: dict = {}
+    for i, rr in enumerate(rows):
+        by_task.setdefault(rr.get("task") or "—", []).append((i, rr))
+
+    def frac(items):
+        tot = ok = 0
+        for _i, rr in items:
+            g = rr.get("grade") or {}
+            tot += g.get("total") or 0
+            ok += g.get("passed") or 0
+        return ok, tot
+
+    # Failures first: that is the question this page exists to answer.
+    ordered = sorted(by_task.items(),
+                     key=lambda kv: (frac(kv[1])[0] >= frac(kv[1])[1], kv[0]))
+
+    toc = []
+    sections = []
+    for tid, items in ordered:
+        ok, tot = frac(items)
+        task = tasks.get(tid) or {}
+        imperfect = ok < tot
+        toc.append(f'<div><a href="#t-{_h(tid)}" class="{"fx" if imperfect else ""}">'
+                   f'{_h(tid)}</a> <span style="color:var(--ink-faint)">{ok}/{tot}</span></div>')
+        blocks = [f'<h2 id="t-{_h(tid)}">{_h(tid)}'
+                  f' <span style="color:var(--ink-faint);font-size:13px;font-weight:400">— '
+                  f'{_h(TASK_DESC.get(tid) or "")} · {ok}/{tot} cases</span></h2>']
+        if task.get("prompt"):
+            blocks.append(f'<details class="gprompt"><summary>the prompt every run got'
+                          f'</summary><pre>{_h(task["prompt"])}</pre></details>')
+        # failed runs first inside the task, then by sequence
+        items = sorted(items, key=lambda p: (
+            (p[1].get("grade") or {}).get("passed", 0)
+            >= (p[1].get("grade") or {}).get("total", 1), p[0]))
+        for run_no, (i, rr) in enumerate(items, start=1):
+            g = rr.get("grade") or {}
+            passed, total = g.get("passed") or 0, g.get("total") or 0
+            ok_run = passed >= total and total > 0
+            flags = []
+            if g.get("truncated"):
+                flags.append("hit the token cap mid-answer")
+            if rr.get("error"):
+                flags.append(f'request error: {_h(str(rr["error"])[:120])}')
+            if g.get("error"):
+                flags.append(f'grader: {_h(str(g["error"])[:160])}')
+            head = (f'<b class="{"ok" if ok_run else "bad"}">{passed}/{total}</b> · '
+                    f'request #{i + 1}'
+                    + (f' · <span style="color:var(--amber,var(--ink-faint))">'
+                       f'{" · ".join(flags)}</span>' if flags else ""))
+            cases_html = ""
+            gcases = g.get("cases") or []
+            if gcases:
+                lis = []
+                for ci, cres in enumerate(gcases):
+                    call, exp = _bench_case_parts(task, ci) if task else (f"case {ci+1}", "?")
+                    cok = bool(cres.get("ok"))
+                    if cok:
+                        line = f'{_h(call)} → {_h(exp)}'
+                    else:
+                        got = cres.get("got")
+                        gtxt = json.dumps(got) if not isinstance(got, str) or len(got) < 80                             else json.dumps(got[:80] + "…")
+                        line = f'{_h(call)} → got {_h(gtxt)}, expected {_h(exp)}'
+                    lis.append(f'<li class="{"ok" if cok else "bad"}">'
+                               f'<span class="mark">{"✓" if cok else "✗"}</span>{line}</li>')
+                cases_html = f'<ul class="gcase">{"".join(lis)}</ul>'
+            resp_html = ""
+            text = rr.get("text")
+            if text:
+                lang = task.get("lang") or "python"
+                code = _bench_extract_code(text, lang)
+                shown = code or text
+                kind = "the code the grader extracted" if code else "raw reply (no code block)"
+                resp_html = (f'<details class="gresp"><summary>{kind}</summary>'
+                             f'<pre>{_h(shown[:6000])}</pre></details>')
+            blocks.append(f'<details class="greq"{"" if ok_run else " open"}>'
+                          f'<summary>{head}</summary>{cases_html}{resp_html}</details>')
+        sections.append("".join(blocks))
+
+    n_req = len(rows)
+    ok_all, tot_all = frac([(i, r) for i, r in enumerate(rows)])
+    body = (f'<style>{_GRADES_CSS}</style>'
+            f'<p class="note">Every request this cell made, every case it was graded on, and '
+            f'what came back — failures first, passing runs collapsed. Static page: save it, '
+            f'print it, it keeps working.</p>'
+            f'<div class="gtoc">{"".join(toc)}</div>'
+            + "".join(sections))
+    return _report_page(
+        title=f"Grades — {label}",
+        eyebrow="AI Proxy · benchmark · grading browser",
+        sub=f'run {run.get("id")} · suite {suite_name or "—"}',
+        meta=[("Requests", n_req), ("Cases passed", f"{ok_all}/{tot_all}"),
+              ("Model", label.split(" · ")[0])],
+        body=body,
+    )
+
+
+def _bench_grades_index_html(parent: dict, children: list) -> str:
+    """A parent sweep's doorway into per-cell grading pages. Static links only."""
+    items = []
+    for c in sorted(children, key=lambda c: ((c.get("label") or ""), c.get("id") or "")):
+        res = (c.get("results") or {})
+        s2 = res.get("summary") or {}
+        q = (s2.get("quality") or {}).get("perfect_rate")
+        qtxt = f'{q * 100:.0f}% fully correct' if q is not None else (c.get("status") or "")
+        items.append(f'<li><a href="/__proxy/api/bench/runs/{_h(c.get("id") or "")}/grades">'
+                     f'{_h(_bench_label_display(c.get("label") or c.get("id") or ""))}</a> '
+                     f'<span style="color:var(--ink-faint)">— {_h(qtxt)}</span></li>')
+    body = ('<p class="note">Pick a cell to browse every request it made and how each was '
+            'graded.</p><ul style="line-height:2">' + "".join(items) + "</ul>")
+    return _report_page(
+        title=f'Grades — {parent.get("id")}',
+        eyebrow="AI Proxy · benchmark · grading browser",
+        sub=f'{len(children)} cells',
+        meta=[("Cells", len(children))],
+        body=body,
+    )
 
 
 def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
@@ -1333,7 +1497,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             + ["TTFT p50", "Decode p50"] + (["Tokens"] if show_tokens else []) + ["Total p50"]
             + (["Fully correct", "Cases"] if graded else [])
             + (["vs best"] if show_vs else [])
-            + ["OK"])
+            + ["OK", ""])   # the trailing blank heads the grades link column
     # Slowdown against the fastest configuration in the set. A raw latency column doesn't make
     # "16x slower for no quality gain" jump out; a ratio does.
     fastest = min((r["total_p50"] for r in rows if r["total_p50"]), default=None)
@@ -1374,6 +1538,11 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
                 f'{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>')
         ok = r["n_success"] == r["n_total"]
         cells.append(f'<td class="n {"ok" if ok else "bad"}">{r["n_success"]}/{r["n_total"]}</td>')
+        # Deep link into the grading browser: every request and case behind this row's
+        # numbers, statically rendered. Hidden in print, where a link is just clutter.
+        cells.append(f'<td class="n ix-only"><a class="glink" '
+                     f'href="/__proxy/api/bench/runs/{_h(r.get("id") or "")}/grades">'
+                     f'grades</a></td>')
         body_rows.append(f'<tr data-m="{_row_m}">' + "".join(cells) + "</tr>")
 
     # One configuration has nothing to compare against: a chart with a single full-width bar

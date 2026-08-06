@@ -9575,6 +9575,41 @@ async def bench_runs_list(request: Request, limit: int = 50, include_children: b
     return {"items": items}
 
 
+@app.get("/__proxy/api/bench/runs/{bench_id}/grades")
+async def bench_grades(bench_id: str):
+    """The grading browser: a cell renders every request and case statically; a sweep parent
+    renders an index of its cells. This is where "89% — what failed in the other 11% and
+    WHY?" gets answered, one request at a time."""
+    conn = db()
+    row = conn.execute("SELECT * FROM bench_runs WHERE id=?", (bench_id,)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"error": "not found"}, status_code=404)
+    run = dict(row)
+    for k, col in (("config", "config_json"), ("results", "results_json")):
+        try:
+            run[k] = json.loads(run.get(col) or "{}")
+        except (json.JSONDecodeError, TypeError):
+            run[k] = {}
+    kids = conn.execute(
+        "SELECT id, label, status, results_json FROM bench_runs WHERE parent_id=? ORDER BY ts",
+        (bench_id,)).fetchall()
+    conn.close()
+    if kids:
+        children = []
+        for k in kids:
+            c = dict(k)
+            try:
+                c["results"] = json.loads(c.get("results_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                c["results"] = {}
+            children.append(c)
+        html = _bench_report_mod._bench_grades_index_html(run, children)
+    else:
+        html = _bench_report_mod._bench_grades_html(run)
+    return Response(content=html, media_type="text/html")
+
+
 @app.get("/__proxy/api/bench/runs/{bench_id}")
 async def bench_run_get(bench_id: str, request: Request):
     conn = db()
