@@ -44,7 +44,7 @@ def test_every_request_appears_with_its_cases(client):
     assert "✓" in html and "✗" in html
     assert "to_roman(" in html, "passing cases still show what was asked"
     assert "IIII" in html and "MDCCCC" in html, "failures show what came back"
-    assert "hit the token cap mid-answer" in html
+    assert "TOKEN CAP" in html and "SYNTAX ERROR" in html, "badges must shout"
     assert "the code the grader extracted" in html
     assert "return &#x27;IIII&#x27;" in html or "return 'IIII'" in html
 
@@ -60,6 +60,23 @@ def test_the_page_is_static(client):
     assert "fetch(" not in html and "XMLHttpRequest" not in html
     assert '<script src=' not in html
     assert "<details" in html, "collapsing is native HTML, not script"
+
+
+def test_grader_errors_are_loud_and_complete(client):
+    html = BR._bench_grades_html(_cell_run())
+    assert 'class="gbadge"' in html
+    assert 'class="gerr"' in html, "the full error renders as its own block, not a grey flag"
+    assert "SyntaxError: invalid syntax" in html
+
+
+def test_grades_pages_link_back_to_the_report(client):
+    run = _cell_run()
+    run["parent_id"] = "b_parent"
+    html = BR._bench_grades_html(run)
+    assert "/__proxy/api/bench/report?format=html&ids=b_parent" in html
+    assert "/__proxy/api/bench/runs/b_parent/grades" in html
+    idx = BR._bench_grades_index_html({"id": "b_parent"}, [])
+    assert "/__proxy/api/bench/report?format=html&ids=b_parent" in idx
 
 
 def test_the_prompt_is_browsable(client):

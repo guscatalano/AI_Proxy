@@ -872,3 +872,15 @@ def test_a_truncated_failing_grade_says_so_in_the_examples():
     ]
     html = _render(runs)
     assert "hit the token cap mid-answer" in html
+
+
+def test_html_enumerated_attributes_compare_case_insensitively():
+    """method="POST" submits identically to method="post" — failing a model over that casing
+    was grader pedantry, spotted in the grading browser. href stays strict: paths are paths."""
+    task = _tasks()["login_form"]
+    shouty = REFERENCE["login_form"].replace('method="post"', 'METHOD="POST"') \
+                                    .replace('type="email"', 'type="EMAIL"')
+    res = P._bench_check_html(shouty, task["cases"])
+    assert res["passed"] == res["total"], res
+    assert P._html_attr_eq("href", "/About", "/about") is False
+    assert P._html_attr_eq("aria-current", "PAGE", "page") is True

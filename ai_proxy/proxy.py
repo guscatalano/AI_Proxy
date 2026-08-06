@@ -10990,6 +10990,7 @@ _bench_html_select = _bench_graders_mod._bench_html_select
 _bench_html_text = _bench_graders_mod._bench_html_text
 _bench_check_html = _bench_graders_mod._bench_check_html
 _bench_check_css = _bench_graders_mod._bench_check_css
+_html_attr_eq = _bench_graders_mod._html_attr_eq
 _bench_extract_code = _bench_graders_mod._bench_extract_code
 _BENCH_GRADER_SRC = _bench_graders_mod._BENCH_GRADER_SRC
 _BENCH_JS_GRADER_SRC = _bench_graders_mod._BENCH_JS_GRADER_SRC

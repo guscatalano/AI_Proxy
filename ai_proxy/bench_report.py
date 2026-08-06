@@ -1245,7 +1245,30 @@ _GRADES_CSS = """
   .gtoc .fx { color:var(--bad); font-weight:600; }
   .gprompt pre { white-space:pre-wrap; font-size:12px; background:var(--panel-2);
                  padding:9px 12px; border-radius:6px; border:1px solid var(--border); }
+  .gbadge { display:inline-block; background:var(--bad); color:#fff; border-radius:4px;
+            padding:1px 8px; font-family:var(--mono); font-size:10.5px; letter-spacing:.06em;
+            margin-left:8px; vertical-align:1px; }
+  .gbadge.warn { background:var(--amber, #9a6b16); }
+  .gerr { border-left:3px solid var(--bad); background:color-mix(in srgb, var(--bad) 6%,
+          var(--panel-2)); border-radius:0 6px 6px 0; padding:8px 12px; margin:8px 0; }
+  .gerr b { color:var(--bad); font-family:var(--mono); font-size:11px; letter-spacing:.08em; }
+  .gerr pre { margin:6px 0 2px; white-space:pre-wrap; overflow-wrap:anywhere;
+              font-size:11.5px; line-height:1.5; }
 """
+
+
+def _grade_error_kind(err: str) -> str:
+    """Name the failure class so a compile error cannot hide inside small grey text."""
+    low = err.lower()
+    if low.startswith("compile error"):
+        return "COMPILE ERROR"
+    if "timeout" in low:
+        return "TIMEOUT"
+    if "syntaxerror" in low:
+        return "SYNTAX ERROR"
+    if "no code" in low:
+        return "NO CODE BLOCK"
+    return "GRADER ERROR"
 
 
 def _bench_grades_html(run: dict) -> str:
@@ -1298,17 +1321,23 @@ def _bench_grades_html(run: dict) -> str:
             g = rr.get("grade") or {}
             passed, total = g.get("passed") or 0, g.get("total") or 0
             ok_run = passed >= total and total > 0
-            flags = []
+            badges = []
+            err_blocks = []
             if g.get("truncated"):
-                flags.append("hit the token cap mid-answer")
+                badges.append('<span class="gbadge warn">TOKEN CAP</span>')
             if rr.get("error"):
-                flags.append(f'request error: {_h(str(rr["error"])[:120])}')
+                badges.append('<span class="gbadge">REQUEST FAILED</span>')
+                err_blocks.append(f'<div class="gerr"><b>REQUEST FAILED</b>'
+                                  f'<pre>{_h(str(rr["error"]))}</pre></div>')
             if g.get("error"):
-                flags.append(f'grader: {_h(str(g["error"])[:160])}')
+                kind = _grade_error_kind(str(g["error"]))
+                badges.append(f'<span class="gbadge">{kind}</span>')
+                # The FULL stored error — compiler output is the diagnosis, and truncating
+                # it to a grey flag was how compile errors stayed invisible.
+                err_blocks.append(f'<div class="gerr"><b>{kind}</b>'
+                                  f'<pre>{_h(str(g["error"]))}</pre></div>')
             head = (f'<b class="{"ok" if ok_run else "bad"}">{passed}/{total}</b> · '
-                    f'request #{i + 1}'
-                    + (f' · <span style="color:var(--amber,var(--ink-faint))">'
-                       f'{" · ".join(flags)}</span>' if flags else ""))
+                    f'request #{i + 1}{"".join(badges)}')
             cases_html = ""
             gcases = g.get("cases") or []
             if gcases:
@@ -1335,12 +1364,18 @@ def _bench_grades_html(run: dict) -> str:
                 resp_html = (f'<details class="gresp"><summary>{kind}</summary>'
                              f'<pre>{_h(shown[:6000])}</pre></details>')
             blocks.append(f'<details class="greq"{"" if ok_run else " open"}>'
-                          f'<summary>{head}</summary>{cases_html}{resp_html}</details>')
+                          f'<summary>{head}</summary>{"".join(err_blocks)}'
+                          f'{cases_html}{resp_html}</details>')
         sections.append("".join(blocks))
 
     n_req = len(rows)
     ok_all, tot_all = frac([(i, r) for i, r in enumerate(rows)])
-    body = (f'<style>{_GRADES_CSS}</style>'
+    _parent = run.get("parent_id")
+    _nav = (f'<p style="margin:0 0 14px"><a href="/__proxy/api/bench/report?format=html'
+            f'&ids={_h(_parent or run.get("id") or "")}">← back to the report</a>'
+            + (f' · <a href="/__proxy/api/bench/runs/{_h(_parent)}/grades">all cells</a>'
+               if _parent else "") + '</p>')
+    body = (_nav + f'<style>{_GRADES_CSS}</style>'
             f'<p class="note">Every request this cell made, every case it was graded on, and '
             f'what came back — failures first, passing runs collapsed. Static page: save it, '
             f'print it, it keeps working.</p>'
@@ -1367,7 +1402,9 @@ def _bench_grades_index_html(parent: dict, children: list) -> str:
         items.append(f'<li><a href="/__proxy/api/bench/runs/{_h(c.get("id") or "")}/grades">'
                      f'{_h(_bench_label_display(c.get("label") or c.get("id") or ""))}</a> '
                      f'<span style="color:var(--ink-faint)">— {_h(qtxt)}</span></li>')
-    body = ('<p class="note">Pick a cell to browse every request it made and how each was '
+    body = (f'<p style="margin:0 0 14px"><a href="/__proxy/api/bench/report?format=html'
+            f'&ids={_h(parent.get("id") or "")}">← back to the report</a></p>'
+            '<p class="note">Pick a cell to browse every request it made and how each was '
             'graded.</p><ul style="line-height:2">' + "".join(items) + "</ul>")
     return _report_page(
         title=f'Grades — {parent.get("id")}',

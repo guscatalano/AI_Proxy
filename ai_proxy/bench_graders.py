@@ -132,6 +132,21 @@ def _bench_suite_tasks(suite_name: str) -> tuple:
     return runnable, skipped
 
 
+# Attributes whose VALUES HTML itself treats as case-insensitive (enumerated keywords):
+# method="POST" submits identically to method="post", and failing a model over that casing
+# is grader pedantry, not a wrong answer. href stays strict — paths are case-sensitive.
+_HTML_CI_ATTRS = {"method", "type", "enctype", "autocomplete", "scope", "aria-current",
+                  "dir", "inputmode"}
+
+
+def _html_attr_eq(name: str, got, want) -> bool:
+    if got is None or want is None:
+        return got == want
+    if name.lower() in _HTML_CI_ATTRS:
+        return str(got).lower() == str(want).lower()
+    return got == want
+
+
 class _BenchHTML(HTMLParser):
     """Just enough DOM to check structure: tags, attributes, text, parentage."""
 
@@ -195,7 +210,7 @@ def _bench_html_select(root: dict, selector: str) -> list:
         for name, val in attrs:
             if name not in node["attrs"]:
                 return False
-            if val is not None and node["attrs"][name] != val:
+            if val is not None and not _html_attr_eq(name, node["attrs"][name], val):
                 return False
         return True
 
@@ -250,7 +265,7 @@ def _bench_check_html(code: str, cases: list) -> dict:
             elif op == "attr":
                 m = _bench_html_select(root, c["sel"])
                 got = m[0]["attrs"].get(c["name"].lower()) if m else None
-                ok = got == c["expect"]
+                ok = _html_attr_eq(c["name"], got, c["expect"])
             elif op == "text":
                 m = _bench_html_select(root, c["sel"])
                 got = _bench_html_text(m[0]) if m else None
