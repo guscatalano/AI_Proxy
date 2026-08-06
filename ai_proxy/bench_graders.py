@@ -60,6 +60,27 @@ def _bench_tool(name: str):
     return None
 
 
+def _compiler_version(binary: str) -> str:
+    """One line of version output, however the toolchain spells the flag."""
+    for args in ([binary, "--version"], [binary, "version"]):
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=10).stdout
+            if out.strip():
+                return out.strip().splitlines()[0][:120]
+        except (OSError, subprocess.SubprocessError):
+            continue
+    return ""
+
+
+def _build_context(comp_cmd: list, src: str) -> dict:
+    """What a compile failure needs to be judged: the exact command, the toolchain version,
+    and the harness the grader wrapped around the model's code — so a reader can tell a
+    model error from a harness error, and knows the model never saw the harness."""
+    return {"cmd": " ".join(str(a) for a in comp_cmd),
+            "compiler": _compiler_version(str(comp_cmd[0])),
+            "harness": src[:2000]}
+
+
 def _bench_lit(v, lang: str) -> str:
     """One argument as a source literal. JSON string escaping is valid in C, C++, Rust and C#
     for the ASCII cases these tasks use, which is exactly why the cases stay ASCII."""
@@ -456,11 +477,13 @@ def _bench_grade_c(code: str, entry: str, cases: list, timeout_s: float) -> dict
             f.write(src)
         env = {"PATH": os.environ.get("PATH", ""),
                "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
-        comp = subprocess.run([gcc, "-O0", "-fwrapv", cpath, "-o", epath],
+        comp_cmd = [gcc, "-O0", "-fwrapv", cpath, "-o", epath]
+        comp = subprocess.run(comp_cmd,
                               capture_output=True, text=True, timeout=20, env=env, cwd=workdir)
         if comp.returncode != 0:
             return {"passed": 0, "total": len(cases),
-                    "error": ("compile error: " + (comp.stderr or "")[-280:]).strip()}
+                    "error": ("compile error: " + (comp.stderr or "")[-600:]).strip(),
+                    "build": _build_context(comp_cmd, src)}
         run = subprocess.run([epath], capture_output=True, text=True,
                              timeout=timeout_s, env=env, cwd=workdir)
         got = (run.stdout or "").strip().splitlines()
@@ -565,9 +588,10 @@ def _bench_grade_compiled(lang: str, code: str, entry: str, cases: list,
         comp = subprocess.run(comp_cmd, capture_output=True, text=True, timeout=90,
                               env=env, cwd=workdir)
         if comp.returncode != 0:
-            msg = (comp.stderr or comp.stdout or "")[-300:]
+            msg = (comp.stderr or comp.stdout or "")[-600:]
             return {"passed": 0, "total": len(cases),
-                    "error": ("compile error: " + msg).strip()}
+                    "error": ("compile error: " + msg).strip(),
+                    "build": _build_context(comp_cmd, src)}
         run = subprocess.run(run_cmd, capture_output=True, text=True,
                              timeout=timeout_s, env=env, cwd=workdir)
         # splitlines on the raw output, not on .strip() of it: stripping ate trailing empty

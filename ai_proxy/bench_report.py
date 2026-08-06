@@ -14,10 +14,10 @@ import time
 from pathlib import Path
 
 try:
-    from .bench_suites import SUITES, TASK_DESC
+    from .bench_suites import SUITES, TASK_DESC, TASK_NOTES
     from .bench_graders import _bench_extract_code
 except ImportError:          # flat-script launch: modules sit beside each other
-    from bench_suites import SUITES, TASK_DESC
+    from bench_suites import SUITES, TASK_DESC, TASK_NOTES
     from bench_graders import _bench_extract_code
 
 def _fmt_n(v, digits=0, suffix=""):
@@ -1245,6 +1245,11 @@ _GRADES_CSS = """
   .gtoc .fx { color:var(--bad); font-weight:600; }
   .gprompt pre { white-space:pre-wrap; font-size:12px; background:var(--panel-2);
                  padding:9px 12px; border-radius:6px; border:1px solid var(--border); }
+  .gnote { border-left:3px solid var(--accent); background:color-mix(in srgb,
+           var(--accent) 6%, var(--panel-2)); border-radius:0 6px 6px 0;
+           padding:8px 12px; margin:6px 0 10px; font-size:12.5px; color:var(--ink-dim); }
+  .gbuild { font-size:12px; color:var(--ink-dim); margin:6px 0 2px; }
+  .gbuild code { overflow-wrap:anywhere; }
   .gbadge { display:inline-block; background:var(--bad); color:#fff; border-radius:4px;
             padding:1px 8px; font-family:var(--mono); font-size:10.5px; letter-spacing:.06em;
             margin-left:8px; vertical-align:1px; }
@@ -1310,6 +1315,10 @@ def _bench_grades_html(run: dict) -> str:
         blocks = [f'<h2 id="t-{_h(tid)}">{_h(tid)}'
                   f' <span style="color:var(--ink-faint);font-size:13px;font-weight:400">— '
                   f'{_h(TASK_DESC.get(tid) or "")} · {ok}/{tot} cases</span></h2>']
+        note = TASK_NOTES.get(tid)
+        if note and imperfect:
+            blocks.append(f'<p class="gnote"><b>Why this fails when it fails:</b> '
+                          f'{_h(note)}</p>')
         if task.get("prompt"):
             blocks.append(f'<details class="gprompt"><summary>the prompt every run got'
                           f'</summary><pre>{_h(task["prompt"])}</pre></details>')
@@ -1334,8 +1343,22 @@ def _bench_grades_html(run: dict) -> str:
                 badges.append(f'<span class="gbadge">{kind}</span>')
                 # The FULL stored error — compiler output is the diagnosis, and truncating
                 # it to a grey flag was how compile errors stayed invisible.
+                build = g.get("build") or {}
+                build_html = ""
+                if build:
+                    build_html = (
+                        f'<div class="gbuild">compiled with <code>{_h(build.get("cmd") or "?")}'
+                        f'</code>'
+                        + (f' — {_h(build["compiler"])}' if build.get("compiler") else "")
+                        + '<br><span style="color:var(--ink-faint)">the model saw only the '
+                        'task prompt above; the harness below is the grader\'s wrapper, '
+                        'added after the fact.</span></div>'
+                        + (f'<details class="gresp"><summary>the full source as compiled '
+                           f'(harness + model code)</summary>'
+                           f'<pre>{_h(build.get("harness") or "")}</pre></details>'
+                           if build.get("harness") else ""))
                 err_blocks.append(f'<div class="gerr"><b>{kind}</b>'
-                                  f'<pre>{_h(str(g["error"]))}</pre></div>')
+                                  f'<pre>{_h(str(g["error"]))}</pre>{build_html}</div>')
             head = (f'<b class="{"ok" if ok_run else "bad"}">{passed}/{total}</b> · '
                     f'request #{i + 1}{"".join(badges)}')
             cases_html = ""

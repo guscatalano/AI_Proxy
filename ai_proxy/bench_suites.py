@@ -1204,3 +1204,140 @@ TASK_DESC.update({
     'html_nav_current': 'Nav list with aria-current on the active link',
     'css_sticky_footer': 'Flexbox sticky footer, no fixed positioning',
 })
+
+
+# Why each task fails when it fails: the authored explanation the grading
+# browser shows next to a task's requests. Metadata only — prompts, cases and
+# grading are untouched, so recorded scores and cell signatures are unaffected.
+TASK_NOTES = {
+    'binary_search':
+        'Classic off-by-one territory: lo/hi drift or a mid that never converges. A wrong index on a present value is a boundary bug; -1 on a present value usually means the loop exits one step early.',
+    'merge_intervals':
+        "Failures cluster on touching intervals ([1,3],[3,5]) and unsorted input — merging requires sorting first, and 'overlap' includes equal endpoints.",
+    'word_freq':
+        'The trap is tie-breaking: equal counts must come back alphabetically. A correct count in the wrong order is the usual miss.',
+    'roman':
+        'Subtractive pairs (4→IV, 9→IX, 40→XL...) are the whole task; IIII-style output means additive-only construction.',
+    'balanced':
+        'Interleaved brackets like ([)] must fail — a counter per bracket type passes counts but misses ordering; only a stack sees it.',
+    'flatten':
+        'Arbitrary depth is the point: one-level flattening survives the shallow cases and dies on [[1,[2]],3].',
+    'two_sum':
+        'Indices, not values — and the same element may not be used twice. Returning values or reusing an index are the classic slips.',
+    'lru_cache_sim':
+        'Eviction order is the test: a get must refresh recency. Evicting the oldest *inserted* rather than least-recently-*used* fails the interleaved case.',
+    'group_anagrams':
+        'Both orderings matter: words sorted inside groups, groups sorted by first member. Correct grouping in arbitrary order is the usual miss.',
+    'run_length':
+        'Runs of length 1 still get their count (a1), and digits in the input must not merge with counts.',
+    'compare_versions':
+        'Numeric per-segment comparison with implicit zeros: 1.10 > 1.9 and 1.0 == 1.0.0. String comparison fails exactly there.',
+    'spiral':
+        'Non-square matrices and the final inward pass: double-visiting the middle row/column is the classic bug.',
+    'edit_distance':
+        "Substitution counts as ONE edit. Off-by-one against empty strings means the DP table's first row/column is wrong.",
+    'lis_length':
+        'STRICTLY increasing — equal elements break the run. Counting equal as increasing inflates the answer by exactly the duplicates.',
+    'simplify_path':
+        "'..' at root stays at root, trailing slashes drop, and '...' is a legal directory name — treating it like '..' is the trap.",
+    'calculator':
+        'Precedence without eval: 2+3*4 is 14. Left-to-right evaluation gives 20 and fails half the cases; integer division truncates toward zero.',
+    'word_break':
+        "Reused words are allowed and greedy matching fails ('aaab' with ['a','aa','ab']); only DP/backtracking sees the split.",
+    'topo_sort':
+        'Any valid ordering passes — failures here are real: dropped nodes, or emitting a node before its prerequisite.',
+    'semver_cmp':
+        "Pre-release < release (1.0.0-alpha < 1.0.0), numeric identifiers compare numerically, alphanumerics lexically, and build metadata (+...) is IGNORED. Most failures treat '-alpha' as greater or compare '10' < '9' stringly.",
+    'csv_line':
+        "Quoted fields hide commas, and '' inside quotes is a literal quote. Splitting on every comma fails the quoted cases; the doubled-quote rule fails the rest.",
+    'glob_match':
+        "* can match empty, and backtracking is required: 'a*b*c' against tricky strings defeats greedy single-pass matching.",
+    'roman_strict':
+        'Parsing is the easy half — REJECTING non-canonical forms (IIII, VX, IC) is the task. Accepting anything that merely sums is the failure mode.',
+    'topo_lex':
+        'Not just any topological order: the lexicographically smallest, which means a min-heap, not a queue. None on cycles — returning a partial order instead is the miss.',
+    'lru_ops':
+        "Same trap as v1's LRU with sharper cases: get refreshes recency, and updating an existing key must not evict.",
+    'justify':
+        'Extra spaces distribute left-first, and the last line is left-justified. Even distribution everywhere fails both.',
+    'path_norm':
+        "Like simplify_path with harder edges: leading '..' at root, and collapsing '//' without eating legitimate names.",
+    'json_pointer':
+        "'/a~1b' decodes to key 'a/b' (~1=/ then ~0=~, in that order), '' is the whole doc, and array indices reject leading zeros. The escape ORDER is the classic miss.",
+    'base_convert':
+        "Validation is half the task: digits must be legal in the SOURCE base ('19' is invalid base-8). Converting first and validating never is the failure.",
+    'interval_intersect':
+        'Closed intervals: touching endpoints ([1,3],[3,5]) DO intersect at [3,3]. Strict inequality drops exactly those.',
+    'tokenize_expr':
+        'Multi-digit numbers stay whole, whitespace splits nothing by itself, and any illegal character means None — not a partial token list.',
+    'parse_query':
+        "Later duplicate keys win, '+' decodes to space, and a bare key gets an empty-string value. Each is its own case.",
+    'group_ranges':
+        "Runs collapse only when strictly consecutive; singletons print alone (no '5-5'). Off-by-one on run ends shows up immediately.",
+    'clamp_add':
+        'int overflow is undefined behaviour in C — adding first and checking after is exactly the bug. The check must precede the add.',
+    'round_to':
+        'Halves round AWAY from zero, including negatives: -25 to tens is -30. Integer division truncation rounds toward zero and fails the negative halves.',
+    'count_words':
+        'Tabs separate too, and leading/trailing/multiple separators must not create empty words. Counting separator+1 fails all of those.',
+    'csv_escape':
+        'RFC 4180: quote only when needed, and double internal quotes. Quoting everything unconditionally fails the no-quote cases.',
+    'balanced_depth':
+        '-1 for unbalanced is half the task: a correct max depth on balanced input with no negative check misses every unbalanced case.',
+    'snake_to_camel':
+        "Digits do not capitalize: x_1y stays x1y. Uppercasing whatever follows '_' fails exactly that case.",
+    'mid_floor':
+        '(a+b)/2 overflows i64 and truncates toward zero for negatives — the task wants mathematical floor. Both traps have dedicated cases.',
+    'clamp_mul':
+        'Same shape as clamp_add but for multiplication: widen (or pre-check) before multiplying, clamp after.',
+    'ordinal':
+        '11th, 12th, 13th — the teens override the last-digit rule. st/nd/rd by last digit alone fails 111, 112, 113.',
+    'slugify':
+        "MAXIMAL runs of non-alphanumerics become ONE hyphen, and edges trim: ' -a- ' is 'a', not '-a-'.",
+    'pluck':
+        'A null VALUE is kept; a MISSING key is skipped. isset() treats them the same and drops the nulls — array_key_exists is the distinction.',
+    'login_form':
+        'Graded structurally: labels must bind via for=id, inputs need the right types, the form must POST to /login. Unbound labels are the usual miss.',
+    'data_table':
+        'caption, thead with scoped th columns, tbody — semantic structure, not appearance. Divs styled as a table score zero here.',
+    'card_grid':
+        "The exact grid recipe: repeat(auto-fill, minmax(240px, 1fr)) and the gap. Flexbox approximations don't declare what the checker reads.",
+    'theme_vars':
+        "The dark token must live INSIDE the media query. Redefining --ink at top level 'works' in a dark browser and is still wrong — last-wins would break light mode.",
+    'quoted_split':
+        'Shell rules: quotes group, \\" and \\\\ escape inside quotes, "" is an EMPTY token (not nothing), and an unterminated quote is None — not a best-effort split. str.split() fails every quoted case.',
+    'ring_buffer':
+        'Push onto a full ring OVERWRITES the oldest — a bounded queue that rejects instead returns the wrong survivors. Pop order then reveals which one you built.',
+    'expand_ranges':
+        "Validation is half the task: '5-3' reversed and 'a-b' are None, not an empty list — range(5,3) silently produces nothing, which is the trap.",
+    'dedent_text':
+        'The common prefix is matched character-by-character: a tab and four spaces share NO prefix. strip()ing every line destroys relative indentation, which the cases check.',
+    'deep_get':
+        "[n] indexes arrays only and CHAINS: x[1][0] resolves x → the array, [1] → its second element, [0] → that element's first. Got-null on a valid chain means the bracket suffixes after the first were dropped; [n] on an object (not array) is a miss by design; a stored null is returned as null.",
+    'sql_top_spenders':
+        "HAVING filters the SUMS, WHERE filters the rows: 'WHERE amount >= 100' drops a customer who spent 60+50. The threshold applies to the total.",
+    'sql_missing_users':
+        "NOT IN over a set containing NULL matches NOTHING — that's SQL's three-valued logic, and the data plants a NULL user_id on purpose. NOT EXISTS or an anti-join is the correct shape.",
+    'bash_dedup_lines':
+        "First occurrence wins IN ORDER — sort -u dedups but reorders, which the cases detect. awk '!seen[$0]++' is the canonical answer.",
+    'bash_sort_versions':
+        'Each dot-component compares numerically: 1.9.0 < 1.10.0. Plain sort puts 1.10 first lexically; sort -V or -t. -k1,1n -k2,2n -k3,3n is needed.',
+    'go_rle_decode':
+        'Strict decode: counts are >= 1 with no leading zeros, letters and counts strictly alternate, and ANY malformation returns "" — not a partial decode of the valid prefix.',
+    'go_ipv4_valid':
+        "Leading zeros are invalid ('01'), '0' alone is fine, exactly four all-digit parts, each 0-255. Atoi-and-range-check silently accepts '01', which is the planted case.",
+    'c_bit_count_range':
+        "b can be INT_MAX: 'for (int i = a; i <= b; i++)' overflows and never terminates — that's a TIMEOUT here, not a wrong number. Use a wider loop variable.",
+    'cpp_wrap_count':
+        "Greedy wrap counting joining spaces; a word LONGER than the width takes its own line UNSPLIT. Splitting long words changes the line count, which is what's graded.",
+    'rust_kv_get':
+        "Split each entry on the FIRST '=' ('a=b=c' has value 'b=c'), LAST duplicate wins, '=' -less entries are ignored. split('=').nth(1) truncates values containing '='.",
+    'cs_round_half':
+        "C#'s Math.Round is banker's rounding: 2.5 → 2. The task wants away-from-zero: 2.5 → 3, -2.5 → -3. Math.Floor(v+0.5) style (mirrored for negatives) is the fix.",
+    'php_flatten_keys':
+        "Recursive flatten with dot-joined keys at ANY depth — one level of looping leaves 'a.b' holding an array. null and false are values, kept as-is.",
+    'html_nav_current':
+        'Structure is the grade: nav > ul > li > a, and aria-current="page" on exactly the About link. Links without the list, or aria-current everywhere, both miss.',
+    'css_sticky_footer':
+        "The flex recipe specifically: body as a min-height:100vh column and footer with margin-top:auto. position:fixed 'looks right' and declares none of what's checked.",
+}

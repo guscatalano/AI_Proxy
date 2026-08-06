@@ -111,3 +111,37 @@ def test_the_report_links_every_row_to_its_grades(client):
     html = _render([_run("a", prompt=32000), _run("b", prompt=131072)])
     assert html.count('class="glink"') == 2
     assert '/__proxy/api/bench/runs/a/grades' in html
+
+
+def test_task_notes_explain_the_trap_for_imperfect_tasks(client):
+    html = BR._bench_grades_html(_cell_run())
+    assert "Why this fails when it fails" in html
+    assert "Subtractive pairs" in html, "roman's authored note must render"
+    # A clean task keeps its page quiet — the note only appears where it answers something.
+    assert html.split('id="t-binary_search"')[1].count("Why this fails") == 0
+
+
+def test_compile_errors_carry_their_build_context(client):
+    run = _cell_run()
+    run["config"]["suite"] = "coding-v2"
+    run["results"]["rows"] = [
+        {"seq": 1, "task": "csv_escape",
+         "text": "```cpp\nstd::string csv_escape(std::string f) { return f\n```",
+         "grade": {"passed": 0, "total": 6,
+                   "error": "compile error: expected ';' before '}' token",
+                   "build": {"cmd": "g++ -std=c++17 -O0 task.cpp -o task.exe",
+                             "compiler": "g++ (Ubuntu 13.2.0) 13.2.0",
+                             "harness": "#include <iostream>\nint main() { /* calls */ }"}}},
+    ]
+    html = BR._bench_grades_html(run)
+    assert "compiled with" in html and "g++ -std=c++17" in html
+    assert "g++ (Ubuntu 13.2.0)" in html
+    assert "the model saw only the task prompt" in html
+    assert "the full source as compiled" in html and "#include &lt;iostream&gt;" in html
+
+
+def test_every_task_in_every_suite_has_a_note(client):
+    from ai_proxy.bench_suites import SUITES, TASK_NOTES
+    missing = [t["id"] for name in ("coding-v1", "coding-v2", "coding-v3")
+               for t in SUITES[name] if t["id"] not in TASK_NOTES]
+    assert not missing, missing

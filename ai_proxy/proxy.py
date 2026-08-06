@@ -10971,6 +10971,7 @@ _BENCH_BASE_TASK = (
 # module) keeps working unchanged.
 _BENCH_SUITES = _bench_suites_mod.SUITES
 _BENCH_TASK_DESC = _bench_suites_mod.TASK_DESC
+_BENCH_TASK_NOTES = _bench_suites_mod.TASK_NOTES
 
 # Grading machinery lives in bench_graders — synchronous, importable without the
 # app. Re-bound under the old names so references and monkeypatching tests keep
