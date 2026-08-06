@@ -1828,8 +1828,25 @@ async def _vllm_boot_state() -> dict:
         return {"state": "unknown", "container": name}
     parts = (out.strip().split("\t") + ["", ""])[:2]
     if parts[0].strip().lower() != "true":
-        return {"state": "stopped", "container": name}
+        stopped = {"state": "stopped", "container": name}
+        try:
+            for c in await _vllm_configs():
+                if c.get("container") == name and c.get("model"):
+                    stopped["model"] = c["model"]
+                    break
+        except Exception:
+            pass
+        return stopped
     info = {"state": "loading", "container": name, "started_at": parts[1].strip() or None}
+    # "loading" without a name is half an answer: the container's own config knows which
+    # model it will serve long before /v1/models can say so.
+    try:
+        for c in await _vllm_configs():
+            if c.get("container") == name and c.get("model"):
+                info["model"] = c["model"]
+                break
+    except Exception:
+        pass
     # The tail is enough: these lines are emitted continuously while it comes up.
     code, logs = await _run_cmd([docker, "logs", "--tail", "40", name], 15.0,
                                 max_chars=20000, keep_tail=True)
@@ -9290,7 +9307,10 @@ async def bench_run(request: Request):
         "concurrency": (payload["concurrency"] if isinstance(payload.get("concurrency"), list)
                         else int(payload.get("concurrency", 1) or 1)),
         "randomize": bool(payload.get("randomize", False)),
-        "exclusive": bool(payload.get("exclusive", False)),
+        # Exclusive by default: a benchmark sharing the box with live traffic measures
+        # contention, disturbs the humans, and is defenseless against their restarts —
+        # all three happened. Callers must opt OUT, knowingly.
+        "exclusive": bool(payload.get("exclusive", True)),
         "drain_seconds": float(payload.get("drain_seconds", 5.0) or 0.0),
         "thinking": thinking if thinking is not None else "auto",
         "bypass_router": bool(payload.get("bypass_router", False)),

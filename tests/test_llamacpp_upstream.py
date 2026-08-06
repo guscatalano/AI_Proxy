@@ -212,3 +212,37 @@ def test_a_booting_vllm_container_is_startable_not_invisible(client, monkeypatch
     idx2 = asyncio.run(P._bench_model_index())
     meta2 = P._bench_resolve_model(idx2, "qwen3-coder-next", "vllm")
     assert meta2.get("loaded") is True and not meta2.get("startable")
+
+
+def test_vllm_boot_state_names_the_model_it_is_loading(client, monkeypatch):
+    """"loading" without a name is half an answer — the container's config knows which model
+    it will serve minutes before /v1/models can say so."""
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "inspect" in args and "{{.State.Running}}" in " ".join(map(str, args)):
+            return 0, "true\t2026-08-05T20:00:00Z"
+        if "logs" in args:
+            return 0, ""
+        return 1, ""
+
+    async def configs():
+        return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "running": True,
+                 "serves_port": True}]
+
+    async def container():
+        return "qwen-vllm"
+
+    monkeypatch.setattr(P, "_docker_bin", lambda: "docker")
+    monkeypatch.setattr(P, "_run_cmd", run)
+    monkeypatch.setattr(P, "_vllm_configs", configs)
+    monkeypatch.setattr(P, "_vllm_container", container)
+    st = asyncio.run(P._vllm_boot_state())
+    assert st["state"] == "loading"
+    assert st["model"] == "qwen3-coder-next"
+
+    async def run_stopped(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "inspect" in args:
+            return 0, "false\t"
+        return 1, ""
+    monkeypatch.setattr(P, "_run_cmd", run_stopped)
+    st2 = asyncio.run(P._vllm_boot_state())
+    assert st2["state"] == "stopped" and st2["model"] == "qwen3-coder-next"

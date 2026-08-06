@@ -5209,7 +5209,8 @@ function renderSystem() {
     unknown: ['bad',  '#666',    'unreachable'],
   };
   const vState = vllm.state || (vllm.reachable ? 'ready' : 'unknown');
-  const [vDot, vColour, vLabel] = vStates[vState] || vStates.unknown;
+  let [vDot, vColour, vLabel] = vStates[vState] || vStates.unknown;
+  if (vState === 'loading' && vllm.model) vLabel = `loading ${vllm.model}`;
   let vllmNote = '';
   if (vState === 'loading') {
     const since = vllm.started_at ? (Date.now() - Date.parse(vllm.started_at)) / 1000 : null;
@@ -5217,13 +5218,13 @@ function renderSystem() {
       ? `${Math.floor(since / 60)}m ${Math.floor(since % 60)}s in` : '';
     vllmNote = `<div style="margin:6px 0 2px;padding:8px 10px;border:1px solid #5a4a20;border-radius:4px;background:#2a2410;color:#f0c674;font-size:12px">
         <span class="spin" style="display:inline-block;margin-right:6px">◐</span>
-        ${esc(vllm.phase || 'starting up')}${elapsed ? ` · ${esc(elapsed)}` : ''}
+        loading <b>${esc(vllm.model || vllm.container || 'model')}</b> — ${esc(vllm.phase || 'starting up')}${elapsed ? ` · ${esc(elapsed)}` : ''}
         <div style="color:#9a8a5a;font-size:11px;margin-top:3px">Requests will fail until this
           finishes — weights are read from disk, so it takes minutes, not seconds.</div>
       </div>`;
   } else if (vState === 'stopped') {
     vllmNote = `<div style="margin:6px 0 2px;padding:8px 10px;border:1px solid #4a2020;border-radius:4px;background:#2a1010;color:#e08080;font-size:12px">
-        Container <code>${esc(vllm.container || '?')}</code> exists but is not running.
+        Container <code>${esc(vllm.container || '?')}</code>${vllm.model ? ` (serves <b>${esc(vllm.model)}</b>)` : ''} exists but is not running.
       </div>`;
   }
   const vllmPanel = `
@@ -6869,7 +6870,10 @@ async function loadBench() {
     _benchSetMode(_mode);
     _benchRenderAxes();
     _benchBindSelectAll();
-    await _benchPopulateModels();
+    // The running-bench banner is the headline; the model list can arrive after it.
+    // Serializing history behind the (slow) models fetch left the page blind to an
+    // ongoing bench for seconds after load.
+    _benchPopulateModels();
   }
   await _benchRefreshHistory();
   if (_benchTimer) clearInterval(_benchTimer);

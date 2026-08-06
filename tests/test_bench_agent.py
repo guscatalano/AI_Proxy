@@ -147,3 +147,21 @@ def test_episode_cases_render_in_the_grades_vocabulary(client):
     assert call == "final answer" and "417" in exp
     call2, _ = BR._bench_case_parts(t, 1)
     assert "conduct" in call2
+
+
+def test_benches_block_other_traffic_by_default(client):
+    """A bench sharing the box measures contention, disturbs the humans, and is defenseless
+    against their restarts — all three happened to the first agent rerun. Opting OUT of
+    exclusive must be a deliberate act."""
+    import time as _t
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.commit()
+    conn.close()
+    r = client.post("/__proxy/api/bench/run", json={"model": "qwen3:4b", "runs": 1})
+    assert r.status_code == 200, r.text
+    assert (r.json().get("config") or {}).get("exclusive") is True
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs")
+    conn.commit()
+    conn.close()
