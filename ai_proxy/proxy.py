@@ -457,6 +457,9 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN conversation_id TEXT",
     "ALTER TABLE requests ADD COLUMN turn_index INTEGER",
     "ALTER TABLE requests ADD COLUMN client_app TEXT",
+    # Which surface an agentic client was driven from (discord / cron / cli). Detected at
+    # ingest from system-prompt fingerprints — see _detect_surface. NULL when unknown.
+    "ALTER TABLE requests ADD COLUMN surface TEXT",
     "ALTER TABLE requests ADD COLUMN shadow_of TEXT",
     "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
     "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
@@ -6022,7 +6025,7 @@ def live_view(request: Request):  # sync → threadpool
     conn = db()
     placeholders = ",".join("?" for _ in inflight) or "''"
     rows = conn.execute(
-        f"""SELECT id, ts, conversation_id, turn_index, client_app, client_ip, model, upstream, path,
+        f"""SELECT id, ts, conversation_id, turn_index, client_app, surface, client_ip, model, upstream, path,
                    status, est_prompt_tokens, prompt_tokens, completion_tokens, duration_ms,
                    has_images, request_body, response_body, stream_chunks, ttft_ms
             FROM requests_v
@@ -6078,6 +6081,7 @@ def live_view(request: Request):  # sync → threadpool
         tiles.append({
             "cache": cache, "key": cid or rid, "fresh": fresh,
             "req_id": rid, "conv": (cid or "")[:6], "client": r["client_app"] or "?",
+            "surface": r["surface"],
             "model": r["model"] or "?", "upstream": r["upstream"], "path": r["path"],
             "state": state, "done": not active, "elapsed_ms": elapsed_ms,
             "ptok": ptok, "otok": otok, "tps": tps, "turn": r["turn_index"],
@@ -6281,7 +6285,7 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
-                  upstream, client_ip, client_app, gate_verdict, gate_rule, gate_reason, shadow_of,
+                  upstream, client_ip, client_app, surface, gate_verdict, gate_rule, gate_reason, shadow_of,
                   has_images
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
@@ -6409,6 +6413,7 @@ def list_conversations(request: Request, limit: int = 100):  # sync → threadpo
                   GROUP_CONCAT(DISTINCT model) AS models,
                   GROUP_CONCAT(DISTINCT client_ip) AS clients,
                   GROUP_CONCAT(DISTINCT client_app) AS apps,
+                  GROUP_CONCAT(DISTINCT surface) AS surfaces,
                   SUM(CASE WHEN gate_verdict = 'block' THEN 1 ELSE 0 END) AS blocks,
                   SUM(CASE WHEN gate_verdict = 'rewrite' THEN 1 ELSE 0 END) AS rewrites
            FROM requests
@@ -6454,7 +6459,7 @@ def get_conversation(conv_id: str, request: Request):  # sync → threadpool
     rows = conn.execute(
         """SELECT id, ts, model, turn_index, prompt_tokens, completion_tokens, total_tokens,
                   est_prompt_tokens, duration_ms, ttft_ms, status, error, gate_verdict, gate_rule,
-                  gate_reason, client_ip, client_app, is_stream, has_images, path, upstream
+                  gate_reason, client_ip, client_app, surface, is_stream, has_images, path, upstream
            FROM requests
            WHERE conversation_id = ?
            ORDER BY ts ASC""",
@@ -11090,6 +11095,9 @@ try:
 except ImportError:          # flat-script launch
     import bench_agent as _bench_agent_mod
 _BENCH_SUITES.setdefault("agent-v1", _bench_agent_mod.AGENT_TASKS)
+# agent-v2: the hard set — each episode targets one specific agentic failure mode
+# (error-message protocols, joins, budgeted search, dedup, authority, migration, recall).
+_BENCH_SUITES.setdefault("agent-v2", _bench_agent_mod.AGENT2_TASKS)
 _BENCH_TASK_DESC.update(_bench_agent_mod.AGENT_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_agent_mod.AGENT_TASK_NOTES)
 
@@ -13552,6 +13560,67 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
     return "unknown"
 
 
+def _body_system_text(body: dict | None) -> str:
+    """The system prompt as one string, whatever shape the client sent it in."""
+    if not isinstance(body, dict):
+        return ""
+    sys_field = body.get("system")
+    if isinstance(sys_field, str):
+        return sys_field
+    if isinstance(sys_field, list):
+        return " ".join(p.get("text", "") for p in sys_field
+                        if isinstance(p, dict) and isinstance(p.get("text"), str))
+    for m in (body.get("messages") or []):
+        if isinstance(m, dict) and m.get("role") == "system":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(p.get("text", "") for p in c
+                                if isinstance(p, dict) and isinstance(p.get("text"), str))
+            break
+    return ""
+
+
+def _detect_surface(headers: dict | None, body: dict | None) -> str | None:
+    """Which surface an agentic client was driven from: 'discord', 'cron', or 'cli'.
+
+    One client_app can front several execution contexts (hermes runs as a Discord bot, a
+    scheduled cron job, AND an interactive local session — same IP, same UA, same
+    x-client-name), so the client label alone can't answer "where did this session come
+    from". The context leaks into the request anyway: cron prompts announce there is no
+    user present, Discord sessions carry a guild/channel context block and discord tools,
+    local sessions offer file/exec tools without any of that. NULL when nothing matches —
+    an honest unknown beats a guessed label."""
+    h = {k.lower(): str(v) for k, v in (headers or {}).items()} if isinstance(headers, dict) else {}
+    v = (h.get("x-client-surface") or "").strip()
+    if v:  # caller-supplied wins, same contract as x-client-name
+        slug = re.sub(r"[^a-z0-9._-]+", "-", v.lower())[:24].strip("-")
+        if slug:
+            return slug
+    sys_text = _body_system_text(body)
+    tools = set()
+    if isinstance(body, dict):
+        for t in (body.get("tools") or []):
+            if isinstance(t, dict):
+                name = (t.get("function") or {}).get("name") or t.get("name")
+                if isinstance(name, str):
+                    tools.add(name)
+    if not sys_text and not tools:
+        return None
+    if re.search(r"running as a scheduled (cron job|task)", sys_text, re.I):
+        return "cron"
+    # A guild/channel context block means a live Discord session; the discord tools alone
+    # also imply one (DMs get the tools without the guild block).
+    if re.search(r"^\s*-?\s*Guild:\s*`?\d", sys_text, re.M) or \
+            not tools.isdisjoint({"discord", "discord_admin"}):
+        return "discord"
+    # Local exec toolset with no discord anywhere → an interactive local/CLI session.
+    if {"execute_code", "read_file"} <= tools or {"read_file", "patch"} <= tools:
+        return "cli"
+    return None
+
+
 def _client_ip(request: Request) -> str | None:
     xff = request.headers.get("x-forwarded-for")
     if xff:
@@ -13713,6 +13782,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     turn = _turn_index(body_json)
     headers_dict = dict(request.headers)
     client_app = _detect_client_app(headers_dict, body_json if isinstance(body_json, dict) else None)
+    surface = _detect_surface(headers_dict, body_json if isinstance(body_json, dict) else None)
     # Chars-based prompt-token estimate, persisted so the requests list can derive a cache
     # verdict (evaluated vs estimated) without re-parsing the body on every load.
     est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
@@ -13748,8 +13818,8 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     has_imgs = 1 if (imgs or _embedded_imgs or _url_imgs) else None
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, surface, upstream, est_prompt_tokens, has_images)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -13763,6 +13833,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             conv_id,
             turn,
             client_app,
+            surface,
             upstream,
             est or None,
             has_imgs,

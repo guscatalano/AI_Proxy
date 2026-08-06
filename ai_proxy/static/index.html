@@ -41,6 +41,12 @@
   .app-badge.app-unknown { background: #262d38; color: #666; }
   .app-badge.app-shadow { background: #2a3a2a; color: #68d391; border-color: #3a4a3a; }
   .app-badge.app-browser-firefox, .app-badge.app-browser-chrome, .app-badge.app-browser-edge, .app-badge.app-browser-safari, .app-badge.app-browser-other { background: #2a2630; color: #b8a8d0; border-color: #3a3640; }
+  /* Surface: where an agentic client was driven from (discord / cron / cli) — detected
+     from system-prompt fingerprints, shown beside the app badge. */
+  .surface-badge { display: inline-block; padding: 1px 6px; margin-left: 4px; border-radius: 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; background: #1d2430; color: #8b97a8; border: 1px solid #2c3542; }
+  .surface-badge.sf-discord { background: #2c2a45; color: #a8a8e8; border-color: #40406a; }
+  .surface-badge.sf-cron { background: #33291d; color: #d9c37a; border-color: #4a3f2a; }
+  .surface-badge.sf-cli { background: #1d3028; color: #7ac7a0; border-color: #2a4a3a; }
   .shadow-section { background: #141922; border: 1px solid #2a4a3a; border-left: 3px solid #5e8c66; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
   .shadow-section h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; color: #57d1e0; letter-spacing: 0.5px; }
   .shadow-row { padding: 8px 0; border-top: 1px solid #262d38; }
@@ -1219,6 +1225,8 @@ function startLiveDetail(id) {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
 const num = (n) => (n == null ? '' : Number(n).toLocaleString());
+// Where an agentic client was driven from (discord / cron / cli), when the proxy could tell.
+const surfaceBadge = (s) => s ? ` <span class="surface-badge sf-${esc(s)}" title="Execution surface, fingerprinted from the system prompt">${esc(s)}</span>` : '';
 // Duration formatting. The requests list shows ms with thousands separators (the column header
 // supplies the "ms" unit). The detail view appends the next-biggest unit in parens for quick
 // reading, e.g. "4,080 ms (4s)" or "125,300 ms (2.1m)".
@@ -1581,7 +1589,7 @@ function tickLive(){
   }
 }
 function lvCols(n){return n<=1?1:n<=2?2:n<=4?2:n<=6?3:n<=9?3:4;}
-function lvSig(t){return [t.state,t.done,t.fresh,t.client,t.model,t.prompt,t.response,t.redacted,t.has_image,t.turn,Math.round((t.ptok||0)/1000),t.upstream].join('|');}
+function lvSig(t){return [t.state,t.done,t.fresh,t.client,t.surface,t.model,t.prompt,t.response,t.redacted,t.has_image,t.turn,Math.round((t.ptok||0)/1000),t.upstream].join('|');}
 function lvInner(t){
   const slow=t.state==='THINKING'&&t.elapsed_ms>25000;
   const call=t.done?`✓ done · ${(t.elapsed_ms/1000).toFixed(1)}s${t.cache==='hit'?' · ⚡ cache hit':t.cache==='partial'?' · ⚡ partial cache':''}`
@@ -1595,7 +1603,7 @@ function lvInner(t){
   else if(t.response) body=`<div class="lv-resp"><div class="lv-scroll">${lvEsc(t.response)}</div></div>`;
   else body=`<div class="lv-prompt"><div class="lv-scroll">${lvEsc(t.prompt||'')}</div></div>`;
   const out=t.state==='STREAMING'?`<div class="lv-ml" style="margin-top:6px"><span>output</span><span><b class="lv-otok">${(t.otok||0).toLocaleString()}</b> tok${t.tps?` · ${t.tps}/s`:''}</span></div>`:'';
-  return `<div class="lv-top"><span class="lv-dot"></span><span class="lv-client">${lvEsc(t.client)}</span><span class="lv-model">${lvEsc(t.model)}</span></div>
+  return `<div class="lv-top"><span class="lv-dot"></span><span class="lv-client">${lvEsc(t.client)}</span>${t.surface?`<span class="surface-badge sf-${lvEsc(t.surface)}">${lvEsc(t.surface)}</span>`:''}<span class="lv-model">${lvEsc(t.model)}</span></div>
     <div class="lv-st">${t.done?'':'<span class="lv-spin"></span>'}<span class="lv-lbl">${t.state}</span><span class="lv-timer${slow?' slow':''}">${(t.elapsed_ms/1000).toFixed(1)}<span style="font-size:11px;color:var(--lv-mute)">s</span></span></div>
     <div class="lv-call">${call}</div>
     <div class="lv-body">${body}</div>
@@ -1759,7 +1767,7 @@ function renderList() {
     }
     const sel = it.id === selected ? 'selected' : '';
     const appBadge = it.client_app
-      ? `<div style="margin-top:2px"><span class="app-badge app-${esc(it.client_app)}" title="Detected client SDK / app">${esc(it.client_app)}</span></div>`
+      ? `<div style="margin-top:2px"><span class="app-badge app-${esc(it.client_app)}" title="Detected client SDK / app">${esc(it.client_app)}</span>${surfaceBadge(it.surface)}</div>`
       : '';
     const ipCell = `<code style="font-size:11px">${esc(it.client_ip || '')}</code>${appBadge}`;
     let rowCls = sel;
@@ -2881,7 +2889,7 @@ async function loadDetail(id) {
     <div class="summary">
       <div class="row"><span class="label">Request ID</span> <code style="user-select:all">${esc(d.id || '?')}</code></div>
       <div class="row"><span class="label">Request</span> <strong class="method">${esc(d.method)}</strong> <code>${esc(d.path)}</code></div>
-      <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
+      <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}${surfaceBadge(d.surface)}</div>
       <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code>${upstreamBadge}${cacheBadge}</div>
       <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${fmtMsLong(d.duration_ms)}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
       <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code>${thinkBadge}</div>
@@ -4078,7 +4086,7 @@ function renderConversationsList() {
       <td class="num">${num(c.turns)}</td>
       <td class="num">${num(c.total_tokens)}</td>
       <td>${esc((c.models || '').split(',').slice(0,3).join(', '))}</td>
-      <td><code style="font-size:11px">${esc((c.clients || '').split(',')[0] || '')}</code></td>
+      <td><code style="font-size:11px">${esc((c.clients || '').split(',')[0] || '')}</code>${surfaceBadge((c.surfaces || '').split(',')[0])}</td>
       <td>${span}</td>
       <td style="color:#aaa;font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.preview || '')}</td>
     </tr>`;

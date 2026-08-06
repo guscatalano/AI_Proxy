@@ -57,17 +57,22 @@ def test_retrying_after_an_error_is_not_a_repeat():
 
 def test_grading_gives_partial_credit():
     t = _task("agent_chain")
-    clean = A.AgentWorld(t)
-    g = A.grade_episode(t, clean, "417", steps=9, exhausted=False)
+
+    def worked():
+        w = A.AgentWorld(t)
+        w.execute("lookup", '{"name": "start"}')      # conduct now requires real evidence
+        return w
+
+    g = A.grade_episode(t, worked(), "417", steps=9, exhausted=False)
     assert g["passed"] == 2 and g["total"] == 2
-    messy = A.AgentWorld(t)
+    messy = worked()
     messy.malformed = 2
     g2 = A.grade_episode(t, messy, "417", steps=9, exhausted=False)
     assert g2["passed"] == 1, "right answer, dirty conduct — one case each"
     assert "malformed" in g2["cases"][1]["got"]
-    g3 = A.grade_episode(t, A.AgentWorld(t), "the answer is see:brass maybe", 3, False)
+    g3 = A.grade_episode(t, worked(), "the answer is see:brass maybe", 3, False)
     assert g3["cases"][0]["ok"] is False
-    g4 = A.grade_episode(t, A.AgentWorld(t), None, 14, exhausted=True)
+    g4 = A.grade_episode(t, worked(), None, 14, exhausted=True)
     assert g4["passed"] == 0 and "budget" in g4["cases"][1]["got"]
 
 
@@ -165,3 +170,20 @@ def test_benches_block_other_traffic_by_default(client):
     conn.execute("DELETE FROM bench_runs")
     conn.commit()
     conn.close()
+
+
+def test_answering_without_required_tools_trips_conduct():
+    """qwen3.6 answered 'ready' in ONE step — no set_value, no get_value — and scored clean:
+    the answer was guessable from the prompt and zero calls meant zero violations. Agency
+    means touching the world; a bare guess is a conduct failure even when it lands."""
+    t = _task("agent_update_verify")
+    lazy = A.AgentWorld(t)
+    g = A.grade_episode(t, lazy, "ready", steps=1, exhausted=False)
+    assert g["cases"][0]["ok"] is True, "the guess itself is right"
+    assert g["cases"][1]["ok"] is False
+    assert "answered without evidence" in g["cases"][1]["got"]
+    diligent = A.AgentWorld(t)
+    diligent.execute("set_value", '{"key": "mode", "value": "ready"}')
+    diligent.execute("get_value", '{"key": "mode"}')
+    g2 = A.grade_episode(t, diligent, "ready", steps=3, exhausted=False)
+    assert g2["passed"] == 2
