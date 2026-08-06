@@ -251,6 +251,12 @@ _REPORT_CSS = """
   .card .v small { font-size:13px; color:var(--ink-faint); font-weight:400; }
   .card .d { font-size:12px; color:var(--ink-faint); margin:7px 0 0; }
   .card.hi { border-color:var(--accent-deep); } .card.hi .v { color:var(--accent); }
+  /* Category winners: the parallel-verdict chips and the engine tag beside a model name. */
+  .pv { font-family:var(--mono); font-size:10.5px; letter-spacing:.05em; text-transform:uppercase;
+        padding:2px 7px; border-radius:5px; white-space:nowrap; }
+  .pv.good { color:var(--good); border:1px solid var(--good); }
+  .pv.bad { color:var(--bad); border:1px solid var(--bad); }
+  .eng { font-family:var(--mono); font-size:11px; color:var(--ink-faint); }
   .tbl { overflow-x:auto; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
   table { border-collapse:collapse; width:100%; font-size:12.5px;
           font-family:var(--sans); }
@@ -559,6 +565,115 @@ tr.style.transform="translateY("+d+"px)";tr.style.transition="none";
 requestAnimationFrame(function(){{tr.style.transition="transform .35s ease";
 tr.style.transform=""}})}})}}
 r.addEventListener("input",render)}})();</script>"""
+
+
+def _bench_parallel_groups(rows: list) -> list:
+    """Pair each (model, engine)'s best sequential cell with its most concurrent cell, and
+    judge whether concurrency actually overlapped.
+
+    The tell is time-to-first-token: an engine that batches holds TTFT roughly flat under
+    load, one that queues multiplies it (qwen3.6 went 0.6s → 35s at 4× with decode speed
+    unchanged — four requests taking turns). A serialized cell's aggregate throughput is
+    its single-stream rate, whatever the concurrency setting claimed; crediting conc ×
+    decode there would award the queue a 4× it never delivered."""
+    groups: dict = {}
+    for r in rows:
+        if not r.get("decode_p50"):
+            continue
+        name = r.get("_name") or _bench_label_display(r.get("label") or "")
+        parts = [p.strip() for p in name.split(" · ")]
+        engine = next((p for p in parts[1:] if p.startswith("@")), "")
+        g = groups.setdefault((parts[0], engine),
+                              {"model": parts[0], "engine": engine, "seq": None, "par": None})
+        conc = int(r.get("concurrency") or 1)
+        if conc <= 1:
+            if g["seq"] is None or r["decode_p50"] > g["seq"]["decode_p50"]:
+                g["seq"] = r
+        else:
+            cur = g["par"]
+            if cur is None or ((int(cur.get("concurrency") or 1), cur["decode_p50"])
+                               < (conc, r["decode_p50"])):
+                g["par"] = r
+    out = []
+    for g in groups.values():
+        if not (g["seq"] and g["par"]):
+            continue
+        seq, par, conc = g["seq"], g["par"], int(g["par"].get("concurrency") or 1)
+        ts, tp = seq.get("ttft_p50"), par.get("ttft_p50")
+        serialized = bool(ts and tp and tp > 3 * ts + 1000)
+        agg = par["decode_p50"] * (1 if serialized else conc)
+        out.append({**g, "conc": conc, "serialized": serialized, "agg": agg,
+                    "scale": (agg / seq["decode_p50"]) if seq["decode_p50"] else None})
+    return sorted(out, key=lambda g: -g["agg"])
+
+
+def _bench_category_winners_html(rows: list) -> str:
+    """Three titles, one line each: most correct, fastest single stream, best under
+    parallel load — with the parallel evidence table underneath. The weighted standings
+    answer "what should I run"; this answers "who wins each event", and the parallel
+    column is the one nothing else in the report shows."""
+    ok = [r for r in rows if r.get("decode_p50")]
+    if len(ok) < 2:
+        return ""
+
+    def nm(r):
+        return (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
+
+    cards = []
+    graded = [r for r in ok if r.get("perfect_rate") is not None]
+    if graded:
+        c = max(graded, key=lambda r: (r["perfect_rate"], r["decode_p50"]))
+        cards.append(('Most correct', nm(c),
+                      f'{c["perfect_rate"] * 100:.0f}% of tasks fully correct'))
+    seq = [r for r in ok if int(r.get("concurrency") or 1) <= 1]
+    if seq:
+        f = max(seq, key=lambda r: r["decode_p50"])
+        cards.append(('Fastest single stream', nm(f),
+                      f'{f["decode_p50"]:,.1f} tok/s sequential'))
+    pgroups = _bench_parallel_groups(rows)
+    batching = [g for g in pgroups if not g["serialized"]]
+    if batching:
+        b = batching[0]
+        cards.append((f'Best under {b["conc"]}× load', b["model"],
+                      f'{b["agg"]:,.0f} tok/s aggregate '
+                      f'({b["par"]["decode_p50"]:,.1f}/stream{" " + b["engine"] if b["engine"] else ""}), '
+                      f'first token in {b["par"]["ttft_p50"] / 1000:.1f}s'))
+    if not cards:
+        return ""
+    cards_html = "".join(
+        f'<div class="card" data-m="{_h(m)}"><p class="k">{_h(k)}</p>'
+        f'<p class="v">{_h(m)}</p><p class="d">{_h(d)}</p></div>'
+        for k, m, d in cards)
+
+    table_html = ""
+    if pgroups:
+        trs = []
+        for g in pgroups:
+            ttfts = (f'{g["seq"]["ttft_p50"] / 1000:.1f}s → {g["par"]["ttft_p50"] / 1000:.1f}s'
+                     if g["seq"].get("ttft_p50") and g["par"].get("ttft_p50") else "—")
+            verdict = ('<span class="pv bad">queues — requests wait in line</span>'
+                       if g["serialized"] else
+                       f'<span class="pv good">batches · {g["scale"]:.1f}×</span>')
+            trs.append(
+                f'<tr data-m="{_h(g["model"])}">'
+                f'<th scope="row"><code class="mdl">{_h(g["model"])}</code>'
+                f'{" <span class=eng>" + _h(g["engine"]) + "</span>" if g["engine"] else ""}</th>'
+                f'<td class="n">{g["seq"]["decode_p50"]:,.1f}</td>'
+                f'<td class="n">{g["par"]["decode_p50"]:,.1f} × {g["conc"]}</td>'
+                f'<td class="n"><b>{g["agg"]:,.0f}</b></td>'
+                f'<td class="n">{ttfts}</td>'
+                f'<td>{verdict}</td></tr>')
+        table_html = (
+            '<p class="note">Aggregate = per-stream decode × streams, credited only when '
+            'time-to-first-token stays flat under load — TTFT exploding while decode holds '
+            'steady means the engine queued the requests, and its real throughput is one '
+            'stream, whatever the concurrency was set to.</p>'
+            '<div class="tbl"><table><thead><tr><th>Model</th><th class="n">Solo tok/s</th>'
+            '<th class="n">Per stream</th><th class="n">Aggregate</th>'
+            '<th class="n">TTFT solo → loaded</th><th>Verdict</th></tr></thead>'
+            f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+    return (f'<h2>Category winners</h2><div class="cards">{cards_html}</div>{table_html}')
 
 
 def _bench_place_labels(cands: list, est: float = 6.6) -> list:
@@ -2092,10 +2207,13 @@ ordinary slowness rather than a misconfiguration.</p>
                   if hw_backfilled else ""))
 
     weighted_html = _bench_weighted_html(rows) if graded else ""
+    winners_html = _bench_category_winners_html(rows)
     body = f"""
   {results}
 
   {weighted_html}
+
+  {winners_html}
 
   <h2>{"Consistency" if single else "Time to a finished answer"}</h2>
   {charts}

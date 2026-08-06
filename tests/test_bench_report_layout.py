@@ -764,3 +764,56 @@ def test_per_task_rows_are_clickable_with_data(client):
     html = _render(runs)
     assert 'class="taskrow" data-task="roman"' in html
     assert '"tasks":' in html.split('id="report-data"')[1][:20000]
+
+
+# ---- category winners: best correctness / speed / parallel ----------------------------------
+
+def _cell(bench_id, model, upstream, *, conc=1, decode=60.0, ttft=400.0, perfect=0.9):
+    r = _run(bench_id, model=model, upstream=upstream)
+    r["label"] = f"{model} · @{upstream} · short · " + (f"{conc}×parallel" if conc > 1 else "t=0.0")
+    r["config"]["concurrency"] = conc
+    s = r["results"]["summary"]
+    s["decode_tps"]["p50"] = decode
+    s["ttft_ms"]["p50"] = ttft
+    s["quality"]["perfect_rate"] = perfect
+    return r
+
+
+def _parallel_field():
+    """The fleet in miniature, numbers shaped like the real coding-v3 matrix: gemma batches
+    (TTFT flat, per-stream drops), qwen-on-ollama queues (decode identical, TTFT explodes)."""
+    return [
+        _cell("g1", "gemma", "ollama", conc=1, decode=63.0, ttft=500, perfect=0.90),
+        _cell("g4", "gemma", "ollama", conc=4, decode=38.0, ttft=800, perfect=0.91),
+        _cell("q1", "qwen", "ollama", conc=1, decode=60.0, ttft=400, perfect=0.72),
+        _cell("q4", "qwen", "ollama", conc=4, decode=60.0, ttft=6200, perfect=0.72),
+    ]
+
+
+def test_parallel_groups_tell_batching_from_queueing(client):
+    rows = [P._bench_report_row(r) for r in _parallel_field()]
+    groups = {g["model"]: g for g in P._bench_parallel_groups(rows)}
+    assert groups["gemma"]["serialized"] is False
+    assert groups["gemma"]["agg"] == 38.0 * 4
+    assert groups["qwen"]["serialized"] is True, "flat decode + 15x TTFT is a queue"
+    assert groups["qwen"]["agg"] == 60.0, "a queue's throughput is one stream"
+
+
+def test_category_winners_crown_the_right_models(client):
+    html = _render(_parallel_field())
+    sec = html.split("Category winners")[-1].split("<h2>")[0]
+    assert "Most correct" in sec and "Fastest single stream" in sec
+    assert "Best under 4× load" in sec
+    # gemma wins all three here: correctness (91%), single stream (63 > 60), parallel (152)
+    assert '<p class="k">Most correct</p><p class="v">gemma</p>' in sec
+    assert '<p class="k">Fastest single stream</p><p class="v">gemma</p>' in sec
+    assert '<p class="k">Best under 4× load</p><p class="v">gemma</p>' in sec
+    assert "queues" in sec and "batches" in sec
+    assert "152" in sec, "aggregate = per-stream × streams for the batcher"
+
+
+def test_no_parallel_cells_means_no_parallel_card(client):
+    runs = [_cell("a", "m1", "ollama", conc=1), _cell("b", "m2", "ollama", conc=1, decode=50)]
+    html = _render(runs)
+    assert "Best under" not in html
+    assert "Category winners" in html, "correctness and speed cards still render"

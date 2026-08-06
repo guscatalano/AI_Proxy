@@ -48,15 +48,25 @@ def _setup(monkeypatch, *, enabled=True, loaded=False, startable=True, size_mb=4
     async def fake_snap():
         return {"backends": [], "ollama": []}
 
+    # Eviction genuinely frees memory here, because the post-eviction re-check now refuses
+    # a load the box still cannot hold — a fixture whose eviction freed nothing would turn
+    # every must-evict test into a refusal.
+    mem = {"free": free_mb}
+
     async def fake_free(snap, keep="", spare="", want_free_mb=0, bench_id=""):
         freed["called"] = True
+        mem["free"] = 120000
         return {"reached_target": True}
+
+    async def fake_claim(container):
+        return None    # claim sizing is pinned by test_memory_guard; size_mb drives these
 
     monkeypatch.setattr(P, "_bench_model_index", fake_index)
     monkeypatch.setattr(P, "_vllm_container", fake_container)
     monkeypatch.setattr(P, "_bench_residency_snapshot", fake_snap)
     monkeypatch.setattr(P, "_bench_free_gpu", fake_free)
-    monkeypatch.setattr(P, "_free_mem_mb", lambda: free_mb)
+    monkeypatch.setattr(P, "_vllm_boot_claim_mb", fake_claim)
+    monkeypatch.setattr(P, "_free_mem_mb", lambda: mem["free"])
     monkeypatch.setattr(P, "PROVIDERS", {"vllm": prov})
     monkeypatch.setattr(P, "_AUTO_LOAD_LAST", {"ts": 0.0, "target": ""})
 

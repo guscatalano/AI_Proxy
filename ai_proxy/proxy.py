@@ -2469,6 +2469,19 @@ class _VllmProvider(_FnProvider):
             if c["running"] and c["container"] != container:
                 await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
                 stopped.append(c["container"])
+        # Last-line memory guard, on the one chokepoint every vLLM start passes through
+        # (auto-load, bench, UI). Priced by the utilization claim — see _vllm_boot_claim_mb
+        # for why checkpoint size is the wrong number. Callers that made room first pass
+        # trivially; a blind start onto a full box is refused with the arithmetic.
+        claim = await _vllm_boot_claim_mb(container)
+        free = _free_mem_mb()
+        if claim and free and free < claim and not payload.get("force"):
+            return JSONResponse(
+                {"error": f"starting {container!r} will claim ~{claim / 1024:.0f} GB "
+                          f"(gpu-memory-utilization × total) but only {free / 1024:.0f} GB "
+                          f"is free — that combination starves the box (it has wedged sshd "
+                          f"and this proxy before). Free memory first, or pass force:true.",
+                 "claim_mb": round(claim), "free_mb": round(free)}, status_code=409)
         code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
         if code != 0:
             return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
@@ -2536,6 +2549,17 @@ async def _control_backend(b, action: str, container: str | None = None) -> dict
         if not container:
             return {"ok": False, "detail": "no container publishing this backend's port"}
         docker_action = "start" if action == "start" else "stop"
+        if docker_action == "start":
+            # Same guard as the load path: every docker start is a utilization-sized claim
+            # on unified memory, and a start the box cannot absorb starves sshd and this
+            # proxy first — refusal is the only failure mode anyone can still see.
+            claim = await _vllm_boot_claim_mb(container)
+            free = _free_mem_mb()
+            if claim and free and free < claim:
+                return {"ok": False, "via": "memory-guard",
+                        "detail": f"refused to start {container}: it will claim "
+                                  f"~{claim / 1024:.0f} GB and only {free / 1024:.0f} GB is "
+                                  f"free — free memory first"}
         code, out = await _run_cmd([_docker_bin(), docker_action, container], 180.0)
         return {"ok": code == 0, "detail": out[:300], "via": "docker",
                 "container": container}
@@ -6105,24 +6129,65 @@ def _norm_model_id(mid: str) -> str:
 
 @app.get("/v1/models")
 async def list_models_enriched():
-    """OpenAI /v1/models, enriched with each model's real context window.
+    """OpenAI /v1/models, but the union of EVERY backend the proxy fronts.
 
-    Ollama's /v1/models omits any context field, so a client that auto-discovers the window
-    (instead of hardcoding it) can't tell how large it is and falls back to a conservative
-    default — often 128k — then compacts/stops early even though the model is loaded much larger.
-    We fill `context_length` (plus `max_context_length` and `max_model_len` aliases, since
-    different clients read different keys) from the cached LM Studio snapshot — the runtime qwen
-    actually routes to — matched by normalized model name. Best-effort: if the snapshot is missing
-    or a model isn't matched, the entry is returned unchanged.
+    A client pointed at the proxy previously saw only Ollama's catalogue — the vLLM models
+    (the ones the router actually prefers for qwen traffic) were invisible, so a model
+    picker in any OpenAI-style client couldn't select them. Now: Ollama's tags, vLLM's
+    served models — including a stopped container's configured model, which the auto-loader
+    boots on first request — plus whatever llama-server and LM Studio are serving. Deduped
+    by id, first writer wins in that order; `owned_by` names the backend so the entries
+    stay tellable apart.
+
+    Context windows are filled in where a backend reports them (vLLM's max_model_len, LM
+    Studio's loaded context, the cached snapshot for Ollama-served names), because clients
+    auto-discover the window and fall back to a conservative default when the field is
+    absent — often 128k, then they compact early against a model loaded much larger.
+    All of it best-effort: an unreachable backend contributes nothing, never an error.
     """
-    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
-    try:
-        r = await client.get(OLLAMA_URL + "/v1/models")
-        data = r.json() if r.status_code == 200 else {"object": "list", "data": []}
-    except Exception:
-        data = {"object": "list", "data": []}
-    finally:
-        await client.aclose()
+    entries: dict[str, dict] = {}
+
+    def add(mid, backend, ctx=None, state=None, created=None):
+        if not mid or mid in entries:
+            return
+        e = {"id": mid, "object": "model", "created": created or 0, "owned_by": backend}
+        if isinstance(ctx, int) and ctx > 0:
+            e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
+        if state:
+            e["proxy_state"] = state
+        entries[mid] = e
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        async def _ollama():
+            r = await client.get(OLLAMA_URL + "/v1/models")
+            return r.json() if r.status_code == 200 else {}
+
+        results = await asyncio.gather(
+            _ollama(), _vllm_snapshot(client), _vllm_configs(),
+            _llamacpp_snapshot(client), _lmstudio_snapshot(client),
+            return_exceptions=True)
+    odata, vllm, vcfgs, lcpp, lms = (
+        r if not isinstance(r, BaseException) else {} for r in results)
+
+    for m in ((odata or {}).get("data") or []):
+        if isinstance(m, dict):
+            add(m.get("id"), "ollama", created=m.get("created"))
+    for m in ((vllm or {}).get("available") or []):
+        add(m.get("id"), "vllm", ctx=m.get("max_context_length"), state="loaded")
+    # A twin that is configured but not up is still one request away: the auto-loader (or a
+    # bench) boots it. Listing it is what makes it selectable at all.
+    for c in (vcfgs if isinstance(vcfgs, list) else []):
+        add(c.get("model"), "vllm",
+            state=("stopped — loads on first request"
+                   if str(c.get("state", "")).lower() != "running" else None))
+    for m in ((lcpp or {}).get("available") or []):
+        add(m.get("id"), "llamacpp", ctx=(lcpp or {}).get("n_ctx"), state="loaded")
+    for m in ((lms or {}).get("available") or []):
+        add(m.get("id"), "lmstudio",
+            ctx=(m.get("loaded_context_length") or m.get("max_context_length")))
+
+    # Ollama's own entries omit any context field; the cached LM Studio snapshot historically
+    # filled it for names served through there. Best-effort, unchanged.
     ctxmap: dict[str, int] = {}
     try:
         conn = db()
@@ -6137,16 +6202,13 @@ async def list_models_enriched():
                 ctxmap[_norm_model_id(m.get("id"))] = ctx
     except Exception:
         pass
-    if isinstance(data, dict) and ctxmap:
-        for m in (data.get("data") or []):
-            if not isinstance(m, dict) or "context_length" in m:
-                continue
-            ctx = ctxmap.get(_norm_model_id(m.get("id")))
+    for e in entries.values():
+        if "context_length" not in e:
+            ctx = ctxmap.get(_norm_model_id(e["id"]))
             if ctx:
-                m["context_length"] = ctx
-                m["max_context_length"] = ctx
-                m["max_model_len"] = ctx
-    return JSONResponse(data)
+                e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
+
+    return JSONResponse({"object": "list", "data": list(entries.values())})
 
 
 @app.get("/__proxy/api/ollama/update-check")
@@ -7272,16 +7334,32 @@ def _request_image_refs(row):
 
 @app.get("/__proxy/api/requests/{req_id}/image/{idx}")
 def get_request_image(req_id: str, idx: int, request: Request):  # sync → threadpool
-    """Reconstruct and serve the idx-th image, from the full-fidelity images_data column."""
+    """Reconstruct and serve the idx-th image, from the full-fidelity images_data column.
+
+    Two-step fetch: images_data and the PII gate first; the request_body — multi-megabyte
+    for screenshot-heavy agent turns, and sitting behind the blob/archive join — is read
+    ONLY for pre-capture rows that have no images_data. Selecting it unconditionally made
+    every image click pay the full body's disk read and page cache just to throw it away.
+    """
     conn = db()
-    row = conn.execute("SELECT request_body, images_data, client_ip FROM requests_v WHERE id = ?", (req_id,)).fetchone()
-    conn.close()
+    row = conn.execute("SELECT images_data, client_ip FROM requests_v WHERE id = ?",
+                       (req_id,)).fetchone()
     if not row:
+        conn.close()
         return JSONResponse({"error": "not found"}, status_code=404)
     # Same visibility gate as the request detail: only a viewer who may see this client's content.
     if not _can_view_pii(_client_ip(request), row["client_ip"]):
+        conn.close()
         return JSONResponse({"error": "forbidden"}, status_code=403)
-    refs = _request_image_refs(row)
+    if _load_images_data(row["images_data"]):
+        conn.close()
+        refs = _request_image_refs(row)
+    else:
+        row = conn.execute(
+            "SELECT request_body, images_data, client_ip FROM requests_v WHERE id = ?",
+            (req_id,)).fetchone()
+        conn.close()
+        refs = _request_image_refs(row)
     if refs is None:
         return JSONResponse({"error": "image not stored (request predates image capture and the body was truncated)"},
                             status_code=422)
@@ -8133,6 +8211,11 @@ async def _vllm_configs() -> list:
             "max_model_len": flags.get("max-model-len"),
             "kv_cache_dtype": flags.get("kv-cache-dtype"),
             "prefix_caching": "--enable-prefix-caching" in args,
+            # What a boot will actually claim: vLLM pre-allocates this fraction of total
+            # memory at startup, which on unified memory is system RAM. The memory guards
+            # price a start by this, NOT by checkpoint size — 43 GB of weights booting with
+            # util 0.80 grabs ~97 GB, and the difference wedged the box once.
+            "gpu_memory_utilization": flags.get("gpu-memory-utilization"),
             "args": " ".join(args),
         })
     return out_list
@@ -9807,6 +9890,8 @@ _BENCH_WEIGHT_DEFAULT = _bench_report_mod._BENCH_WEIGHT_DEFAULT
 _bench_weighted_data = _bench_report_mod._bench_weighted_data
 _bench_weighted_rows = _bench_report_mod._bench_weighted_rows
 _bench_weighted_html = _bench_report_mod._bench_weighted_html
+_bench_parallel_groups = _bench_report_mod._bench_parallel_groups
+_bench_category_winners_html = _bench_report_mod._bench_category_winners_html
 _bench_place_labels = _bench_report_mod._bench_place_labels
 _bench_size_by_model = _bench_report_mod._bench_size_by_model
 _bench_best_per_model = _bench_report_mod._bench_best_per_model
@@ -11759,11 +11844,27 @@ async def _ensure_model_served(model: str, upstream: str) -> dict | None:
                 while _busy() and time.time() < drain_deadline:
                     await asyncio.sleep(2)
                 await prov.stop()
-        # Evict others ONLY if the target does not fit in what is free now.
+        # Evict others ONLY if the target does not fit in what is free now. A vLLM boot is
+        # priced by its utilization claim, never by checkpoint size — size_mb is usually
+        # unknown for containers, and want=0 skipped this check entirely, which is exactly
+        # how a 97 GB boot landed beside a 22 GB resident and wedged the box.
         want = (meta.get("size_mb") or 0) * _BENCH_FIT_OVERHEAD
+        if upstream == "vllm":
+            claim = await _vllm_boot_claim_mb(meta.get("container"))
+            if claim:
+                want = max(want, claim)
         if want and _free_mem_mb() < want:
             snap = await _bench_residency_snapshot()
             await _bench_free_gpu(snap, keep=model, spare=upstream, want_free_mb=want)
+            free_now = _free_mem_mb()
+            if free_now < want:
+                # Refusing IS the guard: starting anyway starves sshd and the proxy first,
+                # so nobody can even reach the box to fix it.
+                return {"status": 503,
+                        "error": f"not enough memory to bring up {model!r} on {upstream}: "
+                                 f"it will claim ~{want / 1024:.0f} GB and only "
+                                 f"{free_now / 1024:.0f} GB is free even after eviction. "
+                                 f"Refusing to start it rather than wedge the box."}
         timeout = float(cfg.get("ready_timeout_s", 900))
         payload: dict = {"ready_timeout_s": timeout, "wait_s": timeout}
         if meta.get("container"):
@@ -11796,8 +11897,16 @@ async def _bench_start_backend(meta: dict, persist: bool = True,
         _bench_phase(bench_id, f"freeing memory for {upstream}")
     snap = await _bench_residency_snapshot()
     want = meta.get("size_mb")
+    want_free = (want * _BENCH_FIT_OVERHEAD) if want else 0
+    if upstream == "vllm":
+        # The utilization claim, not the checkpoint: without this, an unsized vLLM meta
+        # meant want_free=0 and the bench started a ~97 GB boot without waiting for the
+        # evicted memory to actually come back.
+        claim = await _vllm_boot_claim_mb(meta.get("container"))
+        if claim:
+            want_free = max(want_free, claim)
     freed = await _bench_free_gpu(snap, keep=meta.get("model") or "", bench_id=bench_id,
-                                  want_free_mb=(want * _BENCH_FIT_OVERHEAD) if want else 0)
+                                  want_free_mb=want_free)
     # Persisted before anything is started: a proxy restart between here and the restore would
     # otherwise leave the box stripped, with nothing recording what had been running. A cell
     # inside a sweep does not persist: the sweep already recorded the state before its first
@@ -12067,6 +12176,31 @@ async def _bench_residency_snapshot() -> dict:
 def _free_mem_mb() -> float:
     m = _mem_snapshot() or {}
     return float(m.get("avail_mb") or 0)
+
+
+async def _vllm_boot_claim_mb(container: str | None) -> float | None:
+    """What starting this vLLM container will actually take from the box.
+
+    NOT the checkpoint size: vLLM pre-allocates gpu_memory_utilization × total memory at
+    boot (weights + KV pool + CUDA graphs), and on a unified-memory box that claim IS
+    system RAM. Sizing a boot by its 43 GB checkpoint while it grabbed 97 GB is how
+    qwen-vllm landed on top of a resident gemma4 and wedged the machine — sshd and the
+    proxy starved while the resident backends kept answering. Utilization is read from
+    the container's own launch args; vLLM's default is 0.9 when the flag is absent.
+    None when there is nothing to compute with (no total, no such container)."""
+    total = (_mem_snapshot() or {}).get("total_mb")
+    if not total:
+        return None
+    util = 0.90
+    try:
+        for c in await _vllm_configs():
+            if not container or c.get("container") == container:
+                if c.get("gpu_memory_utilization") is not None:
+                    util = float(c["gpu_memory_utilization"])
+                break
+    except (ValueError, TypeError):
+        pass
+    return float(total) * util
 
 
 async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
