@@ -8277,6 +8277,96 @@ async def control_ollama_update():
             "output": out[-800:]}
 
 
+# Parameters a model's own defaults may sensibly carry. num_ctx is the headline: it is the
+# ONLY per-model context lever that reaches /v1 traffic — Ollama's OpenAI endpoint ignores
+# request-level num_ctx (verified live), and the env var is global and needs sudo.
+_OLLAMA_PARAM_ALLOWED = {"num_ctx", "temperature", "top_p", "top_k", "min_p",
+                         "repeat_penalty", "num_predict", "seed"}
+
+
+async def _ollama_apply_params(model: str, params: dict) -> tuple:
+    """Re-create the tag from itself with new default parameters. Blobs are shared, the
+    change is instant, and a later edit simply overrides again."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/create",
+                         json={"model": model, "from": model,
+                               "parameters": params, "stream": False})
+        if r.status_code >= 400:
+            return False, r.text[:300]
+    return True, "ok"
+
+
+@app.post("/__proxy/api/control/models/ollama-params")
+async def ollama_model_params(request: Request):
+    """Set a model's DEFAULT parameters (num_ctx etc.) by re-creating its tag in place.
+
+    Guarded by the same KV arithmetic that protects benchmarks: a num_ctx whose cache
+    cannot fit beside the weights is refused with the math, because that exact mistake
+    OOM-killed the Ollama service in a loop once already. `force: true` overrides — with
+    the numbers in hand, it is the operator's call."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "JSON body required"}, status_code=400)
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"error": "model is required"}, status_code=400)
+    params = dict(payload.get("params") or {})
+    if payload.get("num_ctx") is not None:
+        params["num_ctx"] = payload["num_ctx"]
+    bad = sorted(set(params) - _OLLAMA_PARAM_ALLOWED)
+    if bad:
+        return JSONResponse({"error": f"unsupported parameter(s): {', '.join(bad)} — "
+                                      f"allowed: {', '.join(sorted(_OLLAMA_PARAM_ALLOWED))}"},
+                            status_code=400)
+    if not params:
+        return JSONResponse({"error": "nothing to set"}, status_code=400)
+    try:
+        if "num_ctx" in params:
+            params["num_ctx"] = int(params["num_ctx"])
+            if not (256 <= params["num_ctx"] <= 4194304):
+                raise ValueError
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "num_ctx must be an integer >= 256"}, status_code=400)
+
+    kv_note = None
+    if "num_ctx" in params:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+                show = (await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})).json()
+            info = show.get("model_info") or {}
+            _slot, parallel = _bench_ollama_server_ctx()
+            tokens = params["num_ctx"] * parallel
+            kv_mb = _bench_ollama_kv_mb(info, tokens)
+            size_mb = None
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+                tags = (await c.get(f"{OLLAMA_URL}/api/tags")).json()
+            for m in (tags.get("models") or []):
+                if m.get("name") == model or m.get("model") == model:
+                    size_mb = round((m.get("size") or 0) / 1048576) or None
+            total_mb = (_mem_snapshot() or {}).get("total_mb")
+            if kv_mb is not None and size_mb and total_mb:
+                need = size_mb * _BENCH_FIT_OVERHEAD + kv_mb
+                cap = total_mb - _BENCH_FIT_RESERVE_MB
+                kv_note = (f"~{size_mb / 1024:.0f} GB weights + ~{kv_mb / 1024:.0f} GB KV at "
+                           f"{params['num_ctx']:,} × {parallel} slots, "
+                           f"of {cap / 1024:.0f} GB usable")
+                if need > cap and not payload.get("force"):
+                    return JSONResponse(
+                        {"error": f"that context would OOM this box: {kv_note}. "
+                                  f"Pass force:true to set it anyway.",
+                         "kv_estimate_mb": round(kv_mb)}, status_code=400)
+        except (httpx.RequestError, ValueError, KeyError):
+            kv_note = "KV estimate unavailable — set with care"
+
+    ok, detail = await _ollama_apply_params(model, params)
+    if not ok:
+        return JSONResponse({"error": f"ollama create failed: {detail}"}, status_code=502)
+    return {"ok": True, "model": model, "applied": params, "kv_note": kv_note,
+            "note": "defaults apply on the model's next load; a resident copy keeps its "
+                    "old settings until it unloads"}
+
+
 @app.get("/__proxy/api/control/models/vllm")
 async def control_vllm_configs():
     """The vLLM configurations available to switch between. They contend for one port, so at

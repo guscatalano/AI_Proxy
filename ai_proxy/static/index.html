@@ -4604,7 +4604,41 @@ function ollamaConfigSection(ollama) {
         <thead><tr><th>Variable</th><th>Value</th></tr></thead>
         <tbody>${envRows}</tbody>
       </table>
+      <div style="margin-top:10px;padding:10px 12px;border:1px solid #313a48;border-radius:6px;background:#161b24">
+        <div style="font-size:12px;color:#aab4c3;margin-bottom:6px"><b>Model defaults</b> — bake a per-model context window (works for all clients, incl. OpenAI-style; the global env var stays untouched)</div>
+        <input id="omp-model" list="omp-models" placeholder="model tag" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:220px">
+        <datalist id="omp-models">${(ollama.tags || []).map(t => `<option value="${esc(t.name || t.model || '')}">`).join('')}</datalist>
+        <input id="omp-ctx" type="number" min="256" step="1024" placeholder="num_ctx" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:110px;margin-left:6px">
+        <button onclick="applyOllamaParams(this)" style="margin-left:6px;background:#262d38;border:1px solid #33566b;color:#7cc7f0;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer">Apply</button>
+        <span id="omp-result" style="margin-left:8px;font-size:11.5px;color:#888"></span>
+      </div>
     </details>`;
+}
+
+async function applyOllamaParams(btn) {
+  const model = $('omp-model').value.trim();
+  const ctx = parseInt($('omp-ctx').value, 10);
+  const out = $('omp-result');
+  if (!model || !ctx) { out.textContent = 'model and num_ctx required'; return; }
+  btn.disabled = true; out.textContent = 'applying…';
+  try {
+    let r = await fetch('/__proxy/api/control/models/ollama-params', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, num_ctx: ctx }) });
+    let d = await r.json();
+    if (!r.ok && (d.error || '').includes('force:true')) {
+      if (confirm(d.error + '\n\nSet it anyway?')) {
+        r = await fetch('/__proxy/api/control/models/ollama-params', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model, num_ctx: ctx, force: true }) });
+        d = await r.json();
+      }
+    }
+    out.textContent = r.ok
+      ? `set ✓ ${d.kv_note ? '(' + d.kv_note + ')' : ''} — applies on next load`
+      : (d.error || `failed (${r.status})`);
+  } catch (e) { out.textContent = 'failed: ' + e; }
+  finally { btn.disabled = false; }
 }
 
 function sparklinePath(values, w, h) {
