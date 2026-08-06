@@ -3130,6 +3130,10 @@ DEFAULT_RULES_CONFIG = {
         # they contend for it and only one can be up.
         #   "vllm_containers": ["qwen-vllm", "ornith-vllm"]
         "vllm_containers": [],
+        # Auto-load: Ollama-style on-demand loading for the fixed backends (vLLM containers,
+        # llama.cpp). Off by default — turning it on means a request may stop the currently
+        # serving twin and evict other models when the target does not fit in free memory.
+        "auto_load": {"enabled": False, "ready_timeout_s": 900, "min_hold_s": 120},
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
         "vllm_ready_timeout_s": 420,
@@ -11443,6 +11447,87 @@ async def _bench_ollama_kv_preflight(model: str, meta: dict, cfg: dict) -> str |
             f"model_control.ollama_server_ctx) to bench this model.")
 
 
+# ---- Auto-load: Ollama-style on-demand loading for the fixed backends -----------------------
+#
+# Opt-in via model_control.auto_load.enabled. A request for a model that lives on a stopped
+# backend (or the other vLLM twin) starts what it needs and waits, instead of 404ing until a
+# human swaps containers. Other models are unloaded ONLY when the target does not fit in free
+# memory — a request must not strip the box out of habit the way a benchmark deliberately does.
+_AUTO_LOAD_LOCK = asyncio.Lock()
+_AUTO_LOAD_LAST = {"ts": 0.0, "target": ""}
+
+
+def _auto_load_cfg() -> dict:
+    return (load_rules_config().get("model_control") or {}).get("auto_load") or {}
+
+
+async def _ensure_model_served(model: str, upstream: str) -> dict | None:
+    """Make `model` servable on `upstream`, Ollama-style. None = proceed with the request;
+    a dict = refuse it with this error/status instead.
+
+    Single-flight: concurrent requests during a load coalesce on one lock, re-check, and
+    proceed together. min_hold_s stops two clients ping-ponging the port between the twins."""
+    cfg = _auto_load_cfg()
+    if not cfg.get("enabled"):
+        return None
+    if upstream not in ("vllm", "llamacpp"):
+        return None                    # ollama and lmstudio already load on demand
+    index = await _bench_model_index()
+    meta = _bench_resolve_model(index, model, upstream)
+    if meta.get("loaded"):
+        return None
+    if not meta or not (meta.get("startable") or upstream == "llamacpp"):
+        return None                    # unknown model: let the upstream 404 honestly
+    conn = db()
+    busy = conn.execute("SELECT COUNT(*) FROM bench_runs "
+                        "WHERE status IN ('running', 'pending')").fetchone()[0]
+    conn.close()
+    if busy:
+        return {"status": 503,
+                "error": f"a benchmark owns the box right now; auto-load will not fight it. "
+                         f"{model!r} loads once the bench finishes."}
+    async with _AUTO_LOAD_LOCK:
+        index = await _bench_model_index()
+        meta = _bench_resolve_model(index, model, upstream)
+        if meta.get("loaded"):
+            return None                # someone else loaded it while we queued
+        now = time.time()
+        min_hold = float(cfg.get("min_hold_s", 120))
+        tgt = f"{upstream}:{model}"
+        if (_AUTO_LOAD_LAST["target"] and _AUTO_LOAD_LAST["target"] != tgt
+                and now - _AUTO_LOAD_LAST["ts"] < min_hold):
+            return {"status": 503,
+                    "error": f"auto-load switched to {_AUTO_LOAD_LAST['target']} "
+                             f"{int(now - _AUTO_LOAD_LAST['ts'])}s ago and holds it for "
+                             f"{min_hold:.0f}s to prevent thrashing. Retry shortly."}
+        prov = PROVIDERS.get(upstream)
+        if prov is None:
+            return {"status": 503, "error": f"no provider for {upstream!r}"}
+        # The vLLM twins contend for one port: the running one must stop before the target
+        # starts, and stopping it is also the cheapest way to free memory.
+        if upstream == "vllm":
+            running = await _vllm_container()
+            if running and running != meta.get("container"):
+                await prov.stop()
+        # Evict others ONLY if the target does not fit in what is free now.
+        want = (meta.get("size_mb") or 0) * _BENCH_FIT_OVERHEAD
+        if want and _free_mem_mb() < want:
+            snap = await _bench_residency_snapshot()
+            await _bench_free_gpu(snap, keep=model, spare=upstream, want_free_mb=want)
+        timeout = float(cfg.get("ready_timeout_s", 900))
+        payload: dict = {"ready_timeout_s": timeout, "wait_s": timeout}
+        if meta.get("container"):
+            payload["container"] = meta["container"]
+        res = await prov.load(payload, model)
+        ok, detail = _load_result(res)
+        if not ok:
+            return {"status": 503,
+                    "error": f"auto-load could not bring up {model!r} on {upstream}: "
+                             f"{detail or 'it did not become ready in time'}"}
+        _AUTO_LOAD_LAST.update(ts=time.time(), target=tgt)
+        return None
+
+
 async def _bench_start_backend(meta: dict, persist: bool = True,
                                bench_id: str = "") -> dict:
     """Make room, bring up the stopped backend the run needs, and say how to undo both.
@@ -15207,6 +15292,16 @@ async def proxy(full_path: str, request: Request):
                 _conn.close()
             except Exception:
                 pass
+
+    # Auto-load (opt-in): a request for a model on a stopped backend or the other vLLM twin
+    # starts what it needs and waits, Ollama-style, evicting only when it doesn't fit.
+    if (isinstance(body_json, dict) and body_json.get("model")
+            and upstream_label in ("vllm", "llamacpp")
+            and full_path.startswith(("v1/chat", "v1/completions"))):
+        _al_err = await _ensure_model_served(str(body_json["model"]), upstream_label)
+        if _al_err:
+            return JSONResponse({"error": _al_err["error"], "auto_load": True},
+                                status_code=int(_al_err.get("status", 503)))
 
     # Per-model quirk thinking control (see DEFAULT_MODEL_QUIRKS / model_quirks.json). Some models
     # need thinking managed via chat_template_kwargs.enable_thinking because they ignore the OpenAI
