@@ -72,6 +72,29 @@ def _compiler_version(binary: str) -> str:
     return ""
 
 
+_TOOLCHAIN_VERSIONS: dict = {}
+
+
+def toolchain_versions() -> dict:
+    """One version line per grading toolchain present on this box — part of the record,
+    because "graded with gcc 13" and "graded with gcc 15" are different experiments. Cached
+    for the process; the census is ~8 subprocess calls on first use."""
+    if _TOOLCHAIN_VERSIONS:
+        return dict(_TOOLCHAIN_VERSIONS)
+    import platform
+    import sqlite3 as _sq
+    out = {"python": platform.python_version(), "sqlite": _sq.sqlite_version}
+    for lang, tool in (("js", "node"), ("c", "gcc"), ("cpp", "g++"), ("rust", "rustc"),
+                       ("csharp", "dotnet"), ("php", "php"), ("go", "go"), ("bash", "bash")):
+        binary = _bench_tool(tool)
+        if binary:
+            v = _compiler_version(binary)
+            if v:
+                out[lang] = v
+    _TOOLCHAIN_VERSIONS.update(out)
+    return dict(out)
+
+
 def _build_context(comp_cmd: list, src: str) -> dict:
     """What a compile failure needs to be judged: the exact command, the toolchain version,
     and the harness the grader wrapped around the model's code — so a reader can tell a

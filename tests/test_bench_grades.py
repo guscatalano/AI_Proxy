@@ -145,3 +145,21 @@ def test_every_task_in_every_suite_has_a_note(client):
     missing = [t["id"] for name in ("coding-v1", "coding-v2", "coding-v3")
                for t in SUITES[name] if t["id"] not in TASK_NOTES]
     assert not missing, missing
+
+
+def test_the_report_names_its_graders(client):
+    from test_bench_report_layout import _run, _render
+    runs = [_run("a", prompt=32000), _run("b", prompt=131072)]
+    runs[0]["env"]["toolchains"] = {"c": "gcc (Ubuntu 13.2.0) 13.2.0", "python": "3.12.3"}
+    html = _render(runs)
+    assert "Graded with" in html
+    assert "gcc (Ubuntu 13.2.0)" in html
+    assert "read from the host at report time" not in html.split("Graded with")[1][:600], \
+        "run-recorded versions must not carry the backfill caveat"
+
+
+def test_grades_page_names_its_graders_when_recorded(client):
+    run = _cell_run()
+    run["env"] = {"toolchains": {"python": "3.12.3", "go": "go version go1.26.5"}}
+    html = BR._bench_grades_html(run)
+    assert "Graded with:" in html and "go1.26.5" in html

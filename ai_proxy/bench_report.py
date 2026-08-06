@@ -15,10 +15,10 @@ from pathlib import Path
 
 try:
     from .bench_suites import SUITES, TASK_DESC, TASK_NOTES
-    from .bench_graders import _bench_extract_code
+    from .bench_graders import _bench_extract_code, toolchain_versions
 except ImportError:          # flat-script launch: modules sit beside each other
     from bench_suites import SUITES, TASK_DESC, TASK_NOTES
-    from bench_graders import _bench_extract_code
+    from bench_graders import _bench_extract_code, toolchain_versions
 
 def _fmt_n(v, digits=0, suffix=""):
     return "—" if v is None else f"{v:,.{digits}f}{suffix}"
@@ -1404,6 +1404,11 @@ def _bench_grades_html(run: dict) -> str:
             f'print it, it keeps working.</p>'
             f'<div class="gtoc">{"".join(toc)}</div>'
             + "".join(sections))
+    _tc = (run.get("env") or {}).get("toolchains") if isinstance(run.get("env"), dict) else None
+    if _tc:
+        body += ('<p class="note" style="margin-top:22px">Graded with: '
+                 + " · ".join(f"{_h(k)} {_h(str(v))}" for k, v in sorted(_tc.items()))
+                 + "</p>")
     return _report_page(
         title=f"Grades — {label}",
         eyebrow="AI Proxy · benchmark · grading browser",
@@ -1997,6 +2002,27 @@ ordinary slowness rather than a misconfiguration.</p>
                 f'</span></li>' for t in _ts) + '</ul></div>'
             for _tn, _ts in sorted(_tiers.items()))
         _cfg0 = (runs[0].get("config") or {}) if runs else {}
+        # The graders themselves are part of the method: "graded with gcc 13" and "graded
+        # with gcc 15" are different experiments. Recorded at run time; older runs backfill
+        # from the host at render time and say so, same honesty rule as the hardware panel.
+        _tc = env.get("toolchains")
+        _tc_backfilled = not isinstance(_tc, dict)
+        if _tc_backfilled:
+            try:
+                _tc = toolchain_versions()
+            except Exception:
+                _tc = {}
+        _tc_html = ""
+        if _tc:
+            _tc_html = ('<div class="catalog"><div class="tierblk">'
+                        '<p class="k">Graded with</p><ul class="tl">'
+                        + "".join(f'<li><code>{_h(k)}</code> <span>{_h(str(v))}</span></li>'
+                                  for k, v in sorted(_tc.items()))
+                        + '</ul>'
+                        + ('<p class="note" style="margin:6px 0 0">Versions are a census of '
+                           'the host as of report time — this run predates toolchain '
+                           'recording.</p>' if _tc_backfilled else "")
+                        + '</div></div>')
         method_html = f"""
   <h2>What was tested</h2>
   <p class="note">Every task asks for one answer in the task's language — Python,
@@ -2018,6 +2044,7 @@ ordinary slowness rather than a misconfiguration.</p>
       for t in _suite})}</p></div>
   </div>
   <div class="catalog">{_blocks}</div>
+  {_tc_html}
   {_skip_html}
   <ul class="fn">
     <li>Grading executes model-written code in a subprocess with a hard timeout, a scratch
