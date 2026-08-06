@@ -163,3 +163,9 @@ def test_grades_page_names_its_graders_when_recorded(client):
     run["env"] = {"toolchains": {"python": "3.12.3", "go": "go version go1.26.5"}}
     html = BR._bench_grades_html(run)
     assert "Graded with:" in html and "go1.26.5" in html
+
+
+def test_grades_page_backfills_grader_versions_with_a_caveat(client):
+    html = BR._bench_grades_html(_cell_run())      # no env.toolchains recorded
+    assert "Graded with:" in html
+    assert "predates toolchain recording" in html

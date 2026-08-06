@@ -1405,9 +1405,17 @@ def _bench_grades_html(run: dict) -> str:
             f'<div class="gtoc">{"".join(toc)}</div>'
             + "".join(sections))
     _tc = (run.get("env") or {}).get("toolchains") if isinstance(run.get("env"), dict) else None
+    _tc_backfilled = not _tc
+    if not _tc:
+        try:
+            _tc = toolchain_versions()
+        except Exception:
+            _tc = {}
     if _tc:
         body += ('<p class="note" style="margin-top:22px">Graded with: '
                  + " · ".join(f"{_h(k)} {_h(str(v))}" for k, v in sorted(_tc.items()))
+                 + (" — a census of the host as of viewing; this run predates toolchain "
+                    "recording." if _tc_backfilled else "")
                  + "</p>")
     return _report_page(
         title=f"Grades — {label}",
