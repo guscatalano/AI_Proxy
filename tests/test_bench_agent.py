@@ -43,6 +43,18 @@ def test_conduct_accounting():
     assert w.repeats == 1
 
 
+def test_retrying_after_an_error_is_not_a_repeat():
+    """agent_flaky DEMANDS retrying the identical call; the first conduct rule failed every
+    model that did the right thing — caught by the suite's own first run."""
+    w = A.AgentWorld(_task("agent_flaky"))
+    w.execute("get_balance", '{"account": "ax9"}')      # error 1
+    w.execute("get_balance", '{"account": "ax9"}')      # error 2 — retry, not a repeat
+    w.execute("get_balance", '{"account": "ax9"}')      # success
+    assert w.repeats == 0
+    w.execute("get_balance", '{"account": "ax9"}')      # repeat after SUCCESS — that counts
+    assert w.repeats == 1
+
+
 def test_grading_gives_partial_credit():
     t = _task("agent_chain")
     clean = A.AgentWorld(t)

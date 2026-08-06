@@ -155,6 +155,7 @@ class AgentWorld:
         self.unknown = 0
         self.repeats = 0
         self.flaky_left = int(self.state.get("flaky_failures") or 0)
+        self._last_ok: dict = {}
 
     def execute(self, name: str, raw_args) -> str:
         """Run one tool call, returning the tool message content (always a string)."""
@@ -166,16 +167,24 @@ class AgentWorld:
             self.malformed += 1
             return json.dumps({"error": f"malformed arguments: {e}"})
         sig = (name, json.dumps(args, sort_keys=True))
-        if sig in self.calls:
+        # A repeat only counts against conduct when the previous identical call SUCCEEDED —
+        # retrying after an error is what a competent agent does (agent_flaky demands it),
+        # and the first version of this rule failed every model that did the right thing.
+        if self._last_ok.get(sig):
             self.repeats += 1
         self.calls.append(sig)
         try:
-            return self._dispatch(name, args)
+            out = self._dispatch(name, args)
         except KeyError as e:
-            return json.dumps({"error": f"not found: {e}"})
+            out = json.dumps({"error": f"not found: {e}"})
         except Exception as e:
             self.malformed += 1
-            return json.dumps({"error": f"{type(e).__name__}: {e}"})
+            out = json.dumps({"error": f"{type(e).__name__}: {e}"})
+        try:
+            self._last_ok[sig] = "error" not in (json.loads(out) or {})
+        except (json.JSONDecodeError, TypeError):
+            self._last_ok[sig] = True
+        return out
 
     def _dispatch(self, name: str, a: dict) -> str:
         st = self.state
