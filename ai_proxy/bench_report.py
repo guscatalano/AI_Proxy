@@ -1210,6 +1210,9 @@ def _bench_case_parts(task: dict, idx: int) -> tuple:
     if "stdin" in c:                    # bash: stdin in, stdout compared
         stdin_short = (c.get("stdin") or "").replace("\n", "⏎")[:48]
         return f'stdin "{stdin_short}"', exp
+    if "check" in c:                    # agent episode: answer + conduct
+        return ("final answer" if c["check"] == "answer"
+                else "conduct (no malformed/hallucinated/repeated calls, within budget)"), exp
     return f"case {idx + 1}", exp
 
 

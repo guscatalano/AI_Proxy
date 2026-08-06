@@ -10973,6 +10973,16 @@ _BENCH_SUITES = _bench_suites_mod.SUITES
 _BENCH_TASK_DESC = _bench_suites_mod.TASK_DESC
 _BENCH_TASK_NOTES = _bench_suites_mod.TASK_NOTES
 
+# agent-v1: multi-tool episodes. Registered into the same suite registry so the picker, the
+# reports, the grades browser and reuse signatures all treat it as just another suite.
+try:
+    from . import bench_agent as _bench_agent_mod
+except ImportError:          # flat-script launch
+    import bench_agent as _bench_agent_mod
+_BENCH_SUITES.setdefault("agent-v1", _bench_agent_mod.AGENT_TASKS)
+_BENCH_TASK_DESC.update(_bench_agent_mod.AGENT_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_agent_mod.AGENT_TASK_NOTES)
+
 # Grading machinery lives in bench_graders — synchronous, importable without the
 # app. Re-bound under the old names so references and monkeypatching tests keep
 # working; note that graders-internal calls resolve inside that module, so tests
@@ -11112,6 +11122,77 @@ def _bench_headers(cfg: dict) -> dict:
     if up:
         h["x-proxy-upstream"] = up
     return h
+
+
+async def _bench_run_agent(client: httpx.AsyncClient, base: str, model: str,
+                           task: dict, cfg: dict) -> dict:
+    """One agent EPISODE: the model drives, the bench plays the tools deterministically.
+
+    Non-streaming on purpose — an episode's metric is turns and wall time, not token
+    cadence — and the whole conversation transcript is stored so the grading browser can
+    show exactly where an episode went off the rails."""
+    cfg = cfg or {}
+    world = _bench_agent_mod.AgentWorld(task)
+    messages = [{"role": "user", "content": task["prompt"]}]
+    headers = _bench_headers(cfg)
+    transcript = [f"USER: {task['prompt']}"]
+    t0 = time.perf_counter()
+    steps = 0
+    final = None
+    err = None
+    ttft = None
+    ctok = 0
+    for _ in range(int(task.get("max_steps") or 10)):
+        body = {"model": model, "messages": messages, "tools": task.get("tools") or [],
+                "stream": False, "max_tokens": int(cfg.get("max_tokens") or 1024)}
+        _bench_apply_thinking(body, str(cfg.get("thinking") or "auto"))
+        _bench_apply_sampling(body, cfg)
+        try:
+            resp = await client.post(base + "/v1/chat/completions", headers=headers,
+                                     json=body, timeout=httpx.Timeout(600.0))
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            break
+        if resp.status_code != 200:
+            err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            break
+        try:
+            j = resp.json()
+        except ValueError:
+            err = "non-JSON response"
+            break
+        steps += 1
+        if ttft is None:
+            ttft = (time.perf_counter() - t0) * 1000
+        ctok += ((j.get("usage") or {}).get("completion_tokens") or 0)
+        msg = ((j.get("choices") or [{}])[0].get("message")) or {}
+        tcs = msg.get("tool_calls") or []
+        if tcs:
+            messages.append({"role": "assistant", "content": msg.get("content") or None,
+                             "tool_calls": tcs})
+            for k, tc in enumerate(tcs):
+                fn = (tc.get("function") or {})
+                nm = fn.get("name") or "?"
+                out = world.execute(nm, fn.get("arguments"))
+                transcript.append(f"TOOL CALL: {nm}({str(fn.get('arguments'))[:200]})")
+                transcript.append(f"TOOL RESULT: {out[:200]}")
+                messages.append({"role": "tool",
+                                 "tool_call_id": tc.get("id") or f"call_{steps}_{k}",
+                                 "content": out})
+            continue
+        final = msg.get("content") or ""
+        transcript.append(f"ASSISTANT: {final[:400]}")
+        break
+    exhausted = final is None and err is None
+    if exhausted:
+        transcript.append(f"[step budget of {task.get('max_steps')} exhausted]")
+    grade = _bench_agent_mod.grade_episode(task, world, final, steps, exhausted)
+    total_ms = (time.perf_counter() - t0) * 1000
+    return {"seq": 0, "task": task["id"], "error": err, "grade": grade,
+            "ttft_ms": ttft, "ttfc_ms": ttft, "total_ms": total_ms,
+            "completion_tokens": ctok or None, "reasoning_tokens": None,
+            "decode_tps": (ctok / (total_ms / 1000)) if ctok and total_ms else None,
+            "steps": steps, "text": "\n".join(transcript)[:6000]}
 
 
 async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
@@ -12663,15 +12744,23 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         prompt = (task_prompt if task_prompt is not None
                                   else _bench_build_prompt(prompt_tokens, randomize, seq))
                         wave_tasks.append(task)
-                        coros.append(_bench_run_one(client, base, model, max_tokens, prompt, seq,
-                                                    cfg=cfg, capture_text=bool(task)))
+                        if task and task.get("tools"):
+                            # An agent task is an episode, not a completion: its runner owns
+                            # the tool loop and returns the row already graded.
+                            coros.append(_bench_run_agent(client, base, model, task, cfg))
+                        else:
+                            coros.append(_bench_run_one(client, base, model, max_tokens,
+                                                        prompt, seq,
+                                                        cfg=cfg, capture_text=bool(task)))
                     results = await asyncio.gather(*coros, return_exceptions=False)
                     # Grade after the wave so scoring never overlaps generation — a busy CPU
                     # during generation would show up as slower decode.
                     for res, task in zip(results, wave_tasks):
                         if task:
                             res["task"] = task["id"]
-                            if not res.get("error"):
+                            if "grade" in res:
+                                pass          # agent episodes arrive graded by their runner
+                            elif not res.get("error"):
                                 res["grade"] = await _bench_grade(res.get("text") or "", task,
                                                                   grade_timeout)
                                 # A failing grade on a response that used its whole token
