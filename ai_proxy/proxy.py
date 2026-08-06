@@ -3133,7 +3133,8 @@ DEFAULT_RULES_CONFIG = {
         # Auto-load: Ollama-style on-demand loading for the fixed backends (vLLM containers,
         # llama.cpp). Off by default — turning it on means a request may stop the currently
         # serving twin and evict other models when the target does not fit in free memory.
-        "auto_load": {"enabled": False, "ready_timeout_s": 900, "min_hold_s": 120},
+        "auto_load": {"enabled": False, "ready_timeout_s": 900, "min_hold_s": 120,
+                      "drain_s": 120},
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
         "vllm_ready_timeout_s": 420,
@@ -11491,23 +11492,35 @@ async def _ensure_model_served(model: str, upstream: str) -> dict | None:
         meta = _bench_resolve_model(index, model, upstream)
         if meta.get("loaded"):
             return None                # someone else loaded it while we queued
-        now = time.time()
         min_hold = float(cfg.get("min_hold_s", 120))
         tgt = f"{upstream}:{model}"
-        if (_AUTO_LOAD_LAST["target"] and _AUTO_LOAD_LAST["target"] != tgt
-                and now - _AUTO_LOAD_LAST["ts"] < min_hold):
-            return {"status": 503,
-                    "error": f"auto-load switched to {_AUTO_LOAD_LAST['target']} "
-                             f"{int(now - _AUTO_LOAD_LAST['ts'])}s ago and holds it for "
-                             f"{min_hold:.0f}s to prevent thrashing. Retry shortly."}
+        # HELD, not refused: a request that arrives inside another target's hold window
+        # sleeps the window out and then takes its turn. The hold still prevents thrash —
+        # two clients on different twins get slow alternation instead of a coin-flip 503.
+        while (_AUTO_LOAD_LAST["target"] and _AUTO_LOAD_LAST["target"] != tgt
+                and time.time() - _AUTO_LOAD_LAST["ts"] < min_hold):
+            await asyncio.sleep(min(2.0, min_hold - (time.time() - _AUTO_LOAD_LAST["ts"])))
+            index = await _bench_model_index()
+            meta = _bench_resolve_model(index, model, upstream)
+            if meta.get("loaded"):
+                return None            # the hold ended in our favour after all
         prov = PROVIDERS.get(upstream)
         if prov is None:
             return {"status": 503, "error": f"no provider for {upstream!r}"}
         # The vLLM twins contend for one port: the running one must stop before the target
-        # starts, and stopping it is also the cheapest way to free memory.
+        # starts, and stopping it is also the cheapest way to free memory. But someone may
+        # be mid-stream on it — drain in-flight requests (bounded) before pulling the plug.
         if upstream == "vllm":
             running = await _vllm_container()
             if running and running != meta.get("container"):
+                drain_deadline = time.time() + float(cfg.get("drain_s", 120))
+                def _busy():
+                    now2 = time.time()
+                    return any((not v.get("cancelled")) and v.get("upstream") == upstream
+                               and now2 - v.get("ts", now2) < 900
+                               for v in dict(_INFLIGHT_REQUESTS).values())
+                while _busy() and time.time() < drain_deadline:
+                    await asyncio.sleep(2)
                 await prov.stop()
         # Evict others ONLY if the target does not fit in what is free now.
         want = (meta.get("size_mb") or 0) * _BENCH_FIT_OVERHEAD
@@ -15659,7 +15672,7 @@ async def proxy(full_path: str, request: Request):
 
     # Register this in-flight request so /api/control/cancel/{req_id} can find it.
     _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": upstream_resp,
-                                  "cancelled": False}
+                                  "upstream": upstream_label, "cancelled": False}
 
     # tool_call_xml_retry: when Ollama returns 500 with an XML-parse error in the body
     # (qwen-style models occasionally emit `<parameter>...</function>` without closing the

@@ -104,13 +104,32 @@ def test_a_running_bench_owns_the_box(client, monkeypatch):
     assert not prov.stopped
 
 
-def test_min_hold_prevents_ping_pong(client, monkeypatch):
+def test_min_hold_holds_the_request_then_proceeds(client, monkeypatch):
+    """Held, not refused: a request inside another target's hold window sleeps it out and
+    then takes its turn — thrash becomes slow alternation instead of a 503."""
     prov, _ = _setup(monkeypatch)
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "model_control": {"auto_load": {"enabled": True, "ready_timeout_s": 5,
+                                        "min_hold_s": 0.4, "drain_s": 0}}})
     monkeypatch.setattr(P, "_AUTO_LOAD_LAST",
                         {"ts": time.time(), "target": "vllm:ornith-nvfp4"})
-    err = asyncio.run(P._ensure_model_served("qwen3-coder-next", "vllm"))
-    assert err and "holds it" in err["error"]
-    assert not prov.stopped
+    t0 = time.time()
+    assert asyncio.run(P._ensure_model_served("qwen3-coder-next", "vllm")) is None
+    assert time.time() - t0 >= 0.3, "the hold window must actually be waited out"
+    assert prov.stopped and prov.loaded_with, "after the hold, the swap proceeds"
+
+
+def test_a_swap_drains_in_flight_streams_first(client, monkeypatch):
+    prov, _ = _setup(monkeypatch)
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "model_control": {"auto_load": {"enabled": True, "ready_timeout_s": 5,
+                                        "min_hold_s": 120, "drain_s": 0.5}}})
+    monkeypatch.setattr(P, "_INFLIGHT_REQUESTS",
+                        {"r1": {"ts": time.time(), "upstream": "vllm", "cancelled": False}})
+    t0 = time.time()
+    assert asyncio.run(P._ensure_model_served("qwen3-coder-next", "vllm")) is None
+    assert time.time() - t0 >= 0.4, "a busy upstream is drained (bounded) before the stop"
+    assert prov.stopped
 
 
 def test_an_unknown_model_is_left_to_404_honestly(client, monkeypatch):
