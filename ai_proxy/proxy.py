@@ -6127,6 +6127,14 @@ def _norm_model_id(mid: str) -> str:
     return s.split(":")[0].lower()
 
 
+# The catalogue asks five backends (one of them via `docker inspect`) what they have. Model
+# pickers poll this endpoint, and answering a poll with a fan-out of subprocess calls is how
+# a listing turns into load. Two seconds is short enough that starting a container still
+# shows up promptly and long enough that a polling client costs one sweep.
+_MODELS_CACHE: dict = {"ts": 0.0, "data": None}
+_MODELS_CACHE_TTL_S = 2.0
+
+
 @app.get("/v1/models")
 async def list_models_enriched():
     """OpenAI /v1/models, but the union of EVERY backend the proxy fronts.
@@ -6145,6 +6153,9 @@ async def list_models_enriched():
     absent — often 128k, then they compact early against a model loaded much larger.
     All of it best-effort: an unreachable backend contributes nothing, never an error.
     """
+    now = time.time()
+    if _MODELS_CACHE["data"] is not None and now - _MODELS_CACHE["ts"] < _MODELS_CACHE_TTL_S:
+        return JSONResponse(_MODELS_CACHE["data"])
     entries: dict[str, dict] = {}
 
     def add(mid, backend, ctx=None, state=None, created=None, loaded=None):
@@ -6223,7 +6234,9 @@ async def list_models_enriched():
             if ctx:
                 e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
 
-    return JSONResponse({"object": "list", "data": list(entries.values())})
+    payload = {"object": "list", "data": list(entries.values())}
+    _MODELS_CACHE.update(ts=now, data=payload)
+    return JSONResponse(payload)
 
 
 @app.get("/__proxy/api/ollama/update-check")

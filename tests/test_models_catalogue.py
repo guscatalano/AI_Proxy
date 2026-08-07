@@ -43,6 +43,9 @@ class _FakeClient:
 
 
 def _patch_backends(monkeypatch, vllm=None, cfgs=None, lcpp=None, lms=None):
+    # The endpoint caches its sweep for a couple of seconds; tests that swap the backends
+    # out from under it must start from a cold cache or they assert on the last test's fleet.
+    P._MODELS_CACHE.update(ts=0.0, data=None)
     async def _vllm(c):
         return vllm or {}
 
@@ -111,6 +114,8 @@ def test_catalogue_dedupes_serving_over_config(client, monkeypatch):
 
 
 def test_catalogue_survives_every_backend_down(client, monkeypatch):
+    P._MODELS_CACHE.update(ts=0.0, data=None)   # answer from the dead fleet, not the cache
+
     class _DeadClient(_FakeClient):
         async def get(self, url, **k):
             raise P.httpx.ConnectError("down")
@@ -126,3 +131,24 @@ def test_catalogue_survives_every_backend_down(client, monkeypatch):
     r = client.get("/v1/models")
     assert r.status_code == 200
     assert r.json() == {"object": "list", "data": []}
+
+
+def test_the_catalogue_caches_its_sweep(client, monkeypatch):
+    """Model pickers poll this. Each miss fans out to five backends, one of them through
+    `docker inspect`, so a polling client must not turn a listing into load."""
+    calls = {"n": 0}
+
+    async def counting_cfgs():
+        calls["n"] += 1
+        return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "state": "running"}]
+
+    _patch_backends(monkeypatch, cfgs=[])
+    monkeypatch.setattr(P, "_vllm_configs", counting_cfgs)
+    first = client.get("/v1/models").json()
+    for _ in range(4):
+        assert client.get("/v1/models").json() == first
+    assert calls["n"] == 1, f"swept the fleet {calls['n']} times for 5 requests"
+    # ...and a cache that never expires would hide a container starting up.
+    P._MODELS_CACHE.update(ts=0.0, data=None)
+    client.get("/v1/models")
+    assert calls["n"] == 2

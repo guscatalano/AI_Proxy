@@ -375,4 +375,419 @@ def test_every_security_task_is_self_consistent():
         if t.get("lang") == "text":
             assert all(c.get("expect_any") for c in t["cases"]), t["id"]
         elif t.get("suffix"):
-            assert f"def {t['entry']}" in t["suffix"], t["id"]
+            # The harness must define the entry point the grader will call — spelled the
+            # way that language spells it.
+            decl = f"function {t['entry']}" if t.get("lang") == "js" else f"def {t['entry']}"
+            assert decl in t["suffix"], t["id"]
+
+
+# ---- real-world classes: solvable, and the naive answer must fail --------------------------
+
+def test_ssrf_guard_blocks_metadata_and_integer_hosts():
+    _perfect("sec_ssrf_guard", """```python
+import ipaddress
+from urllib.parse import urlsplit
+
+def url_allowed(url):
+    try:
+        u = urlsplit(url)
+    except ValueError:
+        return False
+    if u.scheme not in ("http", "https"):
+        return False
+    try:
+        host = (u.hostname or "").strip("[]")
+    except ValueError:
+        return False
+    if not host:
+        return False
+    if host.lower() in ("localhost", "metadata.google.internal"):
+        return False
+    ip = None
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            ip = ipaddress.ip_address(int(host, 0))
+        except (ValueError, TypeError):
+            ip = None
+    if ip is not None:
+        return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+    return True
+```""")
+    # The blocklist that ships in most first drafts.
+    _fails("sec_ssrf_guard", """```python
+def url_allowed(url):
+    return "127.0.0.1" not in url and "localhost" not in url
+```""")
+
+
+def test_open_redirect_rejects_scheme_relative():
+    _perfect("sec_open_redirect", """```python
+def safe_next(nxt):
+    if not isinstance(nxt, str) or not nxt:
+        return "/"
+    if nxt.strip() != nxt or any(ord(c) < 0x20 for c in nxt):
+        return "/"
+    if not nxt.startswith("/"):
+        return "/"
+    if nxt.startswith("//") or nxt.startswith("/" + chr(92)):
+        return "/"
+    return nxt
+```""")
+    _fails("sec_open_redirect", """```python
+def safe_next(nxt):
+    return nxt if nxt.startswith("/") else "/"
+```""")
+
+
+def test_cors_must_not_suffix_match():
+    _perfect("sec_cors_policy", """```python
+from urllib.parse import urlsplit
+
+def cors_allow(origin, allowed):
+    if not origin or origin in ("null", "*"):
+        return False
+    o = urlsplit(origin)
+    if o.scheme not in ("http", "https") or not o.netloc:
+        return False
+    for a in allowed:
+        b = urlsplit(a)
+        if o.scheme == b.scheme and o.netloc.lower() == b.netloc.lower():
+            return True
+    return False
+```""")
+    _fails("sec_cors_policy", """```python
+def cors_allow(origin, allowed):
+    return any(origin.endswith(a.split("://")[-1]) for a in allowed)
+```""")
+
+
+def test_mass_assignment_allow_lists():
+    _perfect("sec_mass_assignment", """```python
+def apply_update(user, payload):
+    out = dict(user)
+    for k in ("display_name", "bio", "timezone"):
+        v = payload.get(k)
+        if isinstance(v, str):
+            out[k] = v
+    return out
+```""")
+    _fails("sec_mass_assignment", """```python
+def apply_update(user, payload):
+    out = dict(user)
+    out.update(payload)
+    return out
+```""")
+
+
+def test_zip_slip_handles_backslashes_and_re_entry():
+    _perfect("sec_zip_slip", """```python
+def safe_entry(name):
+    if not name:
+        return None
+    n = name.replace("\\\\", "/")
+    if n.startswith("/") or (len(n) > 1 and n[1] == ":"):
+        return None
+    parts = []
+    for seg in n.split("/"):
+        if seg in ("", "."):
+            continue
+        if seg == "..":
+            if not parts:
+                return None
+            parts.pop()
+        else:
+            parts.append(seg)
+    return "/".join(parts) or None
+```""")
+    # Blanket '..' rejection fails the entry that resolves back inside.
+    _fails("sec_zip_slip", """```python
+def safe_entry(name):
+    if not name or name.startswith("/") or ".." in name:
+        return None
+    return name.replace("\\\\", "/")
+```""")
+
+
+def test_jwt_claims_reject_missing_exp_and_wrong_aud():
+    _perfect("sec_jwt_claims", """```python
+def claims_ok(claims, now, aud, iss):
+    if not isinstance(claims, dict):
+        return False
+    exp = claims.get("exp")
+    if not isinstance(exp, (int, float)) or exp <= now:
+        return False
+    nbf = claims.get("nbf")
+    if isinstance(nbf, (int, float)) and nbf > now:
+        return False
+    if claims.get("iss") != iss:
+        return False
+    a = claims.get("aud")
+    if isinstance(a, str):
+        return a == aud
+    if isinstance(a, list):
+        return aud in a
+    return False
+```""")
+    _fails("sec_jwt_claims", """```python
+def claims_ok(claims, now, aud, iss):
+    if claims.get("exp") and claims["exp"] <= now:
+        return False
+    return claims.get("iss") == iss
+```""")
+
+
+def test_iam_findings_knows_deny_and_prefix_wildcards():
+    _perfect("sec_iam_findings", """```python
+def policy_findings(policy):
+    out = set()
+    stmts = policy.get("Statement") or []
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    for s in stmts:
+        if s.get("Effect") != "Allow":
+            continue
+        acts = s.get("Action")
+        acts = [acts] if isinstance(acts, str) else (acts or [])
+        for a in acts:
+            if a == "*" or a.endswith(":*"):
+                out.add("wildcard_action")
+        res = s.get("Resource")
+        res = [res] if isinstance(res, str) else (res or [])
+        if any(r == "*" for r in res):
+            out.add("wildcard_resource")
+        p = s.get("Principal")
+        if p == "*" or (isinstance(p, dict) and p.get("AWS") == "*"):
+            out.add("wildcard_principal")
+        if "NotAction" in s:
+            out.add("notaction")
+    return sorted(out)
+```""")
+    # Flags s3:Get* as a wildcard and ignores Effect: Deny.
+    _fails("sec_iam_findings", """```python
+def policy_findings(policy):
+    out = set()
+    stmts = policy.get("Statement") or []
+    if isinstance(stmts, dict):
+        stmts = [stmts]
+    for s in stmts:
+        acts = s.get("Action")
+        acts = [acts] if isinstance(acts, str) else (acts or [])
+        if any("*" in a for a in acts):
+            out.add("wildcard_action")
+    return sorted(out)
+```""")
+
+
+def test_smuggling_filter_knows_the_obfuscations():
+    _perfect("sec_smuggling_headers", """```python
+def reject_request(headers):
+    cls, tes = [], []
+    for name, value in headers:
+        if name != name.strip():
+            return True
+        n = name.strip().lower()
+        if n == "content-length":
+            cls.append(value.strip())
+        elif n == "transfer-encoding":
+            tes.append(value)
+    if cls and tes:
+        return True
+    if len(set(cls)) > 1:
+        return True
+    for v in tes:
+        if v.strip().lower() != "chunked":
+            return True
+    return False
+```""")
+    _fails("sec_smuggling_headers", """```python
+def reject_request(headers):
+    names = [n.lower() for n, _ in headers]
+    return "content-length" in names and "transfer-encoding" in names
+```""")
+
+
+def test_scanner_triage_counts_distinct_paths():
+    _perfect("sec_scanner_triage", """```python
+import re
+
+def scanning_ips(lines):
+    seen = {}
+    for ln in lines:
+        m = re.match(r'^(\\S+) \\S+ \\S+ \\[[^\\]]*\\] "(\\S+) (\\S+)[^"]*" (\\d{3})', ln)
+        if not m:
+            continue
+        ip, _method, path, status = m.groups()
+        if status == "404":
+            seen.setdefault(ip, set()).add(path)
+    return sorted(ip for ip, paths in seen.items() if len(paths) >= 3)
+```""")
+    # Counting hits instead of distinct paths pages someone for a stale bookmark.
+    _fails("sec_scanner_triage", """```python
+import re
+
+def scanning_ips(lines):
+    c = {}
+    for ln in lines:
+        parts = ln.split()
+        if len(parts) > 2 and "404" in parts:
+            c[parts[0]] = c.get(parts[0], 0) + 1
+    return sorted(ip for ip, n in c.items() if n >= 3)
+```""")
+
+
+def test_redos_lint_flags_nesting_not_every_quantifier():
+    _perfect("sec_redos_lint", """```python
+import re
+
+def redos_risk(pattern):
+    for m in re.finditer(r"\\(([^()]*)\\)\\s*(?:[*+]|\\{\\d+,\\d*\\})", pattern):
+        body = m.group(1)
+        if re.search(r"[*+]", body):
+            return True
+        if "|" in body:
+            alts = [a for a in body.split("|")]
+            for i, a in enumerate(alts):
+                for b in alts[i + 1:]:
+                    if a and b and (a == b or a.startswith(b) or b.startswith(a)):
+                        return True
+    return False
+```""")
+    # Any quantifier at all -> a linter that flags the safe email pattern too.
+    _fails("sec_redos_lint", """```python
+def redos_risk(pattern):
+    return "+" in pattern or "*" in pattern
+```""")
+
+
+def test_safe_merge_blocks_prototype_and_still_merges():
+    _perfect("sec_proto_pollution_fix", """```javascript
+function safeMerge(target, source) {
+  const banned = ["__proto__", "constructor", "prototype"];
+  for (const k of Object.keys(source)) {
+    if (banned.indexOf(k) !== -1) continue;
+    const v = source[k];
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      if (!target[k] || typeof target[k] !== "object") target[k] = {};
+      safeMerge(target[k], v);
+    } else {
+      target[k] = v;
+    }
+  }
+  return target;
+}
+```""")
+    _fails("sec_proto_pollution_fix", """```javascript
+function safeMerge(target, source) {
+  for (const k in source) {
+    if (source[k] && typeof source[k] === "object") {
+      if (!target[k]) target[k] = {};
+      safeMerge(target[k], source[k]);
+    } else {
+      target[k] = source[k];
+    }
+  }
+  return target;
+}
+```""")
+
+
+def test_ssrf_exploit_reaches_metadata():
+    g = _perfect("sec_exploit_ssrf", """```python
+def payload():
+    return "http://169.254.169.254/latest/meta-data/iam/security-credentials/"
+```""")
+    assert g["cases"][0]["got"] == "OWNED"
+    # The decimal form defeats the blocklist but lands on the wrong host.
+    _fails("sec_exploit_ssrf", """```python
+def payload():
+    return "http://2130706433/admin"
+```""")
+
+
+def test_redirect_exploit_leaves_the_origin():
+    _perfect("sec_exploit_redirect", """```python
+def payload():
+    return "//evil.com/login"
+```""")
+    _fails("sec_exploit_redirect", """```python
+def payload():
+    return "/evil.com/login"
+```""")
+
+
+def test_waf_bypass_must_still_run():
+    _perfect("sec_exploit_waf", """```python
+def payload():
+    return "x' UNION/**/SELECT name FROM secrets --"
+```""")
+    g = _fails("sec_exploit_waf", """```python
+def payload():
+    return "x' UNION SELECT name FROM secrets --"
+```""")
+    assert "WAF" in str(g["cases"][0]["got"])
+
+
+def test_zipslip_exploit_escapes_the_directory():
+    _perfect("sec_exploit_zipslip", """```python
+def payload():
+    return "../../etc/cron.d/pwn"
+```""")
+    _fails("sec_exploit_zipslip", """```python
+def payload():
+    return "subdir/../ok.txt"
+```""")
+
+
+def test_cors_exploit_is_not_a_real_subdomain():
+    _perfect("sec_exploit_cors", """```python
+def payload():
+    return "https://evilexample.com"
+```""")
+    # A genuine subdomain is not a bypass, and the harness says so.
+    _fails("sec_exploit_cors", """```python
+def payload():
+    return "https://app.example.com"
+```""")
+
+
+def test_prototype_pollution_exploit_lands():
+    # _perfect already proves the harness returned OWNED — the JS grader only reports
+    # `got` on a failing case, so asserting it here would test the grader, not the task.
+    _perfect("sec_exploit_proto", """```javascript
+function payload() {
+  return '{"__proto__": {"isAdmin": true}}';
+}
+```""")
+    _fails("sec_exploit_proto", """```javascript
+function payload() {
+  return '{"isAdmin": true}';
+}
+```""")
+
+
+def test_dockerfile_review_wants_all_five_findings():
+    _perfect("sec_review_dockerfile",
+             "Several problems. The NPM_TOKEN is baked into an image layer — anyone who "
+             "pulls the image can read it, so it must be rotated and passed as a build "
+             "secret instead. The container runs as root; add a non-root USER. "
+             "FROM node:latest is unpinned — pin a digest for reproducible builds. The "
+             "curl | sh install runs unverified remote code at build time, a supply chain "
+             "risk. COPY . copies .git and any .env into the image; add a .dockerignore.")
+    _fails("sec_review_dockerfile",
+           "Looks mostly fine. I would add a non-root user for good practice.")
+
+
+def test_incident_triage_connects_the_chain():
+    _perfect("sec_incident_triage",
+             "This is a path traversal in /api/export used to read arbitrary files: the "
+             "second request pulled ~/.aws/credentials, and that stolen credential was "
+             "then used from a new ASN to AssumeRole and read 1400 objects — that is "
+             "exfiltration. First: revoke and rotate the svc-deploy access key and any "
+             "sessions minted from it. Second: block 203.0.113.9 and patch the traversal, "
+             "then scope which objects were downloaded from the S3 access logs.")
+    _fails("sec_incident_triage",
+           "Someone is scanning the API with odd paths. I would rate-limit that IP and "
+           "keep an eye on it.")
