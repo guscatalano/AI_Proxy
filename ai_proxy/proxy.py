@@ -6147,7 +6147,7 @@ async def list_models_enriched():
     """
     entries: dict[str, dict] = {}
 
-    def add(mid, backend, ctx=None, state=None, created=None):
+    def add(mid, backend, ctx=None, state=None, created=None, loaded=None):
         if not mid or mid in entries:
             return
         e = {"id": mid, "object": "model", "created": created or 0, "owned_by": backend}
@@ -6155,6 +6155,11 @@ async def list_models_enriched():
             e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
         if state:
             e["proxy_state"] = state
+        if loaded is not None:
+            # Resident-in-memory vs on-disk, as a machine-readable boolean beside the
+            # human-readable proxy_state — LM Studio's API makes the same distinction,
+            # and "answers now" vs "costs a load first" is real routing information.
+            e["loaded"] = bool(loaded)
         entries[mid] = e
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
@@ -6162,28 +6167,38 @@ async def list_models_enriched():
             r = await client.get(OLLAMA_URL + "/v1/models")
             return r.json() if r.status_code == 200 else {}
 
+        async def _ollama_ps():
+            r = await client.get(OLLAMA_URL + "/api/ps")
+            return r.json() if r.status_code == 200 else {}
+
         results = await asyncio.gather(
-            _ollama(), _vllm_snapshot(client), _vllm_configs(),
+            _ollama(), _ollama_ps(), _vllm_snapshot(client), _vllm_configs(),
             _llamacpp_snapshot(client), _lmstudio_snapshot(client),
             return_exceptions=True)
-    odata, vllm, vcfgs, lcpp, lms = (
+    odata, ops, vllm, vcfgs, lcpp, lms = (
         r if not isinstance(r, BaseException) else {} for r in results)
 
+    resident = {str(m.get("name") or m.get("model") or "")
+                for m in ((ops or {}).get("models") or []) if isinstance(m, dict)}
     for m in ((odata or {}).get("data") or []):
         if isinstance(m, dict):
-            add(m.get("id"), "ollama", created=m.get("created"))
+            is_res = m.get("id") in resident
+            add(m.get("id"), "ollama", created=m.get("created"), loaded=is_res,
+                state="loaded" if is_res else "available — loads on request")
     for m in ((vllm or {}).get("available") or []):
-        add(m.get("id"), "vllm", ctx=m.get("max_context_length"), state="loaded")
+        add(m.get("id"), "vllm", ctx=m.get("max_context_length"),
+            state="loaded", loaded=True)
     # A twin that is configured but not up is still one request away: the auto-loader (or a
     # bench) boots it. Listing it is what makes it selectable at all.
     for c in (vcfgs if isinstance(vcfgs, list) else []):
-        add(c.get("model"), "vllm",
+        add(c.get("model"), "vllm", loaded=False,
             state=("stopped — loads on first request"
                    if str(c.get("state", "")).lower() != "running" else None))
     for m in ((lcpp or {}).get("available") or []):
-        add(m.get("id"), "llamacpp", ctx=(lcpp or {}).get("n_ctx"), state="loaded")
+        add(m.get("id"), "llamacpp", ctx=(lcpp or {}).get("n_ctx"),
+            state="loaded", loaded=True)
     for m in ((lms or {}).get("available") or []):
-        add(m.get("id"), "lmstudio",
+        add(m.get("id"), "lmstudio", loaded=(m.get("state") == "loaded") or None,
             ctx=(m.get("loaded_context_length") or m.get("max_context_length")))
 
     # Ollama's own entries omit any context field; the cached LM Studio snapshot historically

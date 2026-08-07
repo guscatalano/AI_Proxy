@@ -21,6 +21,8 @@ class _Resp:
 
 
 class _FakeClient:
+    RESIDENT: list = []      # tag names ollama /api/ps reports as in-memory
+
     def __init__(self, *a, **k):
         pass
 
@@ -35,6 +37,8 @@ class _FakeClient:
             return _Resp({"object": "list",
                           "data": [{"id": "gemma4:26b", "object": "model", "created": 123,
                                     "owned_by": "library"}]})
+        if url.endswith("/api/ps"):
+            return _Resp({"models": [{"name": n} for n in _FakeClient.RESIDENT]})
         return _Resp({}, 404)
 
 
@@ -73,9 +77,22 @@ def test_catalogue_unions_every_backend(client, monkeypatch):
     assert by_id["gemma4:26b"]["created"] == 123
     assert by_id["qwen3-coder-next"]["owned_by"] == "vllm"
     assert by_id["qwen3-coder-next"]["max_model_len"] == 262144
+    assert by_id["qwen3-coder-next"]["loaded"] is True
     # the stopped twin is listed AND says how it comes back
     assert by_id["ornith"]["proxy_state"] == "stopped — loads on first request"
+    assert by_id["ornith"]["loaded"] is False
     assert by_id["ds4-flash"]["context_length"] == 65536
+    # an ollama model on disk but not resident says so, both ways
+    assert by_id["gemma4:26b"]["loaded"] is False
+    assert by_id["gemma4:26b"]["proxy_state"] == "available — loads on request"
+
+
+def test_a_resident_ollama_model_reports_loaded(client, monkeypatch):
+    _patch_backends(monkeypatch)
+    monkeypatch.setattr(_FakeClient, "RESIDENT", ["gemma4:26b"])
+    d = client.get("/v1/models").json()
+    m = next(x for x in d["data"] if x["id"] == "gemma4:26b")
+    assert m["loaded"] is True and m["proxy_state"] == "loaded"
 
 
 def test_catalogue_dedupes_serving_over_config(client, monkeypatch):
