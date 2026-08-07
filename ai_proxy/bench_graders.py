@@ -143,7 +143,7 @@ def _bench_lang_available(lang: str) -> bool:
     contract: a task whose tooling is absent or broken is SKIPPED — dropped from the run and
     recorded as such — never scored as a zero, because a zero would punish the model for the
     box. The probe result is cached for the life of the process."""
-    if lang in ("python", "html", "css", "sql", None, ""):
+    if lang in ("python", "html", "css", "sql", "text", None, ""):
         return True                    # stdlib-only grading; nothing to probe
     tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
             "php": "php", "bash": "bash", "go": "go"}.get(lang)
@@ -771,14 +771,50 @@ def _bench_grade_bash(code: str, cases: list, timeout_s: float) -> dict:
             pass
 
 
+def _bench_grade_text(answer: str, cases: list) -> dict:
+    """Keyword grading for analysis answers — for tasks where the deliverable is a JUDGEMENT
+    ("name this vulnerability class") rather than code that can be executed.
+
+    Each case is a claim the answer must support: `expect_any` (at least one phrasing must
+    appear) and optional `expect_not` (naming a neighbouring class fails). Matching is
+    case-insensitive on whitespace-collapsed text. This is weaker than execution and is only
+    used where execution has nothing to run — the report labels these tasks as text-graded so
+    the number is never read as an executed pass.
+    """
+    flat = " ".join((answer or "").lower().split())
+    results = []
+    for case in cases:
+        wanted = [str(w).lower() for w in (case.get("expect_any") or [])]
+        banned = [str(w).lower() for w in (case.get("expect_not") or [])]
+        hit = next((w for w in wanted if w in flat), None)
+        bad = next((w for w in banned if w in flat), None)
+        ok = bool(hit) and bad is None
+        r = {"ok": ok, "label": case.get("label")}
+        if not ok:
+            r["got"] = (f"said {bad!r}, which is a different class" if bad
+                        else f"never said any of: {', '.join(wanted[:4])}")
+        results.append(r)
+    return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+            "cases": results, "graded_by": "text"}
+
+
 def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
-                      lang: str = "python") -> dict:
+                      lang: str = "python", suffix: str = "") -> dict:
     """Run one task's code against its cases in a subprocess. Blocking — call via to_thread.
 
     HTML and CSS are the exception: nothing executes, so they grade in-process — the answer is
     parsed and checked against required structure. That is honest static grading, not a claim
     about how the page renders.
+
+    `suffix` is harness code appended after the model's answer. It exists so a task can supply
+    the target and let the model supply only the input: the red-team tasks run the model's
+    payload through a deliberately vulnerable toy and report whether it actually landed, which
+    is the difference between describing an exploit and having one.
     """
+    if lang == "text":
+        return _bench_grade_text(code, cases)
+    if suffix:
+        code = code + "\n\n" + suffix
     if lang == "c":
         return _bench_grade_c(code, entry, cases, timeout_s)
     if lang in ("cpp", "rust", "csharp", "go"):

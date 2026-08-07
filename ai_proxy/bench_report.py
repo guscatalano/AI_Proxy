@@ -676,6 +676,90 @@ def _bench_category_winners_html(rows: list) -> str:
     return (f'<h2>Category winners</h2><div class="cards">{cards_html}</div>{table_html}')
 
 
+# Populated at registration time by proxy.py, which owns the suite definitions — the report
+# must not re-derive which task is which category, or the two definitions drift.
+TASK_CATEGORY: dict = {}
+TASK_SIDE: dict = {}
+
+_CAT_ORDER = ("coding", "agentic", "security")
+_CAT_BLURB = {
+    "coding": "write code that passes its tests",
+    "agentic": "drive tools across many turns and finish",
+    "security": "defend code, and find the hole in it",
+}
+
+
+def _bench_category_html(tasks: dict, axis_names: list) -> str:
+    """Correctness per category, per configuration — the point of merging the suites.
+
+    One aggregate number hides the thing you most need to know: a model can write clean
+    code and still take its orders from a hostile tool result. These are different skills
+    with different failure modes, so they get different columns, and the security column is
+    split red/blue because finding a hole and closing one are also not the same skill.
+    """
+    if not tasks or not TASK_CATEGORY:
+        return ""
+    cats = [c for c in _CAT_ORDER
+            if any(TASK_CATEGORY.get(t) == c for t in tasks)]
+    if len(cats) < 2:
+        return ""      # a single-category run is the plain per-task table's job
+    sides = sorted({TASK_SIDE.get(t) for t in tasks
+                    if TASK_CATEGORY.get(t) == "security" and TASK_SIDE.get(t)})
+
+    def mean_for(name, pred):
+        vals = [rates[name] for tid, rates in tasks.items()
+                if pred(tid) and rates.get(name) is not None]
+        return (sum(vals) / len(vals), len(vals)) if vals else (None, 0)
+
+    def cell(v):
+        if v is None:
+            return '<td class="n">—</td>'
+        cls = " win" if v >= 0.9 else (" bad" if v < 0.6 else "")
+        return f'<td class="n{cls}">{v * 100:.0f}%</td>'
+
+    rows_out = []
+    for name in axis_names:
+        per = {c: mean_for(name, lambda t, c=c: TASK_CATEGORY.get(t) == c)[0] for c in cats}
+        if all(v is None for v in per.values()):
+            continue
+        side_cells = "".join(
+            cell(mean_for(name, lambda t, s=s: TASK_CATEGORY.get(t) == "security"
+                          and TASK_SIDE.get(t) == s)[0]) for s in sides)
+        overall = [v for v in per.values() if v is not None]
+        rows_out.append((name, per, side_cells,
+                         sum(overall) / len(overall) if overall else 0))
+    if not rows_out:
+        return ""
+    rows_out.sort(key=lambda r: -r[3])
+    body = "".join(
+        f'<tr data-m="{_h(name.split(" · ")[0])}">'
+        f'<th scope="row"><code class="mdl">{_h(name.split(" · ")[0])}</code></th>'
+        + "".join(cell(per[c]) for c in cats) + side_cells + "</tr>"
+        for name, per, side_cells, _ in rows_out)
+    counts = {c: sum(1 for t in tasks if TASK_CATEGORY.get(t) == c) for c in cats}
+    head = "".join(f'<th class="n">{_h(c.title())}<br>'
+                   f'<span class="ct">{counts[c]} tasks</span></th>' for c in cats)
+    head += "".join(f'<th class="n">— {_h(s)}<br><span class="ct">team</span></th>'
+                    for s in sides)
+
+    # The sentence a table cannot say: where the same model is strong and weak.
+    note = ""
+    top = rows_out[0]
+    spread = [(c, top[1][c]) for c in cats if top[1][c] is not None]
+    if len(spread) > 1:
+        best_c, best_v = max(spread, key=lambda kv: kv[1])
+        worst_c, worst_v = min(spread, key=lambda kv: kv[1])
+        if best_v - worst_v >= 0.15:
+            note = (f'<p class="note"><b>{_h(top[0].split(" · ")[0])}</b> leads overall on '
+                    f'{best_v * 100:.0f}% {_h(best_c)} — and {worst_v * 100:.0f}% '
+                    f'{_h(worst_c)}. Averaging those into one score would describe a model '
+                    f'that does not exist.</p>')
+    legend = " · ".join(f"<b>{_h(c.title())}</b> {_CAT_BLURB[c]}" for c in cats)
+    return (f'<h2>Results by category</h2><p class="note">{legend}.</p>'
+            f'<div class="tbl"><table><thead><tr><th>Model</th>{head}</tr></thead>'
+            f'<tbody>{body}</tbody></table></div>{note}')
+
+
 def _bench_place_labels(cands: list, est: float = 6.6) -> list:
     """Greedy label placement: sort by x; when a label would collide with one already on its
     row, bump it up a row. Several dots on one line cannot be labelled without this — the
@@ -1328,6 +1412,13 @@ def _bench_case_parts(task: dict, idx: int) -> tuple:
     if "check" in c:                    # agent episode: answer + conduct
         return ("final answer" if c["check"] == "answer"
                 else "conduct (no malformed/hallucinated/repeated calls, within budget)"), exp
+    if "expect_any" in c:               # analysis answer: graded on what it names
+        wanted = ", ".join(str(w) for w in (c.get("expect_any") or [])[:4])
+        banned = c.get("expect_not") or []
+        what = c.get("label") or "the answer must name it"
+        return (f"{what} (text-graded)",
+                f'says any of: {wanted}' + (f'; never: {", ".join(banned[:3])}'
+                                            if banned else ""))
     return f"case {idx + 1}", exp
 
 
@@ -2208,10 +2299,15 @@ ordinary slowness rather than a misconfiguration.</p>
 
     weighted_html = _bench_weighted_html(rows) if graded else ""
     winners_html = _bench_category_winners_html(rows)
+    # Only meaningful once a run spans more than one category — full-v1 does, the older
+    # single-purpose suites do not, and the renderer returns "" for them.
+    category_html = _bench_category_html(tasks, axis_names) if graded else ""
     body = f"""
   {results}
 
   {weighted_html}
+
+  {category_html}
 
   {winners_html}
 

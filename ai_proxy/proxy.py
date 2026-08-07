@@ -11201,6 +11201,43 @@ _BENCH_SUITES.setdefault("agent-v2", _bench_agent_mod.AGENT2_TASKS)
 _BENCH_TASK_DESC.update(_bench_agent_mod.AGENT_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_agent_mod.AGENT_TASK_NOTES)
 
+try:
+    from . import bench_security as _bench_security_mod
+except ImportError:          # flat-script launch
+    import bench_security as _bench_security_mod
+_BENCH_SUITES.setdefault("security-v1", _bench_security_mod.SECURITY_TASKS
+                         + _bench_agent_mod.SECURITY_AGENT_TASKS)
+_BENCH_TASK_DESC.update(_bench_security_mod.SECURITY_TASK_DESC)
+_BENCH_TASK_DESC.update(_bench_agent_mod.SECURITY_AGENT_DESC)
+_BENCH_TASK_NOTES.update(_bench_security_mod.SECURITY_TASK_NOTES)
+_BENCH_TASK_NOTES.update(_bench_agent_mod.SECURITY_AGENT_NOTES)
+
+# full-v1: one suite, three categories. Splitting them was an artefact of when each was
+# written, not of how models are used — the same request stream wants code that works, an
+# agent that finishes, and neither of them handing an attacker the keys. Running them
+# together is also the only way a single number means anything: a model that writes clean
+# code and follows injected instructions is not "87% good".
+_BENCH_SUITES.setdefault("full-v1", _BENCH_SUITES["coding-v3"]
+                         + _BENCH_SUITES["agent-v2"]
+                         + _BENCH_SUITES["security-v1"])
+
+# Category per task id, defaulted by which suite a task came from so the older suites did
+# not need editing task-by-task. Read by the report to break results out by category.
+_BENCH_TASK_CATEGORY: dict = {}
+for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding"),
+                                  ("coding-v3", "coding"), ("agent-v1", "agentic"),
+                                  ("agent-v2", "agentic"), ("security-v1", "security")):
+    for _t in _BENCH_SUITES.get(_suite_name) or []:
+        _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
+# The security suite's own tasks additionally carry a side; agentic security episodes are
+# blue-team by construction (the model is the thing under attack).
+_BENCH_TASK_SIDE: dict = {t["id"]: t.get("side")
+                          for t in (_BENCH_SUITES.get("security-v1") or []) if t.get("side")}
+# The report renders the category breakdown but must not re-derive the mapping — one
+# definition, pushed to it here, so the two cannot drift.
+_bench_report_mod.TASK_CATEGORY.update(_BENCH_TASK_CATEGORY)
+_bench_report_mod.TASK_SIDE.update(_BENCH_TASK_SIDE)
+
 # Grading machinery lives in bench_graders — synchronous, importable without the
 # app. Re-bound under the old names so references and monkeypatching tests keep
 # working; note that graders-internal calls resolve inside that module, so tests
@@ -11236,12 +11273,14 @@ _bench_grade_sync = _bench_graders_mod._bench_grade_sync
 async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
     """Grade one response against one task definition."""
     lang = task.get("lang") or "python"
-    code = _bench_extract_code(text, lang)
+    # Analysis tasks are graded on the prose itself: extracting a code block from an answer
+    # whose deliverable IS the answer would throw away the thing being graded.
+    code = text if lang == "text" else _bench_extract_code(text, lang)
     if not code.strip():
         return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
                 "score": 0.0, "error": "no code in response"}
     res = await asyncio.to_thread(_bench_grade_sync, code, task["entry"], task["cases"],
-                                  timeout_s, lang)
+                                  timeout_s, lang, task.get("suffix") or "")
     total = res.get("total") or len(task["cases"])
     res["task"] = task["id"]
     res["score"] = (res.get("passed", 0) / total) if total else 0.0

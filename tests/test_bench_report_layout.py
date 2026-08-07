@@ -817,3 +817,37 @@ def test_no_parallel_cells_means_no_parallel_card(client):
     html = _render(runs)
     assert "Best under" not in html
     assert "Category winners" in html, "correctness and speed cards still render"
+
+
+# ---- category breakdown (full-v1 merges coding + agentic + security) -----------------------
+
+def _mixed_run(bench_id, model, rates):
+    """One run whose per-task rates span all three categories."""
+    r = _run(bench_id, model=model, upstream="ollama")
+    q = r["results"]["summary"]["quality"]
+    q["tasks"] = [{"task": t, "perfect_rate": v} for t, v in rates.items()]
+    q["perfect_rate"] = sum(rates.values()) / len(rates)
+    return r
+
+
+def test_category_table_splits_the_merged_suite(client):
+    """The reason for merging: one number would average a model that codes well and obeys
+    injected instructions into a single misleading score."""
+    rates = {"roman": 1.0, "csv_line": 1.0,                       # coding
+             "agent_chain": 0.5, "agent_bisect": 0.5,             # agentic
+             "sec_fix_sqli": 0.4, "sec_exploit_sqli": 0.2,        # security (blue, red)
+             "sec_agent_injection": 0.0}                          # security (blue)
+    html = _render([_mixed_run("a", "m1", rates),
+                    _mixed_run("b", "m2", {k: min(1.0, v + 0.3) for k, v in rates.items()})])
+    sec = html.split("Results by category")[-1].split("<h2>")[0]
+    assert "Coding" in sec and "Agentic" in sec and "Security" in sec
+    assert "red" in sec and "blue" in sec, "security splits into finding vs fixing"
+    assert "2 tasks" in sec        # per-category task counts are stated
+    # the spread sentence names both ends rather than leaving the reader to diff columns
+    assert "would describe a model that does not exist" in sec
+
+
+def test_category_table_is_absent_for_a_single_category_run(client):
+    html = _render([_graded("a", "m1", "ollama", 0.9, 60, {"roman": 0.5}),
+                    _graded("b", "m2", "ollama", 0.8, 50, {"roman": 1.0})])
+    assert "Results by category" not in html
