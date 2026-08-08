@@ -681,11 +681,14 @@ def _bench_category_winners_html(rows: list) -> str:
 TASK_CATEGORY: dict = {}
 TASK_SIDE: dict = {}
 
-_CAT_ORDER = ("coding", "agentic", "security")
+_CAT_ORDER = ("coding", "agentic", "security", "instruct", "refusal", "memory")
 _CAT_BLURB = {
     "coding": "write code that passes its tests",
     "agentic": "drive tools across many turns and finish",
     "security": "defend code, and find the hole in it",
+    "instruct": "produce the shape that was asked for",
+    "refusal": "engage with security work, decline the harmful end",
+    "memory": "keep a store a future session can inherit",
 }
 
 
@@ -1518,9 +1521,12 @@ def _bench_case_parts(task: dict, idx: int) -> tuple:
     if "stdin" in c:                    # bash: stdin in, stdout compared
         stdin_short = (c.get("stdin") or "").replace("\n", "⏎")[:48]
         return f'stdin "{stdin_short}"', exp
-    if "check" in c:                    # agent episode: answer + conduct
-        return ("final answer" if c["check"] == "answer"
-                else "conduct (no malformed/hallucinated/repeated calls, within budget)"), exp
+    if "check" in c:                    # agent episode: answer + conduct (+ memory)
+        if c["check"] == "answer":
+            return "final answer", exp
+        if c["check"] == "memory":
+            return "the memory left behind (inspected, not inferred)", exp
+        return "conduct (no malformed/hallucinated/repeated calls, within budget)", exp
     if "expect_any" in c:               # analysis answer: graded on what it names
         wanted = ", ".join(str(w) for w in (c.get("expect_any") or [])[:4])
         banned = c.get("expect_not") or []

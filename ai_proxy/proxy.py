@@ -11233,6 +11233,16 @@ except ImportError:          # flat-script launch
     import bench_instruct as _bench_instruct_mod
 # instruct-v1: obedience and output shape — the properties a parser depends on.
 # refusal-v1: two-sided calibration — engages with security work, declines the harmful end.
+try:
+    from . import bench_memory as _bench_memory_mod
+except ImportError:          # flat-script launch
+    import bench_memory as _bench_memory_mod
+# memory-v1: what the model chooses to write down, look up, and revise. Graded on the
+# STORE the episode leaves behind, not only on the answer it produced.
+_BENCH_SUITES.setdefault("memory-v1", _bench_memory_mod.MEMORY_TASKS)
+_BENCH_TASK_DESC.update(_bench_memory_mod.MEMORY_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_memory_mod.MEMORY_TASK_NOTES)
+
 _BENCH_SUITES.setdefault("instruct-v1", _bench_instruct_mod.INSTRUCT_TASKS)
 _BENCH_SUITES.setdefault("refusal-v1", _bench_instruct_mod.REFUSAL_TASKS)
 _BENCH_TASK_DESC.update(_bench_instruct_mod.INSTRUCT_TASK_DESC)
@@ -11255,7 +11265,8 @@ _BENCH_SUITES.setdefault("full-v1", _BENCH_SUITES["coding-v3"]
 # full-v2 adds the behavioural halves: doing as it is told, and engaging with the work.
 _BENCH_SUITES.setdefault("full-v2", _BENCH_SUITES["full-v1"]
                          + _BENCH_SUITES["instruct-v1"]
-                         + _BENCH_SUITES["refusal-v1"])
+                         + _BENCH_SUITES["refusal-v1"]
+                         + _BENCH_SUITES["memory-v1"])
 
 # Category per task id, defaulted by which suite a task came from so the older suites did
 # not need editing task-by-task. Read by the report to break results out by category.
@@ -11263,7 +11274,8 @@ _BENCH_TASK_CATEGORY: dict = {}
 for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding"),
                                   ("coding-v3", "coding"), ("agent-v1", "agentic"),
                                   ("agent-v2", "agentic"), ("security-v1", "security"),
-                                  ("instruct-v1", "instruct"), ("refusal-v1", "refusal")):
+                                  ("instruct-v1", "instruct"), ("refusal-v1", "refusal"),
+                                  ("memory-v1", "memory")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are

@@ -285,7 +285,7 @@ def test_new_suites_are_registered_and_categorised(client):
     assert {"instruct-v1", "refusal-v1", "full-v2"} <= names
     full2 = P._BENCH_SUITES["full-v2"]
     cats = {P._BENCH_TASK_CATEGORY[t["id"]] for t in full2}
-    assert cats == {"coding", "agentic", "security", "instruct", "refusal"}
+    assert cats == {"coding", "agentic", "security", "instruct", "refusal", "memory"}
     for t in full2:
         assert P._BENCH_TASK_DESC.get(t["id"]), t["id"]
         assert P._BENCH_TASK_NOTES.get(t["id"]), t["id"]
