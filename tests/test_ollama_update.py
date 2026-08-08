@@ -32,10 +32,14 @@ def test_update_runs_the_updater_and_reports_versions(client, monkeypatch):
     conn.execute("DELETE FROM bench_runs")
     conn.commit()
     conn.close()
-    ran = {}
+    # Every invocation, not just the last: the background metrics collector shells out to
+    # docker while the test runs, so a single-slot recorder is a race. It only ever fired
+    # on Linux CI (where docker exists) and never locally, which is the worst way to find
+    # out. Assert the configured updater WAS invoked, not that it was invoked last.
+    ran = []
 
     async def fake_run(cmd, timeout, max_chars=2000, keep_tail=False, env=None):
-        ran["cmd"] = cmd
+        ran.append(list(cmd))
         return 0, "downloaded and installed"
 
     monkeypatch.setattr(P, "_ollama_update_cmd",
@@ -45,7 +49,7 @@ def test_update_runs_the_updater_and_reports_versions(client, monkeypatch):
     assert r.status_code == 200, r.text
     d = r.json()
     assert d["ok"] is True
-    assert ran["cmd"][0] == "sudo"
+    assert ["sudo", "-n", "/usr/local/sbin/ollama-update"] in ran, ran
     assert "installed" in d["output"]
 
 

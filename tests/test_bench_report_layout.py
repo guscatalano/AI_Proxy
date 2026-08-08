@@ -851,3 +851,35 @@ def test_category_table_is_absent_for_a_single_category_run(client):
     html = _render([_graded("a", "m1", "ollama", 0.9, 60, {"roman": 0.5}),
                     _graded("b", "m2", "ollama", 0.8, 50, {"roman": 1.0})])
     assert "Results by category" not in html
+
+
+# ---- cold start: booting the server vs the first request ------------------------------------
+
+def test_cold_start_counts_the_boot_not_just_the_warm_up(client):
+    """The measurement bug the first full-v2 sweep exposed: env.load_ms held only the warm-up
+    request, so a vLLM cell that spent ~6 minutes loading weights before that request reported
+    16 s — and the report compared it against an Ollama cold load as if that were the same
+    thing."""
+    ollama = _run("a", model="gemma4:26b", upstream="ollama")
+    ollama["env"].update(load_ms=27_000, warmup_request_ms=27_000)
+    vllm = _run("b", model="qwen3-coder-next", upstream="vllm")
+    vllm["env"].update(load_ms=372_000, backend_start_ms=356_000, warmup_request_ms=16_000)
+    rows = [P._bench_report_row(r) for r in (ollama, vllm)]
+    assert rows[1]["backend_start_ms"] == 356_000
+    html = P._bench_coldstart_split_html(rows)
+    assert "Boot the server" in html and "First request" in html
+    assert "356 s" in html and "16.0 s" in html and "372 s" in html
+    # An Ollama-only field has no server to boot, so the split says nothing and is omitted.
+    assert P._bench_coldstart_split_html([rows[0]]) == ""
+
+
+def test_cold_start_section_explains_the_correction(client):
+    ollama = _run("a", model="gemma4:26b", upstream="ollama")
+    ollama["env"].update(load_ms=27_000, warmup_request_ms=27_000)
+    ollama["results"]["summary"]["warmup_ms"] = 27_000.0
+    vllm = _run("b", model="qwen3-coder-next", upstream="vllm")
+    vllm["env"].update(load_ms=372_000, backend_start_ms=356_000, warmup_request_ms=16_000)
+    vllm["results"]["summary"]["warmup_ms"] = 16_000.0
+    html = _render([ollama, vllm])
+    seg = html.split("Cold-start cost")[-1]
+    assert "weight load" in seg and "understated" in seg

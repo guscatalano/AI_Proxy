@@ -9920,6 +9920,7 @@ _bench_weighted_rows = _bench_report_mod._bench_weighted_rows
 _bench_weighted_html = _bench_report_mod._bench_weighted_html
 _bench_parallel_groups = _bench_report_mod._bench_parallel_groups
 _bench_category_winners_html = _bench_report_mod._bench_category_winners_html
+_bench_coldstart_split_html = _bench_report_mod._bench_coldstart_split_html
 _bench_category_html = _bench_report_mod._bench_category_html
 _bench_efficiency_html = _bench_report_mod._bench_efficiency_html
 _bench_variance_html = _bench_report_mod._bench_variance_html
@@ -12061,7 +12062,15 @@ async def _bench_start_backend(meta: dict, persist: bool = True,
     payload = {"container": container} if container else {}
     payload["wait_s"] = _BENCH_START_READY_S
     payload["ready_timeout_s"] = _BENCH_START_READY_S
+    # Timed here because this is where the expensive part happens. For an on-demand backend
+    # the warm-up request IS the load, and env["load_ms"] measures it correctly — but a
+    # container backend loads its weights BEFORE the first request, so the warm-up saw an
+    # already-hot server and reported 16s against a boot that really took ~6 minutes
+    # (qwen3-coder-next: 4.7 min of weight loading alone, per the container's own log).
+    # Twenty-fold under-reporting, in the column a reader uses to compare engines.
+    _t_start = time.perf_counter()
     res = await prov.load(payload, meta.get("model") or "")
+    start_ms = round((time.perf_counter() - _t_start) * 1000)
     ok, detail = _load_result(res)
     # `ok` is "it is serving"; this is "the box was changed". vLLM's load starts the container
     # and *then* waits for readiness, so a timeout leaves it running. Reporting nothing to undo
@@ -12069,6 +12078,7 @@ async def _bench_start_backend(meta: dict, persist: bool = True,
     # the memory it had just failed to get.
     started = ok or bool(isinstance(res, dict) and res.get("started_container"))
     return {"ok": ok, "started": started, "detail": detail, "freed": freed,
+            "backend_start_ms": start_ms,
             "restore": {"upstream": upstream, "stop": started,
                         "residency": snap if persist else None}}
 
@@ -12969,6 +12979,10 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 _abort(f"could not start {cfg.get('upstream')} for {model!r}: {got['detail']}")
                 return
             env["started_backend"] = model_meta.get("container") or cfg.get("upstream")
+            # The boot cost, kept separate from the warm-up so the report can show the split
+            # and so neither number silently absorbs the other.
+            if got.get("backend_start_ms"):
+                env["backend_start_ms"] = got["backend_start_ms"]
             # Only a standalone run puts it back. In a sweep the suite started it once for the
             # whole matrix; stopping it here would make every cell pay a full vLLM boot.
             if row["parent_id"] is None:
@@ -13080,7 +13094,12 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                                                 warm_prompt, 0, cfg=cfg)
                     # The warm-up IS the cold load for an on-demand backend, and it is already
                     # excluded from every measurement — so its duration is the load time, free.
-                    env["load_ms"] = round((time.perf_counter() - _t_warm) * 1000)
+                    # For a container backend the weights were loaded before this request, by
+                    # the start above: add that in, or the column compares an Ollama cold load
+                    # against a vLLM warm request and calls vLLM twenty times faster to start.
+                    env["warmup_request_ms"] = round((time.perf_counter() - _t_warm) * 1000)
+                    env["load_ms"] = (env["warmup_request_ms"]
+                                      + int(env.get("backend_start_ms") or 0))
                     env["free_mb_after_load"] = _free_mem_mb()
                     _res = await _bench_resident_mb(model, str(cfg.get("upstream") or ""))
                     if _res is None and env.get("free_mb_before_load") is not None:

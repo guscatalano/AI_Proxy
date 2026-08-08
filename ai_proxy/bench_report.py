@@ -152,6 +152,11 @@ def _bench_report_row(run: dict) -> dict:
         # decodes quickly but takes seven minutes to load is a different proposition from one
         # ready in forty seconds, and the decode column cannot say so.
         "load_ms": (run.get("env") or {}).get("load_ms"),
+        # The two halves of a cold start, kept apart: booting the server (container start
+        # plus weight load) and the first request against it. A container backend spends
+        # nearly all of it in the first half, an on-demand backend all of it in the second.
+        "backend_start_ms": (run.get("env") or {}).get("backend_start_ms"),
+        "warmup_request_ms": (run.get("env") or {}).get("warmup_request_ms"),
         "unload_ms": (run.get("env") or {}).get("unload_ms"),
         "resident_mb": (run.get("env") or {}).get("resident_mb"),
         "n_success": s.get("n_success"),
@@ -869,6 +874,42 @@ def _bench_variance_html(runs: list, rows: list, axis_names: list) -> str:
             'agent run.</p>'
             '<div class="tbl"><table><thead><tr><th>Task</th><th>What it asks</th>'
             '<th>Model</th><th class="n">Passed</th><th class="n">Rate</th></tr></thead>'
+            f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+
+def _bench_coldstart_split_html(rows: list) -> str:
+    """Where a cold start actually goes: booting the server, or the first request.
+
+    Only rendered when at least one cell had a server to boot — for an all-Ollama field the
+    split is meaningless (every millisecond is the warm-up) and the table would be a column
+    of dashes next to a column of totals.
+    """
+    have = [r for r in rows if r.get("backend_start_ms")]
+    if not have:
+        return ""
+
+    def nm(r):
+        return (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
+
+    seen, trs = set(), []
+    for r in sorted(rows, key=lambda r: -(r.get("load_ms") or 0)):
+        name = nm(r)
+        if name in seen or not r.get("load_ms"):
+            continue
+        seen.add(name)
+        boot = (r.get("backend_start_ms") or 0) / 1000
+        warm = (r.get("warmup_request_ms") or r.get("load_ms") or 0) / 1000
+        total = (r.get("load_ms") or 0) / 1000
+        trs.append(
+            f'<tr data-m="{_h(name)}"><th scope="row"><code class="mdl">{_h(name)}</code></th>'
+            f'<td class="n">{("%.0f s" % boot) if boot else "—"}</td>'
+            f'<td class="n">{warm:.1f} s</td>'
+            f'<td class="n"><b>{total:.0f} s</b></td></tr>')
+    if not trs:
+        return ""
+    return ('<div class="tbl"><table><thead><tr><th>Model</th>'
+            '<th class="n">Boot the server</th><th class="n">First request</th>'
+            '<th class="n">Total cold start</th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table></div>')
 
 
@@ -2449,7 +2490,7 @@ ordinary slowness rather than a misconfiguration.</p>
 
   {method_html}
 
-  {"<h2>Cold-start cost</h2><p class='note'>Time for the discarded warm-up request — the price of making the model resident, excluded from every measurement above.</p>" + _bench_coldstart_svg(rows) + (warm[0] if len(rows) > 1 else "<p class='note'>" + _h(warm[0]) + "</p>") if warm else ""}
+  {"<h2>Cold-start cost</h2><p class='note'>The price of making the model answerable, excluded from every measurement above: booting the server where one has to be booted (container start plus weight load) plus the discarded warm-up request. Counting only the warm-up understated a vLLM start twenty-fold — the weights are already in memory by the time that request arrives.</p>" + _bench_coldstart_split_html(rows) + _bench_coldstart_svg(rows) + (warm[0] if len(rows) > 1 else "<p class='note'>" + _h(warm[0]) + "</p>") if warm else ""}
 """
     _ds_rows = [{"name": (r.get("_name") or _bench_label_display(r.get("label") or "")),
                  "m": (r.get("_name") or _bench_label_display(r.get("label") or "")
