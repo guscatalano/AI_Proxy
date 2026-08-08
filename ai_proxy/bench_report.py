@@ -760,6 +760,115 @@ def _bench_category_html(tasks: dict, axis_names: list) -> str:
             f'<tbody>{body}</tbody></table></div>{note}')
 
 
+def _bench_efficiency_html(rows: list) -> str:
+    """Tokens spent per task actually solved — the cost side of the scorecard.
+
+    Decode rate says how fast tokens arrive; it cannot say how many were needed. A model
+    that reasons for 900 tokens to reach the same answer another reaches in 120 is three
+    quarters waste at identical tok/s, and on a shared box that waste is someone else's
+    latency. Tokens per SOLVED task (not per task) is the honest denominator: spending
+    fewer tokens to fail is not efficiency.
+    """
+    usable = [r for r in rows
+              if r.get("mean_tokens") and r.get("perfect_rate") is not None
+              and r.get("n_total")]
+    if len(usable) < 2:
+        return ""
+
+    def nm(r):
+        return (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
+
+    seen, entries = set(), []
+    for r in sorted(usable, key=lambda r: -(r.get("perfect_rate") or 0)):
+        name = nm(r)
+        if name in seen:
+            continue
+        seen.add(name)
+        solved = (r["perfect_rate"] or 0) * r["n_total"]
+        if solved <= 0:
+            continue          # nothing solved: a per-solved figure would be a divide by zero
+        spent = r["mean_tokens"] * r["n_total"]
+        entries.append({"m": name, "per": spent / solved, "mean": r["mean_tokens"],
+                        "q": r["perfect_rate"], "think": r.get("reasoning_tok_p50")})
+    if len(entries) < 2:
+        return ""
+    entries.sort(key=lambda e: e["per"])
+    best = entries[0]["per"]
+    trs = "".join(
+        f'<tr data-m="{_h(e["m"])}"><td class="n">{i}</td>'
+        f'<th scope="row"><code class="mdl">{_h(e["m"])}</code></th>'
+        f'<td class="n">{e["q"] * 100:.0f}%</td>'
+        f'<td class="n">{e["mean"]:,.0f}</td>'
+        f'<td class="n">{"—" if not e["think"] else format(e["think"], ",.0f")}</td>'
+        f'<td class="n{" win" if i == 1 else ""}"><b>{e["per"]:,.0f}</b></td>'
+        f'<td class="n">{e["per"] / best:.1f}×</td></tr>'
+        for i, e in enumerate(entries, start=1))
+    worst = entries[-1]
+    note = ""
+    if worst["per"] >= 2 * best:
+        note = (f'<p class="note"><b>{_h(worst["m"])}</b> spends '
+                f'{worst["per"] / best:.1f}× the tokens of <b>{_h(entries[0]["m"])}</b> per '
+                f'task it gets right. At equal decode rates that is the same answer for '
+                f'{worst["per"] / best:.1f}× the wall-clock and {worst["per"] / best:.1f}× '
+                f'the KV cache.</p>')
+    return ('<h2>Cost per correct answer</h2>'
+            '<p class="note">Output tokens spent per task fully solved — reasoning tokens '
+            'included, because the box pays for them whether or not you read them. Failed '
+            'tasks still cost their tokens; they just buy nothing.</p>'
+            '<div class="tbl"><table><thead><tr><th class="n">#</th><th>Model</th>'
+            '<th class="n">Correct</th><th class="n">Tokens/answer</th>'
+            '<th class="n">of which thinking</th><th class="n">Tokens/SOLVED</th>'
+            '<th class="n">vs best</th></tr></thead>'
+            f'<tbody>{trs}</tbody></table></div>{note}')
+
+
+def _bench_variance_html(runs: list, rows: list, axis_names: list) -> str:
+    """Which tasks a model gets right only sometimes.
+
+    Averages hide instability, and instability is what breaks agents: a task passing 3 runs
+    in 5 is not "60% correct", it is a coin flip that will land wrong inside a 30-step
+    episode. Only visible with repeats, so the section is absent for single-run cells.
+    """
+    flaky: dict = {}
+    cells = 0
+    for run, nm in zip(runs, axis_names):
+        cfg = run.get("config") or {}
+        if int(cfg.get("runs") or 1) < 2:
+            continue
+        cells += 1
+        q = (((run.get("results") or {}).get("summary") or {}).get("quality") or {})
+        for t in (q.get("tasks") or []):
+            rate = t.get("perfect_rate")
+            if rate is None or rate in (0.0, 1.0):
+                continue          # always-right and always-wrong are stable, not flaky
+            flaky.setdefault(t["task"], []).append((nm.split(" · ")[0], rate,
+                                                    int(cfg.get("runs") or 1)))
+    if not cells:
+        return ""
+    if not flaky:
+        return ('<h2>Determinism</h2><p class="note">Every task scored identically across '
+                'all repeats in every cell — no task flipped between runs. At temperature 0 '
+                'that is what you want, and it means the correctness figures above are '
+                'measurements rather than samples.</p>')
+    trs = []
+    for tid, hits in sorted(flaky.items(), key=lambda kv: -len(kv[1])):
+        for model, rate, n in sorted(hits, key=lambda h: h[1]):
+            trs.append(f'<tr data-m="{_h(model)}"><th scope="row"><code>{_h(tid)}</code>'
+                       f'</th><td>{_h(TASK_DESC.get(tid) or "")}</td>'
+                       f'<td><code class="mdl">{_h(model)}</code></td>'
+                       f'<td class="n">{round(rate * n)}/{n}</td>'
+                       f'<td class="n">{rate * 100:.0f}%</td></tr>')
+    return ('<h2>Determinism</h2>'
+            f'<p class="note"><b>{len(flaky)}</b> task'
+            f'{"s" if len(flaky) != 1 else ""} did not settle: the same model, the same '
+            'prompt, a different outcome between repeats. Treat these scores as samples, '
+            'not measurements — and expect the coin to land wrong somewhere inside a long '
+            'agent run.</p>'
+            '<div class="tbl"><table><thead><tr><th>Task</th><th>What it asks</th>'
+            '<th>Model</th><th class="n">Passed</th><th class="n">Rate</th></tr></thead>'
+            f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+
 def _bench_place_labels(cands: list, est: float = 6.6) -> list:
     """Greedy label placement: sort by x; when a label would collide with one already on its
     row, bump it up a row. Several dots on one line cannot be labelled without this — the
@@ -2302,6 +2411,8 @@ ordinary slowness rather than a misconfiguration.</p>
     # Only meaningful once a run spans more than one category — full-v1 does, the older
     # single-purpose suites do not, and the renderer returns "" for them.
     category_html = _bench_category_html(tasks, axis_names) if graded else ""
+    efficiency_html = _bench_efficiency_html(rows) if graded else ""
+    variance_html = _bench_variance_html(runs, rows, axis_names) if graded else ""
     body = f"""
   {results}
 
@@ -2310,6 +2421,10 @@ ordinary slowness rather than a misconfiguration.</p>
   {category_html}
 
   {winners_html}
+
+  {efficiency_html}
+
+  {variance_html}
 
   <h2>{"Consistency" if single else "Time to a finished answer"}</h2>
   {charts}

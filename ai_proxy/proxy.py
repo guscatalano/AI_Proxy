@@ -9920,6 +9920,9 @@ _bench_weighted_rows = _bench_report_mod._bench_weighted_rows
 _bench_weighted_html = _bench_report_mod._bench_weighted_html
 _bench_parallel_groups = _bench_report_mod._bench_parallel_groups
 _bench_category_winners_html = _bench_report_mod._bench_category_winners_html
+_bench_category_html = _bench_report_mod._bench_category_html
+_bench_efficiency_html = _bench_report_mod._bench_efficiency_html
+_bench_variance_html = _bench_report_mod._bench_variance_html
 _bench_place_labels = _bench_report_mod._bench_place_labels
 _bench_size_by_model = _bench_report_mod._bench_size_by_model
 _bench_best_per_model = _bench_report_mod._bench_best_per_model
@@ -11210,9 +11213,12 @@ except ImportError:          # flat-script launch
 _BENCH_SUITES.setdefault("agent-v1", _bench_agent_mod.AGENT_TASKS)
 # agent-v2: the hard set — each episode targets one specific agentic failure mode
 # (error-message protocols, joins, budgeted search, dedup, authority, migration, recall).
-_BENCH_SUITES.setdefault("agent-v2", _bench_agent_mod.AGENT2_TASKS)
+_BENCH_SUITES.setdefault("agent-v2", _bench_agent_mod.AGENT2_TASKS
+                         + _bench_agent_mod.CONSTRAINT_AGENT_TASKS)
 _BENCH_TASK_DESC.update(_bench_agent_mod.AGENT_TASK_DESC)
+_BENCH_TASK_DESC.update(_bench_agent_mod.CONSTRAINT_AGENT_DESC)
 _BENCH_TASK_NOTES.update(_bench_agent_mod.AGENT_TASK_NOTES)
+_BENCH_TASK_NOTES.update(_bench_agent_mod.CONSTRAINT_AGENT_NOTES)
 
 try:
     from . import bench_security as _bench_security_mod
@@ -11220,6 +11226,19 @@ except ImportError:          # flat-script launch
     import bench_security as _bench_security_mod
 _BENCH_SUITES.setdefault("security-v1", _bench_security_mod.SECURITY_TASKS
                          + _bench_agent_mod.SECURITY_AGENT_TASKS)
+
+try:
+    from . import bench_instruct as _bench_instruct_mod
+except ImportError:          # flat-script launch
+    import bench_instruct as _bench_instruct_mod
+# instruct-v1: obedience and output shape — the properties a parser depends on.
+# refusal-v1: two-sided calibration — engages with security work, declines the harmful end.
+_BENCH_SUITES.setdefault("instruct-v1", _bench_instruct_mod.INSTRUCT_TASKS)
+_BENCH_SUITES.setdefault("refusal-v1", _bench_instruct_mod.REFUSAL_TASKS)
+_BENCH_TASK_DESC.update(_bench_instruct_mod.INSTRUCT_TASK_DESC)
+_BENCH_TASK_DESC.update(_bench_instruct_mod.REFUSAL_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_instruct_mod.INSTRUCT_TASK_NOTES)
+_BENCH_TASK_NOTES.update(_bench_instruct_mod.REFUSAL_TASK_NOTES)
 _BENCH_TASK_DESC.update(_bench_security_mod.SECURITY_TASK_DESC)
 _BENCH_TASK_DESC.update(_bench_agent_mod.SECURITY_AGENT_DESC)
 _BENCH_TASK_NOTES.update(_bench_security_mod.SECURITY_TASK_NOTES)
@@ -11233,19 +11252,25 @@ _BENCH_TASK_NOTES.update(_bench_agent_mod.SECURITY_AGENT_NOTES)
 _BENCH_SUITES.setdefault("full-v1", _BENCH_SUITES["coding-v3"]
                          + _BENCH_SUITES["agent-v2"]
                          + _BENCH_SUITES["security-v1"])
+# full-v2 adds the behavioural halves: doing as it is told, and engaging with the work.
+_BENCH_SUITES.setdefault("full-v2", _BENCH_SUITES["full-v1"]
+                         + _BENCH_SUITES["instruct-v1"]
+                         + _BENCH_SUITES["refusal-v1"])
 
 # Category per task id, defaulted by which suite a task came from so the older suites did
 # not need editing task-by-task. Read by the report to break results out by category.
 _BENCH_TASK_CATEGORY: dict = {}
 for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding"),
                                   ("coding-v3", "coding"), ("agent-v1", "agentic"),
-                                  ("agent-v2", "agentic"), ("security-v1", "security")):
+                                  ("agent-v2", "agentic"), ("security-v1", "security"),
+                                  ("instruct-v1", "instruct"), ("refusal-v1", "refusal")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are
 # blue-team by construction (the model is the thing under attack).
 _BENCH_TASK_SIDE: dict = {t["id"]: t.get("side")
-                          for t in (_BENCH_SUITES.get("security-v1") or []) if t.get("side")}
+                          for t in (_BENCH_SUITES.get("security-v1") or [])
+                          + (_BENCH_SUITES.get("refusal-v1") or []) if t.get("side")}
 # The report renders the category breakdown but must not re-derive the mapping — one
 # definition, pushed to it here, so the two cannot drift.
 _bench_report_mod.TASK_CATEGORY.update(_BENCH_TASK_CATEGORY)
@@ -11286,9 +11311,11 @@ _bench_grade_sync = _bench_graders_mod._bench_grade_sync
 async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
     """Grade one response against one task definition."""
     lang = task.get("lang") or "python"
-    # Analysis tasks are graded on the prose itself: extracting a code block from an answer
-    # whose deliverable IS the answer would throw away the thing being graded.
-    code = text if lang == "text" else _bench_extract_code(text, lang)
+    # Analysis, format and refusal tasks are graded on the reply itself: extracting a code
+    # block from an answer whose deliverable IS the answer would throw away the thing being
+    # graded — and for format tasks the wrapper is precisely what is under test.
+    code = (text if lang in ("text", "answer", "format", "refusal")
+            else _bench_extract_code(text, lang))
     if not code.strip():
         return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
                 "score": 0.0, "error": "no code in response"}
@@ -11311,6 +11338,37 @@ def _bench_build_prompt(prompt_tokens: int, randomize: bool, seq: int) -> str:
     salt = f"// nonce: {uuid.uuid4().hex}\n" if randomize else ""
     head = f"Below is a code module. After the module, you'll be given a task.\n\n{salt}<CODE>\n"
     tail = f"\n</CODE>\n\nTask: {_BENCH_BASE_TASK}"
+    body = ""
+    while len(head) + len(body) + len(tail) < target_chars:
+        body += _BENCH_FILLER
+    return head + body + tail
+
+
+def _bench_task_at_depth(task_prompt: str, prompt_tokens: int, randomize: bool,
+                         seq: int) -> str:
+    """The same graded task, asked after `prompt_tokens` of irrelevant context.
+
+    Every suite task is a short prompt, so the suites measure a model at its best and say
+    nothing about the state it is actually used in — hermes sits at 50k tokens by turn 30.
+    Sweeping prompt_tokens as an axis turns any graded suite into a long-context test: the
+    task is identical at every depth, so a score that falls is the context doing it, not
+    the task getting harder.
+
+    The task goes LAST, after the filler, because that is where the real ask sits in a long
+    agent transcript, and it is delimited so a model that reads only the tail can still see
+    the whole instruction. Nothing in the filler is needed to answer — a model that ignores
+    the padding entirely SHOULD score exactly as it does at zero depth, which is what makes
+    a drop meaningful.
+    """
+    if prompt_tokens <= 0:
+        return task_prompt
+    target_chars = int(prompt_tokens * 3.5)
+    salt = f"// nonce: {uuid.uuid4().hex}\n" if randomize else ""
+    head = ("Reference material from the current session follows. It is background only "
+            "and is NOT needed to answer; the task is stated after it.\n\n"
+            f"{salt}<CONTEXT>\n")
+    tail = ("\n</CONTEXT>\n\nIgnore the reference material above unless it is relevant. "
+            f"Your task:\n\n{task_prompt}")
     body = ""
     while len(head) + len(body) + len(tail) < target_chars:
         body += _BENCH_FILLER
@@ -13060,8 +13118,17 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         idx = seq_counter + offset
                         seq = idx + 1
                         task_prompt, task = units[idx]
-                        prompt = (task_prompt if task_prompt is not None
-                                  else _bench_build_prompt(prompt_tokens, randomize, seq))
+                        # A graded task at prompt_tokens > 0 is the same task asked from
+                        # inside a long context — the axis that turns any suite into a
+                        # long-context test. Episodes are excluded: their length comes from
+                        # the transcript they build, and padding the first turn would
+                        # measure something else.
+                        prompt = (
+                            _bench_task_at_depth(task_prompt, prompt_tokens, randomize, seq)
+                            if (task_prompt is not None and prompt_tokens
+                                and not (task or {}).get("tools"))
+                            else task_prompt if task_prompt is not None
+                            else _bench_build_prompt(prompt_tokens, randomize, seq))
                         wave_tasks.append(task)
                         if task and task.get("tools"):
                             # An agent task is an episode, not a completion: its runner owns
