@@ -85,7 +85,8 @@ MEMORY_TASKS = [
     {
         "id": "mem_recall_unprompted",
         "category": "memory", "tier": "hard", "entry": "episode", "max_steps": 14,
-        "require_tools": ["memory_read"],
+        # Either way of consulting memory counts: reading the key or listing the store.
+        "require_tools": [["memory_read", "memory_list"]],
         "prompt": "Memory holds what previous sessions learned about this system. The "
                   "monitoring API is down, so live lookups will fail. Which host runs the "
                   "billing service? Reply with ONLY the hostname.",
@@ -194,9 +195,10 @@ MEMORY_TASK_NOTES = {
         "says 9090. Appending a second entry scores a right ANSWER with a failed memory — "
         "the contradiction is left for a future session to resolve by coin flip.",
     "mem_recall_unprompted": "Nobody says 'check your memory', and the live tool is dead "
-        "on purpose so guessing and probing both fail. A model that answers without "
-        "calling memory_read trips the evidence rule; one that reports the outage instead "
-        "of looking has the answer in front of it and does not look.",
+        "on purpose so guessing and probing both fail. Consulting the store either way "
+        "counts — reading the key or listing it — because the first sweep failed gemma4 "
+        "for using memory_list, which is how it found the right answer. What still trips "
+        "the evidence rule is answering with no lookup at all.",
     "mem_conflict": "Two entries under different key names disagree, which is how memory "
         "actually rots — not one entry going stale but two coexisting. Deleting the "
         "decommissioned host is the deliverable; answering correctly while leaving both "

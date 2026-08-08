@@ -164,3 +164,24 @@ def test_the_memory_case_renders_in_the_grades_vocabulary(client):
     from ai_proxy import bench_report as BR
     call, exp = BR._bench_case_parts(_task("mem_revision"), 2)
     assert "memory left behind" in call and "inspected" in call
+
+
+def test_either_way_of_consulting_memory_counts():
+    """From the first real sweep: gemma4 called memory_list, read the host out of the
+    result, answered correctly — and was failed for not calling memory_read. Requiring one
+    exact tool measured route, not evidence."""
+    t, w = _w("mem_recall_unprompted")
+    entries = _call(w, "memory_list")["entries"]
+    assert any("bill-prod-4.internal" in e[1] for e in entries)
+    g = A.grade_episode(t, w, "bill-prod-4.internal", steps=2, exhausted=False)
+    assert g["passed"] == 3, g
+    # Reading the key directly still counts too.
+    _t2, w2 = _w("mem_recall_unprompted")
+    _call(w2, "memory_read", key="billing_host")
+    assert A.grade_episode(_t2, w2, "bill-prod-4.internal", steps=2,
+                           exhausted=False)["passed"] == 3
+    # Answering with no lookup at all is still a guess.
+    _t3, w3 = _w("mem_recall_unprompted")
+    bare = A.grade_episode(_t3, w3, "bill-prod-4.internal", steps=1, exhausted=False)
+    assert bare["cases"][1]["ok"] is False
+    assert "memory_read or memory_list" in bare["cases"][1]["got"]

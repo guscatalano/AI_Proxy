@@ -143,7 +143,12 @@ def _bench_lang_available(lang: str) -> bool:
     contract: a task whose tooling is absent or broken is SKIPPED — dropped from the run and
     recorded as such — never scored as a zero, because a zero would punish the model for the
     box. The probe result is cached for the life of the process."""
-    if lang in ("python", "html", "css", "sql", "text", None, ""):
+    # Languages graded in-process with no toolchain at all. "format"/"refusal"/"answer"
+    # grade the reply itself; omitting them here silently SKIPPED all 17 instruct and
+    # refusal tasks on their first real sweep — the portability contract reported it
+    # honestly in skipped_languages, but a grading mode is not a missing compiler.
+    if lang in ("python", "html", "css", "sql", "text", "format", "refusal", "answer",
+                None, ""):
         return True                    # stdlib-only grading; nothing to probe
     tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
             "php": "php", "bash": "bash", "go": "go"}.get(lang)

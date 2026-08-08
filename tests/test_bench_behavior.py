@@ -292,3 +292,14 @@ def test_new_suites_are_registered_and_categorised(client):
     for t in P._BENCH_SUITES["instruct-v1"] + P._BENCH_SUITES["refusal-v1"]:
         assert t["lang"] in ("format", "refusal"), t["id"]
         assert t.get("cases"), t["id"]
+
+
+def test_reply_graded_langs_are_never_skipped_as_missing_toolchains():
+    """The first full-v2 sweep silently skipped all 17 instruct and refusal tasks: their
+    grading modes are not compilers, but _bench_lang_available did not know them and the
+    portability contract dropped them as unavailable."""
+    from ai_proxy import bench_graders as G
+    for lang in ("format", "refusal", "answer", "text"):
+        assert G._bench_lang_available(lang) is True, lang
+    for t in P._BENCH_SUITES["instruct-v1"] + P._BENCH_SUITES["refusal-v1"]:
+        assert G._bench_lang_available(t["lang"]) is True, t["id"]
