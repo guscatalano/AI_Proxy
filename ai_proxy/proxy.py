@@ -460,6 +460,10 @@ MIGRATIONS = [
     # Which surface an agentic client was driven from (discord / cron / cli). Detected at
     # ingest from system-prompt fingerprints — see _detect_surface. NULL when unknown.
     "ALTER TABLE requests ADD COLUMN surface TEXT",
+    # A non-reversible id for the credential the caller presented (sha256 prefix + last 4).
+    # Distinguishes callers that share an IP and a client label without putting a usable
+    # secret in a file that gets copied, archived and shared. See _credential_fingerprint.
+    "ALTER TABLE requests ADD COLUMN api_key_fp TEXT",
     "ALTER TABLE requests ADD COLUMN shadow_of TEXT",
     "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
     "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
@@ -6375,8 +6379,8 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
-                  upstream, client_ip, client_app, surface, gate_verdict, gate_rule, gate_reason, shadow_of,
-                  has_images
+                  upstream, client_ip, client_app, surface, api_key_fp, gate_verdict, gate_rule, gate_reason,
+                  shadow_of, has_images
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -6549,7 +6553,7 @@ def get_conversation(conv_id: str, request: Request):  # sync → threadpool
     rows = conn.execute(
         """SELECT id, ts, model, turn_index, prompt_tokens, completion_tokens, total_tokens,
                   est_prompt_tokens, duration_ms, ttft_ms, status, error, gate_verdict, gate_rule,
-                  gate_reason, client_ip, client_app, surface, is_stream, has_images, path, upstream
+                  gate_reason, client_ip, client_app, surface, api_key_fp, is_stream, has_images, path, upstream
            FROM requests
            WHERE conversation_id = ?
            ORDER BY ts ASC""",
@@ -13705,6 +13709,16 @@ _SYS_PROMPT_FINGERPRINTS = (
     # sub-agent uses a distinct "security reviewer" prompt (same host, OpenAI SDK) → hermes-safety.
     ("you are hermes agent", "hermes"),
     ("security reviewer for an ai coding agent", "hermes-safety"),
+    # Hindsight, Hermes's memory plugin. It runs its own pipeline through the stock
+    # AsyncOpenAI SDK with no x-client-name, so it landed in the generic 'openai-sdk'
+    # bucket and was invisible as a caller — while being the second-busiest thing on the
+    # box. Two stages, labelled apart because they cost very differently: extraction runs
+    # per batch of facts, consolidation carries the existing observations in its prompt
+    # (~7k tokens against ~3.5k) and is the one that gets expensive as memory grows.
+    ("extract significant facts from text", "hindsight-extract"),
+    ("you are a memory consolidation system", "hindsight-consolidate"),
+    # Not memory work: whatever generates conversation titles, also on the bare SDK.
+    ("generate a short, descriptive title", "title-generator"),
     ("you are pair programming with a user", "cursor"),
     ("you are cline", "cline"),
     ("you are roo,", "roo-code"),
@@ -13720,6 +13734,53 @@ _SYS_PROMPT_FINGERPRINTS = (
     ("you are amazon q", "amazon-q"),
     ("you are github copilot", "github-copilot"),
 )
+
+
+# Headers whose value is a credential. Stored redacted, never verbatim.
+_CREDENTIAL_HEADERS = ("authorization", "x-api-key", "api-key", "proxy-authorization",
+                       "cookie", "x-auth-token")
+_CRED_REDACTED = "[redacted]"
+
+
+def _credential_fingerprint(headers: dict | None) -> str | None:
+    """A stable, non-reversible id for the credential a caller presented.
+
+    Callers here share an IP and often a client label — everything hermes runs arrives from
+    one host through the same SDK — so the key is the one thing that reliably tells two
+    callers apart. Storing the key itself to get that would be trading a real secret for a
+    convenience: the database is copied, archived and handed around, and a bearer token in
+    it is a bearer token in all of those. A hash plus the last four characters identifies
+    the caller just as well and is worthless to whoever finds it.
+
+    Placeholder credentials that local backends accept ('no-key-required' and friends) are
+    not fingerprinted: they identify nobody, and a column full of one shared value invites
+    the reader to think it means something.
+    """
+    if not isinstance(headers, dict):
+        return None
+    for k, v in headers.items():
+        if k.lower() not in _CREDENTIAL_HEADERS:
+            continue
+        raw = str(v or "").strip()
+        if raw.lower().startswith("bearer "):
+            raw = raw[7:].strip()
+        if len(raw) < 8:
+            return None
+        if re.fullmatch(r"(?i)[-_a-z0-9]*(not|no)[-_]?(key|auth|required|needed)[-_a-z0-9]*",
+                        raw) or raw.lower() in ("none", "null", "dummy", "placeholder"):
+            return None
+        digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:12]
+        return f"{digest}…{raw[-4:]}"
+    return None
+
+
+def _redact_credential_headers(headers: dict) -> dict:
+    """Headers as stored: same shape, credentials replaced. The fingerprint column carries
+    whatever identification value the real value had."""
+    out = {}
+    for k, v in (headers or {}).items():
+        out[k] = _CRED_REDACTED if k.lower() in _CREDENTIAL_HEADERS else v
+    return out
 
 
 def _fingerprint_client_from_system(sys_text: str) -> str | None:
@@ -14082,6 +14143,10 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     headers_dict = dict(request.headers)
     client_app = _detect_client_app(headers_dict, body_json if isinstance(body_json, dict) else None)
     surface = _detect_surface(headers_dict, body_json if isinstance(body_json, dict) else None)
+    # Fingerprint before redacting, store only the fingerprint. The forwarded request is
+    # untouched — headers_dict is our copy for the log, not the one going upstream.
+    api_key_fp = _credential_fingerprint(headers_dict)
+    headers_dict = _redact_credential_headers(headers_dict)
     # Chars-based prompt-token estimate, persisted so the requests list can derive a cache
     # verdict (evaluated vs estimated) without re-parsing the body on every load.
     est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
@@ -14117,8 +14182,8 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     has_imgs = 1 if (imgs or _embedded_imgs or _url_imgs) else None
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, surface, upstream, est_prompt_tokens, has_images)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, surface, api_key_fp, upstream, est_prompt_tokens, has_images)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -14133,6 +14198,7 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             turn,
             client_app,
             surface,
+            api_key_fp,
             upstream,
             est or None,
             has_imgs,
