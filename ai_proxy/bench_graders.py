@@ -148,7 +148,7 @@ def _bench_lang_available(lang: str) -> bool:
     # refusal tasks on their first real sweep — the portability contract reported it
     # honestly in skipped_languages, but a grading mode is not a missing compiler.
     if lang in ("python", "html", "css", "sql", "text", "format", "refusal", "answer",
-                None, ""):
+                "langpick", None, ""):
         return True                    # stdlib-only grading; nothing to probe
     tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
             "php": "php", "bash": "bash", "go": "go"}.get(lang)
@@ -892,6 +892,90 @@ def _schema_errors(value, schema: dict, path: str = "") -> list:
     return out
 
 
+_LANG_ALIASES = {
+    "py": "python", "python3": "python", "ipython": "python",
+    "js": "javascript", "node": "javascript", "nodejs": "javascript", "jsx": "javascript",
+    "ts": "typescript", "tsx": "typescript",
+    "c++": "cpp", "cxx": "cpp", "cc": "cpp",
+    "cs": "csharp", "c#": "csharp", "dotnet": "csharp",
+    "sh": "bash", "shell": "bash", "zsh": "bash", "console": "bash",
+    "ps1": "powershell", "pwsh": "powershell", "posh": "powershell",
+    "golang": "go", "rs": "rust", "kt": "kotlin", "rb": "ruby",
+    "objective-c": "objc", "objectivec": "objc", "yml": "yaml",
+    "html5": "html", "postgresql": "sql", "psql": "sql", "mysql": "sql", "sqlite": "sql",
+    "arduino": "cpp", "ino": "cpp",
+}
+
+# Syntax tells for a block with no language tag. Ordered: the first hit wins, so put the
+# markers that cannot belong to anything else first.
+_LANG_SIGNATURES = (
+    (r"^\s*#include\s*[<\"]", "cpp"),
+    (r"\busing\s+System\b|\bnamespace\s+\w+\s*\{|\bpublic\s+static\s+void\s+Main\b", "csharp"),
+    (r"^\s*<\?php", "php"),
+    (r"\bpackage\s+main\b|\bfunc\s+main\s*\(\)", "go"),
+    (r"\bfn\s+main\s*\(\)|\blet\s+mut\b|::\w+::", "rust"),
+    (r"\bpublic\s+class\s+\w+|\bSystem\.out\.println\b", "java"),
+    (r"^\s*def\s+\w+\s*\(.*\)\s*:|^\s*from\s+\w+\s+import\b|^\s*import\s+\w+$", "python"),
+    (r"\bconst\s+\w+\s*=|\blet\s+\w+\s*=|\bconsole\.log\b|=>\s*\{", "javascript"),
+    (r"\bGet-\w+|\$\w+\s*=\s*Get-|\bWrite-Host\b", "powershell"),
+    (r"^\s*#!/bin/(ba)?sh|^\s*(ls|grep|awk|sed|find)\s+-", "bash"),
+    (r"(?is)\bselect\b.+\bfrom\b", "sql"),
+    (r"(?i)^\s*<!doctype html|<html[\s>]", "html"),
+)
+
+
+def _bench_detect_language(answer: str) -> tuple:
+    """(language, how) for the code in a reply — what the model REACHED FOR.
+
+    Fenced tags first, because a model that writes ```python has told you its choice
+    outright; syntax signatures only when it did not. Where several blocks appear (a web
+    answer is often HTML plus a server), the largest non-markup block wins: the question is
+    which language the model chose to solve the problem in, and HTML around a Python server
+    is scaffolding, not the answer.
+    """
+    text = answer or ""
+    blocks = re.findall(r"```([A-Za-z0-9+#._-]*)\s*\n(.*?)```", text, re.S)
+    tagged = []
+    for tag, code in blocks:
+        t = (tag or "").strip().lower()
+        lang = _LANG_ALIASES.get(t, t)
+        if lang and lang not in ("text", "txt", "output", "plaintext", "", "diff"):
+            tagged.append((lang, len(code)))
+    if tagged:
+        scaffolding = {"html", "css", "json", "yaml", "toml", "xml", "ini", "makefile",
+                       "dockerfile", "bash"}
+        real = [(l, n) for l, n in tagged if l not in scaffolding]
+        pick = max(real or tagged, key=lambda p: p[1])
+        return pick[0], "fence"
+    body = "\n".join(code for _t, code in blocks) or text
+    for pattern, lang in _LANG_SIGNATURES:
+        if re.search(pattern, body, re.M):
+            return lang, "syntax"
+    return None, "none"
+
+
+def _bench_grade_langpick(answer: str, cases: list) -> dict:
+    """Which language did it reach for, and is that a defensible choice here?
+
+    The interesting output is not the score — it is `picked`, aggregated across tasks into
+    a profile. The single case exists so a run still has a number and so a genuinely odd
+    choice (a browser DOM answer written in C++) is visible as a failure rather than
+    disappearing into the distribution.
+    """
+    picked, how = _bench_detect_language(answer)
+    case = (cases or [{}])[0]
+    ok_langs = [str(x).lower() for x in (case.get("expect_any") or [])]
+    ok = bool(picked) and (not ok_langs or picked in ok_langs)
+    got = None
+    if not picked:
+        got = "no code in any language could be identified"
+    elif not ok:
+        got = f"chose {picked}, which is an odd fit here (defensible: {', '.join(ok_langs)})"
+    return {"passed": 1 if ok else 0, "total": 1,
+            "cases": [{"ok": ok, "label": case.get("label"), **({} if ok else {"got": got})}],
+            "picked": picked, "detected_by": how, "graded_by": "langpick"}
+
+
 def _bench_grade_answer(answer: str, cases: list) -> dict:
     """Grade a reply on what it IS rather than what it computes: shape, length, obedience,
     and whether it engaged at all. One case per property, so a model that produces perfect
@@ -973,6 +1057,8 @@ def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
         return _bench_grade_text(code, cases)
     if lang in ("answer", "format", "refusal"):
         return _bench_grade_answer(code, cases)
+    if lang == "langpick":
+        return _bench_grade_langpick(code, cases)
     if suffix:
         code = code + "\n\n" + suffix
     if lang == "c":

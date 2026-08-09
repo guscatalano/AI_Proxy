@@ -9925,6 +9925,7 @@ _bench_weighted_html = _bench_report_mod._bench_weighted_html
 _bench_parallel_groups = _bench_report_mod._bench_parallel_groups
 _bench_category_winners_html = _bench_report_mod._bench_category_winners_html
 _bench_coldstart_split_html = _bench_report_mod._bench_coldstart_split_html
+_bench_language_profile_html = _bench_report_mod._bench_language_profile_html
 _bench_category_html = _bench_report_mod._bench_category_html
 _bench_efficiency_html = _bench_report_mod._bench_efficiency_html
 _bench_variance_html = _bench_report_mod._bench_variance_html
@@ -11248,6 +11249,16 @@ _BENCH_SUITES.setdefault("memory-v1", _bench_memory_mod.MEMORY_TASKS)
 _BENCH_TASK_DESC.update(_bench_memory_mod.MEMORY_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_memory_mod.MEMORY_TASK_NOTES)
 
+try:
+    from . import bench_langpref as _bench_langpref_mod
+except ImportError:          # flat-script launch
+    import bench_langpref as _bench_langpref_mod
+# langpref-v1: not "is it right" but "what did it reach for". The score only catches an
+# outright strange pick; the profile in the report is the point.
+_BENCH_SUITES.setdefault("langpref-v1", _bench_langpref_mod.LANGPREF_TASKS)
+_BENCH_TASK_DESC.update(_bench_langpref_mod.LANGPREF_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_langpref_mod.LANGPREF_TASK_NOTES)
+
 _BENCH_SUITES.setdefault("instruct-v1", _bench_instruct_mod.INSTRUCT_TASKS)
 _BENCH_SUITES.setdefault("refusal-v1", _bench_instruct_mod.REFUSAL_TASKS)
 _BENCH_TASK_DESC.update(_bench_instruct_mod.INSTRUCT_TASK_DESC)
@@ -11280,7 +11291,8 @@ for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding
                                   ("coding-v3", "coding"), ("agent-v1", "agentic"),
                                   ("agent-v2", "agentic"), ("security-v1", "security"),
                                   ("instruct-v1", "instruct"), ("refusal-v1", "refusal"),
-                                  ("memory-v1", "memory")):
+                                  ("memory-v1", "memory"),
+                                  ("langpref-v1", "preference")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are
@@ -11292,6 +11304,7 @@ _BENCH_TASK_SIDE: dict = {t["id"]: t.get("side")
 # definition, pushed to it here, so the two cannot drift.
 _bench_report_mod.TASK_CATEGORY.update(_BENCH_TASK_CATEGORY)
 _bench_report_mod.TASK_SIDE.update(_BENCH_TASK_SIDE)
+_bench_report_mod.TASK_REQUESTED_LANG.update(_bench_langpref_mod.LANGPREF_REQUESTED)
 
 # Grading machinery lives in bench_graders — synchronous, importable without the
 # app. Re-bound under the old names so references and monkeypatching tests keep
@@ -11331,7 +11344,7 @@ async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
     # Analysis, format and refusal tasks are graded on the reply itself: extracting a code
     # block from an answer whose deliverable IS the answer would throw away the thing being
     # graded — and for format tasks the wrapper is precisely what is under test.
-    code = (text if lang in ("text", "answer", "format", "refusal")
+    code = (text if lang in ("text", "answer", "format", "refusal", "langpick")
             else _bench_extract_code(text, lang))
     if not code.strip():
         return {"task": task["id"], "passed": 0, "total": len(task["cases"]),

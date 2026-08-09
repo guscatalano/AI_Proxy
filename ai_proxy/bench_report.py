@@ -685,6 +685,8 @@ def _bench_category_winners_html(rows: list) -> str:
 # must not re-derive which task is which category, or the two definitions drift.
 TASK_CATEGORY: dict = {}
 TASK_SIDE: dict = {}
+# task id -> language its prompt demanded (directed langpref variants only).
+TASK_REQUESTED_LANG: dict = {}
 
 _CAT_ORDER = ("coding", "agentic", "security", "instruct", "refusal", "memory")
 _CAT_BLURB = {
@@ -875,6 +877,128 @@ def _bench_variance_html(runs: list, rows: list, axis_names: list) -> str:
             '<div class="tbl"><table><thead><tr><th>Task</th><th>What it asks</th>'
             '<th>Model</th><th class="n">Passed</th><th class="n">Rate</th></tr></thead>'
             f'<tbody>{"".join(trs)}</tbody></table></div>')
+
+
+def _bench_language_profile_html(runs: list, axis_names: list) -> str:
+    """What each model reached for when the task did not say.
+
+    A score cannot carry this: the answer to "which language" is a distribution, not a
+    number. Two views, because they answer different questions — the profile (how often
+    each model chose each language) says what a model IS, and the per-task grid says where
+    two models disagree, which is where the interesting arguments live.
+    """
+    picks: dict = {}          # model -> {task -> language}, free-choice tasks only
+    directed: dict = {}       # model -> {task -> language}, where a language was demanded
+    for run, nm in zip(runs, axis_names):
+        model = nm.split(" · ")[0]
+        for row in ((run.get("results") or {}).get("rows") or []):
+            g = row.get("grade") or {}
+            lang = g.get("picked")
+            if not lang:
+                continue
+            tid = row.get("task")
+            if TASK_REQUESTED_LANG.get(tid):
+                directed.setdefault(model, {})[tid] = lang
+            else:
+                picks.setdefault(model, {})[tid] = lang
+    if not picks and not directed:
+        return ""
+    models = list(dict.fromkeys(list(picks) + list(directed)))
+    tasks = sorted({t for m in picks.values() for t in m})
+    langs = sorted({l for m in picks.values() for l in m.values()})
+    if len(tasks) < 2 and not directed:
+        return ""
+
+    head = "".join(f'<th class="n">{_h(m)}</th>' for m in models)
+    prof = []
+    for lang in sorted(langs, key=lambda l: -sum(
+            1 for m in models for v in [picks[m].get(t) for t in tasks] if v == lang)):
+        cells = []
+        for m in models:
+            n = sum(1 for t in tasks if picks[m].get(t) == lang)
+            share = n / len(tasks) * 100 if tasks else 0
+            cells.append(f'<td class="n">{n or "—"}'
+                         + (f' <span class="ct">{share:.0f}%</span>' if n else "") + "</td>")
+        prof.append(f'<tr><th scope="row"><code>{_h(lang)}</code></th>{"".join(cells)}</tr>')
+
+    grid = []
+    for t in tasks:
+        cells = []
+        vals = [picks[m].get(t) for m in models]
+        disagree = len({v for v in vals if v}) > 1
+        for v in vals:
+            cells.append(f'<td><code>{_h(v or "—")}</code></td>')
+        grid.append(f'<tr{" class=win" if disagree else ""}>'
+                    f'<th scope="row"><code>{_h(t)}</code></th>'
+                    f'<td>{_h(TASK_DESC.get(t) or "")}</td>{"".join(cells)}</tr>')
+
+    # The one-line reading: a model that answers everything in one language has a reflex,
+    # not a preference, and that is worth saying out loud.
+    notes = []
+    for m in models:
+        counts: dict = {}
+        for t in tasks:
+            v = picks[m].get(t)
+            if v:
+                counts[v] = counts.get(v, 0) + 1
+        if not counts:
+            continue
+        top, n = max(counts.items(), key=lambda kv: kv[1])
+        if n / len(tasks) >= 0.5:
+            notes.append(f'<b>{_h(m)}</b> answered {n} of {len(tasks)} tasks in '
+                         f'{_h(top)} — including ones whose domain points elsewhere')
+    note_html = (f'<p class="note">{" · ".join(notes)}.</p>' if notes else "")
+
+    comply_html = ""
+    if directed:
+        dtasks = sorted({t for m in directed.values() for t in m})
+        rows_out, totals = [], {m: [0, 0] for m in models}
+        for t_id in dtasks:
+            want = TASK_REQUESTED_LANG.get(t_id)
+            cells = []
+            for m in models:
+                got = directed.get(m, {}).get(t_id)
+                if got is None:
+                    cells.append('<td class="n">—</td>')
+                    continue
+                ok = got == want
+                totals[m][1] += 1
+                totals[m][0] += 1 if ok else 0
+                cells.append(f'<td class="n{"" if ok else " bad"}">'
+                             + ("✓" if ok else f"<code>{_h(got)}</code>") + "</td>")
+            rows_out.append(f'<tr><th scope="row"><code>{_h(t_id)}</code></th>'
+                            f'<td><code>{_h(want)}</code></td>{"".join(cells)}</tr>')
+        tot = "".join(
+            f'<td class="n"><b>{totals[m][0]}/{totals[m][1]}</b></td>' for m in models)
+        ignored = [f"{_h(m)} ignored it {totals[m][1] - totals[m][0]} time"
+                   f"{'s' if totals[m][1] - totals[m][0] != 1 else ''}"
+                   for m in models if totals[m][1] and totals[m][0] < totals[m][1]]
+        comply_html = (
+            '<p class="note">The other half of the suite names the language outright, and '
+            'names one the free-choice answers suggest the model would not have picked — '
+            'compliance is only a test when it costs something. A preference a model can '
+            'set aside on request is a preference; one it cannot is a reflex.'
+            + (" Here, " + ", ".join(ignored) + "." if ignored else
+               " Every instruction was followed.") + '</p>'
+            f'<div class="tbl"><table><thead><tr><th>Task</th><th>Asked for</th>{head}'
+            f'</tr></thead><tbody>{"".join(rows_out)}'
+            f'<tr><th scope="row">followed</th><td></td>{tot}</tr>'
+            f'</tbody></table></div>')
+
+    if not tasks:
+        return f'<h2>Language preference</h2>{comply_html}'
+    return ('<h2>Language preference</h2>'
+            '<p class="note">None of these prompts names a language. What came back is the '
+            'model\'s disposition: what it reaches for when the choice is left open. '
+            'Nothing here is graded on whether the code runs.</p>'
+            f'<div class="tbl"><table><thead><tr><th>Language</th>{head}</tr></thead>'
+            f'<tbody>{"".join(prof)}</tbody></table></div>'
+            f'{note_html}'
+            '<p class="note">Task by task — highlighted rows are where the models '
+            'disagreed, which is where the choice was actually a judgement call.</p>'
+            f'<div class="tbl"><table><thead><tr><th>Task</th><th>What it asks</th>'
+            f'{head}</tr></thead><tbody>{"".join(grid)}</tbody></table></div>'
+            + comply_html)
 
 
 def _bench_coldstart_split_html(rows: list) -> str:
@@ -2459,6 +2583,7 @@ ordinary slowness rather than a misconfiguration.</p>
     # single-purpose suites do not, and the renderer returns "" for them.
     category_html = _bench_category_html(tasks, axis_names) if graded else ""
     efficiency_html = _bench_efficiency_html(rows) if graded else ""
+    langpref_html = _bench_language_profile_html(runs, axis_names)
     variance_html = _bench_variance_html(runs, rows, axis_names) if graded else ""
     body = f"""
   {results}
@@ -2468,6 +2593,8 @@ ordinary slowness rather than a misconfiguration.</p>
   {category_html}
 
   {winners_html}
+
+  {langpref_html}
 
   {efficiency_html}
 
