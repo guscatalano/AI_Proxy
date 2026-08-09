@@ -44,7 +44,11 @@ if [ -f "$DEADLINE_FILE" ]; then
   now=$(date +%s)
   if [ "$now" -gt "$deadline" ]; then
     log "deadline passed with no quiet window — disarming, nothing deployed"
-    crontab -l 2>/dev/null | grep -v deferred_deploy.sh | crontab - || true
+    # SELF_DISARM is honoured here too: rehearsing the deadline path against throwaway
+    # directories used to edit the REAL crontab and silently disarm a live deploy.
+    if [ "$SELF_DISARM" = "1" ]; then
+      crontab -l 2>/dev/null | grep -v deferred_deploy.sh | crontab - || true
+    fi
     exit 0
   fi
 fi
