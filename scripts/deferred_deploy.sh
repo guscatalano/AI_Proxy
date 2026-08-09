@@ -25,7 +25,11 @@ LOG=${LOG:-/home/crimson/deferred_deploy.log}
 DEADLINE_FILE=${DEADLINE_FILE:-/home/crimson/deferred_deploy.deadline}
 QUIET_S=${QUIET_S:-1800}
 RESTART_CMD=${RESTART_CMD:-"sudo systemctl restart ai_proxy"}
-HEALTH_URL=${HEALTH_URL:-http://localhost:11444/__proxy/api/version}
+# A real endpoint (there is no /api/version — asking for one returned 404), and the check
+# below accepts ANY http response rather than only a 2xx: the question is whether the
+# process came back and is serving, and a 404 answers that as well as a 200 does. Using
+# `curl -f` against a path that did not exist is what rolled back a healthy deploy once.
+HEALTH_URL=${HEALTH_URL:-http://localhost:11444/__proxy/api/stats}
 IS_ACTIVE_CMD=${IS_ACTIVE_CMD:-"systemctl is-active --quiet ai_proxy"}
 IDLE_CMD=${IDLE_CMD:-"python3 /home/crimson/idle_check.py"}
 SELF_DISARM=${SELF_DISARM:-1}
@@ -65,7 +69,11 @@ $RESTART_CMD
 sleep 8
 ok=0
 for _ in 1 2 3 4 5 6; do
-  if $IS_ACTIVE_CMD && curl -fsS -m 5 -o /dev/null "$HEALTH_URL"; then
+  # curl already prints 000 on a failed connection, so no `|| echo 000` — appending a
+  # second one produced "000000", which is not equal to "000" and would have read a dead
+  # service as alive. A guard that fails open is worse than no guard.
+  code=$(curl -sS -o /dev/null -m 5 -w '%{http_code}' "$HEALTH_URL" 2>/dev/null)
+  if $IS_ACTIVE_CMD && [ -n "$code" ] && [ "$code" != "000" ]; then
     ok=1; break
   fi
   sleep 5
