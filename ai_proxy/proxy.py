@@ -181,6 +181,14 @@ _PANIC_MODE: bool = False
 #   {req_id: {ts, upstream_resp, cancel_evt}}
 _INFLIGHT_REQUESTS: dict = {}
 
+# Upstream responses whose request row has already been finalized but whose socket was never
+# closed. _save_finish is sync (it runs in the threadpool), so it cannot await aclose() itself —
+# and popping the registry entry throws away the ONLY reference to the response, after which the
+# connection can never be returned to the pool and nothing can even see that it is held. That is
+# how 101 sockets to vLLM accumulated unnoticed and wedged every proxied request on 2026-08-08.
+# Hand them here instead; the zombie killer drains this on its next tick.
+_ORPHANED_RESPONSES: list = []
+
 
 # request_dedup: when two identical streaming requests arrive close together (some clients —
 # notably claude-code — fan out parallel duplicates), the second one subscribes to the first's
@@ -1112,7 +1120,18 @@ def _live_update_from_chunk(req_id: str, chunk_text: str) -> None:
     if not chunk_text or req_id not in _LIVE_STREAMS:
         return
     state = _LIVE_STREAMS[req_id]
-    for line in chunk_text.split("\n"):
+    # aiter_raw() yields whatever came off the socket, which splits SSE lines mid-event as
+    # often as not. Parsing each chunk in isolation dropped every fragment that didn't happen
+    # to begin with "data: ", so live text silently lost pieces of the reply. Carry the
+    # trailing partial line into the next chunk and only parse what is complete.
+    chunk_text = (state.get("buf") or "") + chunk_text
+    lines = chunk_text.split("\n")
+    # A chunk ending exactly on "\n" leaves "" here, which is the correct empty carry-over.
+    state["buf"] = lines.pop() if lines else ""
+    # A pathological upstream that never emits a newline must not grow this without bound.
+    if len(state["buf"]) > 65536:
+        state["buf"] = ""
+    for line in lines:
         data = None
         if line.startswith("data: "):
             data = line[6:]
@@ -1249,7 +1268,16 @@ async def lifespan(app: FastAPI):
     _refresh_archive_active()
     _load_panic_mode()
     app.state.started_at = time.time()
-    app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+    # Read/write stay unbounded — a 200k-token prefill legitimately takes minutes and cutting
+    # generation off is worse than waiting. The POOL wait must NOT be unbounded, though: with
+    # httpx's default 100-connection cap and no pool timeout, exhaustion presents as every
+    # proxied request hanging forever, with no error, no log, and no failing health check —
+    # the management routes don't share this client, so /api/health answered in 3ms while
+    # nothing else was served at all. A bounded pool wait turns that silence into a 504.
+    app.state.client = httpx.AsyncClient(
+        timeout=httpx.Timeout(None, pool=15.0),
+        limits=httpx.Limits(max_connections=256, max_keepalive_connections=32),
+    )
     app.state.metrics_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
     app.state.metrics_task = asyncio.create_task(_metrics_loop(app))
     app.state.task_worker = asyncio.create_task(_task_worker_loop(app))
@@ -5742,6 +5770,12 @@ def health(tables: bool = False):
             "table_sizes_pending": bool(tables and not table_sizes
                                         and _DBSTAT_CACHE.get("refreshing")),
         },
+        # Pool occupancy is the one number that would have named the 2026-08-08 outage on
+        # sight. Health is the right home for it: it is what a liveness poll already hits,
+        # and this failure mode is invisible to every other signal — the service is active,
+        # the upstreams are fast, and nothing is served.
+        "upstream_pool": _pool_stats(),
+        "inflight": len(_INFLIGHT_REQUESTS),
         "process": {
             "pid": os.getpid(),
             "rss_kb": rss_kb,
@@ -7430,8 +7464,14 @@ async def request_live(req_id: str, request: Request):
         return {"active": False, "text": None}
     return {
         "active": active,
+        # False means no incremental output is coming — not that none has arrived yet. The
+        # UI needs the difference to say so instead of showing an empty pane that looks broken.
+        "streaming": bool(s.get("stream")),
         "text": s.get("text") or "",
         "prompt_tokens": s.get("prompt"),
+        # Falls back to the chars/3.5 estimate so a non-streaming request still has something
+        # truthful to show while it runs.
+        "est_prompt_tokens": s.get("est_prompt"),
         "completion_tokens": s.get("completion"),
     }
 
@@ -13429,6 +13469,52 @@ async def _task_execute(task_id: int):
         conn.close()
 
 
+_POOL_WARNED = {"at": 0.0}
+
+
+def _pool_stats() -> dict:
+    """Occupancy of the shared upstream connection pool.
+
+    httpx exposes no public accessor for this, so it reaches through the transport into
+    httpcore. Wrapped whole: an observability hook must never be the thing that breaks
+    proxying, so a version bump that moves these internals costs the metric, not the box.
+    """
+    try:
+        pool = app.state.client._transport._pool
+        conns = list(pool.connections)
+        limit = pool._max_connections
+    except Exception:
+        return {}
+    idle = 0
+    for c in conns:
+        try:
+            idle += 1 if c.is_idle() else 0
+        except Exception:
+            pass
+    return {"connections": len(conns), "idle": idle,
+            "active": len(conns) - idle, "limit": limit}
+
+
+def _pool_watch() -> None:
+    """Say something while the pool is filling, rather than after it is full.
+
+    Exhaustion has no natural symptom — requests just stop finishing — so the only warning
+    anyone gets is the one printed here."""
+    s = _pool_stats()
+    limit = s.get("limit") or 0
+    if not limit or s.get("active", 0) < limit * 0.8:
+        return
+    if time.time() - _POOL_WARNED["at"] < 300:
+        return          # once per 5 min: a full pool would otherwise flood the journal
+    _POOL_WARNED["at"] = time.time()
+    try:
+        print(f"[pool] {s['active']}/{limit} upstream connections checked out "
+              f"({s['idle']} idle, {len(_INFLIGHT_REQUESTS)} requests in flight) — "
+              f"at the cap, proxied requests will queue")
+    except Exception:
+        pass
+
+
 async def _inflight_zombie_killer(app: FastAPI):
     """Periodically cancel in-flight requests that have been running longer than the
     configured max. Safety net for streamer coroutines that wedge on a dead client socket
@@ -13440,6 +13526,15 @@ async def _inflight_zombie_killer(app: FastAPI):
         try:
             await asyncio.sleep(60)
             now = time.time()
+            # Drain sockets orphaned by _save_finish first — these are already-finished
+            # requests, so there is nothing to wait for and every one held is a pool slot gone.
+            while _ORPHANED_RESPONSES:
+                _resp = _ORPHANED_RESPONSES.pop()
+                try:
+                    await _resp.aclose()
+                except Exception:
+                    pass
+            _pool_watch()
             for req_id in list(_INFLIGHT_REQUESTS.keys()):
                 info = _INFLIGHT_REQUESTS.get(req_id)
                 if not info or info.get("cancelled"):
@@ -14224,7 +14319,14 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     conn.close()
     # Seed live state with the estimate so the UI shows something immediately, even before
     # the upstream confirms the real input_tokens.
-    _LIVE_STREAMS[req_id] = {"prompt": None, "completion": None, "est_prompt": est or None}
+    #
+    # `stream` is recorded because a non-streaming request produces NO live text, ever: the
+    # body arrives in one aread() and streamer() — the only caller of _live_update_from_chunk —
+    # never runs. Without this flag the live pane cannot tell "streaming, nothing yet" from
+    # "nothing is coming", so it claimed to be live and rendered blank for the full 30s of
+    # every hindsight call. Absence of data and absence of streaming should not look alike.
+    _LIVE_STREAMS[req_id] = {"prompt": None, "completion": None, "est_prompt": est or None,
+                             "stream": bool(is_stream), "buf": ""}
 
 
 _TOOL_ERROR_PATTERNS = (
@@ -15812,7 +15914,13 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
     conn.commit()
     conn.close()
     _LIVE_STREAMS.pop(req_id, None)
-    _INFLIGHT_REQUESTS.pop(req_id, None)
+    _gone = _INFLIGHT_REQUESTS.pop(req_id, None)
+    # Finalizing the row must not strand the socket: whichever path got here, if the response
+    # is still open this is the last moment anything holds a reference to it.
+    if _gone is not None:
+        _resp = _gone.get("upstream_resp")
+        if _resp is not None and not getattr(_resp, "is_closed", True):
+            _ORPHANED_RESPONSES.append(_resp)
 
 
 @app.api_route(
@@ -16841,10 +16949,15 @@ async def proxy(full_path: str, request: Request):
                     except Exception:
                         pass
                     _fin["saved"] = True
-                    try:
-                        await upstream_resp.aclose()   # free the upstream socket / GPU slot
-                    except Exception:
-                        pass
+                # Unconditional, and outside the `not saved` branch it used to live in: on the
+                # happy path streamer() has already closed this and a second aclose() is a
+                # no-op, but "streamer finished normally" and "the socket was released" are not
+                # the same claim, and betting a pool slot on them being equal is what filled
+                # the pool. Closing twice is free; closing never is a 25-minute outage.
+                try:
+                    await upstream_resp.aclose()   # free the upstream socket / GPU slot
+                except Exception:
+                    pass
 
         return StreamingResponse(
             _gen_with_release(),

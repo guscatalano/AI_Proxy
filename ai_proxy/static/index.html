@@ -1167,7 +1167,7 @@ body:not(.bench-simple) .bench-preset { display:none; }
         <div id="chat-pers-list" style="margin-bottom:14px"></div>
         <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px">
           <div style="font-size:12px;color:#aaa;margin-bottom:6px"><strong>+ New personality</strong></div>
-          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
+          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" autocomplete="off" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
           <textarea id="chat-pers-prompt" rows="6" placeholder="System prompt — describe how the model should respond." style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
           <button onclick="chatAddPersonality()" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Save</button>
           <span id="chat-pers-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
@@ -1207,6 +1207,15 @@ function startLiveDetail(id) {
     const out = $('live-detail-out'), meta = $('live-detail-meta');
     if (!out) { stopLiveDetail(); return; }   // detail re-rendered without a live section
     if (j.redacted) { out.textContent = '🔒 live output hidden (PII: not on this client\'s subnet)'; }
+    else if (j.streaming === false) {
+      // Not a streaming request: the upstream sends nothing until it sends everything, so
+      // there is no incremental output and never will be. Saying so beats rendering '…' for
+      // the full 30s of a hindsight call, which reads as the live view being broken.
+      out.textContent = 'Not a streaming request — the reply arrives in one piece when it '
+        + 'finishes, so there is no live output to show.';
+      if (meta) meta.textContent = j.est_prompt_tokens != null
+        ? '~' + num(j.est_prompt_tokens) + ' prompt tokens (estimated)' : '';
+    }
     else if (j.text != null) {
       const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
       out.textContent = j.text || '…';
@@ -3613,8 +3622,8 @@ async function loadAudit() {
       <h2>🔀 Routing mode</h2>
       <div class="desc">Quick toggle between passthrough, shadow comparison, and full redirect to a local model. Edits the rules config below — saves apply immediately, no restart needed.</div>
       <div class="routing-row">
-        <label>From <input type="text" id="routing-from" value="claude-opus-4-7" placeholder="claude-opus-4-7"></label>
-        <label>To <input type="text" id="routing-to" value="qwen3-coder-next:latest" placeholder="qwen3-coder-next:latest"></label>
+        <label>From <input type="text" id="routing-from" value="claude-opus-4-7" placeholder="claude-opus-4-7" autocomplete="off"></label>
+        <label>To <input type="text" id="routing-to" value="qwen3-coder-next:latest" placeholder="qwen3-coder-next:latest" autocomplete="off"></label>
       </div>
       <div class="routing-row">
         <button class="routing-mode-btn mode-passthrough" id="mode-btn-passthrough" onclick="setRoutingMode('passthrough')">Passthrough · Claude → Claude</button>
@@ -4614,7 +4623,7 @@ function ollamaConfigSection(ollama) {
       </table>
       <div style="margin-top:10px;padding:10px 12px;border:1px solid #313a48;border-radius:6px;background:#161b24">
         <div style="font-size:12px;color:#aab4c3;margin-bottom:6px"><b>Model defaults</b> — bake a per-model context window (works for all clients, incl. OpenAI-style; the global env var stays untouched)</div>
-        <input id="omp-model" list="omp-models" placeholder="model tag" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:220px">
+        <input id="omp-model" list="omp-models" placeholder="model tag" autocomplete="off" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:220px">
         <datalist id="omp-models">${(ollama.tags || []).map(t => `<option value="${esc(t.name || t.model || '')}">`).join('')}</datalist>
         <input id="omp-ctx" type="number" min="256" step="1024" placeholder="num_ctx" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:110px;margin-left:6px">
         <button onclick="applyOllamaParams(this)" style="margin-left:6px;background:#262d38;border:1px solid #33566b;color:#7cc7f0;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer">Apply</button>
@@ -5312,7 +5321,7 @@ function renderSystem() {
     <div class="stats-section">
       <h2>Ollama Available (top 25)</h2>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-        <input id="pull-model" placeholder="e.g. llama3:70b-instruct" spellcheck="false"
+        <input id="pull-model" placeholder="e.g. llama3:70b-instruct" spellcheck="false" autocomplete="off"
           style="flex:1;min-width:240px;background:#161a20;color:#ddd;border:1px solid #333;border-radius:4px;padding:5px 9px;font-size:12px;font-family:ui-monospace,monospace">
         <button onclick="startPull(this)" id="pull-btn"
           style="background:#2e3a4a;color:#8ab4e8;border:1px solid #3a4a5a;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px">Pull</button>
@@ -6150,7 +6159,7 @@ function chatRenderPersonalityList() {
   wrap.innerHTML = chatPersonalities.map(p => `
     <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px;margin-bottom:6px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" style="flex:1;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
+        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" autocomplete="off" style="flex:1;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
         <button data-pers-save="${esc(p.id)}" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Save</button>
         <button data-pers-del="${esc(p.id)}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
       </div>
@@ -6795,7 +6804,7 @@ async function loadBench() {
             </div>
             <div class="bench-adv bench-row">
               <label for="bench-temp">Temperature</label>
-              <input id="bench-temp" type="text" placeholder="engine default, or 0, 0.2">
+              <input id="bench-temp" type="text" placeholder="engine default, or 0, 0.2" autocomplete="off">
             </div>
           </div>
 
@@ -8279,7 +8288,7 @@ async function loadTasks() {
         <textarea id="t2-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
         <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:6px;align-items:center">
           <label id="t2-model-wrap">Model <select id="t2-model" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px;min-width:220px"></select></label>
-          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
+          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" autocomplete="off" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
         </div>
         <button id="t2-add" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Queue task</button>
         <span id="t2-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
