@@ -4718,6 +4718,13 @@ function renderProxyHealth(hp) {
   const db = hp.db || {};
   const proc = hp.process || {};
   const oh = hp.overhead_ms || {};
+  // Every file, not just the main database. The archive and the two write-ahead logs are
+  // usually the bulk of it, and none of them used to appear anywhere in this tab.
+  const disk = db.disk || {};
+  const diskFiles = disk.files || [];
+  const diskRows = diskFiles
+    .map(f => `<tr><td>${esc(f.label)}</td><td class="num">${fmtBytes(f.bytes)}</td>
+               <td style="color:#666;font-size:11px"><code>${esc(f.path)}</code></td></tr>`).join('');
   const tableRows = Object.entries(db.table_sizes || {})
     .map(([name, sz]) => `<tr><td><code>${esc(name)}</code></td><td class="num">${fmtBytes(sz)}</td></tr>`).join('') ||
     '<tr><td colspan="2" style="color:#666;font-size:11px;padding:4px 8px">(per-table sizes unavailable — SQLite was built without dbstat)</td></tr>';
@@ -4727,9 +4734,10 @@ function renderProxyHealth(hp) {
       <h2>Proxy Health</h2>
       <div class="cards" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
         <div class="gauge">
-          <div class="l">Database</div>
-          <div class="v">${fmtBytes(db.size_bytes)}</div>
-          <div class="s">${num(db.request_count || 0)} requests · ${num(db.metric_count || 0)} metric rows</div>
+          <div class="l">On disk (all files)</div>
+          <div class="v">${fmtBytes(disk.total_bytes != null ? disk.total_bytes : db.size_bytes)}</div>
+          <div class="s">${num(db.request_count || 0)} requests · ${num(db.metric_count || 0)} metric rows${
+            diskFiles.length > 1 ? ` · main file ${fmtBytes(db.size_bytes)}` : ''}</div>
         </div>
         <div class="gauge">
           <div class="l">Proxy memory (RSS)</div>
@@ -4742,6 +4750,17 @@ function renderProxyHealth(hp) {
           <div class="s">avg ${oh.avg_ms != null ? oh.avg_ms.toFixed(2) : '—'} · p95 ${oh.p95_ms != null ? oh.p95_ms.toFixed(2) : '—'} · p99 ${oh.p99_ms != null ? oh.p99_ms.toFixed(2) : '—'} (${num(oh.samples || 0)} samples)</div>
         </div>
       </div>
+      ${diskRows ? `
+        <details style="margin-bottom:14px" open>
+          <summary style="cursor:pointer;color:#888;font-size:12px">Files on disk — ${fmtBytes(disk.total_bytes)} total</summary>
+          <table style="width:auto;min-width:420px;margin-top:6px">
+            <thead><tr><th>File</th><th class="num">Size</th><th>Path</th></tr></thead>
+            <tbody>${diskRows}</tbody>
+          </table>
+          <div style="color:#666;font-size:11px;margin-top:4px">Write-ahead logs grow while rows
+            are being deleted and shrink at the next checkpoint — a clear makes this total rise
+            before it falls.</div>
+        </details>` : ''}
       ${Object.keys(db.table_sizes || {}).length ? `
         <details style="margin-bottom:14px">
           <summary style="cursor:pointer;color:#888;font-size:12px">Per-table sizes</summary>
@@ -4804,7 +4823,12 @@ async function resetDb(btn) {
     btn._armed = true;
     btn.textContent = `Delete ${targets.join(' + ')}?`;
     btn.style.background = '#6a3030';
-    _resetSay('This cannot be undone. Click again to confirm, or wait to cancel.', '#e0a080');
+    // Say what it costs, not just that it is irreversible: on a large database this runs for
+    // minutes and competes with live traffic for the write lock. A clear once returned 500s
+    // to a real request and knocked out metrics collection, with nothing warning beforehand.
+    _resetSay('This cannot be undone, and on a large database it runs for several minutes — '
+      + 'proxied requests may fail while it works. Click again to confirm, or wait to cancel.',
+      '#e0a080');
     btn._t = setTimeout(() => { _resetDisarm(btn); _resetSay(''); }, 5000);
     return;
   }
@@ -4826,7 +4850,17 @@ async function resetDb(btn) {
       if (s.state !== 'running') return;
       const el = s.elapsed_s != null ? ` · ${s.elapsed_s.toFixed(0)}s` : '';
       const slow = vacuum ? ' <span style="color:#666">(rewrites the whole file — minutes on a large database)</span>' : '';
-      _resetSay(`<span style="color:#f0c674">${esc(s.step || 'working')}</span>${el}${s.step === 'compacting the database' ? slow : ''}`);
+      // Rows done / total within the step. Without it, "deleting request bodies" sat unchanged
+      // for seven minutes and was indistinguishable from a wedged job.
+      const p = s.progress || {};
+      const pct = (p.total ? ` <span style="color:#888">${num(p.done || 0)} / ${num(p.total)}`
+        + ` (${Math.floor(100 * (p.done || 0) / p.total)}%)</span>` : '');
+      // Deletes land in the write-ahead log first, so disk climbs during a clear. Showing the
+      // total makes that legible instead of alarming.
+      const dk = s.disk && s.disk.total_bytes
+        ? ` <span style="color:#666">· ${fmtBytes(s.disk.total_bytes)} on disk</span>` : '';
+      _resetSay(`<span style="color:#f0c674">${esc(s.step || 'working')}</span>${pct}${el}${dk}`
+        + `${s.step === 'compacting the database' ? slow : ''}`);
     } catch {}
   }, 700);
 

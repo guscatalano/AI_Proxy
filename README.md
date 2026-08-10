@@ -249,6 +249,7 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | `PROXY_SSL_CERT` / `PROXY_SSL_KEY` | (none) | Cert and key for that listener — both required, plus a non-zero HTTPS port |
 | `PROXY_SSL_KEY_PASSWORD` | (none) | Passphrase for an encrypted key |
 | `PROXY_GRACEFUL_SHUTDOWN` | `10` | Seconds uvicorn waits for connections to drain, so a lingering SSE stream can't hang a restart |
+| `PROXY_STARTUP_TIMEOUT_S` | `120` | How long the HTTPS listener waits for HTTP startup (migrations, backfills) before refusing to start. Raise it if startup is legitimately slow; it never opens HTTPS against a half-initialised app |
 
 #### State
 
@@ -378,6 +379,10 @@ New-Service -Name "AIProxy" `
 ### HTTPS
 
 Set `PROXY_SSL_CERT`, `PROXY_SSL_KEY`, and a non-zero `PROXY_HTTPS_PORT` to run a second listener alongside HTTP. Both share one FastAPI app, one lifespan, and one database — the HTTP listener owns startup, the HTTPS one attaches to the running state.
+
+Because the HTTPS listener borrows that state, it does not open until HTTP startup has actually completed, and refuses to start at all if that takes longer than `PROXY_STARTUP_TIMEOUT_S`. If either listener stops, the other is brought down with it rather than left serving against a torn-down client and database.
+
+`GET /__proxy/api/health` reports the certificate under `tls` — `days_remaining`, `expired`, `expiring_soon` — and the log warns hourly once expiry is within 14 days. Expiry is otherwise a silent, scheduled outage: nothing reports it until every HTTPS client is already failing.
 
 ---
 

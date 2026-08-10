@@ -14,6 +14,7 @@ import subprocess
 import tempfile
 import collections
 import gzip
+import ssl
 import struct
 import threading
 import ipaddress
@@ -140,6 +141,10 @@ ANALYTICS_CACHE_TTL_S = float(os.environ.get("PROXY_ANALYTICS_CACHE_TTL", "5") o
 # Cap uvicorn's graceful shutdown so a lingering connection (e.g. the UI's live SSE feed
 # or an in-flight stream) can't hang a `systemctl restart` forever. 0 = wait indefinitely.
 GRACEFUL_SHUTDOWN_S = int(float(os.environ.get("PROXY_GRACEFUL_SHUTDOWN", "10") or 0))
+# How long the HTTPS listener waits for the HTTP listener's lifespan (init_db, migrations,
+# backfills, shared httpx client) before giving up. Generous by default: a slow start is a
+# reason to keep waiting, not a reason to start serving against half-built state.
+STARTUP_TIMEOUT_S = float(os.environ.get("PROXY_STARTUP_TIMEOUT_S", "120") or 120)
 _last_request_prune = 0.0
 _last_archive_sweep = 0.0
 _ANALYTICS_CACHE: dict = {}
@@ -5765,6 +5770,9 @@ def health(tables: bool = False):
             "archive_path": ARCHIVE_DB_PATH,
             "archive_bytes": (Path(ARCHIVE_DB_PATH).stat().st_size
                               if Path(ARCHIVE_DB_PATH).exists() else 0),
+            # Itemised, because the two fields above were computed and then never rendered:
+            # the UI showed the main file alone while the proxy held four times that on disk.
+            "disk": _db_files(),
             # So the UI can say "measuring" instead of silently showing nothing on the first
             # load after a restart.
             "table_sizes_pending": bool(tables and not table_sizes
@@ -5776,6 +5784,7 @@ def health(tables: bool = False):
         # the upstreams are fast, and nothing is served.
         "upstream_pool": _pool_stats(),
         "inflight": len(_INFLIGHT_REQUESTS),
+        "tls": _tls_status(),
         "process": {
             "pid": os.getpid(),
             "rss_kb": rss_kb,
@@ -5804,6 +5813,11 @@ def _db_job_status() -> dict:
     step_started = job.pop("step_started", None)
     if step_started and job.get("state") == "running":
         job["step_elapsed_s"] = round(time.time() - step_started, 1)
+    if job.get("state") == "running":
+        # Disk grows while rows are being deleted — the removals land in the write-ahead log
+        # before a checkpoint folds them in. Watching the total climb during a "clear" looks
+        # like failure unless the log is shown as its own number.
+        job["disk"] = _db_files()
     return job
 
 
@@ -5819,11 +5833,80 @@ def _db_size() -> int:
     return total
 
 
+def _db_files() -> dict:
+    """Every file the proxy keeps on disk, itemised.
+
+    The System tab used to report only the main database. During a clear that read 7.7 GB
+    while the proxy actually occupied 35 GB — the archive, the two write-ahead logs and a
+    stale pre-backup made up the rest, and none of them appeared anywhere in the UI. The
+    number you check before deciding to clear the database has to be the real one.
+    """
+    seen: list = []
+    total = 0
+    # -wal and -shm are not incidental: during a large delete the WAL can exceed the database
+    # it belongs to, which is why disk climbs while rows are being removed.
+    for label, path in (
+        ("database", DB_PATH),
+        ("write-ahead log", DB_PATH + "-wal"),
+        ("shared index", DB_PATH + "-shm"),
+        ("archive", ARCHIVE_DB_PATH),
+        ("archive write-ahead log", ARCHIVE_DB_PATH + "-wal"),
+        ("archive shared index", ARCHIVE_DB_PATH + "-shm"),
+        ("pre-migration backup", DB_PATH + ".prebak"),
+    ):
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            continue                      # absent is the normal case for several of these
+        seen.append({"label": label, "path": path, "bytes": size})
+        total += size
+    return {"files": seen, "total_bytes": total,
+            "total_mb": round(total / (1024 * 1024), 2)}
+
+
+# Batch size and pause for the reset's deletes. One `DELETE FROM requests` holds a write lock
+# for the whole multi-minute operation, which is how clearing the database made the metrics
+# collector fail ten times over and returned a 500 to a live /v1/chat/completions. Committing
+# in batches with a breath between them lets other writers interleave. Same shape as the
+# archive sweep, which already worked this way.
+DB_RESET_CHUNK = int(os.environ.get("PROXY_DB_RESET_CHUNK", "2000") or 2000)
+DB_RESET_PAUSE_S = float(os.environ.get("PROXY_DB_RESET_PAUSE_S", "0.05") or 0)
+
+
+def _chunked_delete(conn, table: str, chunk: int, pause_s: float, on_progress) -> int:
+    """Delete every row of `table`, committing as it goes. Returns the number removed.
+
+    Chunked by rowid rather than a WHERE clause on the data: every one of these tables is
+    being emptied completely, and rowid is the one column guaranteed present and indexed.
+    """
+    done = 0
+    while True:
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT ?)",
+            (int(chunk),))
+        removed = cur.rowcount or 0
+        conn.commit()                     # release the write lock between batches
+        if removed <= 0:
+            return done
+        done += removed
+        on_progress(done)
+        if pause_s:
+            time.sleep(pause_s)
+
+
 def _db_reset_job(targets: list, vacuum: bool) -> dict:
     """Runs in a worker thread. Publishes each step so the UI has something true to show."""
-    def step(name: str):
+    def step(name: str, total: int | None = None):
         _DB_JOB["step"] = name
         _DB_JOB["step_started"] = time.time()
+        # Reset per-step progress, so a step with no countable work doesn't inherit the last
+        # step's numbers and appear stuck at 100%.
+        _DB_JOB["progress"] = {"done": 0, "total": total}
+
+    def progress(done: int):
+        p = _DB_JOB.get("progress") or {}
+        p["done"] = done
+        _DB_JOB["progress"] = p
 
     _DB_JOB.update({"state": "running", "started": time.time(), "finished": None,
                     "targets": list(targets), "vacuum": bool(vacuum), "deleted": {},
@@ -5846,19 +5929,31 @@ def _db_reset_job(targets: list, vacuum: bool) -> dict:
                                   ("settings", "settings")):
                 if target not in targets:
                     continue
-                counts[target] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                step(f"deleting {target}")
-                conn.execute(f"DELETE FROM {table}")
+                total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                counts[target] = total
+                step(f"deleting {target}", total)
+                _chunked_delete(conn, table, DB_RESET_CHUNK, DB_RESET_PAUSE_S, progress)
                 _DB_JOB["deleted"] = dict(counts)
             # Blobs live in their own table now; wiping requests without them would strand
             # gigabytes of bodies with nothing pointing at them.
             if "requests" in targets:
-                step("deleting request bodies")
-                conn.execute("DELETE FROM request_blobs")
+                blob_total = conn.execute("SELECT COUNT(*) FROM request_blobs").fetchone()[0]
+                arch_total = 0
+                try:
+                    arch_total = conn.execute(
+                        "SELECT COUNT(*) FROM arch.request_blobs").fetchone()[0]
+                except sqlite3.Error:
+                    pass
+                step("deleting request bodies", blob_total + arch_total)
+                done_so_far = 0
+                done_so_far += _chunked_delete(
+                    conn, "request_blobs", DB_RESET_CHUNK, DB_RESET_PAUSE_S, progress)
                 # Including the ones that were moved out — otherwise "wipe requests" leaves
                 # gigabytes of bodies behind in the archive file.
                 try:
-                    conn.execute("DELETE FROM arch.request_blobs")
+                    base = done_so_far
+                    _chunked_delete(conn, "arch.request_blobs", DB_RESET_CHUNK,
+                                    DB_RESET_PAUSE_S, lambda n: progress(base + n))
                 except sqlite3.Error:
                     pass
             conn.commit()
@@ -13470,6 +13565,107 @@ async def _task_execute(task_id: int):
 
 
 _POOL_WARNED = {"at": 0.0}
+_TLS_WARNED = {"at": 0.0}
+_TLS_CACHE: dict = {"key": None, "value": None}
+# Certificates are renewed on a schedule nobody watches. Two weeks is enough warning to act
+# without being so early the message becomes background noise.
+TLS_EXPIRY_WARN_DAYS = 14
+
+
+async def _wait_for_http_start(http_server, http_task, timeout_s: float) -> None:
+    """Block until the HTTP listener has finished starting, or refuse to continue.
+
+    The HTTPS listener runs with lifespan="off" and borrows the HTTP server's state, so it
+    must not open until that state exists. The original loop polled for 5 seconds and then
+    opened the listener regardless — but init_db runs migrations and backfills, which on a
+    multi-gigabyte database takes far longer than that, and every HTTPS request arriving in
+    the gap fails on an app.state.client that has not been created yet.
+
+    A slow start is a reason to keep waiting, not a reason to serve half-built state, so
+    exhausting the deadline raises instead of proceeding.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not getattr(http_server, "started", False):
+        if http_task.done():
+            await http_task                  # surface whatever killed it, if anything
+            raise RuntimeError("HTTP listener exited during startup; HTTPS was not started")
+        if time.monotonic() > deadline:
+            http_server.should_exit = True
+            raise RuntimeError(
+                f"HTTP listener did not finish starting within {timeout_s}s; refusing to open "
+                f"HTTPS against an uninitialised app (raise PROXY_STARTUP_TIMEOUT_S if startup "
+                f"is legitimately slow)")
+        await asyncio.sleep(0.05)
+
+
+def _cert_not_after(path: str) -> float | None:
+    """Expiry of a PEM certificate as an epoch, or None if it can't be read.
+
+    `_test_decode_cert` is private, but it is the only stdlib way to read a certificate from
+    disk without opening a connection, and this package deliberately carries no crypto
+    dependency. `cert_time_to_seconds` beside it is public. Both are wrapped: a certificate we
+    cannot parse must cost the metric, never the health endpoint.
+    """
+    try:
+        info = ssl._ssl._test_decode_cert(path)
+        return ssl.cert_time_to_seconds((info or {})["notAfter"])
+    except Exception:
+        return None
+
+
+def _tls_status() -> dict:
+    """Expiry of the configured HTTPS certificate.
+
+    Expiry is the same shape of failure as pool exhaustion: scheduled, silent, and total the
+    moment it lands, with nothing reporting it beforehand. Health is where it belongs — the
+    file is stat'd per call and only re-parsed when it changes, so a polling UI costs nothing.
+    """
+    cert = os.environ.get("PROXY_SSL_CERT", "").strip()
+    try:
+        port = int(os.environ.get("PROXY_HTTPS_PORT", "0") or "0")
+    except ValueError:
+        port = 0
+    if not cert or port <= 0:
+        return {"enabled": False}
+    out = {"enabled": True, "port": port, "cert": cert, "exists": False}
+    try:
+        mtime = Path(cert).stat().st_mtime
+    except OSError:
+        # Configured but unreadable: HTTPS did not start, and silence would read as healthy.
+        return out
+    out["exists"] = True
+    key = (cert, mtime)
+    if _TLS_CACHE.get("key") != key:
+        _TLS_CACHE["key"] = key
+        _TLS_CACHE["value"] = _cert_not_after(cert)
+    not_after = _TLS_CACHE.get("value")
+    if not_after is None:
+        return out
+    days = (not_after - time.time()) / 86400.0
+    out["not_after"] = not_after
+    out["days_remaining"] = round(days, 2)
+    out["expired"] = days <= 0
+    out["expiring_soon"] = days <= TLS_EXPIRY_WARN_DAYS
+    return out
+
+
+def _tls_watch() -> None:
+    """Warn while the certificate is still valid, rather than after it isn't."""
+    s = _tls_status()
+    if not s.get("enabled") or not s.get("expiring_soon"):
+        return
+    if time.time() - _TLS_WARNED["at"] < 3600:
+        return          # hourly: this is a slow-moving condition, not an incident
+    _TLS_WARNED["at"] = time.time()
+    days = s.get("days_remaining")
+    try:
+        if s.get("expired"):
+            print(f"[tls] certificate {s['cert']} EXPIRED {abs(days):.1f} days ago — "
+                  f"HTTPS clients are failing")
+        else:
+            print(f"[tls] certificate {s['cert']} expires in {days:.1f} days")
+    except Exception:
+        pass
 
 
 def _pool_stats() -> dict:
@@ -13535,6 +13731,7 @@ async def _inflight_zombie_killer(app: FastAPI):
                 except Exception:
                     pass
             _pool_watch()
+            _tls_watch()
             for req_id in list(_INFLIGHT_REQUESTS.keys()):
                 info = _INFLIGHT_REQUESTS.get(req_id)
                 if not info or info.get("cancelled"):
@@ -17767,15 +17964,27 @@ def main():
                 http_server = uvicorn.Server(http_cfg)
                 https_server = uvicorn.Server(https_cfg)
                 http_task = asyncio.create_task(http_server.serve())
-                # Wait for HTTP server lifespan startup to complete before opening HTTPS,
-                # so the shared httpx client / DB are ready when HTTPS requests arrive.
-                for _ in range(50):
-                    await asyncio.sleep(0.1)
-                    if getattr(http_server, "started", False):
-                        break
+
+                await _wait_for_http_start(http_server, http_task, STARTUP_TIMEOUT_S)
                 https_task = asyncio.create_task(https_server.serve())
                 try:
-                    await asyncio.gather(http_task, https_task)
+                    # Not gather(): the HTTPS server runs with lifespan="off" and borrows the
+                    # HTTP server's client and database, so it must never outlive it answering
+                    # requests against torn-down state. Whichever stops first takes the other
+                    # down with it.
+                    done, pending = await asyncio.wait(
+                        {http_task, https_task}, return_when=asyncio.FIRST_COMPLETED)
+                    http_server.should_exit = True
+                    https_server.should_exit = True
+                    for t in pending:
+                        try:
+                            await asyncio.wait_for(t, timeout=(GRACEFUL_SHUTDOWN_S or 10) + 5)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            t.cancel()
+                    for t in done:
+                        exc = t.exception()
+                        if exc and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            raise exc
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     pass
 
