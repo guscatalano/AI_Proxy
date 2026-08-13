@@ -1,0 +1,29 @@
+{
+  "_comment": "Listing-as-code for the Microsoft Store (product 9N00C9KJPXT2, language en-us). NOTE: this app has NOT had its first Store submission yet - complete it once in Partner Center (age rating, pricing, privacy URL, screenshots, real store logos - the msix assets are placeholders per packaging/windows/README.md) before the automated pipeline can publish. Store limits: Title<=256, ShortDescription<=1000, Description<=10000, each Feature<=200 (<=20 items), ReleaseNotes<=1500, Keywords<=7 (<=30 each). Title MUST match the reserved app name in Partner Center.",
+  "Title": "AI Proxy",
+  "ShortTitle": null,
+  "ShortDescription": "A transparent inspector and rule engine for AI API traffic. Sits between your AI clients (Claude Code, Copilot Chat, Cursor, raw SDKs) and upstreams like Anthropic, Ollama, LM Studio, or vLLM - logging every request, tool call, and token count, applying configurable rules, and showing it all in a live local web dashboard.",
+  "Description": "AI Proxy is a transparent inspector and rule engine that sits between your AI clients (Claude Code, GitHub Copilot Chat, Cursor, raw SDKs) and their upstreams (Anthropic, Ollama, LM Studio, vLLM, anything OpenAI-compatible). Point your client's base URL at the proxy and every request, response, tool call, token count, and conversation thread is captured automatically - no client changes required. A live web dashboard runs locally at http://127.0.0.1:8000/__proxy/.\n\nOBSERVE\n• Inspect every request - full bodies, headers, streaming chunks, tool calls, token counts, and latency, searchable and filterable by client app.\n• Group requests into conversations automatically, with a turn-by-turn timeline, in-conversation search, and message-type filters.\n• Watch traffic live - one tile per active conversation, with elapsed time and token counts updating as the model generates.\n• Identify the client app (Claude Code, VS Code Copilot Chat, Cursor, Continue, Cline, SDKs, and more) via fingerprinting.\n• Track artifacts - files, URLs, directories, and images the model touched through tool calls, browsable by conversation or folder.\n• Aggregate stats - per-model, per-client, per-app, and per-tool counts, tokens, latency percentiles, and trend charts.\n• System metrics - CPU, memory, GPU utilization and VRAM, and loaded models on Ollama, LM Studio, and vLLM.\n\nINTERVENE\n• Translate Anthropic and OpenAI API shapes in both directions, so Claude Code can talk to any OpenAI-compatible backend (Ollama, LM Studio, vLLM).\n• Route requests across models and upstreams with conditional rules on model name, prompt size, tool presence, image presence, client IP, or path.\n• Pluggable rule pipeline - pre-flight and post-flight rules with a JSON editor and quick-toggle UI. Changes apply on the next request; no restart.\n• Compress bloated context, guard against silent context-window truncation, validate and auto-fix malformed tool calls, and block tool-call loops.\n• Shadow runs - send the same request to a primary upstream and a local model in parallel and get an automatic side-by-side comparison.\n• Take control - kill a stuck in-flight request to free the GPU, or flip panic mode to stop all proxied traffic while keeping the dashboard up.\n\nAUTOMATE\n• Auditor suggestions - the proxy analyzes recent traffic and recommends configuration changes.\n• Benchmarks - compare models on speed and correctness, sweeping models, context sizes, thinking modes, and temperatures in one submission.\n• Scheduled tasks - queue a prompt to run one-shot or on a schedule, with pause, resume, and run-now controls.\n• MCP server - exposes the captured data via the Model Context Protocol, so an LLM can query traffic patterns directly.\n\nRuns entirely on your machine: a single local process with SQLite-backed storage and no build step. PII redaction is on by default for viewers on other subnets. There is no built-in authentication - bind to 127.0.0.1 for local-only use. Open source (MIT): github.com/guscatalano/AI_Proxy",
+  "Keywords": [
+    "AI proxy",
+    "LLM inspector",
+    "API traffic",
+    "Ollama",
+    "Claude Code",
+    "OpenAI compatible",
+    "local AI"
+  ],
+  "Features": [
+    "Inspect every AI API request: full bodies, headers, streaming chunks, tool calls, token counts, and latency",
+    "Live local dashboard with automatic conversation threading and real-time token counts",
+    "Translate Anthropic and OpenAI API shapes so Claude Code can use any OpenAI-compatible backend",
+    "Route requests across models and upstreams (Ollama, LM Studio, vLLM) with conditional rules",
+    "Rule pipeline that blocks tool-call loops, fixes malformed tool calls, and compresses bloated context",
+    "Shadow runs: compare a primary upstream against a local model side by side",
+    "Benchmarks, usage stats, system metrics, scheduled tasks, and an MCP server for querying traffic"
+  ],
+  "ReleaseNotes": "Initial release.",
+  "CopyrightAndTrademarkInfo": "© 2026 Gus Catalano",
+  "LicenseTerms": "",
+  "DevStudio": "Gus Catalano"
+}

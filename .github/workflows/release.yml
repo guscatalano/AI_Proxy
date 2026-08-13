@@ -247,3 +247,14 @@ jobs:
           name: v${{ needs.version.outputs.version }}
           files: release/*
           fail_on_unmatched_files: true
+
+  publish-store:
+    # Publish the MSIX to the Microsoft Store (product 9N00C9KJPXT2) via the shared
+    # reusable workflow. Requires the first submission to have been completed once
+    # manually in Partner Center; listing text lives in store/listing.en-us.json.
+    needs: windows-installers
+    uses: guscatalano/store-publish/.github/workflows/publish.yml@main
+    with:
+      product-id: 9N00C9KJPXT2
+      package-artifact: installer-msix
+    secrets: inherit
