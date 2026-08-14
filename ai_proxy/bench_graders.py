@@ -924,6 +924,23 @@ _LANG_SIGNATURES = (
 )
 
 
+# Fence tags that are never an answer to "which language did you choose". Data formats,
+# diagrams and schedules are things a model emits ALONGSIDE its answer, so counting one as
+# the choice both misgrades the task and pollutes the preference distribution — a model that
+# drew a Mermaid diagram beside its REST design was recorded as preferring "mermaid".
+_LANG_NEVER = {
+    "", "text", "txt", "output", "plaintext", "diff", "log", "console", "shell-session",
+    "cron", "crontab", "mermaid", "plantuml", "dot", "graphviz", "csv", "tsv",
+    "json", "yaml", "yml", "toml", "ini", "properties", "env", "markdown", "md", "rst",
+}
+# Real languages, but usually the packaging around an answer rather than the answer. Used
+# only when nothing better appears — which is what lets a genuinely shell-shaped task
+# (nightly log rotation) still resolve to bash.
+# powershell is deliberately NOT here: it is the right answer to the Windows-ops task and a
+# directed target elsewhere, so demoting it would misread a correct choice as packaging.
+_LANG_WEAK = {"html", "css", "xml", "makefile", "dockerfile", "bash", "sh", "shell", "batch"}
+
+
 def _bench_detect_language(answer: str) -> tuple:
     """(language, how) for the code in a reply — what the model REACHED FOR.
 
@@ -939,14 +956,19 @@ def _bench_detect_language(answer: str) -> tuple:
     for tag, code in blocks:
         t = (tag or "").strip().lower()
         lang = _LANG_ALIASES.get(t, t)
-        if lang and lang not in ("text", "txt", "output", "plaintext", "", "diff"):
+        if lang and lang not in _LANG_NEVER:
             tagged.append((lang, len(code)))
     if tagged:
-        scaffolding = {"html", "css", "json", "yaml", "toml", "xml", "ini", "makefile",
-                       "dockerfile", "bash"}
-        real = [(l, n) for l, n in tagged if l not in scaffolding]
-        pick = max(real or tagged, key=lambda p: p[1])
-        return pick[0], "fence"
+        # Three tiers, not two. With only "real vs scaffolding", an ops answer consisting of
+        # a full bash script plus a two-line crontab entry resolved to `cron`: bash was
+        # demoted as scaffolding, which left the crontab as the only "real" candidate and it
+        # won on a technicality. It scored the model wrong AND recorded `cron` as a language
+        # it reaches for. A schedule is not a language; a shell script is, when the task is
+        # shell-shaped.
+        real = [(l, n) for l, n in tagged if l not in _LANG_WEAK]
+        weak = [(l, n) for l, n in tagged if l in _LANG_WEAK]
+        if real or weak:
+            return max(real or weak, key=lambda p: p[1])[0], "fence"
     body = "\n".join(code for _t, code in blocks) or text
     for pattern, lang in _LANG_SIGNATURES:
         if re.search(pattern, body, re.M):

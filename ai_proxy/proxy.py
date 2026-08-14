@@ -9271,6 +9271,22 @@ async def _bench_model_index() -> dict:
                     loaded_context=lcp.get("n_ctx"),
                     checkpoint=lcp.get("model_path"),
                     parallel=lcp.get("parallel"))
+        # vLLM reports no weight size — its OpenAI /v1/models says nothing about bytes on disk,
+        # so every vLLM row rendered a blank in the report's size column and the memory chart
+        # could not describe the one backend where memory is tightest. Size the checkpoint in
+        # the Hugging Face cache instead, which is where vLLM put it.
+        for rec in index.values():
+            if rec.get("upstream") != "vllm" or rec.get("size_mb"):
+                continue
+            ckpt = rec.get("checkpoint")
+            if not ckpt:
+                continue
+            try:
+                total = _hf_cache_bytes(ckpt)
+                if total:
+                    rec["size_mb"] = round(total / 1048576)
+            except OSError:
+                pass          # a missing cache is a missing metric, not a broken index
         # A stopped llama.cpp offers no models at all, so once the bench stopped it to make room
         # for vLLM, its own cells could not resolve a model and failed preflight. The unit is
         # configured with exactly one model; offer that, the same way a stopped container is.
@@ -9399,6 +9415,40 @@ async def _ollama_capabilities(client, name: str):
         caps = None
     _OLLAMA_CAPS[name] = caps
     return caps
+
+
+def _hf_cache_bytes(checkpoint: str) -> int:
+    """Bytes on disk for a Hugging Face repo id, or a local checkpoint path.
+
+    vLLM serves whatever `--model` named: either a path, or a repo id it downloaded into the
+    cache as `models--org--name`. Only weight files are counted — a repo also carries configs,
+    tokenizers and often the original unquantised safetensors under a different revision, and
+    summing the directory would report a number nobody is holding in memory.
+    """
+    p = Path(checkpoint)
+    if p.is_dir():
+        roots = [p]
+    else:
+        cache = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
+        hub = cache / "hub" if (cache / "hub").is_dir() else cache
+        slug = "models--" + checkpoint.strip("/").replace("/", "--")
+        root = hub / slug / "snapshots"
+        if not root.is_dir():
+            return 0
+        # Newest revision only: an updated repo leaves the previous snapshot in place, and
+        # adding them together would double the model's apparent size.
+        revs = sorted((d for d in root.iterdir() if d.is_dir()),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+        roots = revs[:1]
+    total = 0
+    for r in roots:
+        for f in r.rglob("*"):
+            if f.suffix.lower() in (".safetensors", ".bin", ".gguf", ".pt") and f.is_file():
+                try:
+                    total += f.stat().st_size      # follows the symlink into blobs/
+                except OSError:
+                    pass
+    return total
 
 
 def _bench_fits(size_mb: float | None, total_mb: float | None) -> bool | None:
@@ -12404,7 +12454,33 @@ async def _bench_resident_mb(model: str, upstream: str) -> float | None:
             return None
     except (httpx.RequestError, ValueError, KeyError):
         return None
+    # vLLM holds its weights inside a container that was already running, so the caller's
+    # "what did the machine lose while this loaded" fallback measures nothing — it reported
+    # 712 MB for a 20 GB model. Ask the container what it is holding instead.
+    if upstream == "vllm":
+        try:
+            name = await _vllm_container()
+            docker = _docker_bin()
+            if name and docker:
+                rc, out = await _run_cmd(
+                    [docker, "stats", "--no-stream", "--format", "{{.MemUsage}}", name],
+                    timeout=25.0)
+                if rc == 0:
+                    return _docker_mem_mb(out)
+        except Exception:
+            return None          # an unreadable container costs the metric, not the run
     return None
+
+
+def _docker_mem_mb(usage: str) -> float | None:
+    """Megabytes from a `docker stats` MemUsage cell, e.g. '12.34GiB / 121GiB' -> 12636."""
+    m = re.match(r"\s*([\d.]+)\s*([KMGT]?i?B)", usage or "", re.I)
+    if not m:
+        return None
+    scale = {"b": 1 / 1048576, "kib": 1 / 1024, "kb": 1 / 1024, "mib": 1.0, "mb": 1.0,
+             "gib": 1024.0, "gb": 1024.0, "tib": 1048576.0, "tb": 1048576.0}
+    factor = scale.get(m.group(2).lower())
+    return round(float(m.group(1)) * factor) if factor else None
 
 
 async def _bench_reload_ollama(names: list) -> list:
@@ -13100,7 +13176,12 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 # What this cell's model actually needs resident, so the wait has a target
                 # rather than a guess. Unknown size falls back to no target, which is the old
                 # behaviour and no worse.
-                _want = model_meta.get("size_mb")
+                # A model already resident needs no room made for it — its weights are inside
+                # the pool its backend allocated at boot. Asking for size_mb of FREE memory on
+                # top double-counts, and it stamped every vLLM cell "measured under memory
+                # pressure — only 22 GB free; 23 GB wanted" while the 20 GB in question was
+                # already loaded and serving requests.
+                _want = 0 if model_meta.get("loaded") else (model_meta.get("size_mb") or 0)
                 _want = _want * _BENCH_FIT_OVERHEAD if _want else 0
                 # A standalone run owns the restore; inside a sweep the suite already recorded
                 # the box before its first cell and puts everything back at the end.

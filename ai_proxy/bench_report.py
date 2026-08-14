@@ -321,6 +321,35 @@ _REPORT_CSS = """
          overflow:hidden; border:1px solid var(--border); min-width:60px; }
   .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--accent-deep),var(--accent)); }
   svg { margin:4px 0 16px; display:block; }
+  /* Language profile: one stacked bar per model. Colours are assigned per language so the
+     same language keeps its colour down the column and the eye can compare rows directly. */
+  .langbars { margin:6px 0 16px; }
+  .lrow { display:flex; align-items:center; gap:12px; margin:0 0 3px; }
+  .lname { flex:0 0 auto; min-width:15ch; text-align:right; }
+  .lbar { flex:1 1 auto; display:flex; height:26px; border-radius:5px; overflow:hidden;
+          border:1px solid var(--border); background:var(--panel-2); min-width:220px; }
+  .lseg { display:flex; align-items:center; justify-content:center; font-family:var(--mono);
+          font-size:11px; color:#05080c; font-weight:700; white-space:nowrap; overflow:hidden;
+          box-shadow:inset -1px 0 0 rgba(0,0,0,.28); letter-spacing:-.2px; }
+  .lleg { display:flex; flex-wrap:wrap; gap:4px 14px; font-family:var(--mono); font-size:11px;
+          color:var(--ink-dim); margin:0 0 14px calc(15ch + 12px); }
+  .lchip { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
+  .lchip i { width:9px; height:9px; border-radius:2px; display:inline-block; flex:none;
+             border:1px solid rgba(0,0,0,.35); }
+  .lseg-none { background:repeating-linear-gradient(45deg,var(--panel-2),var(--panel-2) 5px,
+               var(--border) 5px,var(--border) 10px); color:var(--ink-dim); }
+  details.lnum { margin:0 0 16px; }
+  details.lnum summary { cursor:pointer; color:var(--ink-faint); font-size:12.5px; }
+  .lang-python { background:#5b9bd5; } .lang-javascript { background:#e6c84f; }
+  .lang-typescript { background:#4b8bbe; } .lang-c { background:#8fb7d9; }
+  .lang-cpp { background:#a06fc4; } .lang-csharp { background:#7bc47b; }
+  .lang-java { background:#e08a4a; } .lang-go { background:#57d1e0; }
+  .lang-rust { background:#d97757; } .lang-kotlin { background:#b58ae0; }
+  .lang-bash { background:#8aa06a; } .lang-powershell { background:#6d8ed6; }
+  .lang-html { background:#d9736a; } .lang-css { background:#6ab0d9; }
+  .lang-lua { background:#7f8ce0; } .lang-sql { background:#c9a35e; }
+  .lang-php { background:#9a8fd0; } .lang-ruby { background:#d96a7f; }
+  .lang-swift { background:#e09a5a; } .lang-scala { background:#d95f5f; }
   .ct { font-size:10.5px; fill:var(--ink-faint); font-weight:600; text-transform:uppercase;
         letter-spacing:.6px; font-family:var(--sans); }
   .cl { font-size:11.5px; fill:var(--ink-dim); font-family:var(--sans); }
@@ -788,18 +817,25 @@ def _bench_efficiency_html(rows: list) -> str:
     def nm(r):
         return (r.get("_name") or _bench_label_display(r.get("label") or "")).split(" · ")[0]
 
-    seen, entries = set(), []
-    for r in sorted(usable, key=lambda r: -(r.get("perfect_rate") or 0)):
-        name = nm(r)
-        if name in seen:
-            continue
-        seen.add(name)
-        solved = (r["perfect_rate"] or 0) * r["n_total"]
-        if solved <= 0:
+    # Aggregate every row a model has, rather than keeping one of them. The previous version
+    # sorted by perfect_rate and kept the FIRST row per model — which silently reported each
+    # model at its best suite. A model with a 65% full-v2 row and a 100% langpref row was
+    # printed as "100% correct", flattering everything and comparing nothing.
+    acc: dict = {}
+    for r in usable:
+        a = acc.setdefault(nm(r), {"tasks": 0, "solved": 0.0, "spent": 0.0, "think": []})
+        a["tasks"] += r["n_total"]
+        a["solved"] += (r["perfect_rate"] or 0) * r["n_total"]
+        a["spent"] += r["mean_tokens"] * r["n_total"]
+        if r.get("reasoning_tok_p50"):
+            a["think"].append(r["reasoning_tok_p50"])
+    entries = []
+    for name, a in acc.items():
+        if a["solved"] <= 0:
             continue          # nothing solved: a per-solved figure would be a divide by zero
-        spent = r["mean_tokens"] * r["n_total"]
-        entries.append({"m": name, "per": spent / solved, "mean": r["mean_tokens"],
-                        "q": r["perfect_rate"], "think": r.get("reasoning_tok_p50")})
+        entries.append({"m": name, "per": a["spent"] / a["solved"],
+                        "mean": a["spent"] / a["tasks"], "q": a["solved"] / a["tasks"],
+                        "think": (sum(a["think"]) / len(a["think"])) if a["think"] else None})
     if len(entries) < 2:
         return ""
     entries.sort(key=lambda e: e["per"])
@@ -879,6 +915,17 @@ def _bench_variance_html(runs: list, rows: list, axis_names: list) -> str:
             f'<tbody>{"".join(trs)}</tbody></table></div>')
 
 
+# Short codes for bar segments too narrow for the full name. One task out of sixteen is ~6%
+# of the bar — enough for "ps1", not for "powershell".
+_LANG_SHORT = {
+    "python": "py", "javascript": "js", "typescript": "ts", "csharp": "c#", "cpp": "c++",
+    "powershell": "ps1", "kotlin": "kt", "rust": "rs", "ruby": "rb", "bash": "sh",
+    "shell": "sh", "java": "java", "swift": "swift", "scala": "scala", "html": "html",
+    "css": "css", "sql": "sql", "go": "go", "lua": "lua", "php": "php", "c": "c",
+    "perl": "pl", "haskell": "hs", "elixir": "ex", "clojure": "clj", "dart": "dart",
+}
+
+
 def _bench_language_profile_html(runs: list, axis_names: list) -> str:
     """What each model reached for when the task did not say.
 
@@ -910,15 +957,52 @@ def _bench_language_profile_html(runs: list, axis_names: list) -> str:
         return ""
 
     head = "".join(f'<th class="n">{_h(m)}</th>' for m in models)
+
+    # One stacked bar per model instead of a language×model grid. The grid was mostly dashes
+    # — thirteen rows, four columns, and the answer to "what does this model reach for" was
+    # spread across all of them. A bar puts each model's disposition on one line, in order,
+    # with the dominant language first and unmistakable.
+    order = sorted(langs, key=lambda l: -sum(
+        1 for m in models for t in tasks if picks[m].get(t) == l))
+    bars = []
+    for m in models:
+        counts = [(l, sum(1 for t in tasks if picks[m].get(t) == l)) for l in order]
+        counts = [(l, n) for l, n in counts if n]
+        counts.sort(key=lambda p: -p[1])
+        undet = len(tasks) - sum(n for _l, n in counts)
+        segs = []
+        for l, n in counts:
+            pct = n / len(tasks) * 100
+            # Every segment gets a label. A one-task segment is ~6% of the bar, far too narrow
+            # for "powershell", so narrow segments fall back to a short code — readable at a
+            # glance, where an unlabelled block was readable only by hovering it.
+            label = _h(l) if pct >= 15 else _h(_LANG_SHORT.get(l, l[:3]))
+            segs.append(f'<span class="lseg lang-{_h(l)}" style="width:{pct:.4f}%" '
+                        f'title="{_h(l)}: {n} of {len(tasks)} ({pct:.0f}%)">{label}</span>')
+        if undet:
+            pct = undet / len(tasks) * 100
+            segs.append(f'<span class="lseg lseg-none" style="width:{pct:.4f}%" '
+                        f'title="no identifiable code: {undet} of {len(tasks)}">—</span>')
+        # Colour-keyed legend: the swatch is what ties a narrow "ps1" back to powershell.
+        chips = "".join(f'<span class="lchip"><i class="lang-{_h(l)}"></i>{_h(l)} {n}</span>'
+                        for l, n in counts)
+        if undet:
+            chips += f'<span class="lchip"><i class="lseg-none"></i>no code {undet}</span>'
+        bars.append(f'<div class="lrow"><div class="lname"><code class="mdl">{_h(m)}</code></div>'
+                    f'<div class="lbar">{"".join(segs)}</div></div>'
+                    f'<div class="lleg">{chips}</div>')
+    prof_html = f'<div class="langbars">{"".join(bars)}</div>'
+
     prof = []
-    for lang in sorted(langs, key=lambda l: -sum(
-            1 for m in models for v in [picks[m].get(t) for t in tasks] if v == lang)):
+    for lang in order:
         cells = []
         for m in models:
             n = sum(1 for t in tasks if picks[m].get(t) == lang)
             share = n / len(tasks) * 100 if tasks else 0
+            # Parenthesised, because "1 6%" and "7 44%" were unreadable — the count and the
+            # share ran together into what looked like one number (16%, 744%).
             cells.append(f'<td class="n">{n or "—"}'
-                         + (f' <span class="ct">{share:.0f}%</span>' if n else "") + "</td>")
+                         + (f' <span class="ct">({share:.0f}%)</span>' if n else "") + "</td>")
         prof.append(f'<tr><th scope="row"><code>{_h(lang)}</code></th>{"".join(cells)}</tr>')
 
     grid = []
@@ -991,8 +1075,13 @@ def _bench_language_profile_html(runs: list, axis_names: list) -> str:
             '<p class="note">None of these prompts names a language. What came back is the '
             'model\'s disposition: what it reaches for when the choice is left open. '
             'Nothing here is graded on whether the code runs.</p>'
+            f'<p class="note">Each bar is one model across the {len(tasks)} free-choice '
+            f'tasks, widest language first. <b>none</b> means no identifiable code came '
+            f'back — a diagram or prose rather than a program.</p>'
+            f'{prof_html}'
+            '<details class="lnum"><summary>The same thing as numbers</summary>'
             f'<div class="tbl"><table><thead><tr><th>Language</th>{head}</tr></thead>'
-            f'<tbody>{"".join(prof)}</tbody></table></div>'
+            f'<tbody>{"".join(prof)}</tbody></table></div></details>'
             f'{note_html}'
             '<p class="note">Task by task — highlighted rows are where the models '
             'disagreed, which is where the choice was actually a judgement call.</p>'
@@ -2017,6 +2106,28 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     def pct(v):
         return "—" if v is None else f"{v * 100:.0f}%"
 
+    # Suites are not comparable, and every ranking below assumes they are ------------------
+    #
+    # A report handed both a 119-task full suite and a 24-task language-preference suite used
+    # to rank their rows against each other. Language preference grades "did you pick a
+    # defensible language", so a model scoring 24/24 there outranked one scoring 101/119 on
+    # the real thing — and that false winner propagated into the headline, the standings, the
+    # category winners, the scatter and the memory chart. Rank inside the largest suite only;
+    # the other suites keep their own sections, which is what they were for.
+    _by_suite: dict = {}
+    for _r, _run in zip(rows, runs):
+        _by_suite.setdefault(_r.get("suite") or "—", []).append((_r, _run))
+    _primary = max(_by_suite, key=lambda s: (
+        max((x[0].get("n_total") or 0) for x in _by_suite[s]), len(_by_suite[s])))
+    _other_suites = [s for s in _by_suite if s != _primary]
+    # The language section is about the language suite, so it keeps every run. Its own naming
+    # only needs the model, which is the head of the label.
+    _lang_pairs = [(run, (r.get("label") or r.get("model") or ""))
+                   for s in _by_suite for (r, run) in _by_suite[s]]
+    if _other_suites:
+        rows = [r for (r, _run) in _by_suite[_primary]]
+        runs = [run for (_r, run) in _by_suite[_primary]]
+
     # Table -------------------------------------------------------------------------------
     varying, constant, axis_vals = _bench_axis_split(rows, runs)
     # Best first. Run order is an implementation detail of the sweep, and a reader scanning
@@ -2583,7 +2694,20 @@ ordinary slowness rather than a misconfiguration.</p>
     # single-purpose suites do not, and the renderer returns "" for them.
     category_html = _bench_category_html(tasks, axis_names) if graded else ""
     efficiency_html = _bench_efficiency_html(rows) if graded else ""
-    langpref_html = _bench_language_profile_html(runs, axis_names)
+    langpref_html = _bench_language_profile_html([p[0] for p in _lang_pairs],
+                                                 [p[1] for p in _lang_pairs])
+    # Say what was set aside, so a reader counting runs in the URL against rows in the table
+    # is not left wondering which ones went missing.
+    if _other_suites:
+        _n_other = sum(len(_by_suite[s]) for s in _other_suites)
+        langpref_html = (
+            f'<p class="note">Scores, standings and charts above describe '
+            f'<b>{_h(_primary)}</b> only. {_n_other} further run'
+            f'{"s" if _n_other != 1 else ""} from '
+            f'{", ".join("<b>" + _h(s) + "</b>" for s in _other_suites)} '
+            f'{"are" if _n_other != 1 else "is"} reported in their own sections rather than '
+            f'ranked alongside — a 24-task preference suite and a 119-task correctness suite '
+            f'produce numbers that do not mean the same thing.</p>') + langpref_html
     variance_html = _bench_variance_html(runs, rows, axis_names) if graded else ""
     body = f"""
   {results}
