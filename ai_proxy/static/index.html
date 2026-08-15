@@ -2169,7 +2169,6 @@ function renderList() {
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
     const imgBadge = it.has_images ? '<span class="badge" title="contains an image / non-text content" style="background:#3a2a4a;color:#d0b0f0;border-color:#5a3a6a">🖼 img</span>' : '';
-    const thinkB = thinkBadgeFor(it);
     const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
@@ -2197,7 +2196,7 @@ function renderList() {
       pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
     }
     else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${thinkB}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
@@ -2563,22 +2562,6 @@ function analyzeThinking(d) {
   }
   if (!isGen && !thought && requested === 'default') return null;
   return { requested, thought, reasoningTokens, signal, by };
-}
-
-// The same verdict as a one-glance badge for the requests list, where there is no body to
-// parse — the row already carries the recorded columns.
-function thinkBadgeFor(it) {
-  const mode = it.thinking, eff = it.reasoning_effort, src = it.thinking_src || '';
-  if (!mode) return '';
-  const byProxy = src.startsWith('quirk:');
-  const who = byProxy ? 'the proxy (model quirk ' + src.slice(6) + ')' : 'the client (' + src + ')';
-  if (mode === 'off') {
-    return `<span class="badge" title="thinking off — set by ${esc(who)}"
-      style="background:#2a2a2e;color:#9098a8;border-color:#3a3f4a">🚫 no-think</span>`;
-  }
-  const lvl = eff ? ' ' + eff : '';
-  return `<span class="badge" title="thinking on${eff ? ' at effort ' + eff : ''} — set by ${esc(who)}"
-    style="background:#3a3220;color:#f0c674;border-color:#5a4a28">💭${esc(lvl) || ' think'}</span>`;
 }
 
 function renderAnalysis(d) {
