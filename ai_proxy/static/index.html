@@ -208,6 +208,12 @@
   /* Queued-but-not-yet-posted files. Dashed, because they are not on the board until you post
      and a chip identical to a real attachment would claim otherwise. */
   .sb-file.pend { border-style: dashed; border-color: #3a4658; color: #9fb0c8; }
+  /* Origin chip. Legible on purpose: on a board every machine writes to, where a note came
+     from is half of what it says. */
+  .sb-ip { color: #8d99ad; background: #0c1016; border: 1px solid #232a35; border-radius: 4px;
+    padding: 1px 6px; font-size: 11px; }
+  .sb-ip.me { color: #57d1e0; border-color: #24505a; }
+  .sb-ip.none { color: #5d6675; font-style: italic; }
   .sb-file.pend a { color: #6c7789; cursor: pointer; font-size: 12px; }
   .sb-file.pend a:hover { color: #e08080; }
   #sb-pending { display: flex; flex-wrap: wrap; gap: 6px; margin: -8px 0 14px; max-width: 900px; }
@@ -1343,6 +1349,8 @@ function setView(v) {
 // subnet sees a different version of would not be shared. Agents can read it over MCP.
 const SB_AUTHOR_KEY = 'proxy.scratch.author';
 
+let SB_MY_IP = null;
+
 async function loadWork() {
   const host = $('work');
   if (!host) return;
@@ -1350,6 +1358,12 @@ async function loadWork() {
   try {
     items = (await (await fetch('/__proxy/api/scratchboard')).json()).items || [];
   } catch { host.innerHTML = '<p class="sb-empty">Could not reach the scratchboard.</p>'; return; }
+  // Which address the proxy sees us as, so your own notes are marked on a board everybody
+  // shares. Fetched once — it does not change while the page is open.
+  if (SB_MY_IP === null) {
+    try { SB_MY_IP = (await (await fetch('/__proxy/api/whoami')).json()).ip || ''; }
+    catch { SB_MY_IP = ''; }
+  }
 
   const who = localStorage.getItem(SB_AUTHOR_KEY) || '';
   // Attachments render as a row of download chips. Size is shown because "report.zip" tells
@@ -1370,7 +1384,7 @@ async function loadWork() {
       <div class="sb-meta">
         <span class="who">${esc(r.author || 'anonymous')}</span>
         <span>${esc(when)}</span>
-        ${r.client_ip ? `<span style="color:#4d5666">${esc(r.client_ip)}</span>` : ''}
+        ${sbOrigin(r)}
         <a onclick="sbCopy(this)">copy</a>
         <a onclick="sbDelete('${esc(r.id)}')" style="margin-left:10px">delete</a>
       </div>
@@ -1389,7 +1403,7 @@ async function loadWork() {
         ${n.orphaned ? '<span title="the note this answered was deleted">↳ orphaned reply</span>' : ''}
         <span class="who">${esc(n.author || 'anonymous')}</span>
         <span>${esc(when)}</span>
-        ${n.client_ip ? `<span style="color:#4d5666">${esc(n.client_ip)}</span>` : ''}
+        ${sbOrigin(n)}
         ${count ? `<span style="color:#57d1e0">${count} repl${count === 1 ? 'y' : 'ies'}</span>` : ''}
         <a onclick="sbCopy(this)">copy</a>
         <a onclick="sbAttach('${esc(n.id)}')" style="margin-left:10px">attach</a>
@@ -1430,6 +1444,16 @@ async function loadWork() {
       attach them to it.</p>
     ${notes}`;
   sbRenderPending();   // a queued file must survive the re-render that follows every action
+}
+
+// Where a note came from. It was always recorded, but drawn in #4d5666 on a #10141c card it
+// was effectively invisible — the board looked anonymous. On a shared board the origin is
+// half the message: "who said don't touch this" is the point of reading it.
+function sbOrigin(n) {
+  const ip = n.client_ip;
+  if (!ip) return `<span class="sb-ip none" title="posted through a path that carried no client address (an MCP call without a request context)">origin unknown</span>`;
+  const me = ip === SB_MY_IP ? ' me' : '';
+  return `<span class="sb-ip${me ? ' me' : ''}" title="posted from ${esc(ip)}${me ? ' — this machine' : ''}">${esc(ip)}${me}</span>`;
 }
 
 const sbFmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
@@ -2145,6 +2169,7 @@ function renderList() {
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
     const imgBadge = it.has_images ? '<span class="badge" title="contains an image / non-text content" style="background:#3a2a4a;color:#d0b0f0;border-color:#5a3a6a">🖼 img</span>' : '';
+    const thinkB = thinkBadgeFor(it);
     const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
@@ -2172,7 +2197,7 @@ function renderList() {
       pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
     }
     else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${thinkB}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
@@ -2525,8 +2550,35 @@ function analyzeThinking(d) {
     }
   }
   if (!thought && (/<think>/.test(d.response_body || '') || /<think>/.test(sc))) thought = true;
+  // The recorded columns win over anything parsed out of the body: they carry the proxy's own
+  // quirk decision, and the stored body is the client's original, captured before the quirks
+  // run. A model whose thinking the proxy switched off looks untouched in the blob.
+  let by = 'client';
+  if (d.thinking) {
+    requested = d.thinking === 'off' ? 'off' : (d.reasoning_effort || 'on');
+    signal = d.thinking_src || signal;
+    if (String(d.thinking_src || '').startsWith('quirk:')) by = 'proxy';
+  } else if (d.reasoning_effort) {
+    requested = d.reasoning_effort;
+  }
   if (!isGen && !thought && requested === 'default') return null;
-  return { requested, thought, reasoningTokens, signal };
+  return { requested, thought, reasoningTokens, signal, by };
+}
+
+// The same verdict as a one-glance badge for the requests list, where there is no body to
+// parse — the row already carries the recorded columns.
+function thinkBadgeFor(it) {
+  const mode = it.thinking, eff = it.reasoning_effort, src = it.thinking_src || '';
+  if (!mode) return '';
+  const byProxy = src.startsWith('quirk:');
+  const who = byProxy ? 'the proxy (model quirk ' + src.slice(6) + ')' : 'the client (' + src + ')';
+  if (mode === 'off') {
+    return `<span class="badge" title="thinking off — set by ${esc(who)}"
+      style="background:#2a2a2e;color:#9098a8;border-color:#3a3f4a">🚫 no-think</span>`;
+  }
+  const lvl = eff ? ' ' + eff : '';
+  return `<span class="badge" title="thinking on${eff ? ' at effort ' + eff : ''} — set by ${esc(who)}"
+    style="background:#3a3220;color:#f0c674;border-color:#5a4a28">💭${esc(lvl) || ' think'}</span>`;
 }
 
 function renderAnalysis(d) {
@@ -3118,22 +3170,28 @@ async function loadDetail(id) {
   const think = analyzeThinking(d);
   if (think) {
     const lvlTxt = ['low','medium','high'].includes(think.requested) ? ': ' + think.requested : '';
+    // Who settled it. Saying "client sent" about a decision the proxy made on the client's
+    // behalf sends you looking through the client's config for a setting that isn't there.
+    const byTxt = think.signal
+      ? (think.by === 'proxy' ? ' (proxy quirk: ' + think.signal.replace('quirk:', '') + ')'
+                              : ' (client sent ' + think.signal + ')')
+      : '';
     let col, txt, tip;
     if (think.thought) {
       col = '#c8a8f0';
       const tok = think.reasoningTokens ? ' · ' + num(think.reasoningTokens) + ' tok' : '';
       txt = '💭 thinking' + lvlTxt + tok;
-      tip = 'model produced reasoning'
-        + (think.signal ? ' (client sent ' + think.signal + ')' : '')
+      tip = 'model produced reasoning' + byTxt
         + (think.reasoningTokens ? ' — ' + think.reasoningTokens + ' reasoning tokens' : '');
     } else if (think.requested === 'off') {
       col = '#8b93a0';
       txt = '🚫 no-think';
-      tip = 'thinking explicitly disabled by the client' + (think.signal ? ' (' + think.signal + ')' : '');
+      tip = (think.by === 'proxy' ? 'thinking disabled by a model quirk in the proxy'
+                                  : 'thinking explicitly disabled by the client') + byTxt;
     } else if (think.requested !== 'default') {
       col = '#f0c674';
       txt = '💭 think' + (lvlTxt || ': on') + ' (req)';
-      tip = 'client requested thinking (' + think.signal + ') but no reasoning was detected in the response';
+      tip = 'thinking was requested' + byTxt + ' but no reasoning was detected in the response';
     } else {
       col = '#8b93a0';
       txt = 'no-think';

@@ -546,6 +546,14 @@ MIGRATIONS = [
     # The scratchboard shipped without replies. Databases created since then already have the
     # column from SCHEMA; this is for the ones that do not.
     "ALTER TABLE scratchboard ADD COLUMN parent_id TEXT",
+    # Thinking, recorded at write time. It was only ever knowable by parsing the stored body
+    # in the browser, so nothing could filter or count by it — and the stored body is the
+    # client's original, taken before the model quirks run, so it cannot show what the proxy
+    # itself decided. Three separate values because they answer three different questions:
+    # what the client asked for, what actually happened, and who settled it.
+    "ALTER TABLE requests ADD COLUMN reasoning_effort TEXT",
+    "ALTER TABLE requests ADD COLUMN thinking TEXT",
+    "ALTER TABLE requests ADD COLUMN thinking_src TEXT",
     # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
     # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
     # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
@@ -6637,7 +6645,7 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
                   upstream, client_ip, client_app, surface, api_key_fp, gate_verdict, gate_rule, gate_reason,
-                  shadow_of, has_images
+                  shadow_of, has_images, reasoning_effort, thinking, thinking_src
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -11131,7 +11139,6 @@ async def memory_delete(scope: str):
 _SCRATCH_MAX_CHARS = 8000
 _SCRATCH_MAX_ROWS = 500
 _SCRATCH_MAX_FILE_BYTES = 8 * 1024 * 1024
-_SCRATCH_MAX_FILES_PER_NOTE = 10
 
 
 @app.get("/__proxy/api/scratchboard")
@@ -11259,13 +11266,6 @@ async def scratchboard_attach(entry_id: str, request: Request):
     if not conn.execute("SELECT 1 FROM scratchboard WHERE id = ?", (entry_id,)).fetchone():
         conn.close()
         return JSONResponse({"error": f"no note {entry_id!r}"}, status_code=404)
-    n = conn.execute("SELECT COUNT(*) FROM scratchboard_files WHERE note_id = ?",
-                     (entry_id,)).fetchone()[0]
-    if n >= _SCRATCH_MAX_FILES_PER_NOTE:
-        conn.close()
-        return JSONResponse(
-            {"error": f"note already has {n} files; limit {_SCRATCH_MAX_FILES_PER_NOTE}"},
-            status_code=409)
     fid = uuid.uuid4().hex[:16]
     conn.execute("INSERT INTO scratchboard_files (id, note_id, ts, name, mime, size, data) "
                  "VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -14880,6 +14880,84 @@ def _redact_row(row: dict, viewer_ip: str | None, *, originator_ip_field: str = 
     return row
 
 
+# Every dialect a client has used here to say "think" or "don't", in the order they override
+# each other: a body carrying both reasoning_effort and an explicit enable_thinking meant the
+# latter, because it is the one the template actually reads.
+_THINK_LEVELS = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"}
+
+
+def _thinking_intent(body) -> tuple[str | None, str | None, str | None]:
+    """What the client asked for: (effort, mode, source).
+
+    effort is the level when one was named ('low'/'medium'/'high'), mode is 'on' or 'off', and
+    source names the field that settled it — so a row can say *why* it was recorded that way
+    rather than leaving you to guess which of six dialects the client speaks. All three are
+    None when the request said nothing, which is the common case: most clients never mention
+    thinking and take whatever the model defaults to.
+    """
+    if not isinstance(body, dict):
+        return None, None, None
+    effort = mode = src = None
+
+    eff = body.get("reasoning_effort")
+    if eff is None and isinstance(body.get("reasoning"), dict):
+        eff = body["reasoning"].get("effort")
+    if eff is not None:
+        e = str(eff).strip().lower()
+        src = "reasoning_effort"
+        if e in ("none", "off"):
+            mode = "off"
+        elif e in _THINK_LEVELS:
+            effort, mode = _THINK_LEVELS[e], "on"
+        else:
+            mode = "on"
+
+    ctk = body.get("chat_template_kwargs")
+    et = body.get("enable_thinking")
+    if et is None and isinstance(ctk, dict):
+        et = ctk.get("enable_thinking")
+    if isinstance(et, bool):
+        mode, src = ("on" if et else "off"), "enable_thinking"
+
+    # Ollama's native field. Newer versions take a level here as well as a bool.
+    think = body.get("think")
+    if isinstance(think, bool):
+        mode, src = ("on" if think else "off"), "think"
+    elif isinstance(think, str) and think.strip().lower() in _THINK_LEVELS:
+        effort, mode, src = _THINK_LEVELS[think.strip().lower()], "on", "think"
+
+    t = body.get("thinking")
+    if isinstance(t, dict):
+        if t.get("type") == "disabled":
+            mode, src = "off", "thinking"
+        elif t.get("type") == "enabled":
+            b = t.get("budget_tokens") or 0
+            effort = "high" if b >= 8000 else "medium" if b >= 2000 else "low" if b > 0 else None
+            mode, src = "on", "thinking_budget"
+
+    # Qwen's in-band switches, which live in the prompt rather than the body.
+    last_user = ""
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        for m in reversed(msgs):
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    last_user = c
+                elif isinstance(c, list):
+                    last_user = " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
+                break
+    if not last_user and isinstance(body.get("prompt"), str):
+        last_user = body["prompt"]
+    if last_user:
+        if re.search(r"/no_think\b", last_user):
+            mode, src = "off", "/no_think"
+        elif re.search(r"/think\b", last_user):
+            mode, src = "on", "/think"
+
+    return effort, mode, src
+
+
 def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: str, body_text: str, body_json, model, is_stream: bool, upstream: str | None = None):
     conv_id = _conversation_id(body_json)
     turn = _turn_index(body_json)
@@ -14923,10 +15001,11 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     _url_imgs = any(k == "url" for (_i, _mt, k, _p) in _iter_request_images(body_json)) \
         if isinstance(body_json, dict) else False
     has_imgs = 1 if (imgs or _embedded_imgs or _url_imgs) else None
+    _effort, _think_mode, _think_src = _thinking_intent(body_json)
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, surface, api_key_fp, upstream, est_prompt_tokens, has_images)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, surface, api_key_fp, upstream, est_prompt_tokens, has_images, reasoning_effort, thinking, thinking_src)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -14945,6 +15024,9 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             upstream,
             est or None,
             has_imgs,
+            _effort,
+            _think_mode,
+            _think_src,
         ),
     )
     _blobs_upsert(conn, req_id,
@@ -16769,6 +16851,20 @@ async def proxy(full_path: str, request: Request):
             ctk["enable_thinking"] = want
             body_json["chat_template_kwargs"] = ctk
             ornith_think = want
+            # The row already holds what the client asked for; this is the only place that
+            # knows what it actually got. The stored body is the client's original, so
+            # without this the audit would show "nothing requested" for a model the proxy
+            # had just silently switched off.
+            try:
+                _conn = db()
+                _conn.execute(
+                    "UPDATE requests SET thinking=?, thinking_src=? WHERE id=?",
+                    ("on" if want else "off", f"quirk:{_tmode}", req_id),
+                )
+                _conn.commit()
+                _conn.close()
+            except Exception:
+                pass
     # system_nudge: some reasoning-trained models (Ornith) narrate their reasoning in the *content*
     # even with the <think> block disabled. A short system-prompt instruction is the only lever
     # that curbs that (the thinking toggle can't — it's not in a think block). Appended, not replaced.

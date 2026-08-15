@@ -238,9 +238,21 @@ def test_deleting_a_note_takes_its_files(client):
     assert client.get(f"/__proxy/api/scratchboard/files/{fid}").status_code == 404
 
 
-def test_the_per_note_file_cap_is_enforced(client):
+def test_a_note_takes_as_many_files_as_you_give_it(client):
+    """There was a cap of 10, invented rather than measured. Dropping a folder's worth of files
+    on a note is the normal case, and a 409 halfway through leaves the note half-attached."""
     _clear()
     nid = client.post("/__proxy/api/scratchboard", json={"text": "n"}).json()["id"]
-    for i in range(proxy._SCRATCH_MAX_FILES_PER_NOTE):
-        assert _attach(client, nid, f"f{i}.txt", b"x").status_code == 200
-    assert _attach(client, nid, "one-too-many.txt", b"x").status_code == 409
+    for i in range(25):
+        assert _attach(client, nid, f"f{i}.txt", b"x").status_code == 200, f"rejected at file {i}"
+    files = client.get("/__proxy/api/scratchboard").json()["items"][0]["files"]
+    assert len(files) == 25
+
+
+def test_the_per_file_size_cap_still_holds(client):
+    """The size limit is the one that protects the database: it bounds a single request body,
+    and 8 MB of base64 is already ~11 MB on the wire."""
+    _clear()
+    nid = client.post("/__proxy/api/scratchboard", json={"text": "n"}).json()["id"]
+    assert _attach(client, nid, "big.bin",
+                   b"x" * (proxy._SCRATCH_MAX_FILE_BYTES + 1)).status_code == 413

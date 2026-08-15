@@ -86,7 +86,7 @@ check(page.url() === before, 'a drop on the page background does not navigate aw
 // --- cleanup -------------------------------------------------------------------------------
 await page.evaluate(async (m) => {
   const r = await fetch('/__proxy/api/scratchboard');
-  for (const n of (await r.json()).notes || []) {
+  for (const n of (await r.json()).items || []) {
     if ((n.text || '').includes(m)) {
       await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(n.id), { method: 'DELETE' });
     }
