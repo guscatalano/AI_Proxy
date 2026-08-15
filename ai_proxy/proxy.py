@@ -17322,6 +17322,15 @@ async def proxy(full_path: str, request: Request):
             _pri_sem.release()
             _pri_released = True
 
+    # Registered BEFORE the send, not after it. client.send(stream=True) does not return until
+    # the upstream produces response headers, and for a long prefill — or a request queued
+    # behind a busy single-slot model — that is minutes away. Registering afterwards meant the
+    # Live view was blind to exactly the requests worth watching: a 300k-token prefill was
+    # invisible for its whole six minutes, and a queued request never appeared at all. (Short
+    # ones still showed, because the tile query also picks up rows from the last 32 seconds,
+    # which is why this looked like an intermittent glitch rather than a rule.)
+    _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": None,
+                                  "upstream": upstream_label, "cancelled": False}
     try:
         upstream_req = client.build_request(
             request.method, upstream_url, headers=headers_out, content=body or None
@@ -17339,9 +17348,24 @@ async def proxy(full_path: str, request: Request):
             status_code=502,
         )
 
-    # Register this in-flight request so /api/control/cancel/{req_id} can find it.
-    _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": upstream_resp,
-                                  "upstream": upstream_label, "cancelled": False}
+    # Attach the socket to the entry registered above, so /api/control/cancel/{req_id} has
+    # something to close.
+    _entry = _INFLIGHT_REQUESTS.get(req_id)
+    if _entry is None:            # zombie-killer reaped it while we waited on headers
+        _entry = {"ts": time.time(), "upstream": upstream_label, "cancelled": False}
+        _INFLIGHT_REQUESTS[req_id] = _entry
+    _entry["upstream_resp"] = upstream_resp
+    if _entry.get("cancelled"):
+        # Killed while the prefill was still running. There was no socket to close at the time,
+        # so honour it now rather than streaming out a response nobody is waiting for.
+        try:
+            await upstream_resp.aclose()
+        except Exception:
+            pass
+        _release_pri_slot()
+        _save_finish(req_id, 499, {}, None, None, (time.perf_counter() - start) * 1000,
+                     "cancelled while waiting for the upstream to respond")
+        return JSONResponse({"error": "cancelled"}, status_code=499)
 
     # tool_call_xml_retry: when Ollama returns 500 with an XML-parse error in the body
     # (qwen-style models occasionally emit `<parameter>...</function>` without closing the
