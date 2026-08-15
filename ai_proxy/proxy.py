@@ -4737,6 +4737,94 @@ def _cap_num_ctx(body: dict, cap: int) -> int | None:
     return changed
 
 
+# num_ctx cannot be delivered over Ollama's OpenAI-compatible endpoint. Measured directly:
+# top-level `num_ctx` and nested `options.num_ctx` are both ignored there, and only the native
+# /api/chat honours them. A preload does not survive either — the OpenAI handler sends the
+# server default with every request, which reloads the model and silently discards the window
+# that was asked for. That is what quietly undid a 65,536 preload in the middle of a benchmark.
+#
+# Ollama's own answer is a derived model carrying the parameter, which every endpoint respects
+# because it lives in the model rather than the request. Deriving costs no disk (the blobs are
+# shared) and the rule then works as its config always implied it did.
+_CTX_MODELS_SEEN: set = set()
+
+
+def _ctx_derived_name(model: str, num_ctx: int) -> str:
+    """Stable, collision-free name for the pinned variant. Tag is dropped into the name so
+    'qwen3.8:27b' at 512k becomes 'qwen3.8-27b-ctx512k', which reads in `ollama list`."""
+    base = re.sub(r"[^A-Za-z0-9._-]", "-", (model or "").replace(":", "-")).strip("-")
+    k = num_ctx // 1024
+    suffix = f"{k // 1024}m" if k >= 1024 and k % 1024 == 0 else f"{k}k"
+    return f"{base}-ctx{suffix}"
+
+
+async def _ensure_ctx_model(base: str, num_ctx: int) -> str | None:
+    """Create (once) and return the pinned variant of `base`, or None to leave the request be.
+
+    Failure is never fatal: a request that cannot get its bigger window should still be served
+    at the default rather than refused, so every error path returns None and the caller
+    forwards the original model.
+    """
+    name = _ctx_derived_name(base, num_ctx)
+    if name in _CTX_MODELS_SEEN:
+        return name
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+            tags = (await c.get(f"{OLLAMA_URL}/api/tags")).json()
+            have = {(t.get("name") or "").split(":")[0] for t in (tags.get("models") or [])}
+            if name in have:
+                _CTX_MODELS_SEEN.add(name)
+                return name
+            # A derived vision model loses its projector and then fails to load at all:
+            # deriving minicpm-v4.5 produced "Load failed" with the mmproj still being sized.
+            # Serving the base model at the default window is a worse context but a working
+            # one, which beats a variant that cannot answer.
+            info = await c.post(f"{OLLAMA_URL}/api/show", json={"model": base})
+            caps = (info.json() or {}).get("capabilities") or [] if info.status_code < 400 else []
+            if "vision" in [str(x).lower() for x in caps]:
+                print(f"[ollama_options] refusing to derive {name}: {base} is a vision model "
+                      f"and loses its projector when derived — serving it unpinned instead")
+                return None
+            r = await c.post(f"{OLLAMA_URL}/api/create",
+                             json={"model": name, "from": base,
+                                   "parameters": {"num_ctx": int(num_ctx)}, "stream": False})
+            if r.status_code >= 400:
+                print(f"[ollama_options] could not derive {name} from {base}: "
+                      f"HTTP {r.status_code} {r.text[:120]}")
+                return None
+    except (httpx.RequestError, ValueError, KeyError) as e:
+        print(f"[ollama_options] could not derive {name}: {type(e).__name__}: {e}")
+        return None
+    _CTX_MODELS_SEEN.add(name)
+    print(f"[ollama_options] derived {name} from {base} with num_ctx={num_ctx}")
+    return name
+
+
+async def apply_ollama_ctx_model(body: dict, ctx: dict) -> dict | None:
+    """Swap the model for a context-pinned variant when the rule asks for a num_ctx the
+    OpenAI path cannot carry. Native-path requests are left alone — there, num_ctx works."""
+    if not isinstance(body, dict) or "/api/" in (ctx.get("path") or ""):
+        return None
+    cfg = (load_rules_config().get("ollama_options") or {})
+    if not cfg.get("enabled", False):
+        return None
+    base = body.get("model")
+    if not base or _ctx_derived_name(base, 1).rsplit("-ctx", 1)[0] in ("", None):
+        return None
+    want = None
+    for src in ((cfg.get("per_model") or {}).get(base), cfg.get("defaults") or {}):
+        if isinstance(src, dict) and src.get("num_ctx"):
+            want = int(src["num_ctx"])
+            break
+    if not want:
+        return None
+    derived = await _ensure_ctx_model(base, want)
+    if not derived or derived == base:
+        return None
+    body["model"] = derived
+    return {"from": base, "to": derived, "num_ctx": want}
+
+
 def evaluate_ollama_options(body: dict, ctx: dict) -> dict | None:
     """Inject generation parameters per the ollama_options config. Mutates body in place.
     Never overwrites a value the client already set. Returns {applied:{...}, sources:[...]} or None."""
@@ -4798,6 +4886,12 @@ def evaluate_ollama_options(body: dict, ctx: dict) -> dict | None:
         for k, v in candidate.items():
             if k in _NATIVE_TOP_LEVEL_KEYS:
                 continue  # not applicable to OpenAI-compat path
+            if k == "num_ctx":
+                # Measured: Ollama's OpenAI endpoint ignores num_ctx both at top level and
+                # nested under options. Setting it here changed nothing while reporting itself
+                # as applied — a rule claiming an effect it does not have. apply_ollama_ctx_model
+                # delivers it for real, via a derived model, and records itself in `sources`.
+                continue
             if k not in body:
                 body[k] = v
                 applied[k] = v
@@ -16726,6 +16820,20 @@ async def proxy(full_path: str, request: Request):
 
     options_inject = (evaluate_ollama_options(body_json, router_ctx)
                       if isinstance(body_json, dict) and upstream_label != "anthropic" else None)
+    # num_ctx is the one option the OpenAI-compat endpoint drops on the floor, so it is carried
+    # by a derived model instead. Runs right after the injection whose promise it keeps, and
+    # before the overflow guard so that guard sees the window the request will really get.
+    ctx_swap = None
+    if isinstance(body_json, dict) and upstream_label == "ollama":
+        try:
+            ctx_swap = await apply_ollama_ctx_model(body_json, router_ctx)
+        except Exception as e:                       # never fail a request over a tuning knob
+            print(f"[ollama_options] ctx model swap failed: {type(e).__name__}: {e}")
+        if ctx_swap:
+            options_inject = dict(options_inject or {})
+            options_inject.setdefault("applied", {})["num_ctx"] = ctx_swap["num_ctx"]
+            options_inject.setdefault("sources", []).append(
+                f"ctx_model:{ctx_swap['from']}->{ctx_swap['to']}")
     # tool_pruner runs after model/options choice, before overflow guard, so pruning shrinks
     # the token estimate the overflow guard sees.
     pruned = evaluate_tool_pruner(body_json, router_ctx) if isinstance(body_json, dict) else None
