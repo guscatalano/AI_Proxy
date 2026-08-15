@@ -1310,7 +1310,11 @@ const fmtMsLong = (v) => {
 };
 
 const VIEW_KEY = 'ai-proxy-active-view';
-const VALID_VIEWS = new Set(['requests', 'live', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'bench']);
+// Every view that setView() can restore into on load. A tab missing from this set still
+// works when clicked and still gets written to storage — it just silently falls back to
+// Requests on the next refresh, which is how Work spent a week forgetting where you were.
+// 'artifacts' is deliberately absent: it is entered from a conversation, not from the rail.
+const VALID_VIEWS = new Set(['requests', 'live', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'work', 'bench']);
 
 function setView(v) {
   view = v;
@@ -1406,6 +1410,8 @@ async function loadWork() {
         ${sbOrigin(n)}
         ${count ? `<span style="color:#57d1e0">${count} repl${count === 1 ? 'y' : 'ies'}</span>` : ''}
         <a onclick="sbCopy(this)">copy</a>
+        <a href="/__proxy/api/scratchboard/${esc(n.id)}/zip" download style="margin-left:10px"
+           title="one zip: every attachment on this note and its replies, plus the text as note.txt">download</a>
         <a onclick="sbAttach('${esc(n.id)}')" style="margin-left:10px">attach</a>
         <a onclick="sbPin('${esc(n.id)}', ${n.pinned ? 'false' : 'true'})" style="margin-left:10px">${n.pinned ? 'unpin' : 'pin'}</a>
         <a onclick="sbDelete('${esc(n.id)}')" style="margin-left:10px">delete</a>
@@ -1426,6 +1432,9 @@ async function loadWork() {
       A shared scratchboard. Unlike the rest of this dashboard it is never redacted by subnet —
       every machine sees the same notes — and agents can read it through the MCP endpoint
       (<code>read_scratchboard</code>). Pin a note to keep it at the top as standing context.
+      <a href="/__proxy/api/scratchboard/zip" download style="color:#57d1e0;text-decoration:none"
+         title="the whole board as one zip: a folder per note with its attachments, plus notes.txt">
+        ⤓ download the whole board</a>
     </p>
     <div class="sb-compose" ondragover="sbDragOver(this, event)" ondragleave="sbDragLeave(this, event)"
          ondrop="sbDropCompose(this, event)">

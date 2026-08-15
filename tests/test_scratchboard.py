@@ -256,3 +256,122 @@ def test_the_per_file_size_cap_still_holds(client):
     nid = client.post("/__proxy/api/scratchboard", json={"text": "n"}).json()["id"]
     assert _attach(client, nid, "big.bin",
                    b"x" * (proxy._SCRATCH_MAX_FILE_BYTES + 1)).status_code == 413
+
+
+# --- download-all ---------------------------------------------------------------------------
+
+import io as _io
+import zipfile as _zip
+
+
+def _zipped(resp):
+    assert resp.status_code == 200, resp.text[:200]
+    assert resp.headers["content-type"] == "application/zip"
+    return _zip.ZipFile(_io.BytesIO(resp.content))
+
+
+def test_one_note_zips_flat_with_its_text_and_files(client):
+    _clear()
+    nid = client.post("/__proxy/api/scratchboard",
+                      json={"text": "the deploy notes", "author": "gus"}).json()["id"]
+    _attach(client, nid, "log.txt", b"exit 0")
+    z = _zipped(client.get(f"/__proxy/api/scratchboard/{nid}/zip"))
+    assert sorted(z.namelist()) == ["log.txt", "note.txt"], \
+        "a single note should extract flat, not into a stray folder"
+    assert z.read("log.txt") == b"exit 0"
+    txt = z.read("note.txt").decode()
+    assert "the deploy notes" in txt and "gus" in txt, "the text is the other half of the note"
+
+
+def test_the_zip_carries_replies_and_their_attachments(client):
+    _clear()
+    root = client.post("/__proxy/api/scratchboard", json={"text": "what broke?"}).json()["id"]
+    rep = client.post("/__proxy/api/scratchboard",
+                      json={"text": "here is the trace", "parent_id": root}).json()["id"]
+    _attach(client, rep, "trace.txt", b"Traceback")
+    z = _zipped(client.get(f"/__proxy/api/scratchboard/{root}/zip"))
+    assert "trace.txt" in z.namelist(), "a reply's attachment belongs to the thread"
+    assert "here is the trace" in z.read("note.txt").decode()
+
+
+def test_two_files_with_one_name_both_survive(client):
+    """Silently keeping one would be a download that quietly lost a file."""
+    _clear()
+    nid = client.post("/__proxy/api/scratchboard", json={"text": "n"}).json()["id"]
+    _attach(client, nid, "shot.png", b"first")
+    _attach(client, nid, "shot.png", b"second")
+    names = _zipped(client.get(f"/__proxy/api/scratchboard/{nid}/zip")).namelist()
+    assert len([n for n in names if n.endswith(".png")]) == 2, names
+
+
+def test_a_path_in_a_filename_cannot_escape_the_zip(client):
+    _clear()
+    nid = client.post("/__proxy/api/scratchboard", json={"text": "n"}).json()["id"]
+    _attach(client, nid, "../../etc/passwd", b"nope")
+    names = _zipped(client.get(f"/__proxy/api/scratchboard/{nid}/zip")).namelist()
+    assert not any(".." in n or n.startswith("/") for n in names), names
+
+
+def test_the_whole_board_zips_one_folder_per_note(client):
+    _clear()
+    a = client.post("/__proxy/api/scratchboard", json={"text": "note A", "author": "ann"}).json()["id"]
+    client.post("/__proxy/api/scratchboard", json={"text": "note B", "author": "bob"})
+    _attach(client, a, "a.txt", b"aaa")
+    z = _zipped(client.get("/__proxy/api/scratchboard/zip"))
+    names = z.namelist()
+    assert "notes.txt" in names, "one text file with the whole board in it"
+    assert any(n.endswith("/a.txt") for n in names), f"attachments go under their note: {names}"
+    board = z.read("notes.txt").decode()
+    assert "note A" in board and "note B" in board
+
+
+def test_zipping_a_missing_note_is_a_404(client):
+    _clear()
+    assert client.get("/__proxy/api/scratchboard/nope/zip").status_code == 404
+
+
+def test_an_empty_board_says_so_rather_than_serving_an_empty_zip(client):
+    _clear()
+    assert client.get("/__proxy/api/scratchboard/zip").status_code == 404
+
+
+def test_an_oversized_board_is_refused_with_the_arithmetic(client, monkeypatch):
+    _clear()
+    nid = client.post("/__proxy/api/scratchboard", json={"text": "n"}).json()["id"]
+    _attach(client, nid, "a.txt", b"x" * 1024)
+    monkeypatch.setattr(proxy, "_SCRATCH_ZIP_MAX_BYTES", 100)
+    r = client.get(f"/__proxy/api/scratchboard/{nid}/zip")
+    assert r.status_code == 413 and "MB" in r.json()["error"]
+
+
+# --- the prune must not strand attachments ---------------------------------------------------
+
+
+def test_pruning_the_board_takes_the_pruned_notes_files(client, monkeypatch):
+    """The bound exists to stop the table growing. Leaving 8 MB blobs behind with nothing
+    referencing them defeats the point, silently."""
+    _clear()
+    monkeypatch.setattr(proxy, "_SCRATCH_MAX_ROWS", 2)
+    old = client.post("/__proxy/api/scratchboard", json={"text": "oldest"}).json()["id"]
+    _attach(client, old, "doomed.bin", b"x" * 512)
+    conn = proxy.db()
+    assert conn.execute("SELECT COUNT(*) FROM scratchboard_files").fetchone()[0] == 1
+    conn.close()
+    for t in ("second", "third", "fourth"):
+        client.post("/__proxy/api/scratchboard", json={"text": t})
+    conn = proxy.db()
+    left = conn.execute("SELECT COUNT(*) FROM scratchboard_files").fetchone()[0]
+    conn.close()
+    assert left == 0, "the pruned note's attachment is still in the database"
+
+
+def test_pruning_a_note_takes_its_replies_too(client, monkeypatch):
+    _clear()
+    monkeypatch.setattr(proxy, "_SCRATCH_MAX_ROWS", 2)
+    root = client.post("/__proxy/api/scratchboard", json={"text": "oldest"}).json()["id"]
+    client.post("/__proxy/api/scratchboard", json={"text": "an answer", "parent_id": root})
+    for t in ("second", "third", "fourth"):
+        client.post("/__proxy/api/scratchboard", json={"text": t})
+    texts = str(client.get("/__proxy/api/scratchboard").json())
+    assert "an answer" not in texts, \
+        "a pruned root's reply came back as an orphan root, so the bound did not bind"

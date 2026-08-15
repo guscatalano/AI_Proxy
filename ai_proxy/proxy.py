@@ -11218,6 +11218,15 @@ async def scratchboard_add(request: Request):
         "(SELECT id FROM scratchboard WHERE pinned = 0 AND parent_id IS NULL "
         " ORDER BY ts DESC LIMIT ?)",
         (_SCRATCH_MAX_ROWS,))
+    # The prune above took only the root. Its replies came back as orphan roots — which is the
+    # right answer when a human deletes a note by accident, and the wrong one for a bound whose
+    # whole job is to stop the board growing — and its attachments stayed in the table with
+    # nothing referencing them, at up to 8 MB each. Written as a sweep rather than a targeted
+    # delete so it also clears whatever the earlier version already stranded.
+    conn.execute("DELETE FROM scratchboard WHERE parent_id IS NOT NULL "
+                 "AND parent_id NOT IN (SELECT id FROM scratchboard WHERE parent_id IS NULL)")
+    conn.execute("DELETE FROM scratchboard_files "
+                 "WHERE note_id NOT IN (SELECT id FROM scratchboard)")
     conn.commit()
     conn.close()
     return {"ok": True, "id": entry_id}
@@ -11274,6 +11283,123 @@ async def scratchboard_attach(entry_id: str, request: Request):
     conn.commit()
     conn.close()
     return {"ok": True, "id": fid, "size": len(blob)}
+
+
+_SCRATCH_ZIP_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _zip_safe_name(name: str, fallback: str = "file") -> str:
+    """A filename a zip can carry and an extractor will not write outside the target
+    directory. Path separators and .. are stripped rather than escaped: the name is a label,
+    and no attachment here legitimately contains a directory."""
+    base = (name or "").replace("\\", "/").split("/")[-1]
+    base = re.sub(r'[^A-Za-z0-9._ ()\[\]-]', "_", base).strip(" .")
+    return base[:120] or fallback
+
+
+def _scratch_note_text(note: dict, replies: list) -> str:
+    """The note as it reads on the board. Whoever opens the zip a month later needs the author,
+    the time and the thread, not just the body — the attachments are only half of a note."""
+    def block(n, indent=""):
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(n.get("ts") or 0))
+        head = f"{n.get('author') or 'anonymous'} · {when}"
+        if n.get("client_ip"):
+            head += f" · from {n['client_ip']}"
+        files = [f["name"] for f in (n.get("files") or [])]
+        out = [indent + head, indent + "-" * len(head)]
+        out += [indent + line for line in (n.get("text") or "").splitlines()]
+        if files:
+            out += ["", indent + "attached: " + ", ".join(files)]
+        return "\n".join(out)
+
+    parts = [block(note)]
+    for r in replies:
+        parts.append("\n" + block(r, indent="    "))
+    return "\n".join(parts) + "\n"
+
+
+def _scratch_zip(notes: list[dict], filename: str):
+    """One download: every attachment plus the text that goes with it.
+
+    Built in memory. The per-file cap is 8 MB and a board is 500 notes, so the ceiling is
+    theoretically large — hence the explicit total check, which refuses with the arithmetic
+    rather than having the process killed while assembling a 4 GB buffer.
+    """
+    import io
+    import zipfile
+
+    total = sum(f.get("size") or 0 for n in notes for f in (n.get("files") or []))
+    if total > _SCRATCH_ZIP_MAX_BYTES:
+        return JSONResponse(
+            {"error": f"attachments total {total / 1048576:.0f} MB; the zip is built in memory "
+                      f"and refuses above {_SCRATCH_ZIP_MAX_BYTES // 1048576} MB. Download the "
+                      f"files individually, or delete some first.",
+             "total_bytes": total}, status_code=413)
+
+    conn = db()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        board = []
+        for note in notes:
+            replies = note.get("replies") or []
+            text = _scratch_note_text(note, replies)
+            board.append(text)
+            # One folder per note only when there is more than one, so the common case —
+            # downloading a single note — extracts flat instead of into a stray directory.
+            stem = _zip_safe_name(
+                f"{time.strftime('%Y%m%d-%H%M', time.localtime(note.get('ts') or 0))}-"
+                f"{note.get('author') or 'anon'}", "note")
+            prefix = f"{stem}/" if len(notes) > 1 else ""
+            if len(notes) > 1:
+                z.writestr(prefix + "note.txt", text)
+            seen: dict = {}
+            for n in [note] + list(replies):
+                for f in (n.get("files") or []):
+                    row = conn.execute("SELECT data FROM scratchboard_files WHERE id = ?",
+                                       (f["id"],)).fetchone()
+                    if not row:
+                        continue          # deleted between listing the board and reading it
+                    name = _zip_safe_name(f.get("name") or "", "file")
+                    # Two attachments called screenshot.png are normal; silently keeping one
+                    # would be a download that quietly lost a file.
+                    if name in seen:
+                        seen[name] += 1
+                        stem_, dot, ext = name.rpartition(".")
+                        name = (f"{stem_} ({seen[name] - 1}).{ext}" if dot
+                                else f"{name} ({seen[name] - 1})")
+                    else:
+                        seen[name] = 1
+                    z.writestr(prefix + name, row["data"])
+        z.writestr("notes.txt" if len(notes) > 1 else "note.txt",
+                   ("\n\n" + "=" * 78 + "\n\n").join(board))
+    conn.close()
+    data = buf.getvalue()
+    return Response(
+        content=data, media_type="application/zip",
+        headers={"content-disposition": f'attachment; filename="{filename}"',
+                 "content-length": str(len(data))})
+
+
+@app.get("/__proxy/api/scratchboard/zip")
+def scratchboard_zip_all():
+    """The whole board as one file. Registered before the {entry_id} route below so that
+    'zip' is read as the literal path it is."""
+    board = scratchboard_list()
+    notes = board.get("items") or []
+    if not notes:
+        return JSONResponse({"error": "the board is empty"}, status_code=404)
+    return _scratch_zip(notes, f"scratchboard-{time.strftime('%Y%m%d-%H%M')}.zip")
+
+
+@app.get("/__proxy/api/scratchboard/{entry_id}/zip")
+def scratchboard_zip_note(entry_id: str):
+    notes = [n for n in (scratchboard_list().get("items") or []) if n["id"] == entry_id]
+    if not notes:
+        return JSONResponse({"error": f"no note {entry_id!r}"}, status_code=404)
+    stem = _zip_safe_name(f"{notes[0].get('author') or 'note'}-"
+                          f"{time.strftime('%Y%m%d-%H%M', time.localtime(notes[0].get('ts') or 0))}",
+                          "note")
+    return _scratch_zip(notes, f"{stem}.zip")
 
 
 @app.get("/__proxy/api/scratchboard/files/{file_id}")
