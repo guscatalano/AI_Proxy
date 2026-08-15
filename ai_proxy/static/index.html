@@ -205,6 +205,18 @@
     font-size: 12px; color: #b8c4d4; font-family: ui-monospace, Consolas, monospace; }
   .sb-file:hover { border-color: #3a4658; color: #e9edf4; }
   .sb-file .sz { color: #6c7789; font-size: 11px; }
+  /* Queued-but-not-yet-posted files. Dashed, because they are not on the board until you post
+     and a chip identical to a real attachment would claim otherwise. */
+  .sb-file.pend { border-style: dashed; border-color: #3a4658; color: #9fb0c8; }
+  .sb-file.pend a { color: #6c7789; cursor: pointer; font-size: 12px; }
+  .sb-file.pend a:hover { color: #e08080; }
+  #sb-pending { display: flex; flex-wrap: wrap; gap: 6px; margin: -8px 0 14px; max-width: 900px; }
+  /* Drop feedback. A dashed accent outline drawn inside the element, so the layout does not
+     shift under the cursor mid-drag and retrigger dragleave. */
+  .sb-drop { outline: 2px dashed #57d1e0; outline-offset: -3px; background: #12202a; }
+  .sb-note.sb-busy { opacity: .55; pointer-events: none; }
+  .sb-drophint { color: #6c7789; font-size: 11.5px; margin: -10px 0 14px; max-width: 900px;
+    font-family: ui-monospace, Consolas, monospace; }
 
   /* ---------- Live View ---------- */
   #live{--lv-bg:#0a0d13;--lv-panel:#151b26;--lv-panel2:#1b2230;--lv-hair:#28303f;--lv-ink:#e9edf4;--lv-mute:#7d879b;
@@ -1342,16 +1354,19 @@ async function loadWork() {
   const who = localStorage.getItem(SB_AUTHOR_KEY) || '';
   // Attachments render as a row of download chips. Size is shown because "report.zip" tells
   // you nothing about whether it is worth clicking on a slow link.
-  const fmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
-                     : b >= 1024 ? Math.round(b / 1024) + ' KB' : b + ' B';
   const filesOf = n => (n.files || []).length ? `<div class="sb-files">` + (n.files || []).map(f =>
       `<a class="sb-file" href="/__proxy/api/scratchboard/files/${esc(f.id)}" download>
-         <span>📎 ${esc(f.name)}</span><span class="sz">${fmtSize(f.size || 0)}</span></a>`
+         <span>📎 ${esc(f.name)}</span><span class="sz">${sbFmtSize(f.size || 0)}</span></a>`
     ).join('') + `</div>` : '';
+
+  // Every note and reply is its own drop target, so a dropped file lands where it was aimed
+  // rather than on whatever was posted most recently.
+  const drop = id => `ondragover="sbDragOver(this, event)" ondragleave="sbDragLeave(this, event)"`
+                   + ` ondrop="sbDropNote(this, event, '${esc(id)}')"`;
 
   const reply = r => {
     const when = new Date((r.ts || 0) * 1000).toLocaleString();
-    return `<div class="sb-reply" data-text="${esc(r.text || '')}">
+    return `<div class="sb-reply" data-text="${esc(r.text || '')}" ${drop(r.id)}>
       <div class="sb-meta">
         <span class="who">${esc(r.author || 'anonymous')}</span>
         <span>${esc(when)}</span>
@@ -1368,7 +1383,7 @@ async function loadWork() {
     const when = new Date((n.ts || 0) * 1000).toLocaleString();
     const reps = (n.replies || []).map(reply).join('');
     const count = (n.replies || []).length;
-    return `<div class="sb-note${n.pinned ? ' pin' : ''}${n.orphaned ? ' orphan' : ''}" data-text="${esc(n.text || '')}">
+    return `<div class="sb-note${n.pinned ? ' pin' : ''}${n.orphaned ? ' orphan' : ''}" data-text="${esc(n.text || '')}" ${drop(n.id)}>
       <div class="sb-meta">
         ${n.pinned ? '<span title="pinned">📌</span>' : ''}
         ${n.orphaned ? '<span title="the note this answered was deleted">↳ orphaned reply</span>' : ''}
@@ -1398,7 +1413,8 @@ async function loadWork() {
       every machine sees the same notes — and agents can read it through the MCP endpoint
       (<code>read_scratchboard</code>). Pin a note to keep it at the top as standing context.
     </p>
-    <div class="sb-compose">
+    <div class="sb-compose" ondragover="sbDragOver(this, event)" ondragleave="sbDragLeave(this, event)"
+         ondrop="sbDropCompose(this, event)">
       <textarea id="sb-text" placeholder="What are you working on? What should nobody else touch?"></textarea>
       <div class="sb-btns">
         <input id="sb-author" placeholder="your name" value="${esc(who)}">
@@ -1409,20 +1425,126 @@ async function loadWork() {
         <button onclick="sbPost(true)" title="Keep at the top as standing context">Post pinned</button>
       </div>
     </div>
+    <div id="sb-pending"></div>
+    <p class="sb-drophint">Drop files on the box above to post them with a note, or on any note to
+      attach them to it.</p>
     ${notes}`;
+  sbRenderPending();   // a queued file must survive the re-render that follows every action
 }
 
-// The compose box shows what will be attached before you commit to posting, because a file
-// picker that reports nothing back leaves you unsure whether it took.
-function sbComposeFiles() {
-  const inp = $('sb-files'), btn = $('sb-attach-btn');
-  const n = (inp && inp.files || []).length;
-  if (btn) btn.textContent = n ? `${n} file${n === 1 ? '' : 's'} ↑` : 'Attach…';
+const sbFmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
+                     : b >= 1024 ? Math.round(b / 1024) + ' KB' : b + ' B';
+
+// --- drag and drop ---------------------------------------------------------------------
+// Dropped anywhere the page does not handle, a file makes the browser navigate away and
+// replace the dashboard with it, losing whatever was half-typed. So the Work view swallows
+// file drops wholesale and only acts on the two places that mean something.
+
+function sbHasFiles(ev) {
+  const t = (ev.dataTransfer || {}).types || [];
+  return Array.prototype.indexOf.call(t, 'Files') >= 0;
 }
+
+function sbDragOver(el, ev) {
+  if (!sbHasFiles(ev)) return;          // dragging selected text should not arm a drop target
+  ev.preventDefault();
+  ev.stopPropagation();
+  ev.dataTransfer.dropEffect = 'copy';
+  el.classList.add('sb-drop');
+}
+
+function sbDragLeave(el, ev) {
+  // dragleave also fires when the pointer crosses into a child, so the highlight would flicker
+  // off over every button and attachment chip inside the target.
+  if (ev.relatedTarget && el.contains(ev.relatedTarget)) return;
+  el.classList.remove('sb-drop');
+}
+
+// A dropped folder arrives as a zero-byte File that would upload as an empty attachment. There
+// is no recursive directory read here, so say what was skipped instead of posting junk.
+function sbFilesFrom(ev) {
+  const dt = ev.dataTransfer || {};
+  const items = Array.from(dt.items || []);
+  const files = [], dirs = [];
+  if (items.length && items[0].webkitGetAsEntry) {
+    for (const it of items) {
+      if (it.kind !== 'file') continue;
+      const entry = it.webkitGetAsEntry();      // must be read before any await
+      const f = it.getAsFile();
+      if (entry && entry.isDirectory) { dirs.push(entry.name); continue; }
+      if (f) files.push(f);
+    }
+  } else {
+    files.push(...Array.from(dt.files || []));
+  }
+  if (dirs.length) {
+    alert('Folders are not uploaded: ' + dirs.join(', ') +
+          '\nDrop the files inside it, or zip it first.');
+  }
+  return files;
+}
+
+function sbDropCompose(el, ev) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  el.classList.remove('sb-drop');
+  sbPending = sbPending.concat(sbFilesFrom(ev));
+  sbRenderPending();
+}
+
+async function sbDropNote(el, ev, noteId) {
+  ev.preventDefault();
+  ev.stopPropagation();   // a reply sits inside its note; without this both would take the drop
+  el.classList.remove('sb-drop');
+  const files = sbFilesFrom(ev);
+  if (!files.length) return;
+  el.classList.add('sb-busy');   // uploads are one at a time and can be slow on a big file
+  for (const f of files) {
+    if (!await sbUpload(noteId, f)) break;
+  }
+  loadWork();
+}
+
+// The catch-all. Both handlers above stopPropagation, so these only see drops nothing claimed —
+// and those are exactly the ones that would otherwise navigate the dashboard away.
+document.addEventListener('dragover', ev => { if (sbHasFiles(ev)) ev.preventDefault(); });
+document.addEventListener('drop', ev => { if (sbHasFiles(ev)) ev.preventDefault(); });
+
+// Files waiting to go up with the next post. The file input cannot hold this: its FileList is
+// read-only, so a second drop or a second trip through the picker would discard the first.
+let sbPending = [];
+
+// The compose box shows what will be attached before you commit to posting, because a picker
+// that reports nothing back leaves you unsure whether it took.
+function sbComposeFiles() {
+  const inp = $('sb-files');
+  if (inp && inp.files && inp.files.length) {
+    sbPending = sbPending.concat(Array.from(inp.files));
+    inp.value = '';   // else picking the same file twice fires no change event at all
+  }
+  sbRenderPending();
+}
+
+function sbRenderPending() {
+  const host = $('sb-pending'), btn = $('sb-attach-btn');
+  if (btn) btn.textContent = sbPending.length ? `Attach… (${sbPending.length})` : 'Attach…';
+  if (!host) return;
+  host.innerHTML = sbPending.map((f, i) =>
+    `<span class="sb-file pend"><span>📎 ${esc(f.name)}</span>
+       <span class="sz">${sbFmtSize(f.size || 0)}</span>
+       <a onclick="sbUnqueue(${i})" title="remove">✕</a></span>`).join('');
+}
+
+function sbUnqueue(i) { sbPending.splice(i, 1); sbRenderPending(); }
 
 async function sbPost(pinned) {
-  const t = $('sb-text'), a = $('sb-author'), f = $('sb-files');
-  const text = (t && t.value || '').trim();
+  const t = $('sb-text'), a = $('sb-author');
+  let text = (t && t.value || '').trim();
+  // Dropping files and hitting Post with nothing typed is a real intent, but the board requires
+  // text, so name the files rather than rejecting the post.
+  if (!text && sbPending.length) {
+    text = 'Attached: ' + sbPending.map(f => f.name).join(', ');
+  }
   if (!text) return;
   const author = (a && a.value || '').trim();
   if (author) localStorage.setItem(SB_AUTHOR_KEY, author);
@@ -1435,11 +1557,11 @@ async function sbPost(pinned) {
     // Files need the note's id, so they go up after it exists. A failure here leaves the note
     // posted and says which file failed, rather than discarding what was written.
     const id = (await r.json()).id;
-    for (const file of Array.from((f && f.files) || [])) {
+    for (const file of sbPending) {
       if (!await sbUpload(id, file)) break;
     }
     if (t) t.value = '';
-    if (f) { f.value = ''; sbComposeFiles(); }
+    sbPending = [];
     loadWork();
   } catch { alert('Could not post — the proxy is unreachable.'); }
 }
@@ -1482,7 +1604,15 @@ function sbAttach(noteId) {
   inp.click();
 }
 
+// Mirrors _SCRATCH_MAX_FILE_BYTES. Checked here as well because base64ing an oversized file in
+// the browser costs real seconds and a third of its size again, all to earn a 413.
+const SB_MAX_FILE = 8 * 1024 * 1024;
+
 async function sbUpload(noteId, file) {
+  if (file.size > SB_MAX_FILE) {
+    alert(`${file.name} is ${sbFmtSize(file.size)} — the limit is ${sbFmtSize(SB_MAX_FILE)}.`);
+    return false;
+  }
   const b64 = await new Promise((res, rej) => {
     const fr = new FileReader();
     fr.onload = () => res(String(fr.result).split(',')[1] || '');
