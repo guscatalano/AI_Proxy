@@ -164,6 +164,47 @@
   #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup, #main.chat #tasks, #main.chat #bench { display: none; }
   #main.tasks #list, #main.tasks #detail, #main.tasks #stats, #main.tasks #audit, #main.tasks #convs, #main.tasks #system, #main.tasks #setup, #main.tasks #chat, #main.tasks #bench { display: none; }
   #main.bench #list, #main.bench #detail, #main.bench #stats, #main.bench #audit, #main.bench #convs, #main.bench #system, #main.bench #setup, #main.bench #chat, #main.bench #tasks { display: none; }
+  #main.work #list, #main.work #detail, #main.work #stats, #main.work #audit, #main.work #convs, #main.work #system, #main.work #setup, #main.work #chat, #main.work #tasks, #main.work #bench { display: none; }
+  #main.work #split-handle, #main.work #artifacts { display: none; }
+  #work { display: none; flex: 1; overflow: auto; padding: 18px 22px; }
+  #work.show { display: block; }
+  /* Shared board: everyone on the network sees the same thing, so it reads as a wall of notes
+     rather than a form. Pinned notes sit on top with a marked edge. */
+  .sb-compose { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 16px; max-width: 900px; }
+  .sb-compose textarea { flex: 1; min-height: 62px; background: #0a0d12; color: #dfe6f0;
+    border: 1px solid #262d38; border-radius: 6px; padding: 9px 11px; font: inherit;
+    font-size: 13px; resize: vertical; }
+  .sb-compose input { width: 130px; background: #0a0d12; color: #dfe6f0; border: 1px solid #262d38;
+    border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12.5px; }
+  .sb-btns { display: flex; flex-direction: column; gap: 6px; }
+  .sb-note { border: 1px solid #262d38; border-left: 3px solid #2f3a4a; border-radius: 7px;
+    background: #10141c; padding: 11px 13px; margin: 0 0 9px; max-width: 900px; }
+  .sb-note.pin { border-left-color: #f0c674; background: #151519; }
+  .sb-meta { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: #7d879b;
+    margin-bottom: 5px; font-family: ui-monospace, Consolas, monospace; }
+  .sb-meta .who { color: #9fb0c8; font-weight: 600; }
+  .sb-meta a { color: #6c7789; text-decoration: none; margin-left: auto; cursor: pointer; }
+  .sb-meta a:hover { color: #e08080; }
+  .sb-body { white-space: pre-wrap; word-break: break-word; font-size: 13.5px; line-height: 1.5;
+    color: #dfe6f0; }
+  .sb-empty { color: #6c7789; font-size: 13px; }
+  /* Replies sit inside their note rather than beside it: a reply read apart from what it
+     answers is worse than not reading it. */
+  .sb-reply { margin: 9px 0 0 16px; padding: 8px 11px; border-left: 2px solid #2f3a4a;
+    background: #0c1016; border-radius: 0 5px 5px 0; }
+  .sb-reply .sb-body { font-size: 13px; }
+  .sb-replybox { display: flex; gap: 6px; margin: 10px 0 0 16px; }
+  .sb-replybox textarea { flex: 1; background: #0a0d12; color: #dfe6f0; border: 1px solid #222934;
+    border-radius: 5px; padding: 6px 9px; font: inherit; font-size: 12.5px; resize: vertical;
+    min-height: 30px; }
+  .sb-replybox button { font-size: 12px; padding: 4px 12px; }
+  .sb-note.orphan { border-left-color: #6a4a2f; }
+  .sb-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+  .sb-file { display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+    background: #0c1016; border: 1px solid #262d38; border-radius: 5px; padding: 4px 9px;
+    font-size: 12px; color: #b8c4d4; font-family: ui-monospace, Consolas, monospace; }
+  .sb-file:hover { border-color: #3a4658; color: #e9edf4; }
+  .sb-file .sz { color: #6c7789; font-size: 11px; }
 
   /* ---------- Live View ---------- */
   #live{--lv-bg:#0a0d13;--lv-panel:#151b26;--lv-panel2:#1b2230;--lv-hair:#28303f;--lv-ink:#e9edf4;--lv-mute:#7d879b;
@@ -1073,6 +1114,7 @@ body:not(.bench-simple) .bench-preset { display:none; }
   <div class="shell-grp"><div class="gl">Work</div>
     <button class="snav" data-view="chat" onclick="setView('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 10h8M8 13.5h5M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Chat</span></button>
     <button class="snav" data-view="tasks" onclick="setView('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg><span class="lbl2">Tasks</span><span class="cntx" id="rail-tasks-count"></span></button>
+    <button class="snav" data-view="work" onclick="setView('work')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg><span class="lbl2">Work</span><span class="cntx" id="rail-work-count"></span></button>
   </div>
   <div class="shell-grp"><div class="gl">System</div>
     <button class="snav" data-view="system" onclick="setView('system')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.3 2.6a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L4 11a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/></svg><span class="lbl2">System</span></button>
@@ -1123,6 +1165,7 @@ body:not(.bench-simple) .bench-preset { display:none; }
   <div id="system"></div>
   <div id="setup"></div>
   <div id="tasks"></div>
+  <div id="work"></div>
   <div id="bench"></div>
   <div id="chat">
     <div class="chat-header">
@@ -1254,12 +1297,12 @@ const VALID_VIEWS = new Set(['requests', 'live', 'stats', 'audit', 'convs', 'sys
 function setView(v) {
   view = v;
   try { if (v !== 'live' && window.stopLive) stopLive(); } catch {}
-  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','bench','live']) {
+  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','work','bench','live']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
   try { syncShellNav(v); } catch {}
-  for (const c of ['stats','audit','convs','artifacts','system','setup','chat','tasks','bench','live']) {
+  for (const c of ['stats','audit','convs','artifacts','system','setup','chat','tasks','work','bench','live']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
@@ -1276,9 +1319,213 @@ function setView(v) {
   else if (v === 'setup') loadSetup();
   else if (v === 'chat') loadChat();
   else if (v === 'tasks') loadTasks();
+  else if (v === 'work') loadWork();
   else if (v === 'bench') loadBench();
   else if (v === 'live') loadLive();
   else refresh();
+}
+
+// ---------- Work: the shared scratchboard ----------
+// Deliberately unredacted, unlike everything else in this dashboard: these notes are written
+// by the people looking at them, not captured from someone else's traffic, and a board each
+// subnet sees a different version of would not be shared. Agents can read it over MCP.
+const SB_AUTHOR_KEY = 'proxy.scratch.author';
+
+async function loadWork() {
+  const host = $('work');
+  if (!host) return;
+  let items = [];
+  try {
+    items = (await (await fetch('/__proxy/api/scratchboard')).json()).items || [];
+  } catch { host.innerHTML = '<p class="sb-empty">Could not reach the scratchboard.</p>'; return; }
+
+  const who = localStorage.getItem(SB_AUTHOR_KEY) || '';
+  // Attachments render as a row of download chips. Size is shown because "report.zip" tells
+  // you nothing about whether it is worth clicking on a slow link.
+  const fmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
+                     : b >= 1024 ? Math.round(b / 1024) + ' KB' : b + ' B';
+  const filesOf = n => (n.files || []).length ? `<div class="sb-files">` + (n.files || []).map(f =>
+      `<a class="sb-file" href="/__proxy/api/scratchboard/files/${esc(f.id)}" download>
+         <span>📎 ${esc(f.name)}</span><span class="sz">${fmtSize(f.size || 0)}</span></a>`
+    ).join('') + `</div>` : '';
+
+  const reply = r => {
+    const when = new Date((r.ts || 0) * 1000).toLocaleString();
+    return `<div class="sb-reply" data-text="${esc(r.text || '')}">
+      <div class="sb-meta">
+        <span class="who">${esc(r.author || 'anonymous')}</span>
+        <span>${esc(when)}</span>
+        ${r.client_ip ? `<span style="color:#4d5666">${esc(r.client_ip)}</span>` : ''}
+        <a onclick="sbCopy(this)">copy</a>
+        <a onclick="sbDelete('${esc(r.id)}')" style="margin-left:10px">delete</a>
+      </div>
+      <div class="sb-body">${esc(r.text || '')}</div>
+      ${filesOf(r)}
+    </div>`;
+  };
+
+  const notes = items.map(n => {
+    const when = new Date((n.ts || 0) * 1000).toLocaleString();
+    const reps = (n.replies || []).map(reply).join('');
+    const count = (n.replies || []).length;
+    return `<div class="sb-note${n.pinned ? ' pin' : ''}${n.orphaned ? ' orphan' : ''}" data-text="${esc(n.text || '')}">
+      <div class="sb-meta">
+        ${n.pinned ? '<span title="pinned">📌</span>' : ''}
+        ${n.orphaned ? '<span title="the note this answered was deleted">↳ orphaned reply</span>' : ''}
+        <span class="who">${esc(n.author || 'anonymous')}</span>
+        <span>${esc(when)}</span>
+        ${n.client_ip ? `<span style="color:#4d5666">${esc(n.client_ip)}</span>` : ''}
+        ${count ? `<span style="color:#57d1e0">${count} repl${count === 1 ? 'y' : 'ies'}</span>` : ''}
+        <a onclick="sbCopy(this)">copy</a>
+        <a onclick="sbAttach('${esc(n.id)}')" style="margin-left:10px">attach</a>
+        <a onclick="sbPin('${esc(n.id)}', ${n.pinned ? 'false' : 'true'})" style="margin-left:10px">${n.pinned ? 'unpin' : 'pin'}</a>
+        <a onclick="sbDelete('${esc(n.id)}')" style="margin-left:10px">delete</a>
+      </div>
+      <div class="sb-body">${esc(n.text || '')}</div>
+      ${filesOf(n)}
+      ${reps}
+      <div class="sb-replybox">
+        <textarea id="sb-r-${esc(n.id)}" rows="1" placeholder="Reply…"></textarea>
+        <button onclick="sbReply('${esc(n.id)}')">Reply</button>
+      </div>
+    </div>`;
+  }).join('') || '<p class="sb-empty">Nothing on the board yet. Anything posted here is visible from every machine on the network, and readable by agents over MCP.</p>';
+
+  host.innerHTML = `
+    <h2 style="margin:0 0 4px">Work</h2>
+    <p class="note" style="color:#7d879b;font-size:12.5px;margin:0 0 14px;max-width:76ch">
+      A shared scratchboard. Unlike the rest of this dashboard it is never redacted by subnet —
+      every machine sees the same notes — and agents can read it through the MCP endpoint
+      (<code>read_scratchboard</code>). Pin a note to keep it at the top as standing context.
+    </p>
+    <div class="sb-compose">
+      <textarea id="sb-text" placeholder="What are you working on? What should nobody else touch?"></textarea>
+      <div class="sb-btns">
+        <input id="sb-author" placeholder="your name" value="${esc(who)}">
+        <input type="file" id="sb-files" multiple style="display:none" onchange="sbComposeFiles()">
+        <button onclick="document.getElementById('sb-files').click()" id="sb-attach-btn"
+                title="Files are uploaded after the note is posted">Attach…</button>
+        <button onclick="sbPost(false)">Post</button>
+        <button onclick="sbPost(true)" title="Keep at the top as standing context">Post pinned</button>
+      </div>
+    </div>
+    ${notes}`;
+}
+
+// The compose box shows what will be attached before you commit to posting, because a file
+// picker that reports nothing back leaves you unsure whether it took.
+function sbComposeFiles() {
+  const inp = $('sb-files'), btn = $('sb-attach-btn');
+  const n = (inp && inp.files || []).length;
+  if (btn) btn.textContent = n ? `${n} file${n === 1 ? '' : 's'} ↑` : 'Attach…';
+}
+
+async function sbPost(pinned) {
+  const t = $('sb-text'), a = $('sb-author'), f = $('sb-files');
+  const text = (t && t.value || '').trim();
+  if (!text) return;
+  const author = (a && a.value || '').trim();
+  if (author) localStorage.setItem(SB_AUTHOR_KEY, author);
+  try {
+    const r = await fetch('/__proxy/api/scratchboard', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, author, pinned: !!pinned }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.error || ('HTTP ' + r.status)); return; }
+    // Files need the note's id, so they go up after it exists. A failure here leaves the note
+    // posted and says which file failed, rather than discarding what was written.
+    const id = (await r.json()).id;
+    for (const file of Array.from((f && f.files) || [])) {
+      if (!await sbUpload(id, file)) break;
+    }
+    if (t) t.value = '';
+    if (f) { f.value = ''; sbComposeFiles(); }
+    loadWork();
+  } catch { alert('Could not post — the proxy is unreachable.'); }
+}
+
+async function sbDelete(id) {
+  try { await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(id), { method: 'DELETE' }); } catch {}
+  loadWork();
+}
+
+// Copy the note's text, not the rendered DOM — the reader wants what was written, without
+// the author line, timestamp and attachment chips wrapped around it.
+async function sbCopy(el) {
+  const host = el.closest('.sb-note, .sb-reply');
+  const text = host ? (host.getAttribute('data-text') || '') : '';
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Clipboard API needs a secure context; over plain http to an IP it is often unavailable.
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch {}
+    ta.remove();
+  }
+  const was = el.textContent; el.textContent = 'copied';
+  setTimeout(() => { el.textContent = was; }, 1200);
+}
+
+// Attach to an existing note. Files are uploaded one at a time so a single rejection (too
+// large, too many) reports which file failed instead of failing the whole batch silently.
+function sbAttach(noteId) {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.multiple = true;
+  inp.onchange = async () => {
+    for (const f of Array.from(inp.files || [])) {
+      const ok = await sbUpload(noteId, f);
+      if (!ok) break;
+    }
+    loadWork();
+  };
+  inp.click();
+}
+
+async function sbUpload(noteId, file) {
+  const b64 = await new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result).split(',')[1] || '');
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+  try {
+    const r = await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(noteId) + '/files', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: file.name, mime: file.type, data_b64: b64 }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      alert(`${file.name}: ${d.error || ('HTTP ' + r.status)}`);
+      return false;
+    }
+    return true;
+  } catch { alert('Upload failed — the proxy is unreachable.'); return false; }
+}
+
+async function sbReply(parentId) {
+  const t = $('sb-r-' + parentId);
+  const text = (t && t.value || '').trim();
+  if (!text) return;
+  const author = localStorage.getItem(SB_AUTHOR_KEY) || '';
+  try {
+    const r = await fetch('/__proxy/api/scratchboard', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, author, parent_id: parentId }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.error || ('HTTP ' + r.status)); return; }
+    loadWork();
+  } catch { alert('Could not reply — the proxy is unreachable.'); }
+}
+
+async function sbPin(id, pinned) {
+  try {
+    await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(id) + '/pin', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pinned }),
+    });
+  } catch {}
+  loadWork();
 }
 
 // ---------- Console shell (alternate skin) ----------

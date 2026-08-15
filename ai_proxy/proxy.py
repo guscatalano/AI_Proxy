@@ -349,6 +349,37 @@ CREATE TABLE IF NOT EXISTS request_blobs (
     stream_chunks TEXT,
     images_data TEXT
 );
+-- Shared working notes. Deliberately not scoped to a conversation, a client or a subnet: the
+-- point is a board every machine on the network sees the same view of. Unlike request bodies,
+-- nothing here arrives from a third party, so the PII gate that redacts cross-subnet viewers
+-- would only hide the notes from the people who wrote them.
+CREATE TABLE IF NOT EXISTS scratchboard (
+    id TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    author TEXT,
+    text TEXT NOT NULL,
+    client_ip TEXT,
+    pinned INTEGER DEFAULT 0,
+    -- Replies hang off a root note. One level only: a note and the answers to it. Deeper
+    -- nesting turns a board into a forum, and the thing being replied to here is usually a
+    -- question with an answer — "run this command" / "here is what it printed".
+    parent_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scratchboard_ts ON scratchboard(ts DESC);
+-- Attachments live in the database rather than on disk. A board that is 500 notes deep with a
+-- hard per-file cap cannot grow the way request bodies did, and keeping the bytes in SQLite
+-- means deletes cascade and there are no filesystem paths to get wrong — which, given the week
+-- this file has had, is worth something on its own.
+CREATE TABLE IF NOT EXISTS scratchboard_files (
+    id TEXT PRIMARY KEY,
+    note_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    name TEXT NOT NULL,
+    mime TEXT,
+    size INTEGER,
+    data BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scratchboard_files_note ON scratchboard_files(note_id);
 CREATE TABLE IF NOT EXISTS proxy_memory (
     conversation_id TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -512,6 +543,9 @@ MIGRATIONS = [
     # weights and waiting for a server to answer take minutes each, and all of them looked
     # identical to a hang: a counter that does not move and nothing saying why.
     "ALTER TABLE bench_runs ADD COLUMN phase TEXT",
+    # The scratchboard shipped without replies. Databases created since then already have the
+    # column from SCHEMA; this is for the ones that do not.
+    "ALTER TABLE scratchboard ADD COLUMN parent_id TEXT",
     # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
     # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
     # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
@@ -10993,6 +11027,202 @@ async def memory_delete(scope: str):
     return {"ok": True, "removed": cur.rowcount}
 
 
+# -------- Scratchboard: shared working notes, visible from every subnet --------
+#
+# Everything else the dashboard shows is somebody's captured traffic, so it goes through the
+# PII gate: a viewer on another subnet sees placeholders. These notes are written BY the
+# viewers rather than captured from them, and a shared board that each machine sees a
+# different version of is not a shared board. So this endpoint deliberately does not redact,
+# and that is the whole feature rather than an oversight.
+_SCRATCH_MAX_CHARS = 8000
+_SCRATCH_MAX_ROWS = 500
+_SCRATCH_MAX_FILE_BYTES = 8 * 1024 * 1024
+_SCRATCH_MAX_FILES_PER_NOTE = 10
+
+
+@app.get("/__proxy/api/scratchboard")
+def scratchboard_list():          # sync → threadpool, same as the other small reads
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, ts, author, text, client_ip, pinned, parent_id FROM scratchboard "
+        "ORDER BY ts DESC LIMIT ?", (_SCRATCH_MAX_ROWS * 4,)).fetchall()]
+    conn.close()
+    # Roots newest-first with pinned on top; replies oldest-first beneath their parent, because
+    # a thread reads forwards even though a board reads backwards.
+    by_parent: dict = {}
+    for r in rows:
+        if r.get("parent_id"):
+            by_parent.setdefault(r["parent_id"], []).append(r)
+    roots = [r for r in rows if not r.get("parent_id")]
+    roots.sort(key=lambda r: (-(r.get("pinned") or 0), -(r.get("ts") or 0)))
+    # Attachment metadata only — never the bytes. A board with a few images on it would
+    # otherwise ship megabytes of base64 on every poll of a page that refreshes constantly.
+    files: dict = {}
+    conn2 = db()
+    for f in conn2.execute("SELECT id, note_id, name, mime, size, ts FROM scratchboard_files "
+                           "ORDER BY ts").fetchall():
+        files.setdefault(f["note_id"], []).append(dict(f))
+    conn2.close()
+    for r in rows:
+        r["files"] = files.get(r["id"], [])
+    for r in roots:
+        r["replies"] = sorted(by_parent.get(r["id"], []), key=lambda x: x.get("ts") or 0)
+    # A reply whose parent was deleted would otherwise vanish silently; surface it as a root
+    # rather than losing someone's answer to a question that no longer exists.
+    known = {r["id"] for r in roots}
+    orphans = [r for pid, kids in by_parent.items() if pid not in known for r in kids]
+    for o in orphans:
+        o["replies"] = []
+        o["orphaned"] = True
+    return {"items": roots[:_SCRATCH_MAX_ROWS] + orphans}
+
+
+@app.post("/__proxy/api/scratchboard")
+async def scratchboard_add(request: Request):
+    """Add a note. Body: {text, author?, pinned?}."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > _SCRATCH_MAX_CHARS:
+        return JSONResponse(
+            {"error": f"text too long ({len(text)} chars, limit {_SCRATCH_MAX_CHARS})"},
+            status_code=413)
+    author = (payload.get("author") or "").strip()[:64] or None
+    entry_id = uuid.uuid4().hex[:16]
+    conn = db()
+    # One level of nesting: replying to a reply attaches to the same root, so a thread stays a
+    # thread instead of becoming a tree nobody can render.
+    parent = (payload.get("parent_id") or "").strip() or None
+    if parent:
+        row = conn.execute("SELECT id, parent_id FROM scratchboard WHERE id = ?",
+                           (parent,)).fetchone()
+        if not row:
+            conn.close()
+            return JSONResponse({"error": f"no note {parent!r} to reply to"}, status_code=404)
+        parent = row["parent_id"] or row["id"]
+    conn.execute(
+        "INSERT INTO scratchboard (id, ts, author, text, client_ip, pinned, parent_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (entry_id, time.time(), author, text, _client_ip(request),
+         1 if (payload.get("pinned") and not parent) else 0, parent))
+    # Bound the table rather than letting a board become a log nobody reads. Pinned notes are
+    # exempt: pinning is the way to say "this one is not scratch". Replies are exempt too —
+    # pruning them by age would strip answers off notes that are still on the board.
+    conn.execute(
+        "DELETE FROM scratchboard WHERE pinned = 0 AND parent_id IS NULL AND id NOT IN "
+        "(SELECT id FROM scratchboard WHERE pinned = 0 AND parent_id IS NULL "
+        " ORDER BY ts DESC LIMIT ?)",
+        (_SCRATCH_MAX_ROWS,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": entry_id}
+
+
+@app.delete("/__proxy/api/scratchboard/{entry_id}")
+def scratchboard_delete(entry_id: str):
+    conn = db()
+    # Replies go with their parent. Leaving them behind would surface answers as roots, which
+    # is right for a parent that vanished by accident and wrong for one deleted on purpose.
+    # Attachments go too — orphaned blobs would sit in the database with nothing referencing
+    # them, which is how a bounded table stops being bounded.
+    conn.execute("DELETE FROM scratchboard_files WHERE note_id = ? OR note_id IN "
+                 "(SELECT id FROM scratchboard WHERE parent_id = ?)", (entry_id, entry_id))
+    cur = conn.execute("DELETE FROM scratchboard WHERE id = ? OR parent_id = ?",
+                       (entry_id, entry_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.post("/__proxy/api/scratchboard/{entry_id}/files")
+async def scratchboard_attach(entry_id: str, request: Request):
+    """Attach a file to a note. Body: {name, mime?, data_b64}.
+
+    base64 in JSON rather than multipart: multipart needs python-multipart, and this package
+    ships three dependencies on purpose. The 33% encoding overhead is irrelevant at an 8 MB cap.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    name = (payload.get("name") or "").strip()[:200]
+    b64 = payload.get("data_b64") or ""
+    if not name or not b64:
+        return JSONResponse({"error": "name and data_b64 are required"}, status_code=400)
+    try:
+        blob = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        return JSONResponse({"error": "data_b64 is not valid base64"}, status_code=400)
+    if len(blob) > _SCRATCH_MAX_FILE_BYTES:
+        return JSONResponse(
+            {"error": f"file is {len(blob):,} bytes; limit {_SCRATCH_MAX_FILE_BYTES:,}"},
+            status_code=413)
+    conn = db()
+    if not conn.execute("SELECT 1 FROM scratchboard WHERE id = ?", (entry_id,)).fetchone():
+        conn.close()
+        return JSONResponse({"error": f"no note {entry_id!r}"}, status_code=404)
+    n = conn.execute("SELECT COUNT(*) FROM scratchboard_files WHERE note_id = ?",
+                     (entry_id,)).fetchone()[0]
+    if n >= _SCRATCH_MAX_FILES_PER_NOTE:
+        conn.close()
+        return JSONResponse(
+            {"error": f"note already has {n} files; limit {_SCRATCH_MAX_FILES_PER_NOTE}"},
+            status_code=409)
+    fid = uuid.uuid4().hex[:16]
+    conn.execute("INSERT INTO scratchboard_files (id, note_id, ts, name, mime, size, data) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (fid, entry_id, time.time(), name,
+                  (payload.get("mime") or "").strip()[:100] or None, len(blob), blob))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": fid, "size": len(blob)}
+
+
+@app.get("/__proxy/api/scratchboard/files/{file_id}")
+def scratchboard_file(file_id: str):
+    conn = db()
+    row = conn.execute("SELECT name, mime, data FROM scratchboard_files WHERE id = ?",
+                       (file_id,)).fetchone()
+    conn.close()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # Always as an attachment, always octet-stream, never sniffed. These bytes are uploaded by
+    # whoever can reach the proxy and are served from the same origin as the dashboard — an
+    # HTML or SVG file rendered inline would be script execution against this page.
+    safe = re.sub(r'[^A-Za-z0-9._ -]', "_", row["name"] or "file")[:120]
+    return Response(
+        content=row["data"], media_type="application/octet-stream",
+        headers={"content-disposition": f'attachment; filename="{safe}"',
+                 "x-content-type-options": "nosniff"})
+
+
+@app.delete("/__proxy/api/scratchboard/files/{file_id}")
+def scratchboard_file_delete(file_id: str):
+    conn = db()
+    cur = conn.execute("DELETE FROM scratchboard_files WHERE id = ?", (file_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.post("/__proxy/api/scratchboard/{entry_id}/pin")
+async def scratchboard_pin(entry_id: str, request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    conn = db()
+    cur = conn.execute("UPDATE scratchboard SET pinned = ? WHERE id = ?",
+                       (0 if payload.get("pinned") is False else 1, entry_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "updated": cur.rowcount}
+
+
 @app.get("/__proxy/api/personalities")
 async def personalities_list(request: Request):
     viewer = _client_ip(request)
@@ -12435,6 +12665,33 @@ async def _bench_evict_ollama(keep: str = "") -> list:
     return unloaded
 
 
+async def _bench_loaded_context(model: str, upstream: str) -> int | None:
+    """The context window the backend ACTUALLY loaded, read after the model is up.
+
+    Not the same as what was asked for. A preload at num_ctx=65536 is discarded the moment a
+    request arrives carrying no context hint — Ollama reloads at OLLAMA_CONTEXT_LENGTH, which
+    here is 262144. That happened silently in the middle of a benchmark and nothing in the
+    report could show it, because the only context the report knew was the catalogue's.
+    """
+    try:
+        if upstream == "ollama":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+            for m in (ps.get("models") or []):
+                if (m.get("name") or m.get("model")) == model:
+                    return m.get("context_length") or None
+            return None
+        if upstream == "vllm":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                data = (await c.get(f"{VLLM_URL}/v1/models")).json()
+            for m in (data.get("data") or []):
+                if m.get("id") == model or len(data.get("data") or []) == 1:
+                    return m.get("max_model_len") or m.get("context_length") or None
+    except (httpx.RequestError, ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
 async def _bench_resident_mb(model: str, upstream: str) -> float | None:
     """How much the model is actually holding, as opposed to how big it is on disk.
 
@@ -13340,6 +13597,12 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         # only thing happening was this model loading.
                         _res = max(0, env["free_mb_before_load"] - env["free_mb_after_load"])
                     env["resident_mb"] = _res
+                    # Read after the warm-up, so it reflects what is serving rather than what
+                    # was requested. Overrides the catalogue value: the catalogue records what
+                    # the backend offered, this records what it did.
+                    _ctx = await _bench_loaded_context(model, str(cfg.get("upstream") or ""))
+                    if _ctx:
+                        env["loaded_context"] = _ctx
                     conn = db()
                     # env_json rides the write that already happens here. Without it, load_ms
                     # and resident_mb were captured into a dict that never touched the
@@ -17876,6 +18139,99 @@ async def _mcp_export(args: dict, request: Request | None = None):
                                   include_bodies=bool(args.get("include_bodies", False)),
                                   redact=bool(args.get("redact", True)))
     return _mcp_text_result(md)
+
+
+@mcp_tool(
+    "read_scratchboard",
+    "Read the shared scratchboard: working notes anyone on the network can post, newest "
+    "first with pinned notes at the top. Use it to pick up context a human or another agent "
+    "left behind — what is being worked on, what was already tried, what not to touch.",
+    {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            "pinned_only": {"type": "boolean", "default": False,
+                            "description": "Only the pinned notes — the standing context."},
+        },
+    },
+)
+async def _mcp_read_scratchboard(args: dict, request: Request | None = None):
+    limit = max(1, min(int(args.get("limit", 50) or 50), 200))
+    conn = db()
+    where = "WHERE pinned = 1 " if args.get("pinned_only") else ""
+    roots = conn.execute(
+        "SELECT id, ts, author, text, pinned FROM scratchboard "
+        + where + ("AND " if where else "WHERE ") + "parent_id IS NULL "
+        "ORDER BY pinned DESC, ts DESC LIMIT ?", (limit,)).fetchall()
+    replies: dict = {}
+    for r in conn.execute("SELECT id, ts, author, text, parent_id FROM scratchboard "
+                          "WHERE parent_id IS NOT NULL ORDER BY ts ASC").fetchall():
+        replies.setdefault(r["parent_id"], []).append(r)
+    conn.close()
+
+    # Rendered rather than dumped: an agent reading this wants the notes, not a JSON envelope
+    # around them, and timestamps are more useful as dates than as floats. Replies are indented
+    # under their note so a question and its answer arrive together — a reply read apart from
+    # what it answers is worse than not reading it.
+    def fmt(r, indent=""):
+        when = datetime.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M")
+        who = f" — {r['author']}" if r["author"] else ""
+        head = f"{indent}{'📌 ' if r.keys().__contains__('pinned') and r['pinned'] else ''}[{when}{who}]"
+        body = "\n".join(indent + line for line in (r["text"] or "").splitlines())
+        return f"{head}\n{body}"
+
+    out = []
+    for r in roots:
+        block = [fmt(r)]
+        for rep in replies.get(r["id"], []):
+            block.append(fmt(rep, indent="    ↳ "))
+        out.append("\n".join(block))
+    return _mcp_text_result("\n\n".join(out) or "(the scratchboard is empty)")
+
+
+@mcp_tool(
+    "write_scratchboard",
+    "Post a note to the shared scratchboard so humans and other agents can see it. "
+    "WRITE TOOL — gated by MCP_ALLOW_WRITE.",
+    {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "The note."},
+            "author": {"type": "string", "description": "Who is posting — an agent name is fine."},
+            "pinned": {"type": "boolean", "default": False,
+                       "description": "Pin as standing context rather than a scratch note."},
+            "reply_to": {"type": "string",
+                         "description": "Note id to reply to — answer a question on the board "
+                                        "rather than starting a new thread."},
+        },
+        "required": ["text"],
+    },
+    write=True,
+)
+async def _mcp_write_scratchboard(args: dict, request: Request | None = None):
+    text = (args.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required")
+    if len(text) > _SCRATCH_MAX_CHARS:
+        raise ValueError(f"text too long ({len(text)} chars, limit {_SCRATCH_MAX_CHARS})")
+    entry_id = uuid.uuid4().hex[:16]
+    conn = db()
+    parent = (args.get("reply_to") or "").strip() or None
+    if parent:
+        row = conn.execute("SELECT id, parent_id FROM scratchboard WHERE id = ?",
+                           (parent,)).fetchone()
+        if not row:
+            conn.close()
+            raise ValueError(f"no note {parent!r} to reply to")
+        parent = row["parent_id"] or row["id"]      # flatten to one level
+    conn.execute("INSERT INTO scratchboard (id, ts, author, text, client_ip, pinned, parent_id) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (entry_id, time.time(), (args.get("author") or "mcp").strip()[:64],
+                  text, _client_ip(request) if request else None,
+                  1 if (args.get("pinned") and not parent) else 0, parent))
+    conn.commit()
+    conn.close()
+    return _mcp_text_result({"ok": True, "id": entry_id})
 
 
 @mcp_tool(

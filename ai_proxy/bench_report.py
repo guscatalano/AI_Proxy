@@ -336,6 +336,10 @@ _REPORT_CSS = """
   .lchip { display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }
   .lchip i { width:9px; height:9px; border-radius:2px; display:inline-block; flex:none;
              border:1px solid rgba(0,0,0,.35); }
+  /* The failure taxonomy leads with the reason and explains it underneath, so the table can
+     be read without carrying a legend in your head. */
+  .fr-d { font-weight:400; font-size:11px; color:var(--ink-faint); margin-top:2px;
+          max-width:44ch; }
   .lseg-none { background:repeating-linear-gradient(45deg,var(--panel-2),var(--panel-2) 5px,
                var(--border) 5px,var(--border) 10px); color:var(--ink-dim); }
   details.lnum { margin:0 0 16px; }
@@ -924,6 +928,94 @@ _LANG_SHORT = {
     "css": "css", "sql": "sql", "go": "go", "lua": "lua", "php": "php", "c": "c",
     "perl": "pl", "haskell": "hs", "elixir": "ex", "clojure": "clj", "dart": "dart",
 }
+
+
+# Why a task failed, in priority order — the first match wins, so a truncated answer is
+# counted as truncated rather than as the wrong answer it necessarily also was. Every key
+# here is something the graders already recorded and the report used to discard: the page
+# said 84/119 and left the other 35 as an undifferentiated deficit, when a third of them
+# were the model running out of tokens and a third were it refusing to engage.
+_FAIL_REASONS = [
+    ("backend",    "backend or harness error", "the request never produced a gradeable answer"),
+    ("build",      "did not compile",          "code was returned but the toolchain rejected it"),
+    ("truncated",  "ran out of tokens",        "hit the max_tokens ceiling mid-answer"),
+    ("exhausted",  "agent ran out of steps",   "the episode ended before the task was done"),
+    ("malformed",  "malformed tool calls",     "emitted tool calls the dispatcher could not parse"),
+    ("looped",     "repeated itself",          "the same call often enough to be a loop"),
+    ("nocode",     "produced no code",         "prose or a diagram where a program was asked for"),
+    ("refused",    "declined to engage",       "refused a request the suite expects answered"),
+    ("wrong",      "wrong answer",             "ran, returned, and did not match"),
+]
+
+
+def _bench_failure_reason(row: dict, grade: dict, max_tokens=None) -> str:
+    """Classify one failed task. Grounded in fields the graders already emit."""
+    if row.get("error") or not (row.get("text") or "").strip():
+        return "backend"
+    if grade.get("build") is False or (grade.get("error") and "cases" not in grade):
+        return "build"
+    if grade.get("truncated") or (max_tokens and (row.get("completion_tokens") or 0) >= max_tokens - 8):
+        return "truncated"
+    if grade.get("exhausted"):
+        return "exhausted"
+    if grade.get("malformed"):
+        return "malformed"
+    if (grade.get("repeats") or 0) > 0:
+        return "looped"
+    gots = " ".join(str(c.get("got") or "") for c in (grade.get("cases") or []) if not c.get("ok"))
+    if "no code in any language" in gots or "no code" in gots:
+        return "nocode"
+    if "declined" in gots or "refused" in gots:
+        return "refused"
+    return "wrong"
+
+
+def _bench_failure_taxonomy_html(runs: list, rows_meta: list, axis_names: list) -> str:
+    """Counts of WHY each model failed, not just how often.
+
+    A score says a model lost 35 tasks. It cannot say whether it was wrong, silent, cut off,
+    or unwilling — and those call for four different responses: a better model, a bigger token
+    budget, a different prompt, or a policy change. The information was always in the grades.
+    """
+    per: dict = {}
+    for run, nm, meta in zip(runs, axis_names, rows_meta):
+        model = nm.split(" · ")[0]
+        mt = (run.get("config") or {}).get("max_tokens")
+        for row in ((run.get("results") or {}).get("rows") or []):
+            g = row.get("grade") or {}
+            if not g:
+                continue
+            if (g.get("passed") or 0) >= (g.get("total") or 1):
+                continue
+            per.setdefault(model, {})
+            k = _bench_failure_reason(row, g, mt)
+            per[model][k] = per[model].get(k, 0) + 1
+    if not per or not any(sum(v.values()) for v in per.values()):
+        return ""
+    models = [m for m in dict.fromkeys(nm.split(" · ")[0] for nm in axis_names) if m in per]
+    live = [(k, lbl, desc) for k, lbl, desc in _FAIL_REASONS
+            if any(per[m].get(k) for m in models)]
+    if not live:
+        return ""
+    head = "".join(f'<th class="n">{_h(m)}</th>' for m in models)
+    body = []
+    for k, lbl, desc in live:
+        cells = ""
+        for m in models:
+            n = per[m].get(k, 0)
+            tot = sum(per[m].values()) or 1
+            cells += (f'<td class="n">{n}'
+                      + (f' <span class="ct">({n / tot * 100:.0f}%)</span>' if n else "") + "</td>")
+        body.append(f'<tr><th scope="row">{_h(lbl)}<div class="fr-d">{_h(desc)}</div></th>{cells}</tr>')
+    tot_row = "".join(f'<td class="n"><b>{sum(per[m].values())}</b></td>' for m in models)
+    body.append(f'<tr><th scope="row">total failures</th>{tot_row}</tr>')
+    return ('<h2>Why it failed</h2>'
+            '<p class="note">Every failed task, classified by the first thing that went wrong. '
+            'A model that is cut off, silent, unwilling or simply incorrect has four different '
+            'problems, and only one of them is answered by picking a different model — the '
+            'others are a token budget, a prompt, and a policy decision.</p>'
+            f'<div class="tbl"><table><thead><tr><th>Reason</th>{head}</tr></thead>'
+            f'<tbody>{"".join(body)}</tbody></table></div>')
 
 
 def _bench_language_profile_html(runs: list, axis_names: list) -> str:
@@ -1716,7 +1808,12 @@ def _bench_axis_values(r: dict, cfg: dict) -> dict:
         "backend": cfg.get("upstream"),
         "think": r.get("thinking") or "auto",
         "cache": r.get("cache"),
-        "prompt": (f"{r['prompt_tokens']:,}" if r.get("prompt_tokens") else None),
+        # `is not None`, not truthiness: depth 0 is the BASELINE of a long-context sweep, not
+        # an absent setting. Treating it as absent left the axis with one distinct value, so
+        # it was judged constant and no column was drawn — a 0-vs-32k comparison rendered as
+        # four rows labelled only by model, with nothing saying which was which.
+        "prompt": ("none" if (r.get("prompt_tokens") or 0) == 0
+                   else f"{r['prompt_tokens']:,}") if r.get("prompt_tokens") is not None else None,
         "ctx": (f"{r['server_context']:,}" if r.get("server_context") else None),
         "temp": (str(r["temperature"]) if r.get("temperature") is not None else None),
         "conc": str(cfg.get("concurrency") or 1),
@@ -2693,6 +2790,7 @@ ordinary slowness rather than a misconfiguration.</p>
     # Only meaningful once a run spans more than one category — full-v1 does, the older
     # single-purpose suites do not, and the renderer returns "" for them.
     category_html = _bench_category_html(tasks, axis_names) if graded else ""
+    failure_html = _bench_failure_taxonomy_html(runs, rows, axis_names) if graded else ""
     efficiency_html = _bench_efficiency_html(rows) if graded else ""
     langpref_html = _bench_language_profile_html([p[0] for p in _lang_pairs],
                                                  [p[1] for p in _lang_pairs])
@@ -2717,6 +2815,8 @@ ordinary slowness rather than a misconfiguration.</p>
   {category_html}
 
   {winners_html}
+
+  {failure_html}
 
   {langpref_html}
 
