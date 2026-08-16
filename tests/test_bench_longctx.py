@@ -392,3 +392,35 @@ def test_the_timeout_is_not_unbounded():
     def budget(tokens):
         return max(600.0, (tokens * 4) / 4 / 250 + 600.0)
     assert budget(1_000_000) < 7200, "an hour and a half is already generous"
+
+
+# --- real replies from the 600k rung ----------------------------------------------------------
+
+
+def test_a_code_pinned_to_the_wrong_needle_does_not_also_credit_the_right_one():
+    """Verbatim from a 600k unit. charlie is answered with echo's code; delta and echo are
+    never answered at all. Scoring echo correct because its code appears SOMEWHERE turns one
+    confabulation into one error and one success — inflating the score in exactly the case
+    this suite exists to catch."""
+    reply = "alpha=CRIMSON-4417\nbeta=MERIDIAN-8823\ncharlie=PERIWINKLE-2051"
+    r = G._bench_grade_needles(reply, L._cases())
+    by = {c["label"].split(" @ ")[0]: c for c in r["cases"]}
+    assert by["alpha"]["ok"], "alpha was answered correctly"
+    assert by["bravo"]["ok"], "the code is right even though the model called it 'beta'"
+    assert not by["charlie"]["ok"] and "another needle" in by["charlie"]["got"]
+    assert not by["delta"]["ok"], "never answered"
+    assert not by["echo"]["ok"], "its code was pinned to charlie, not reported as echo's"
+    assert r["passed"] == 2, r["cases"]
+
+
+def test_an_inverted_format_still_scores_what_it_actually_found():
+    """Also verbatim: the model answered CODE=linenumber instead of NAME=CODE. Every needle
+    was genuinely located; the layout was wrong. The deliverable is the code."""
+    reply = ("CRIMSON-4417=0000000, MERIDIAN-8823=0000001, OBSIDIAN-1596=0010266, "
+             "TANGERINE-7304=0014677, PERIWINKLE-2051= echo vault access code is "
+             "PERIWINKLE-2051.")
+    assert G._bench_grade_needles(reply, L._cases())["passed"] == 5
+
+
+def test_the_bare_code_fallback_still_works_when_nothing_is_misattributed():
+    assert G._bench_grade_needles("CRIMSON-4417", L._cases())["passed"] == 1

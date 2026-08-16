@@ -1065,40 +1065,59 @@ def _bench_grade_answer(answer: str, cases: list) -> dict:
 def _bench_grade_needles(answer: str, cases: list) -> dict:
     """Score a long-context recall reply: one case per planted fact.
 
-    A wrong answer is recorded differently from a missing one. Measured at 700k, this model
-    reported echo's code as charlie's — the same substitution twice, across two KV cache
-    precisions — and "not correct" would have flattened a confident misattribution into the
-    same bucket as an honest "I could not find it". They mean different things about whether
-    the context is usable.
+    Three outcomes, not two. A model that writes NAME=MISSING has lost the fact and knows it;
+    one that reports another needle's code has lost it and does not. Both fail, but only the
+    second is a confabulation, and averaging them into "not correct" hides which is happening.
 
-    Matching is deliberately loose about surrounding punctuation and case: the deliverable is
-    the code, not the formatting, and a model that writes `- ALPHA: CRIMSON-4417` has recalled
-    it. It is strict about which code goes with which name, because that is the failure.
+    Matching is loose about layout and strict about which code belongs to which name. One real
+    reply came back as "CRIMSON-4417=0000000, MERIDIAN-8823=0000001, ..." — codes and line
+    numbers inverted — having genuinely found all five; the deliverable is the code, not the
+    formatting. Another answered charlie with echo's code and never mentioned echo at all, and
+    an earlier version of this scored that as one error AND one success, because echo's code
+    did appear somewhere in the reply. A code consumed by one needle's answer can no longer
+    stand in as another's.
     """
     text = answer or ""
+    lines = text.splitlines()
     all_codes = {str(c.get("code")) for c in cases if c.get("code")}
+    verdicts: dict = {}
+    consumed: dict = {}                 # code -> the needle whose answer used it
+
+    # Pass 1: needles the reply actually names. These bind a code to a name, which is what
+    # makes the bare-code fallback in pass 2 safe.
+    for case in cases:
+        name = str(case.get("name") or "")
+        code = str(case.get("code") or "")
+        said = next((ln.strip() for ln in lines if name and name.lower() in ln.lower()), None)
+        if said is None:
+            continue
+        if code.lower() in said.lower():
+            verdicts[name] = (True, None)
+            consumed[code] = name
+        elif "missing" in said.lower():
+            verdicts[name] = (False, f"reported {name} as not found")
+        else:
+            wrong = next((c for c in all_codes - {code} if c.lower() in said.lower()), None)
+            if wrong:
+                verdicts[name] = (False, f"said {wrong} — that is another needle's code, "
+                                         f"not {code}")
+                consumed[wrong] = name
+            else:
+                verdicts[name] = (False, f"answered {said[:60]!r}, expected {code}")
+
+    # Pass 2: needles the reply never named. A bare code still counts — the layout was wrong,
+    # not the recall — unless another needle's answer already claimed that exact code.
     results = []
     for case in cases:
         name = str(case.get("name") or "")
         code = str(case.get("code") or "")
-        # The line the model wrote about this needle, if it wrote one.
-        said = next((ln.strip() for ln in text.splitlines()
-                     if name and name.lower() in ln.lower()), None)
-        if said and code.lower() in said.lower():
+        if name in verdicts:
+            ok, got = verdicts[name]
+        elif code.lower() in text.lower() and consumed.get(code, name) == name:
             ok, got = True, None
-        elif said and any(c.lower() in said.lower() for c in all_codes - {code}):
-            wrong = next(c for c in all_codes - {code} if c.lower() in said.lower())
-            ok, got = False, f"said {wrong} — that is another needle's code, not {code}"
-        elif said and "missing" in said.lower():
-            # The model was asked to say MISSING when it could not find one, and did. An honest
-            # miss and a confident wrong answer are both failures, but only one of them means
-            # the model knows it lost the thread.
-            ok, got = False, f"reported {name} as not found"
-        elif said:
-            ok, got = False, f"answered {said[:60]!r}, expected {code}"
-        elif code.lower() in text.lower():
-            # Listed without its label. Still recalled; the format was not what was asked.
-            ok, got = True, None
+        elif consumed.get(code):
+            ok, got = False, (f"{code} appears only as {consumed[code]}'s answer, "
+                              f"never as {name}'s")
         else:
             ok, got = False, f"{code} does not appear anywhere in the reply"
         results.append({"ok": ok, "label": case.get("label") or name,
