@@ -658,3 +658,25 @@ def test_the_section_itself_does_not_care_which_suite_a_unit_came_from():
         {"suite": "longctx-deep", "results": {"rows": [_unit("longctx_900k", 4)]}},
     ])
     assert ">16k<" in html and ">900k<" in html
+
+
+def test_a_unit_that_never_reached_the_model_is_not_a_recall_of_zero():
+    """Merging three runs surfaced this: five ReadTimeout casualties from an early run dragged
+    the 700k rung to 18/50, and a rung whose prompts never fit the window showed 0/5 against a
+    prompt size of zero. A request that died measured nothing."""
+    from ai_proxy import bench_report as R
+    good = _unit("longctx_16k", 5)
+    errored = dict(_unit("longctx_16k", 0), error="ReadTimeout: ")
+    no_prompt = dict(_unit("longctx_16k", 0), prompt_tokens=0)
+    html = R._bench_longctx_html(_run_with([good, errored, no_prompt]))
+    assert "5/5" in html and "5/15" not in html, "dead units were counted against the score"
+    assert "not counted at all" in html, "the exclusion has to be stated, not silent"
+
+
+def test_a_rung_made_entirely_of_dead_units_disappears_rather_than_scoring_zero():
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([
+        _unit("longctx_16k", 5),
+        dict(_unit("longctx_1m", 0), prompt_tokens=0),
+    ]))
+    assert ">1m<" not in html, "a rung that never ran should not appear as a failure"

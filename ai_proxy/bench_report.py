@@ -2218,10 +2218,21 @@ def _bench_longctx_html(runs: list) -> str:
     other suite.
     """
     units = []
+    dead = 0
     for r in runs:
         for u in ((r.get("results") or {}).get("rows") or []):
-            if str(u.get("task") or "").startswith("longctx_"):
-                units.append(u)
+            if not str(u.get("task") or "").startswith("longctx_"):
+                continue
+            # A unit that errored, or that never got a prompt size back, measured nothing —
+            # the request died before the model saw the haystack. Counting those as zero
+            # recall is the same mistake as counting a truncated reply as a wrong answer.
+            # Merging three runs surfaced it: five ReadTimeout casualties from an early run
+            # dragged the 700k rung to 18/50, and a rung whose prompts never fit the window
+            # showed 0/5 against a prompt size of zero.
+            if u.get("error") or not (u.get("prompt_tokens") or 0):
+                dead += 1
+                continue
+            units.append(u)
     if not units:
         return ""
 
@@ -2298,6 +2309,11 @@ def _bench_longctx_html(runs: list) -> str:
         f'<td class="n">{dep_tot[d][0]}/{dep_tot[d][1]}</td>' if dep_tot[d][1] else '<td class="n">—</td>'
         for d in depths)
     kinds_txt = " · ".join(f"{v} {k}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1]))         or "none — every planted fact was recalled"
+    dead_note = ""
+    if dead:
+        dead_note = (f'<p class="note"><b>{dead}</b> unit(s) are not counted at all: the '
+                     f'request failed or never reported a prompt size, so the model never saw '
+                     f'the haystack. A request that died is not a recall of zero.</p>')
     cut_note = ""
     if grand_cut:
         cut_note = (f'<p class="note"><b>{grand_cut}</b> unit(s) excluded: the reply hit the '
@@ -2348,7 +2364,7 @@ def _bench_longctx_html(runs: list) -> str:
           <td class="n">{grand_ok}/{grand_n}</td>{dep_foot}
           <td class="n">&mdash;</td><td class="n">{grand_cut or '&mdash;'}</td></tr></tfoot>
       </table></div>
-      {cut_note}
+      {cut_note}{dead_note}
       <p class="note"><b>Failures by kind:</b> {_h(kinds_txt)}. These are not
       interchangeable. A model that writes NAME=MISSING has lost the fact and knows it — it can
       tell you it does not know. A model that answers with another needle's code has lost it and
