@@ -494,3 +494,15 @@ def test_the_lite_suite_stops_below_the_measured_edge():
 
 def test_lite_is_registered(client):
     assert "longctx-lite" in proxy._BENCH_SUITES
+
+
+def test_the_output_budget_can_exceed_eight_thousand_tokens():
+    """The runner clamped max_tokens to 8192, chosen when prompts were short. It silently
+    clamped a deliberate 32768 and the re-run was identical to the one it replaced — the
+    request carried 8192 while the run config said 32768. Long-context reasoning needs the
+    room: ~1k characters at 16k of context, 24,652 at 300k."""
+    import re as _re
+    src = open(proxy.__file__, encoding="utf-8").read()
+    m = _re.search(r'max_tokens = max\(16, min\(int\(_scalar\("max_tokens", 256\)\), (\d+)\)\)', src)
+    assert m, "the clamp moved or was renamed"
+    assert int(m.group(1)) >= 32768, f"still clamped at {m.group(1)}"

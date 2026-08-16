@@ -13645,7 +13645,14 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             return (v[0] if v else default) if isinstance(v, list) else v
 
         runs = max(1, min(int(_scalar("runs", 5)), 50))
-        max_tokens = max(16, min(int(_scalar("max_tokens", 256)), 8192))
+        # The ceiling was 8192, chosen when every prompt was short and every answer shorter.
+        # It silently clamped a deliberate 32768 and the run looked identical to the one it was
+        # meant to replace. Long-context work needs the room: reasoning length here scales with
+        # INPUT size, not task difficulty — the same five-line answer drew ~1k characters of
+        # reasoning at 16k of context and 24,652 at 300k, which overruns 8192 tokens.
+        # It stays a runaway guard rather than a correctness mechanism; a reply that hits it is
+        # now flagged truncated rather than scored as a failure.
+        max_tokens = max(16, min(int(_scalar("max_tokens", 256)), 32768))
         prompt_tokens = max(0, min(int(_scalar("prompt_tokens", 0)), 262144))
         concurrency = max(1, min(int(_scalar("concurrency", 1)), 8))
         randomize = bool(cfg.get("randomize", False))
