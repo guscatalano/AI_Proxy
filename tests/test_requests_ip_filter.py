@@ -68,16 +68,14 @@ def test_an_address_nobody_used_returns_nothing_rather_than_everything(client):
         _cleanup()
 
 
-def test_the_dropdown_gets_addresses_with_counts_and_the_apps_behind_them(client):
-    """A bare 192.168.x.y is not memorable; which box is 'the hermes one' is what is being
-    picked, so the apps ride along with the address."""
+def test_the_dropdown_gets_the_addresses_and_nothing_else(client):
+    """Just the address and a count. Listing the apps behind each one scans client_app across
+    every row of a multi-gigabyte table to decorate a select box."""
     _seed([("hermes", "10.0.0.1"), ("hermes-safety", "10.0.0.1"), ("opencode", "10.0.0.2")])
     try:
-        body = client.get("/__proxy/api/requests?limit=200").json()
-        rows = {r["ip"]: r for r in body["ips"]}
+        rows = {r["ip"]: r for r in client.get("/__proxy/api/requests?limit=200").json()["ips"]}
         assert "10.0.0.1" in rows and rows["10.0.0.1"]["count"] >= 2
-        apps = set((rows["10.0.0.1"]["apps"] or "").split(","))
-        assert {"hermes", "hermes-safety"} <= apps, apps
+        assert "apps" not in rows["10.0.0.1"], "the dropdown does not need it"
     finally:
         _cleanup()
 

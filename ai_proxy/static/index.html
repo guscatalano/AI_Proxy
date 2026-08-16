@@ -2118,13 +2118,8 @@ function renderRequestsPager() {
     .concat(_reqClients.map(c => `<option value="${esc(c.app)}" ${c.app===_reqClient?'selected':''}>${esc(c.app)} (${c.count})</option>`))
     .join('');
   const selCss = 'background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px';
-  // The apps seen from an address are shown with it: a bare 192.168.x.y is not memorable,
-  // and which box is "the hermes one" is the thing you are actually selecting.
   const ipOpts = ['<option value="">all sources</option>']
-    .concat(_reqIps.map(r => {
-      const apps = (r.apps || '').split(',').filter(Boolean).slice(0, 2).join(', ');
-      return `<option value="${esc(r.ip)}" ${r.ip===_reqIp?'selected':''}>${esc(r.ip)}${apps ? ' — ' + esc(apps) : ''} (${r.count})</option>`;
-    }))
+    .concat(_reqIps.map(r => `<option value="${esc(r.ip)}" ${r.ip===_reqIp?'selected':''}>${esc(r.ip)}</option>`))
     .join('');
   const clientSel = `<label>Client <select id="rq-client" style="${selCss}">${clientOpts}</select></label>`
     + ` <label>Source <select id="rq-ip" style="${selCss}">${ipOpts}</select></label>`

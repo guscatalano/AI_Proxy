@@ -6664,13 +6664,12 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         + ("" if include_shadows else " AND shadow_of IS NULL")
         + " GROUP BY client_app ORDER BY count DESC"
     ).fetchall()
-    # Distinct source addresses, with the apps seen from each — an address alone is not
-    # memorable, and "192.168.15.10 (hermes)" is. Not gated by the PII rules: client_ip is
-    # not in the redaction set and the list already renders an address on every row, so this
-    # discloses nothing a viewer cannot already read off the screen.
+    # Distinct source addresses for the filter dropdown. Deliberately just the address and a
+    # count: a GROUP_CONCAT of the apps behind each one reads nicely but scans client_app across
+    # every row of a multi-gigabyte table to decorate a select box. Not gated by the PII rules —
+    # client_ip is not in the redaction set and the list already renders an address on every row.
     ip_rows = conn.execute(
-        "SELECT client_ip AS ip, COUNT(*) AS count, "
-        "       GROUP_CONCAT(DISTINCT client_app) AS apps "
+        "SELECT client_ip AS ip, COUNT(*) AS count "
         "FROM requests WHERE client_ip IS NOT NULL"
         + ("" if include_shadows else " AND shadow_of IS NULL")
         + " GROUP BY client_ip ORDER BY count DESC"
