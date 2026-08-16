@@ -158,11 +158,28 @@ def test_the_suite_listing_does_not_ship_the_haystacks(client):
 # --- the ladder, and what happens to rungs a model cannot reach -------------------------------
 
 
-def test_the_ladder_spans_small_to_the_largest_advertised_window():
+def test_the_ladder_ascends_and_reaches_the_deep_end():
     """One suite has to say something useful about a 32k model and a 1M one."""
     sizes = [t["target_tokens"] for t in L.LONGCTX_TASKS]
     assert sizes == sorted(sizes), "rungs must ascend or the curve reads backwards"
-    assert min(sizes) <= 16_000 and max(sizes) >= 1_000_000
+    assert min(sizes) <= 16_000 and max(sizes) >= 900_000
+
+
+def test_no_rung_is_unreachable_by_construction():
+    """A prompt can never fill its own window — the model needs room to answer and the
+    estimator holds 10% back, so a 1,048,576 window admits about 936k. A rung set at the
+    advertised maximum can only ever run on a model that advertises MORE, which is not the
+    model you are testing. The 1M rung was here once: it never ran, it made progress_total
+    read 55 where 50 was expected, and it would have spent two hours of exclusive GPU on
+    front-truncated units."""
+    for window, out in ((1_048_576, 8_192), (1_048_576, 32_768), (262_144, 8_192)):
+        budget = proxy._bench_ctx_budget(window, out)
+        fits = [t for t in L.LONGCTX_TASKS if t["target_tokens"] <= budget]
+        assert fits, f"nothing fits a {window:,} window"
+        assert max(t["target_tokens"] for t in fits) <= budget
+    # The top rung must be reachable on the window it was designed around.
+    assert max(t["target_tokens"] for t in L.LONGCTX_TASKS) <= proxy._bench_ctx_budget(
+        1_048_576, 32_768), "the top rung cannot be asked of a 1M model"
 
 
 def test_the_ladder_brackets_the_measured_cliff():

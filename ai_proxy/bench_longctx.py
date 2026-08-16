@@ -157,9 +157,15 @@ def _task(target_tokens: int, label: str):
 #
 # Rungs are chosen where the answer changes, not on a round grid: 16k is the control, 128k is
 # where most local deployments sit, 262,144 is the Ollama server default this box ran for months,
-# 300k is the first rung past it, and 512k/700k/1M cover the range where a "1M" claim is actually
-# being tested. Measured here, 300k scored 5/5 and 700k scored 2/5 — a cliff that a ladder
-# stopping at 300k would have reported as a clean sweep.
+# 300k is the first rung past it, and 512k upward is where a "1M" claim is actually tested.
+#
+# The ladder stops at 900k and there is no 1M rung, because a prompt can never fill its own
+# window — the model needs room to answer, and the estimator keeps 10% back, so a 1,048,576
+# window admits about 936k. A rung set at the advertised maximum is unreachable by construction
+# on exactly the model that advertises it. It was here once and earned nothing: it never ran, it
+# made progress_total read 55 where 50 was expected, and it would have spent two hours of
+# exclusive GPU on five front-truncated units that measure nothing. 900k is ~86% of the window
+# and runs clean.
 LONGCTX_TASKS = [
     _task(16_000, "16k"),
     _task(64_000, "64k"),
@@ -171,7 +177,6 @@ LONGCTX_TASKS = [
     _task(700_000, "700k"),
     _task(800_000, "800k"),
     _task(900_000, "900k"),
-    _task(1_000_000, "1m"),
 ]
 
 # The deep end on its own. Re-running six rungs that already scored 149/150 to reach the two
@@ -205,9 +210,7 @@ LONGCTX_TASK_NOTES = {
                     "measured at 6,134 characters, and a flat 600s client timeout that aborted "
                     "the request mid-prefill. Treat those numbers as unmeasured.",
     "longctx_800k": "Past anything measured on this box.",
-    "longctx_900k": "The highest rung that fits: a 1M window minus room to answer, minus the "
-                    "estimator's 10% headroom, leaves about 936k.",
-    "longctx_1m": "The advertised maximum, and unreachable by construction: a prompt cannot "
-                  "fill the whole window and still leave room for a reply. Kept as the rung "
-                  "that documents the ceiling — it is skipped and recorded, never failed.",
+    "longctx_900k": "The top of the ladder, and the highest rung a 1M model can actually be "
+                    "asked: the window minus room to answer, minus the estimator's 10% "
+                    "headroom, leaves about 936k.",
 }
