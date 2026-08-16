@@ -2205,6 +2205,127 @@ def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
             sorted(out.items(), key=lambda kv: -len(kv[1]))}
 
 
+def _bench_longctx_html(runs: list) -> str:
+    """The long-context view, rendered instead of guessing from the generic tables.
+
+    A needle ladder is not a coding suite and does not read like one. The generic report calls
+    this run "93% fully correct" because it counts two units that hit the output cap as
+    failures — they are not failures, they are units where the model never finished answering,
+    and the truth is 140 of 140. It also has no place to show the two things the metric exists
+    to expose: where recall breaks as the prompt grows, and which DEPTH the lost facts were at.
+
+    Rendered only when the run actually contains needle tasks, so nothing changes for every
+    other suite.
+    """
+    units = []
+    for r in runs:
+        for u in ((r.get("results") or {}).get("rows") or []):
+            if str(u.get("task") or "").startswith("longctx_"):
+                units.append(u)
+    if not units:
+        return ""
+
+    by_rung: dict = {}
+    for u in units:
+        by_rung.setdefault(u["task"], []).append(u)
+
+    def size_of(task):
+        z = task.replace("longctx_", "")
+        try:
+            return float(z[:-1]) * (1_000_000 if z.endswith("m") else 1000)
+        except ValueError:
+            return 0.0
+
+    depths = ["start", "25%", "50%", "75%", "end"]
+    rows_html = []
+    dep_tot: dict = {d: [0, 0] for d in depths}
+    kinds: dict = {}
+    grand_ok = grand_n = grand_cut = 0
+
+    for task in sorted(by_rung, key=size_of):
+        us = by_rung[task]
+        clean = [u for u in us if not (u.get("grade") or {}).get("truncated")]
+        cut = len(us) - len(clean)
+        ok = sum((u.get("grade") or {}).get("passed", 0) for u in clean)
+        n = len(clean) * 5
+        grand_ok += ok
+        grand_n += n
+        grand_cut += cut
+        # Real prompt size as the upstream counted it, not the size we asked for.
+        pts = sorted(u.get("prompt_tokens") or 0 for u in us) or [0]
+        med_pt = pts[len(pts) // 2]
+        # Prefill rate: tokens the model had to read, over the time before the first one came
+        # back. The only throughput number that means anything on a prompt this size.
+        rates = [(u.get("prompt_tokens") or 0) / ((u.get("ttft_ms") or 0) / 1000.0)
+                 for u in us if (u.get("ttft_ms") or 0) > 0 and (u.get("prompt_tokens") or 0)]
+        rate = sorted(rates)[len(rates) // 2] if rates else None
+        per_depth = []
+        for d in depths:
+            hit = tot = 0
+            for u in clean:
+                for c in ((u.get("grade") or {}).get("cases") or []):
+                    if str(c.get("label") or "").endswith("@ " + d):
+                        tot += 1
+                        hit += 1 if c.get("ok") else 0
+            dep_tot[d][0] += hit
+            dep_tot[d][1] += tot
+            cls = "" if not tot else (" win" if hit == tot else (" bad" if hit * 2 < tot else ""))
+            per_depth.append(f'<td class="n{cls}">{hit}/{tot}</td>' if tot else '<td class="n">—</td>')
+        for u in clean:
+            for c in ((u.get("grade") or {}).get("cases") or []):
+                if c.get("ok"):
+                    continue
+                got = c.get("got") or ""
+                k = ("misattributed to another needle"
+                     if ("another needle" in got or "appears only as" in got)
+                     else "reported as not found" if "not found" in got
+                     else "absent from the reply")
+                kinds[k] = kinds.get(k, 0) + 1
+        pct = (ok / n) if n else None
+        cls = "" if pct is None else (" win" if pct >= 0.999 else (" bad" if pct < 0.8 else ""))
+        rate_cell = f'<td class="n">{rate:,.0f}</td>' if rate else '<td class="n">&mdash;</td>'
+        cut_cell = f'<td class="n">{cut}</td>' if cut else '<td class="n">&mdash;</td>'
+        rows_html.append(
+            f'<tr><th scope="row"><code>{_h(task.replace("longctx_", ""))}</code></th>'
+            f'<td class="n">{med_pt:,}</td>'
+            f'<td class="n{cls}">{ok}/{n}</td>'
+            + "".join(per_depth) + rate_cell + cut_cell + "</tr>")
+
+    dep_head = "".join(f"<th>{_h(d)}</th>" for d in depths)
+    dep_foot = "".join(
+        f'<td class="n">{dep_tot[d][0]}/{dep_tot[d][1]}</td>' if dep_tot[d][1] else '<td class="n">—</td>'
+        for d in depths)
+    kinds_txt = " · ".join(f"{v} {k}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1]))         or "none — every planted fact was recalled"
+    cut_note = ""
+    if grand_cut:
+        cut_note = (f'<p class="note"><b>{grand_cut}</b> unit(s) excluded: the reply hit the '
+                    f'output cap before it finished answering. A truncated reply is not a '
+                    f'recall failure, and scoring it as one measures the token budget rather '
+                    f'than the model. Reasoning length here grows with the size of the prompt, '
+                    f'not the difficulty of the task.</p>')
+
+    return f"""
+    <section>
+      <h2>Long context — what the window actually holds</h2>
+      <p class="note">Five facts are planted at fixed depths through a haystack of known size and
+      asked for in one request. The first sits near the <b>start</b>, because a backend that
+      front-truncates an over-long prompt loses that one first — so a healthy start column is
+      what proves the window is real, and the middle columns are where recall actually fails.</p>
+      <table class="tbl">
+        <thead><tr><th>Rung</th><th>Prompt tokens</th><th>Recalled</th>{dep_head}
+          <th>Prefill tok/s</th><th>Excluded</th></tr></thead>
+        <tbody>{''.join(rows_html)}</tbody>
+        <tfoot><tr><th scope="row">all</th><td class="n">—</td>
+          <td class="n">{grand_ok}/{grand_n}</td>{dep_foot}
+          <td class="n">—</td><td class="n">{grand_cut or '—'}</td></tr></tfoot>
+      </table>
+      {cut_note}
+      <p class="note">Failures by kind: {_h(kinds_txt)}. A model that writes NAME=MISSING has
+      lost the fact and knows it; one that answers with another needle's code has lost it and
+      does not. They fail the same and mean different things.</p>
+    </section>"""
+
+
 def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
 
@@ -2833,8 +2954,14 @@ ordinary slowness rather than a misconfiguration.</p>
             f'ranked alongside — a 24-task preference suite and a 119-task correctness suite '
             f'produce numbers that do not mean the same thing.</p>') + langpref_html
     variance_html = _bench_variance_html(runs, rows, axis_names) if graded else ""
+    # Placed directly under the results table rather than among the coding sections: for a
+    # needle ladder this IS the result, and the generic tables above it are the supporting
+    # detail. Empty for every other suite, so nothing else moves.
+    longctx_html = _bench_longctx_html(runs)
     body = f"""
   {results}
+
+  {longctx_html}
 
   {weighted_html}
 

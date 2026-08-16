@@ -506,3 +506,69 @@ def test_the_output_budget_can_exceed_eight_thousand_tokens():
     m = _re.search(r'max_tokens = max\(16, min\(int\(_scalar\("max_tokens", 256\)\), (\d+)\)\)', src)
     assert m, "the clamp moved or was renamed"
     assert int(m.group(1)) >= 32768, f"still clamped at {m.group(1)}"
+
+
+# --- the report tailors itself to this workload -----------------------------------------------
+
+
+def _run_with(units):
+    return [{"results": {"rows": units}}]
+
+
+def _unit(task, passed, truncated=False, pt=100_000, ttft=50_000, depths=None):
+    depths = depths or ["start", "25%", "50%", "75%", "end"]
+    cases = [{"label": f"n @ {d}", "ok": i < passed} for i, d in enumerate(depths)]
+    g = {"passed": passed, "total": 5, "cases": cases}
+    if truncated:
+        g["truncated"] = True
+    return {"task": task, "grade": g, "prompt_tokens": pt, "ttft_ms": ttft}
+
+
+def test_the_section_is_absent_for_every_other_suite():
+    """It must not appear on a coding run; the generic tables are right for those."""
+    from ai_proxy import bench_report as R
+    other = [{"results": {"rows": [{"task": "mid_floor", "grade": {"passed": 3, "total": 3}}]}}]
+    assert R._bench_longctx_html(other) == ""
+
+
+def test_a_truncated_unit_is_excluded_from_the_score_not_counted_as_a_failure():
+    """The generic report called a 140/140 ladder "93% fully correct" because two units hit the
+    output cap. That measures the token budget, not the model."""
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([
+        _unit("longctx_16k", 5), _unit("longctx_16k", 5),
+        _unit("longctx_16k", 2, truncated=True),
+    ]))
+    assert "10/10" in html, "two clean units of five needles each"
+    assert "2/5" not in html, "the truncated unit's score must not appear"
+    assert "excluded" in html
+
+
+def test_the_depth_columns_are_broken_out():
+    """Which depth lost the fact is the finding; a single percentage hides it."""
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([_unit("longctx_64k", 3)]))
+    for d in ("start", "25%", "50%", "75%", "end"):
+        assert f">{d}<" in html, d
+
+
+def test_rungs_render_in_size_order():
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([
+        _unit("longctx_512k", 5), _unit("longctx_16k", 5), _unit("longctx_128k", 5),
+    ]))
+    assert html.index(">16k<") < html.index(">128k<") < html.index(">512k<")
+
+
+def test_the_prefill_rate_is_reported():
+    """Tokens read per second is the only throughput number that means anything when the prompt
+    is half a million tokens and the answer is five lines."""
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([_unit("longctx_128k", 5, pt=128_000, ttft=64_000)]))
+    assert "Prefill tok/s" in html and "2,000" in html
+
+
+def test_a_rung_with_no_clean_units_does_not_divide_by_zero():
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([_unit("longctx_900k", 1, truncated=True)]))
+    assert "0/0" in html
