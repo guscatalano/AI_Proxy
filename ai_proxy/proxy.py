@@ -11923,6 +11923,7 @@ _BENCH_SUITES.setdefault("longctx-v1", _bench_longctx_mod.LONGCTX_TASKS)
 # identified by its suite name, and "which rungs did this number come from" has to survive
 # into the report.
 _BENCH_SUITES.setdefault("longctx-deep", _bench_longctx_mod.LONGCTX_DEEP_TASKS)
+_BENCH_SUITES.setdefault("longctx-lite", _bench_longctx_mod.LONGCTX_LITE_TASKS)
 _BENCH_TASK_DESC.update(_bench_longctx_mod.LONGCTX_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_longctx_mod.LONGCTX_TASK_NOTES)
 
@@ -11961,7 +11962,8 @@ for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding
                                   ("memory-v1", "memory"),
                                   ("langpref-v1", "preference"),
                                   ("longctx-v1", "longcontext"),
-                                  ("longctx-deep", "longcontext")):
+                                  ("longctx-deep", "longcontext"),
+                                  ("longctx-lite", "longcontext")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are

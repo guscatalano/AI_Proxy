@@ -179,6 +179,11 @@ LONGCTX_TASKS = [
 # ladder is expensive enough that the difference matters.
 LONGCTX_DEEP_TASKS = [t for t in LONGCTX_TASKS if t["target_tokens"] >= 600_000]
 
+# The other half. Together the two cover the ladder without overlap, so a comparison that needs
+# only one end of it does not pay for the other — the deep rungs are four hours of exclusive
+# GPU and the shallow ones are barely one.
+LONGCTX_LITE_TASKS = [t for t in LONGCTX_TASKS if t["target_tokens"] < 600_000]
+
 LONGCTX_TASK_DESC = {t["id"]: f"Recall five facts planted through a "
                               f"{t['target_tokens']:,}-token haystack."
                      for t in LONGCTX_TASKS}

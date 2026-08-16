@@ -474,3 +474,23 @@ def test_normalising_does_not_invent_matches_from_the_filler():
     line 3, so any prefix of a real haystack legitimately contains one."""
     filler = "\n".join(L._filler(i) for i in range(4000))
     assert G._bench_grade_needles(filler, L._cases())["passed"] == 0
+
+
+def test_lite_and_deep_partition_the_ladder():
+    """Together they cover it exactly once. A comparison that needs one end should not pay for
+    the other — the deep rungs are four hours of exclusive GPU, the shallow ones barely one."""
+    lite = {t["id"] for t in L.LONGCTX_LITE_TASKS}
+    deep = {t["id"] for t in L.LONGCTX_DEEP_TASKS}
+    full = {t["id"] for t in L.LONGCTX_TASKS}
+    assert lite | deep == full and not (lite & deep)
+    assert lite and deep
+
+
+def test_the_lite_suite_stops_below_the_measured_edge():
+    """512k measured 23-25/25 and 600k drops to ~4/5, so the split sits on the edge rather
+    than through the middle of it."""
+    assert max(t["target_tokens"] for t in L.LONGCTX_LITE_TASKS) == 512_000
+
+
+def test_lite_is_registered(client):
+    assert "longctx-lite" in proxy._BENCH_SUITES
