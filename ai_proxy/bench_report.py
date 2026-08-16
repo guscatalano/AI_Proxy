@@ -721,7 +721,8 @@ TASK_SIDE: dict = {}
 # task id -> language its prompt demanded (directed langpref variants only).
 TASK_REQUESTED_LANG: dict = {}
 
-_CAT_ORDER = ("coding", "agentic", "security", "instruct", "refusal", "memory")
+_CAT_ORDER = ("coding", "agentic", "security", "instruct", "refusal", "memory",
+              "longcontext")
 _CAT_BLURB = {
     "coding": "write code that passes its tests",
     "agentic": "drive tools across many turns and finish",
@@ -729,7 +730,25 @@ _CAT_BLURB = {
     "instruct": "produce the shape that was asked for",
     "refusal": "engage with security work, decline the harmful end",
     "memory": "keep a store a future session can inherit",
+    "longcontext": "still find a fact after a very long prompt",
 }
+
+
+def _task_sort_key(task_id: str):
+    """Order tasks for display. Plain alphabetical is right for every suite except the
+    long-context ladder, whose ids sort 128k, 16k, 1m, 256k, 300k, 512k, 64k, 700k — the axis
+    of a curve, scrambled. A rung is placed by the size it measures instead.
+    """
+    if task_id.startswith("longctx_"):
+        suffix = task_id[len("longctx_"):].lower()
+        try:
+            if suffix.endswith("m"):
+                return (0, float(suffix[:-1]) * 1_000_000, task_id)
+            if suffix.endswith("k"):
+                return (0, float(suffix[:-1]) * 1_000, task_id)
+        except ValueError:
+            pass
+    return (1, 0.0, task_id)
 
 
 def _bench_category_html(tasks: dict, axis_names: list) -> str:
@@ -1877,6 +1896,13 @@ def _bench_case_parts(task: dict, idx: int) -> tuple:
             return "final answer", exp
         if c["check"] == "memory":
             return "the memory left behind (inspected, not inferred)", exp
+        if c["check"] == "needle":      # long-context recall: which fact, and how deep
+            # Without this the case fell through to the conduct line below and a missed needle
+            # was reported as the model making malformed tool calls, expecting null.
+            depth = str(c.get("depth") or "")
+            where = (f"at the {depth}" if depth in ("start", "end")
+                     else f"{depth} of the way through" if depth else "in the haystack")
+            return f'the {c.get("name")} code, planted {where}', json.dumps(c.get("code"))
         return "conduct (no malformed/hallucinated/repeated calls, within budget)", exp
     if "expect_any" in c:               # analysis answer: graded on what it names
         wanted = ", ".join(str(w) for w in (c.get("expect_any") or [])[:4])
@@ -2386,7 +2412,7 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
             th = "".join(f"<th>{_h(l)}</th>" for l in col_labels)
             # With one configuration, a row per task is a column of identical 100%s. Only the
             # tasks that lost a case carry information, so list those and count the rest.
-            items = sorted(tasks.items())
+            items = sorted(tasks.items(), key=lambda kv: _task_sort_key(kv[0]))
             if len(rows) == 1:
                 lab = col_labels[0]
                 imperfect = [(t, per) for t, per in items if (per.get(lab) or 0) < 1]

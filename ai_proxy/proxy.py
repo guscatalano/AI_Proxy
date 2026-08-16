@@ -12004,7 +12004,7 @@ _bench_grade_needles = _bench_graders_mod._bench_grade_needles
 
 
 async def _bench_grade(text: str, task: dict, timeout_s: float,
-                       reasoning: str = "") -> dict:
+                       reasoning: str = "", finish_reason: str | None = None) -> dict:
     """Grade one response against one task definition."""
     lang = task.get("lang") or "python"
     # Analysis, format and refusal tasks are graded on the reply itself: extracting a code
@@ -12027,6 +12027,12 @@ async def _bench_grade(text: str, task: dict, timeout_s: float,
     total = res.get("total") or len(task["cases"])
     res["task"] = task["id"]
     res["score"] = (res.get("passed", 0) / total) if total else 0.0
+    # A reply cut off at max_tokens did not fail the task, it never finished answering it.
+    # Measured during the first longctx run: one 262k unit spent its whole 2,048-token budget
+    # on 6,134 characters of reasoning and emitted no content at all, which would have been
+    # read as recall collapsing at 256k. Flagged rather than silently scored.
+    if finish_reason == "length" and res.get("passed", 0) < total:
+        res["truncated"] = True
     return res
 
 
@@ -12251,6 +12257,7 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     served_model: str | None = None
     text_parts: list[str] = []
     reasoning_parts: list[str] = []
+    finish_reason: str | None = None
     err: str | None = None
     status_code: int | None = None
     try:
@@ -12274,6 +12281,8 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                     if served_model is None and j.get("model"):
                         served_model = str(j["model"])
                     for ch in (j.get("choices") or []):
+                        if ch.get("finish_reason"):
+                            finish_reason = str(ch["finish_reason"])
                         delta = ch.get("delta") or {}
                         # Engines disagree on the field name for reasoning deltas.
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
@@ -12334,6 +12343,7 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
         # field is the deliverable and folding a scratchpad into it would change what they
         # grade. Only the long-context grader reads this, and only when content came back empty.
         row["reasoning_text"] = "".join(reasoning_parts)
+    row["finish_reason"] = finish_reason
     return row
 
 
@@ -12422,6 +12432,8 @@ def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
         if not g:
             slot["errors"] += 1
             continue
+        if g.get("truncated"):
+            slot["truncated"] = slot.get("truncated", 0) + 1
         slot["passed_cases"] += g.get("passed", 0)
         slot["total_cases"] += g.get("total", 0)
         if g.get("total") and g.get("passed") == g.get("total"):
@@ -13986,7 +13998,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                             elif not res.get("error"):
                                 res["grade"] = await _bench_grade(
                                     res.get("text") or "", task, grade_timeout,
-                                    reasoning=res.get("reasoning_text") or "")
+                                    reasoning=res.get("reasoning_text") or "",
+                                    finish_reason=res.get("finish_reason"))
                                 # A failing grade on a response that used its whole token
                                 # budget is a different diagnosis from wrong code, and the
                                 # report must say which one it is.

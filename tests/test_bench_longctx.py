@@ -264,3 +264,101 @@ def test_the_repeat_default_is_five():
     src = inspect.getsource(proxy.bench_start) if hasattr(proxy, "bench_start") else ""
     assert '"runs": int(payload.get("runs", 5) or 5)' in \
         (src or open(proxy.__file__, encoding="utf-8").read())
+
+
+# --- the report has to render a curve, not a scramble -----------------------------------------
+
+
+def test_the_ladder_renders_in_size_order_not_alphabetical():
+    """Task ids sort 128k, 16k, 1m, 256k, 300k, 512k, 64k, 700k. That is the x-axis of a curve,
+    shuffled — and a reader would take the first drop in the column as the cliff."""
+    from ai_proxy.bench_report import _task_sort_key
+    ids = [t["id"] for t in L.LONGCTX_TASKS]
+    ordered = sorted(ids, key=_task_sort_key)
+    assert ordered == ids, ordered
+    assert sorted(ids) != ids, "if ids ever sort correctly on their own, drop the sort key"
+
+
+def test_the_sort_key_leaves_other_suites_alone():
+    from ai_proxy.bench_report import _task_sort_key
+    others = ["mem_write_discipline", "sec_sql_injection", "aaa_first"]
+    assert sorted(others, key=_task_sort_key) == sorted(others)
+
+
+def test_the_report_knows_the_new_category():
+    """A category absent from _CAT_ORDER is dropped from the breakdown table entirely."""
+    from ai_proxy import bench_report as R
+    assert "longcontext" in R._CAT_ORDER
+    assert R._CAT_BLURB.get("longcontext")
+
+
+def test_a_missed_needle_reads_as_a_missed_needle_in_the_report():
+    """A needle case carries check="needle", which fell through to the agent-episode branch:
+    a missed fact was reported as "conduct (no malformed/hallucinated/repeated calls…)
+    expected null" — telling the reader the model made bad tool calls."""
+    from ai_proxy.bench_report import _bench_case_text
+    task = dict(L.LONGCTX_TASKS[0])
+    txt = _bench_case_text(task, 2, "said PERIWINKLE-2051 — that is another needle's code")
+    assert "charlie" in txt and "50%" in txt, txt
+    assert "OBSIDIAN-1596" in txt, txt
+    assert "conduct" not in txt and "expected null" not in txt, txt
+
+
+def test_the_depth_is_named_so_the_reader_can_see_where_it_failed():
+    """Which depth broke is the whole point of the metric; a bare pass/fail loses it."""
+    from ai_proxy.bench_report import _bench_case_parts
+    task = dict(L.LONGCTX_TASKS[0])
+    for idx, (name, code, _f) in enumerate(L.NEEDLES):
+        what, exp = _bench_case_parts(task, idx)
+        assert name in what, what
+        assert code in exp, exp
+
+
+# --- a truncated reply is not a failed one ----------------------------------------------------
+
+
+import pytest
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+@pytest.mark.anyio
+async def test_a_reply_cut_off_at_the_token_cap_is_flagged_not_just_scored(client):
+    """Measured during the first run of this suite: a 262k unit spent its entire 2,048-token
+    budget on 6,134 characters of reasoning and emitted no content at all. Scored plainly that
+    reads as recall collapsing at 256k, which is a claim about the model made from a fact about
+    the token budget."""
+    task = dict(L.LONGCTX_TASKS[0])
+    res = await proxy._bench_grade("alpha=CRIMSON-4417", task, 10.0, finish_reason="length")
+    assert res["passed"] == 1 and res["score"] < 1
+    assert res.get("truncated") is True
+
+
+@pytest.mark.anyio
+async def test_a_complete_reply_is_never_flagged(client):
+    task = dict(L.LONGCTX_TASKS[0])
+    ans = "\n".join(f"{n}={c}" for n, c, _f in L.NEEDLES)
+    res = await proxy._bench_grade(ans, task, 10.0, finish_reason="stop")
+    assert res["passed"] == 5 and not res.get("truncated")
+
+
+@pytest.mark.anyio
+async def test_a_perfect_answer_that_happened_to_hit_the_cap_is_not_flagged(client):
+    """Nothing was lost if every case passed, so calling it truncated would be noise."""
+    task = dict(L.LONGCTX_TASKS[0])
+    ans = "\n".join(f"{n}={c}" for n, c, _f in L.NEEDLES)
+    res = await proxy._bench_grade(ans, task, 10.0, finish_reason="length")
+    assert not res.get("truncated")
+
+
+@pytest.mark.anyio
+async def test_an_answer_that_arrived_only_in_reasoning_still_grades(client):
+    """The runner captures content deltas; this model put all five codes in `reasoning` and
+    returned empty content at 700k."""
+    task = dict(L.LONGCTX_TASKS[0])
+    only_reasoning = "\n".join(f"{n}={c}" for n, c, _f in L.NEEDLES)
+    res = await proxy._bench_grade("", task, 10.0, reasoning=only_reasoning)
+    assert res["passed"] == 5, res
