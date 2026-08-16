@@ -572,3 +572,48 @@ def test_a_rung_with_no_clean_units_does_not_divide_by_zero():
     from ai_proxy import bench_report as R
     html = R._bench_longctx_html(_run_with([_unit("longctx_900k", 1, truncated=True)]))
     assert "0/0" in html
+
+
+def test_numeric_headers_are_right_aligned_like_their_columns():
+    """Without class="n" the header sits left while the figures under it sit right, and every
+    column reads as offset by one. The rest of the report already uses this convention."""
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([_unit("longctx_16k", 5)]))
+    import re as _re
+    head = _re.search(r"<thead>(.*?)</thead>", html, _re.S).group(1)
+    cells = _re.findall(r"<th([^>]*)>(.*?)</th>", head, _re.S)
+    for attrs, text in cells:
+        numeric = text.strip() in ("Prompt tokens", "Recalled", "Prefill tok/s", "Excluded") \
+            or text.strip() in ("start", "25%", "50%", "75%", "end")
+        assert ('class="n"' in attrs) == numeric, f"{text.strip()!r} alignment does not match"
+
+
+def test_the_table_sits_in_the_scrolling_wrapper():
+    """.tbl is a wrapper div — border, radius and overflow-x. Put on the <table> instead it
+    styles the wrong box and the table cannot scroll on a narrow screen."""
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([_unit("longctx_16k", 5)]))
+    assert '<div class="tbl"><table>' in html
+    assert '<table class="tbl">' not in html
+
+
+def test_every_row_has_the_same_cell_count_as_the_header():
+    from ai_proxy import bench_report as R
+    import re as _re
+    html = R._bench_longctx_html(_run_with([
+        _unit("longctx_16k", 5), _unit("longctx_64k", 3, truncated=True), _unit("longctx_64k", 4),
+    ]))
+    tbl = _re.search(r"<div class=\"tbl\"><table>(.*?)</table>", html, _re.S).group(1)
+    counts = [len(_re.findall(r"<t[hd][^>]*>", tr))
+              for tr in _re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, _re.S)]
+    assert len(set(counts)) == 1, f"ragged table: {counts}"
+
+
+def test_the_preamble_explains_what_is_being_measured():
+    """A reader who did not build this needs to know that advertised context and usable context
+    are different properties before the numbers mean anything."""
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html(_run_with([_unit("longctx_16k", 5)]))
+    for phrase in ("advertised context", "front-truncates", "prompt cache",
+                   "lower bound", "Prefill tok/s"):
+        assert phrase in html, phrase

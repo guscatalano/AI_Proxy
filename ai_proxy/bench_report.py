@@ -2291,7 +2291,9 @@ def _bench_longctx_html(runs: list) -> str:
             f'<td class="n{cls}">{ok}/{n}</td>'
             + "".join(per_depth) + rate_cell + cut_cell + "</tr>")
 
-    dep_head = "".join(f"<th>{_h(d)}</th>" for d in depths)
+    # class="n" on a numeric header, matching td.n — without it the header sits left while the
+    # figures under it sit right, and every column reads as offset by one.
+    dep_head = "".join(f'<th class="n">{_h(d)}</th>' for d in depths)
     dep_foot = "".join(
         f'<td class="n">{dep_tot[d][0]}/{dep_tot[d][1]}</td>' if dep_tot[d][1] else '<td class="n">—</td>'
         for d in depths)
@@ -2307,22 +2309,51 @@ def _bench_longctx_html(runs: list) -> str:
     return f"""
     <section>
       <h2>Long context — what the window actually holds</h2>
-      <p class="note">Five facts are planted at fixed depths through a haystack of known size and
-      asked for in one request. The first sits near the <b>start</b>, because a backend that
-      front-truncates an over-long prompt loses that one first — so a healthy start column is
-      what proves the window is real, and the middle columns are where recall actually fails.</p>
-      <table class="tbl">
-        <thead><tr><th>Rung</th><th>Prompt tokens</th><th>Recalled</th>{dep_head}
-          <th>Prefill tok/s</th><th>Excluded</th></tr></thead>
+
+      <p>A model's advertised context is the prompt it will <em>accept</em>. It says nothing
+      about whether the model can still find anything in there. Those are different properties
+      and they part company well before the advertised number: a backend will happily prefill
+      a prompt the model cannot actually read, return a confident answer, and report success at
+      every layer. Nothing in a coding or agentic suite can catch that, because every one of
+      their prompts fits in a few thousand tokens.</p>
+
+      <p>So this measures the second property directly. Five facts — short codes — are planted
+      at fixed depths through a haystack of known size, and all five are asked for in a single
+      request. The haystack is deliberately repetitive, enumerated ledger lines that all look
+      alike, which is the hard case for binding a fact to a position: the number below is a
+      lower bound, and a real document of the same size would score better.</p>
+
+      <p>Each rung is run five times, and each repeat is a <em>different</em> draw — the filler
+      shifts from the first line and the needles jitter around their depths. Repeating one
+      identical prompt would measure the backend's prompt cache instead, which serves repeats
+      two through five off a prefix it already holds and returns five matching answers that
+      look like consistency.</p>
+
+      <p><b>Read the depth columns before the totals.</b> The first needle sits near the
+      <b>start</b> on every repeat, because a backend that front-truncates an over-long prompt
+      discards the beginning first — so a healthy start column is the evidence that the window
+      is genuinely allocated, and a failing one means the prompt was silently cut rather than
+      badly recalled. When start holds and the middle columns fall, that is a retrieval limit
+      in the model. When start falls, it is a configuration problem in the stack.</p>
+
+      <p><b>Prefill tok/s</b> is the prompt size over the time before the first token returned.
+      At these sizes it is the only throughput figure that means anything — the answer is five
+      short lines, so decode speed is noise next to the cost of reading the haystack.</p>
+
+      <div class="tbl"><table>
+        <thead><tr><th>Rung</th><th class="n">Prompt tokens</th><th class="n">Recalled</th>{dep_head}
+          <th class="n">Prefill tok/s</th><th class="n">Excluded</th></tr></thead>
         <tbody>{''.join(rows_html)}</tbody>
-        <tfoot><tr><th scope="row">all</th><td class="n">—</td>
+        <tfoot><tr><th scope="row">all</th><td class="n">&mdash;</td>
           <td class="n">{grand_ok}/{grand_n}</td>{dep_foot}
-          <td class="n">—</td><td class="n">{grand_cut or '—'}</td></tr></tfoot>
-      </table>
+          <td class="n">&mdash;</td><td class="n">{grand_cut or '&mdash;'}</td></tr></tfoot>
+      </table></div>
       {cut_note}
-      <p class="note">Failures by kind: {_h(kinds_txt)}. A model that writes NAME=MISSING has
-      lost the fact and knows it; one that answers with another needle's code has lost it and
-      does not. They fail the same and mean different things.</p>
+      <p class="note"><b>Failures by kind:</b> {_h(kinds_txt)}. These are not
+      interchangeable. A model that writes NAME=MISSING has lost the fact and knows it — it can
+      tell you it does not know. A model that answers with another needle's code has lost it and
+      does not know, and will state the wrong answer with the same confidence as a right one.
+      Both score zero; only one is safe to build on.</p>
     </section>"""
 
 
