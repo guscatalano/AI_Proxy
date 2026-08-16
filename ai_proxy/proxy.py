@@ -11919,6 +11919,10 @@ except ImportError:          # flat-script launch
 # full-v2 — a 300k prefill is minutes of exclusive GPU, and quietly adding that to the suite
 # everyone runs would turn a 20-minute sweep into an afternoon. Run it on purpose.
 _BENCH_SUITES.setdefault("longctx-v1", _bench_longctx_mod.LONGCTX_TASKS)
+# The same ladder from 600k up. Separate suite rather than a task filter because a run is
+# identified by its suite name, and "which rungs did this number come from" has to survive
+# into the report.
+_BENCH_SUITES.setdefault("longctx-deep", _bench_longctx_mod.LONGCTX_DEEP_TASKS)
 _BENCH_TASK_DESC.update(_bench_longctx_mod.LONGCTX_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_longctx_mod.LONGCTX_TASK_NOTES)
 
@@ -11956,7 +11960,8 @@ for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding
                                   ("instruct-v1", "instruct"), ("refusal-v1", "refusal"),
                                   ("memory-v1", "memory"),
                                   ("langpref-v1", "preference"),
-                                  ("longctx-v1", "longcontext")):
+                                  ("longctx-v1", "longcontext"),
+                                  ("longctx-deep", "longcontext")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are
@@ -12261,8 +12266,17 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     err: str | None = None
     status_code: int | None = None
     try:
+        # Scaled to the prompt, not fixed. A flat 600s aborted every 700k-token unit of the
+        # long-context ladder while the model was still prefilling — the proxy logged
+        # "499 client disconnected" and six of them tripped the run's circuit breaker, so a
+        # harness limit was recorded as the backend failing. Measured prefill on this box runs
+        # 650-1900s at 700k; 250 tok/s is well under the slowest observed rate, and the floor
+        # keeps short prompts on the old behaviour.
+        _prefill_s = len(body) / 4 / 250 if body else 0        # ~4 chars per token
+        _timeout_s = max(600.0, _prefill_s + 600.0)
         async with client.stream("POST", base + "/v1/chat/completions",
-                                 headers=headers, content=body, timeout=httpx.Timeout(600.0)) as resp:
+                                 headers=headers, content=body,
+                                 timeout=httpx.Timeout(_timeout_s)) as resp:
             status_code = resp.status_code
             if resp.status_code != 200:
                 err = f"HTTP {resp.status_code}: {(await resp.aread()).decode('utf-8', errors='replace')[:300]}"

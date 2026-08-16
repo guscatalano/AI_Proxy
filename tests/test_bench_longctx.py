@@ -362,3 +362,33 @@ async def test_an_answer_that_arrived_only_in_reasoning_still_grades(client):
     only_reasoning = "\n".join(f"{n}={c}" for n, c, _f in L.NEEDLES)
     res = await proxy._bench_grade("", task, 10.0, reasoning=only_reasoning)
     assert res["passed"] == 5, res
+
+
+# --- the harness must outlast the prefill it asked for ----------------------------------------
+
+
+def test_the_request_timeout_scales_with_the_prompt():
+    """A flat 600s aborted every 700k unit while the model was still prefilling. The proxy
+    logged "499 client disconnected" and six of them tripped the circuit breaker, so a limit
+    in the harness was recorded as the backend failing."""
+    import re as _re
+    src = open(proxy.__file__, encoding="utf-8").read()
+    m = _re.search(r"_prefill_s = (.+?)\n\s+_timeout_s = (.+?)\n", src)
+    assert m, "the scaled timeout is gone or was renamed"
+
+    def budget(tokens):
+        body_len = tokens * 4
+        return max(600.0, body_len / 4 / 250 + 600.0)
+
+    # Measured on this box: 700k prefills ran 656-1864s. The budget has to clear the worst.
+    assert budget(700_000) > 1864, budget(700_000)
+    assert budget(16_000) >= 600, "short prompts keep the old floor"
+    assert budget(940_000) > budget(700_000) > budget(300_000), "must be monotonic"
+
+
+def test_the_timeout_is_not_unbounded():
+    """A run that hangs forever is worse than one that fails: the box is exclusive for the
+    duration and nothing says why."""
+    def budget(tokens):
+        return max(600.0, (tokens * 4) / 4 / 250 + 600.0)
+    assert budget(1_000_000) < 7200, "an hour and a half is already generous"

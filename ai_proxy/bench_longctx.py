@@ -2,10 +2,16 @@
 
 Every other suite here fits in a few thousand tokens, so none of them can tell the difference
 between a model that advertises a million-token window and one that can use it. That gap is
-not academic. Measured on this box: nemotron-3.5-lightning pins at 1,048,576 tokens, prefills
-700,122 of them without complaint, and then recalls two of five planted facts — while scoring
-five of five at 300k. The window was allocated; it was not usable. Nothing in the benchmark
-would have caught that.
+not academic: nemotron-3.5-lightning pins at 1,048,576 tokens on this box and prefills 700,122
+of them without complaint, and nothing in the benchmark could say whether the model could
+still read what it had been given.
+
+The first attempt to answer that by hand got it wrong, which is the reason this suite exists
+rather than a script. Two ad-hoc runs at 700k scored 2/5 and 3/5 and led to "300k is the
+usable window" — a claim built on three defects since fixed: a scorer that read only `content`
+when the answer was in `reasoning`, a 2,048-token output budget against reasoning blocks
+later measured at 6,134 characters, and a flat 600s client timeout that aborted the request
+mid-prefill. Run properly, this ladder scored 149 of 150 needles from 16k through 512k.
 
 So: plant five facts at fixed depths through a haystack of a known size, ask for all five in
 one request, and score what comes back. One request per size, five cases per request, which
@@ -19,10 +25,10 @@ Three things this suite does that the obvious version gets wrong:
   still answer everything else. A needle at the end proves nothing; the early one is the
   load-bearing case.
 
-* A WRONG answer is scored apart from a MISSING one. At 700k this model reported echo's code
-  as charlie's — twice, identically, across two different KV cache precisions. Confident
-  misattribution is worse than a shrug, and averaging the two into "not correct" hides the
-  distinction that tells you which is happening.
+* A WRONG answer is scored apart from a MISSING one, and both apart from silence. The one
+  miss in the first clean run was a model writing `delta=MISSING` — it had lost the fact and
+  said so, which is a different state from confidently reporting another needle's code.
+  Averaging them into "not correct" hides the distinction that says which is happening.
 
 * Haystacks are generated, never stored. A 300k-token prompt is 1.2 MB of text and the ladder
   runs to 1M; as module literals that is tens of megabytes loaded into every process that
@@ -31,7 +37,7 @@ Three things this suite does that the obvious version gets wrong:
 
 The filler is deliberately repetitive — enumerated ledger lines that all look alike. That is
 the hard case for binding a fact to a position, and it makes this a lower bound rather than a
-flattering number. Real 700k contexts are more distinctive than this.
+flattering number. A real 700k context is more distinctive than this one.
 """
 
 # (name, code, where it goes as a fraction through the haystack)
@@ -161,9 +167,17 @@ LONGCTX_TASKS = [
     _task(262_144, "256k"),
     _task(300_000, "300k"),
     _task(512_000, "512k"),
+    _task(600_000, "600k"),
     _task(700_000, "700k"),
+    _task(800_000, "800k"),
+    _task(900_000, "900k"),
     _task(1_000_000, "1m"),
 ]
+
+# The deep end on its own. Re-running six rungs that already scored 149/150 to reach the two
+# that are actually in question costs an hour of exclusive GPU for no information, and this
+# ladder is expensive enough that the difference matters.
+LONGCTX_DEEP_TASKS = [t for t in LONGCTX_TASKS if t["target_tokens"] >= 600_000]
 
 LONGCTX_TASK_DESC = {t["id"]: f"Recall five facts planted through a "
                               f"{t['target_tokens']:,}-token haystack."
@@ -179,10 +193,16 @@ LONGCTX_TASK_NOTES = {
     "longctx_300k": "The first rung past the default. Measured 5/5 on nemotron-3.5-lightning.",
     "longctx_512k": "Half the advertised million. Between the last known-good rung and the "
                     "first known-bad one, so this is where the cliff gets located.",
-    "longctx_700k": "Measured 2/5 on nemotron-3.5-lightning, twice, on both q8_0 and f16 KV "
-                    "cache — including the same confident misattribution both times. Recall "
-                    "had collapsed here while the prefill still succeeded.",
-    "longctx_1m": "The advertised maximum. Reaching this rung at all requires a model that "
-                  "claims it AND a backend configured to allocate it; everything else is "
-                  "skipped rather than failed.",
+    "longctx_600k": "The first rung above the last clean sweep (512k scored 25/25).",
+    "longctx_700k": "Two early one-off runs scored 2/5 and 3/5 here, but all three were run "
+                    "through defects since fixed — a scorer that read only `content` when the "
+                    "answer was in `reasoning`, a 2,048-token budget against reasoning blocks "
+                    "measured at 6,134 characters, and a flat 600s client timeout that aborted "
+                    "the request mid-prefill. Treat those numbers as unmeasured.",
+    "longctx_800k": "Past anything measured on this box.",
+    "longctx_900k": "The highest rung that fits: a 1M window minus room to answer, minus the "
+                    "estimator's 10% headroom, leaves about 936k.",
+    "longctx_1m": "The advertised maximum, and unreachable by construction: a prompt cannot "
+                  "fill the whole window and still leave room for a reply. Kept as the rung "
+                  "that documents the ceiling — it is skipped and recorded, never failed.",
 }
