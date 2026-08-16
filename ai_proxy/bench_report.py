@@ -2399,6 +2399,12 @@ def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     # only needs the model, which is the head of the label.
     _lang_pairs = [(run, (r.get("label") or r.get("model") or ""))
                    for s in _by_suite for (r, run) in _by_suite[s]]
+    # Same reasoning for the long-context ladder: longctx-lite, longctx-deep and longctx-v1 are
+    # the same metric at different rungs, not different metrics, so the section that draws the
+    # curve has to see all of them. Without this it silently rendered the primary suite alone —
+    # a request naming three runs came back describing one, and the only clue was a rung count
+    # that did not match the ladder.
+    _all_runs = [run for s in _by_suite for (_r, run) in _by_suite[s]]
     if _other_suites:
         rows = [r for (r, _run) in _by_suite[_primary]]
         runs = [run for (_r, run) in _by_suite[_primary]]
@@ -2988,7 +2994,7 @@ ordinary slowness rather than a misconfiguration.</p>
     # Placed directly under the results table rather than among the coding sections: for a
     # needle ladder this IS the result, and the generic tables above it are the supporting
     # detail. Empty for every other suite, so nothing else moves.
-    longctx_html = _bench_longctx_html(runs)
+    longctx_html = _bench_longctx_html(_all_runs)
     body = f"""
   {results}
 

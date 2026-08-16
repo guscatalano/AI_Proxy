@@ -634,3 +634,27 @@ def test_the_preamble_explains_what_is_being_measured():
     for phrase in ("advertised context", "front-truncates", "prompt cache",
                    "lower bound", "Prefill tok/s"):
         assert phrase in html, phrase
+
+
+def test_the_curve_merges_every_longctx_suite_not_just_the_primary_one():
+    """The report ranks one suite at a time — right for a coding suite beside a preference
+    suite, wrong here. longctx-lite, longctx-deep and longctx-v1 are rungs of one ladder, so
+    the curve is built from the unfiltered run list. A report naming three runs came back
+    describing one, and the only clue was a rung count that did not match the ladder."""
+    import inspect
+    from ai_proxy import bench_report as R
+    src = inspect.getsource(R._bench_report_html)
+    assert "_bench_longctx_html(_all_runs)" in src,         "the curve is being fed the suite-filtered list again"
+    whole = inspect.getsource(R)
+    assert "_all_runs = [run for s in _by_suite for (_r, run) in _by_suite[s]]" in whole,         "_all_runs is no longer built from every suite"
+    # And it must be built BEFORE runs is rebound to the primary suite.
+    assert whole.index("_all_runs = [run") < whole.index("runs = [run for (_r, run) in _by_suite"),         "_all_runs is captured after the filter, so it is the filtered list"
+
+
+def test_the_section_itself_does_not_care_which_suite_a_unit_came_from():
+    from ai_proxy import bench_report as R
+    html = R._bench_longctx_html([
+        {"suite": "longctx-lite", "results": {"rows": [_unit("longctx_16k", 5)]}},
+        {"suite": "longctx-deep", "results": {"rows": [_unit("longctx_900k", 4)]}},
+    ])
+    assert ">16k<" in html and ">900k<" in html
