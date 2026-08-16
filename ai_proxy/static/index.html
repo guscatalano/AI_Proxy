@@ -2126,6 +2126,24 @@ function fmt(ts) {
   return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
 }
 
+// Start and end as wall-clock times, not just a duration. "took 691s" does not tell you which
+// eleven minutes of the afternoon the GPU was busy, which is the question you are actually
+// asking when a request overlaps something else. End is derived: the row stores when the
+// request arrived and how long it ran, never a finish timestamp.
+function timingLine(d) {
+  const start = d.ts;
+  if (!start) return '<span style="color:#6c7789">unknown</span>';
+  const day = new Date(start * 1000).toLocaleDateString();
+  const s = `<code title="${esc(day)}">${fmt(start)}</code>`;
+  if (d.duration_ms == null) {
+    // Still running: the end has not happened yet, so show how long it has been going.
+    const secs = Math.max(0, Math.round(Date.now() / 1000 - start));
+    return `${s} → <span style="color:#f0c674">in flight, ${fmtMsLong(secs * 1000)} so far</span>`;
+  }
+  const end = start + d.duration_ms / 1000;
+  return `${s} → <code>${fmt(end)}</code> <span style="color:#6c7789">· ${esc(day)}</span>`;
+}
+
 // Detail sidebar: drag the split handle to resize, click the chevron (or double-click the
 // handle) to collapse/expand. Width + collapsed state persist in localStorage.
 const _LS_LIST_W = 'ai-proxy-list-width', _LS_DETAIL_COLLAPSED = 'ai-proxy-detail-collapsed';
@@ -2380,7 +2398,13 @@ function analyzeRequest(bodyText) {
 // Walk a response body or SSE stream and extract finish reason + invoked tool calls + assistant content length.
 // Handles three response shapes: OpenAI chat.completion(.chunk), Ollama native /api/chat, and Anthropic /v1/messages.
 function analyzeResponse(respBody, streamChunks) {
-  const out = { finish_reason: null, tool_calls: [], content_chars: 0, content: '' };
+  // reasoning is collected separately from content because models put the answer in either
+  // one: a 700k-token request came back with empty content and the entire reply in reasoning,
+  // which read as "the model returned nothing" until the raw JSON was opened by hand.
+  const out = { finish_reason: null, tool_calls: [], content_chars: 0, content: '', reasoning: '' };
+  const reasoningOf = (m) => (typeof m.reasoning === 'string' ? m.reasoning
+                            : typeof m.reasoning_content === 'string' ? m.reasoning_content
+                            : typeof m.thinking === 'string' ? m.thinking : '');
 
   function fromObj(j) {
     if (!j || typeof j !== 'object') return;
@@ -2389,6 +2413,7 @@ function analyzeResponse(respBody, streamChunks) {
       if (c.finish_reason) out.finish_reason = c.finish_reason;
       const msg = c.message || c.delta || {};
       if (typeof msg.content === 'string') out.content += msg.content;
+      out.reasoning += reasoningOf(msg);
       for (const tc of (msg.tool_calls || [])) {
         const fn = tc.function || {};
         out.tool_calls.push({ name: fn.name || '?', arguments: fn.arguments || '' });
@@ -2397,6 +2422,7 @@ function analyzeResponse(respBody, streamChunks) {
     // Ollama native shape
     if (j.message && typeof j.message === 'object') {
       if (typeof j.message.content === 'string') out.content += j.message.content;
+      out.reasoning += reasoningOf(j.message);
       for (const tc of (j.message.tool_calls || [])) {
         const fn = tc.function || {};
         out.tool_calls.push({ name: fn.name || '?', arguments: fn.arguments ? JSON.stringify(fn.arguments) : '' });
@@ -2409,6 +2435,7 @@ function analyzeResponse(respBody, streamChunks) {
       for (const blk of j.content) {
         if (!blk || typeof blk !== 'object') continue;
         if (blk.type === 'text' && typeof blk.text === 'string') out.content += blk.text;
+        else if (blk.type === 'thinking' && typeof blk.thinking === 'string') out.reasoning += blk.thinking;
         else if (blk.type === 'tool_use') {
           out.tool_calls.push({
             name: blk.name || '?',
@@ -2436,6 +2463,7 @@ function analyzeResponse(respBody, streamChunks) {
         if (c.finish_reason) out.finish_reason = c.finish_reason;
         const delta = c.delta || c.message || {};
         if (typeof delta.content === 'string') out.content += delta.content;
+        out.reasoning += reasoningOf(delta);
         for (const tc of (delta.tool_calls || [])) {
           const idx = tc.index ?? Object.keys(tcByIdx).length;
           const slot = tcByIdx[idx] = tcByIdx[idx] || { name: '', arguments: '' };
@@ -2576,7 +2604,8 @@ function analyzeThinking(d) {
 function renderAnalysis(d) {
   const req = analyzeRequest(d.request_body);
   const resp = analyzeResponse(d.response_body, d.stream_chunks);
-  if (!req && (!resp.tool_calls.length && !resp.finish_reason && !resp.content_chars) && !d.proxy_tool_log) return '';
+  if (!req && (!resp.tool_calls.length && !resp.finish_reason && !resp.content_chars
+               && !resp.reasoning) && !d.proxy_tool_log) return '';
 
   let reqHtml = '';
   if (req) {
@@ -2630,6 +2659,44 @@ function renderAnalysis(d) {
     `;
   }
 
+  // The counterpart to "Latest User Message": what the model actually said, in plain text,
+  // for every request rather than only streaming ones. Non-streaming replies used to be
+  // readable only as raw JSON, and reasoning was not shown anywhere at all.
+  let replyHtml = '';
+  {
+    const body = resp.content || '';
+    const think = resp.reasoning || '';
+    const CAP = 8000;
+    const clip = (t) => esc(t.slice(0, CAP)) + (t.length > CAP ? '\n…' : '');
+    if (body) {
+      replyHtml += `<div class="section"><h3>Assistant Reply (${num(body.length)} chars)</h3>`
+        + `<pre data-k="reply" class="stream-text" style="max-height:340px">${clip(body)}</pre></div>`;
+    }
+    if (think) {
+      // Collapsed: it is usually longer than the answer and is not what you came to read,
+      // but it is where the answer hides when the content field comes back empty.
+      replyHtml += `<div class="section"><h3>Model Reasoning (${num(think.length)} chars)</h3>`
+        + `<details${body ? '' : ' open'}><summary style="cursor:pointer;color:#888;font-size:11px">show</summary>`
+        + `<pre data-k="reasoning" class="stream-text" style="max-height:300px;margin-top:6px">${clip(think)}</pre>`
+        + `</details></div>`;
+    }
+    // Nothing came back. Say why, because "no reply" and "a reply you cannot see" look
+    // identical here, and the difference is usually the token cap.
+    if (!body && !think) {
+      const why = resp.tool_calls.length
+        ? `the model answered with ${resp.tool_calls.length} tool call${resp.tool_calls.length === 1 ? '' : 's'} and no prose — see Tool Calls Invoked below`
+        : resp.finish_reason === 'length'
+          ? 'generation hit max_tokens before anything was emitted — an unterminated tool call is discarded whole, so the tokens are billed and nothing arrives'
+          : (d.status && d.status >= 400) ? 'the request failed; see the error above'
+          : (!d.status && !d.error) ? 'still in flight'
+          : 'the response carried no assistant text';
+      if (d.status || d.error) {
+        replyHtml += `<div class="section"><h3>Assistant Reply</h3>`
+          + `<div style="color:#9098a8;font-size:12.5px">(empty) — ${esc(why)}</div></div>`;
+      }
+    }
+  }
+
   let respHtml = '';
   if (resp.finish_reason || resp.tool_calls.length || resp.content_chars) {
     const tcRows = resp.tool_calls.map(t => {
@@ -2675,7 +2742,7 @@ function renderAnalysis(d) {
     }
   }
 
-  return reqHtml + respHtml + toolLogHtml;
+  return reqHtml + replyHtml + respHtml + toolLogHtml;
 }
 
 // Heuristic: does this tool-result content look like an error? Returns { isError, excerpt }.
@@ -3328,6 +3395,7 @@ async function loadDetail(id) {
       <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}${surfaceBadge(d.surface)}</div>
       <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code>${upstreamBadge}${cacheBadge}</div>
       <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${fmtMsLong(d.duration_ms)}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
+      <div class="row"><span class="label">Timing</span> ${timingLine(d)}</div>
       <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code>${thinkBadge}</div>
       ${tokensLine}
       ${downsizeLine}

@@ -42,3 +42,64 @@ def test_work_specifically_is_restorable():
 
 def test_the_default_view_is_still_listed():
     assert "requests" in _valid_views()
+
+
+# --- request detail: start and end -----------------------------------------------------------
+
+
+def test_the_detail_view_shows_a_timing_row():
+    """A duration alone does not say WHICH eleven minutes the GPU was busy, which is the
+    question being asked whenever two requests overlap."""
+    assert 'class="label">Timing</span> ${timingLine(d)}' in HTML
+
+
+def test_the_end_time_is_derived_rather_than_read_from_a_column():
+    """There is no finish timestamp on the row — only ts and duration_ms — so anything that
+    reads d.end_ts would render undefined."""
+    m = re.search(r"function timingLine\(d\) \{(.*?)\n\}", HTML, re.S)
+    assert m, "timingLine is gone or was renamed"
+    body = m.group(1)
+    assert "d.duration_ms / 1000" in body, "the end must be computed from the duration"
+    assert "end_ts" not in body, "requests has no end_ts column"
+
+
+def test_an_in_flight_request_says_so_instead_of_inventing_an_end():
+    m = re.search(r"function timingLine\(d\) \{(.*?)\n\}", HTML, re.S)
+    assert "in flight" in m.group(1), \
+        "a request with no duration yet has not ended; showing an end time would be a lie"
+
+
+# --- the assistant's reply, in plain text -----------------------------------------------------
+
+
+def test_the_reply_has_a_readable_section_like_the_user_message_does():
+    """"Latest User Message" existed; its counterpart did not. A non-streaming reply was
+    readable only as raw JSON."""
+    assert "Assistant Reply (" in HTML
+    assert "Latest User Message (" in HTML, "the section this one mirrors is gone"
+
+
+def test_reasoning_is_captured_from_every_response_shape():
+    """A 700k request returned empty content with the whole answer in `reasoning`, which read
+    as "the model returned nothing" until the raw JSON was opened by hand."""
+    assert HTML.count("out.reasoning +=") >= 4, \
+        "OpenAI message, OpenAI delta, Ollama native and Anthropic thinking blocks"
+    m = re.search(r"const reasoningOf = \(m\) =>(.*?);\n", HTML, re.S)
+    assert m, "the reasoning extractor is gone"
+    for field in ("reasoning", "reasoning_content", "thinking"):
+        assert field in m.group(1), f"{field} is not read"
+
+
+def test_an_empty_reply_explains_itself_instead_of_rendering_nothing():
+    """"No reply" and "a reply you cannot see" look identical; the difference is usually the
+    token cap eating an unterminated tool call."""
+    assert "(empty) — " in HTML
+    assert "max_tokens before anything was emitted" in HTML
+
+
+def test_reasoning_alone_keeps_the_analysis_section_alive():
+    """It used to bail out when content_chars was 0, which is exactly the case where the
+    reasoning field is the only place the answer exists."""
+    m = re.search(r"if \(!req && \(!resp\.tool_calls\.length.*?\) return '';", HTML, re.S)
+    assert m and "resp.reasoning" in m.group(0), \
+        "the early return still discards a reasoning-only response"
