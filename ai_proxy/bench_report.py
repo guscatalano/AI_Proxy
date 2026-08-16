@@ -2205,6 +2205,17 @@ def _bench_failure_examples(runs: list, rows: list, per_task: int = 4) -> dict:
             sorted(out.items(), key=lambda kv: -len(kv[1]))}
 
 
+def _secs(ms) -> str:
+    """A duration a reader can hold in their head. Seconds up to a minute, then m:ss — a rung
+    that takes 1,010,000 ms is easier to judge as 16:50 than as six digits."""
+    if not ms:
+        return "&mdash;"
+    total = ms / 1000.0
+    if total < 60:
+        return f"{total:.1f}s"
+    return f"{int(total // 60)}:{int(total % 60):02d}"
+
+
 def _bench_longctx_html(runs: list) -> str:
     """The long-context view, rendered instead of guessing from the generic tables.
 
@@ -2270,6 +2281,13 @@ def _bench_longctx_html(runs: list) -> str:
         rates = [(u.get("prompt_tokens") or 0) / ((u.get("ttft_ms") or 0) / 1000.0)
                  for u in us if (u.get("ttft_ms") or 0) > 0 and (u.get("prompt_tokens") or 0)]
         rate = sorted(rates)[len(rates) // 2] if rates else None
+        # Wall clock, because a throughput figure does not answer "how long do I wait". At these
+        # sizes almost all of it is prefill — the answer is five short lines — so `wait` is
+        # dominated by `first token`, and the gap between them is the only part decode owns.
+        waits = sorted(u.get("total_ms") or 0 for u in us if (u.get("total_ms") or 0) > 0)
+        wait = waits[len(waits) // 2] if waits else None
+        ttfts = sorted(u.get("ttft_ms") or 0 for u in us if (u.get("ttft_ms") or 0) > 0)
+        ttft = ttfts[len(ttfts) // 2] if ttfts else None
         per_depth = []
         for d in depths:
             hit = tot = 0
@@ -2295,12 +2313,14 @@ def _bench_longctx_html(runs: list) -> str:
         pct = (ok / n) if n else None
         cls = "" if pct is None else (" win" if pct >= 0.999 else (" bad" if pct < 0.8 else ""))
         rate_cell = f'<td class="n">{rate:,.0f}</td>' if rate else '<td class="n">&mdash;</td>'
+        ttft_cell = f'<td class="n">{_secs(ttft)}</td>' if ttft else '<td class="n">&mdash;</td>'
+        wait_cell = f'<td class="n">{_secs(wait)}</td>' if wait else '<td class="n">&mdash;</td>'
         cut_cell = f'<td class="n">{cut}</td>' if cut else '<td class="n">&mdash;</td>'
         rows_html.append(
             f'<tr><th scope="row"><code>{_h(task.replace("longctx_", ""))}</code></th>'
             f'<td class="n">{med_pt:,}</td>'
             f'<td class="n{cls}">{ok}/{n}</td>'
-            + "".join(per_depth) + rate_cell + cut_cell + "</tr>")
+            + "".join(per_depth) + rate_cell + ttft_cell + wait_cell + cut_cell + "</tr>")
 
     # class="n" on a numeric header, matching td.n — without it the header sits left while the
     # figures under it sit right, and every column reads as offset by one.
@@ -2358,11 +2378,13 @@ def _bench_longctx_html(runs: list) -> str:
 
       <div class="tbl"><table>
         <thead><tr><th>Rung</th><th class="n">Prompt tokens</th><th class="n">Recalled</th>{dep_head}
-          <th class="n">Prefill tok/s</th><th class="n">Excluded</th></tr></thead>
+          <th class="n">Prefill tok/s</th><th class="n">First token</th>
+          <th class="n">Wait</th><th class="n">Excluded</th></tr></thead>
         <tbody>{''.join(rows_html)}</tbody>
         <tfoot><tr><th scope="row">all</th><td class="n">&mdash;</td>
           <td class="n">{grand_ok}/{grand_n}</td>{dep_foot}
-          <td class="n">&mdash;</td><td class="n">{grand_cut or '&mdash;'}</td></tr></tfoot>
+          <td class="n">&mdash;</td><td class="n">&mdash;</td><td class="n">&mdash;</td>
+          <td class="n">{grand_cut or '&mdash;'}</td></tr></tfoot>
       </table></div>
       {cut_note}{dead_note}
       <p class="note"><b>Failures by kind:</b> {_h(kinds_txt)}. These are not

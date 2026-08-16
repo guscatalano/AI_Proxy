@@ -599,10 +599,14 @@ def test_numeric_headers_are_right_aligned_like_their_columns():
     import re as _re
     head = _re.search(r"<thead>(.*?)</thead>", html, _re.S).group(1)
     cells = _re.findall(r"<th([^>]*)>(.*?)</th>", head, _re.S)
+    assert len(cells) > 5
     for attrs, text in cells:
-        numeric = text.strip() in ("Prompt tokens", "Recalled", "Prefill tok/s", "Excluded") \
-            or text.strip() in ("start", "25%", "50%", "75%", "end")
-        assert ('class="n"' in attrs) == numeric, f"{text.strip()!r} alignment does not match"
+        # Every column but the row label holds a figure, so listing them by name only rots the
+        # test when a column is added — which is what happened when the timing columns landed
+        # and the headers had been right all along.
+        label_col = text.strip() == "Rung"
+        assert ('class="n"' in attrs) != label_col, \
+            f"{text.strip()!r} alignment does not match its column"
 
 
 def test_the_table_sits_in_the_scrolling_wrapper():
@@ -680,3 +684,48 @@ def test_a_rung_made_entirely_of_dead_units_disappears_rather_than_scoring_zero(
         dict(_unit("longctx_1m", 0), prompt_tokens=0),
     ]))
     assert ">1m<" not in html, "a rung that never ran should not appear as a failure"
+
+
+# --- how long the wait actually is ------------------------------------------------------------
+
+
+def test_the_wait_is_reported_not_just_the_throughput():
+    """A prefill rate does not answer "how long do I wait for an answer". At 900k that is
+    sixteen minutes, and a reader planning a workload needs the number in minutes."""
+    from ai_proxy import bench_report as R
+    u = _unit("longctx_128k", 5, pt=128_000, ttft=64_000)
+    u["total_ms"] = 70_000
+    html = R._bench_longctx_html(_run_with([u]))
+    assert "First token" in html and "Wait" in html
+    assert "1:04" in html, "time to first token should render as m:ss"
+    assert "1:10" in html, "total wait should render as m:ss"
+
+
+def test_short_durations_stay_in_seconds():
+    from ai_proxy import bench_report as R
+    assert R._secs(11_133) == "11.1s"
+    assert R._secs(59_400) == "59.4s"
+
+
+def test_long_durations_become_minutes():
+    """1,010,000 ms is easier to judge as 16:50 than as six digits."""
+    from ai_proxy import bench_report as R
+    assert R._secs(1_010_000) == "16:50"
+    assert R._secs(60_000) == "1:00"
+
+
+def test_a_missing_duration_does_not_render_as_zero():
+    from ai_proxy import bench_report as R
+    assert R._secs(None) == "&mdash;" and R._secs(0) == "&mdash;"
+
+
+def test_the_timing_columns_keep_the_table_square():
+    from ai_proxy import bench_report as R
+    import re as _re
+    u1 = _unit("longctx_16k", 5); u1["total_ms"] = 12_000
+    u2 = _unit("longctx_900k", 3); u2["total_ms"] = 1_010_000
+    html = R._bench_longctx_html(_run_with([u1, u2]))
+    tbl = _re.search(r'<div class="tbl"><table>(.*?)</table>', html, _re.S).group(1)
+    counts = [len(_re.findall(r"<t[hd][^>]*>", tr))
+              for tr in _re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, _re.S)]
+    assert len(set(counts)) == 1, f"ragged after adding timing columns: {counts}"
