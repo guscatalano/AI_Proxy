@@ -424,3 +424,53 @@ def test_an_inverted_format_still_scores_what_it_actually_found():
 
 def test_the_bare_code_fallback_still_works_when_nothing_is_misattributed():
     assert G._bench_grade_needles("CRIMSON-4417", L._cases())["passed"] == 1
+
+
+def test_the_context_guard_falls_back_to_asking_the_backend():
+    """Measured: the model index entry for a resident Ollama model held only {"loaded": True} —
+    no window at all — so the guard read None and skipped nothing. A 1M rung was then sent to a
+    1M window it cannot fit, front-truncated, and scored a number that measured nothing."""
+    import re as _re
+    src = open(proxy.__file__, encoding="utf-8").read()
+    block = _re.search(r'_window = model_meta\.get\("loaded_context"\).*?if _window:', src, _re.S)
+    assert block, "the guard moved"
+    assert "_bench_loaded_context" in block.group(0), \
+        "with no window in the catalogue the guard must ask the backend, not give up"
+
+
+# --- formatting is not recall -----------------------------------------------------------------
+
+
+def test_a_code_split_at_its_hyphen_still_counts():
+    """Verbatim from a 512k thinking-off unit: every needle found, every hyphen turned into an
+    equals sign. Exact-substring matching scored it 0/5 — a grader reading punctuation as part
+    of the answer measures formatting, not recall. Notably this only ever happened with
+    thinking off; with thinking on the model kept the requested format every time, so the bug
+    would have penalised exactly one arm of the comparison."""
+    reply = "CRIMSON=4417, MERIDIAN=8823, OBSIDIAN=1596, TANGERINE=7304, PERIWINKLE=2051"
+    assert G._bench_grade_needles(reply, L._cases())["passed"] == 5
+
+
+def test_one_mangled_code_among_intact_ones_still_counts():
+    reply = ("crimson=4417\nbravo=MERIDIAN-8823\ncharlie=OBSIDIAN-1596\n"
+             "delta=TANGERINE-7304\necho=PERIWINKLE-2051")
+    assert G._bench_grade_needles(reply, L._cases())["passed"] == 5
+
+
+def test_normalising_does_not_rescue_a_genuine_misattribution():
+    """The loosened match must not start forgiving the failure it exists to catch."""
+    reply = ("alpha=CRIMSON-4417\nbravo=MERIDIAN-8823\ncharlie=PERIWINKLE-2051\n"
+             "delta=TANGERINE-7304\necho=MISSING")
+    r = G._bench_grade_needles(reply, L._cases())
+    assert r["passed"] == 3
+    by = {c["label"].split(" @ ")[0]: c for c in r["cases"]}
+    assert "another needle" in by["charlie"]["got"]
+    assert not by["echo"]["ok"]
+
+
+def test_normalising_does_not_invent_matches_from_the_filler():
+    """The filler is enumerated ledger lines; a normalised match must not collide with it.
+    Built from _filler directly rather than slicing a haystack — the first needle sits at
+    line 3, so any prefix of a real haystack legitimately contains one."""
+    filler = "\n".join(L._filler(i) for i in range(4000))
+    assert G._bench_grade_needles(filler, L._cases())["passed"] == 0

@@ -1077,7 +1077,17 @@ def _bench_grade_needles(answer: str, cases: list) -> dict:
     did appear somewhere in the reply. A code consumed by one needle's answer can no longer
     stand in as another's.
     """
+    # Compare on alphanumerics only. Measured at 512k: the model answered
+    # "CRIMSON=4417, MERIDIAN=8823, OBSIDIAN=1596, TANGERINE=7304, PERIWINKLE=2051" — every
+    # needle found, every hyphen turned into an equals sign — and an exact-substring match
+    # scored it 0/5. A grader that reads punctuation as part of the answer measures formatting,
+    # not recall. The codes are a distinctive word plus four digits, so a normalised match
+    # cannot collide with the filler.
+    def _norm(v):
+        return re.sub(r"[^a-z0-9]", "", str(v).lower())
+
     text = answer or ""
+    ntext = _norm(text)
     lines = text.splitlines()
     all_codes = {str(c.get("code")) for c in cases if c.get("code")}
     verdicts: dict = {}
@@ -1091,13 +1101,14 @@ def _bench_grade_needles(answer: str, cases: list) -> dict:
         said = next((ln.strip() for ln in lines if name and name.lower() in ln.lower()), None)
         if said is None:
             continue
-        if code.lower() in said.lower():
+        nsaid = _norm(said)
+        if _norm(code) in nsaid:
             verdicts[name] = (True, None)
             consumed[code] = name
         elif "missing" in said.lower():
             verdicts[name] = (False, f"reported {name} as not found")
         else:
-            wrong = next((c for c in all_codes - {code} if c.lower() in said.lower()), None)
+            wrong = next((c for c in all_codes - {code} if _norm(c) in nsaid), None)
             if wrong:
                 verdicts[name] = (False, f"said {wrong} — that is another needle's code, "
                                          f"not {code}")
@@ -1113,7 +1124,7 @@ def _bench_grade_needles(answer: str, cases: list) -> dict:
         code = str(case.get("code") or "")
         if name in verdicts:
             ok, got = verdicts[name]
-        elif code.lower() in text.lower() and consumed.get(code, name) == name:
+        elif _norm(code) in ntext and consumed.get(code, name) == name:
             ok, got = True, None
         elif consumed.get(code):
             ok, got = False, (f"{code} appears only as {consumed[code]}'s answer, "

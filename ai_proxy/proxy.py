@@ -13690,6 +13690,17 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # reported as the model failing to recall something it was never shown.
         if suite:
             _window = model_meta.get("loaded_context") or model_meta.get("max_context")
+            if not _window:
+                # The catalogue does not always carry a window. Measured: the index entry for a
+                # resident Ollama model held only {"loaded": True}, so this guard silently did
+                # nothing and a 1M-token rung was sent to a 1M window it cannot fit — the
+                # backend front-truncated it and the rung scored a number that measured
+                # nothing. Ask the backend what it actually loaded, which is the same source
+                # the env snapshot uses further down.
+                try:
+                    _window = await _bench_loaded_context(model, str(cfg.get("upstream") or ""))
+                except Exception:
+                    _window = None
             if _window:
                 _budget = _bench_ctx_budget(int(_window), int(cfg.get("max_tokens") or 256))
                 _too_big = {t["id"]: int(t["target_tokens"]) for t in suite
