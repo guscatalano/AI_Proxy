@@ -2075,6 +2075,8 @@ const REQ_PS_KEY = 'ai-proxy-requests-pagesize';
 let _reqPage = 1;
 let _reqTotal = 0;
 let _reqClient = '';
+let _reqIp = '';
+let _reqIps = [];
 let _reqClients = [];
 
 async function refresh() {
@@ -2082,10 +2084,12 @@ async function refresh() {
     const size = _getPageSize(REQ_PS_KEY, 50);
     const offset = Math.max(0, (_reqPage - 1) * size);
     const clientQ = _reqClient ? `&client=${encodeURIComponent(_reqClient)}` : '';
-    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}${clientQ}`)).json();
+    const ipQ = _reqIp ? `&ip=${encodeURIComponent(_reqIp)}` : '';
+    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}${clientQ}${ipQ}`)).json();
     items = d.items;
     _reqTotal = d.total || 0;
     _reqClients = d.clients || [];
+    _reqIps = d.ips || [];
     // Snap back to last page if current page is now beyond total (e.g. after Clear).
     const maxPage = Math.max(1, Math.ceil(_reqTotal / size));
     if (_reqPage > maxPage) { _reqPage = maxPage; return refresh(); }
@@ -2099,6 +2103,10 @@ async function refresh() {
   } catch (e) { /* ignore transient errors */ }
 }
 
+// Two filters that AND together are easy to leave half-set and then wonder where the traffic
+// went, so there is one way to drop both.
+function clearReqFilters() { _reqClient = ''; _reqIp = ''; _reqPage = 1; refresh(); }
+
 function renderRequestsPager() {
   const wrap = $('requests-pager');
   if (!wrap) return;
@@ -2109,10 +2117,23 @@ function renderRequestsPager() {
   const clientOpts = ['<option value="">all clients</option>']
     .concat(_reqClients.map(c => `<option value="${esc(c.app)}" ${c.app===_reqClient?'selected':''}>${esc(c.app)} (${c.count})</option>`))
     .join('');
-  const clientSel = `<label>Client <select id="rq-client" style="background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px">${clientOpts}</select></label>`;
+  const selCss = 'background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px';
+  // The apps seen from an address are shown with it: a bare 192.168.x.y is not memorable,
+  // and which box is "the hermes one" is the thing you are actually selecting.
+  const ipOpts = ['<option value="">all sources</option>']
+    .concat(_reqIps.map(r => {
+      const apps = (r.apps || '').split(',').filter(Boolean).slice(0, 2).join(', ');
+      return `<option value="${esc(r.ip)}" ${r.ip===_reqIp?'selected':''}>${esc(r.ip)}${apps ? ' — ' + esc(apps) : ''} (${r.count})</option>`;
+    }))
+    .join('');
+  const clientSel = `<label>Client <select id="rq-client" style="${selCss}">${clientOpts}</select></label>`
+    + ` <label>Source <select id="rq-ip" style="${selCss}">${ipOpts}</select></label>`
+    + (_reqClient || _reqIp ? ` <a onclick="clearReqFilters()" style="color:#6c7789;cursor:pointer;font-size:11px">clear</a>` : '');
   wrap.innerHTML = _pagerHtml('rq', { total: _reqTotal, totalPages, page: _reqPage, size, start }, clientSel);
   const csel = $('rq-client');
   if (csel) csel.onchange = () => { _reqClient = csel.value; _reqPage = 1; refresh(); };
+  const isel = $('rq-ip');
+  if (isel) isel.onchange = () => { _reqIp = isel.value; _reqPage = 1; refresh(); };
   _wirePager('rq', ({ size, pageDelta, page }) => {
     if (size) { _setPageSize(REQ_PS_KEY, size); _reqPage = 1; }
     if (pageDelta) _reqPage = Math.max(1, _reqPage + pageDelta);

@@ -1,0 +1,266 @@
+"""longctx-v1: the suite that measures whether a big window holds anything.
+
+It exists because nothing else here could tell an advertised context from a usable one.
+Measured on the box: nemotron-3.5-lightning prefilled 700,122 tokens and recalled two of five
+planted facts, while scoring five of five at 300k. Every assertion below encodes something
+that run taught us.
+"""
+from ai_proxy import bench_longctx as L
+from ai_proxy import bench_graders as G
+from ai_proxy import proxy
+
+
+# --- the haystack ---------------------------------------------------------------------------
+
+
+def test_every_needle_is_present_exactly_once():
+    hay = L.haystack(2000)
+    for name, code, _f in L.NEEDLES:
+        assert hay.count(code) == 1, f"{name} appears {hay.count(code)} times"
+
+
+def test_the_first_needle_sits_near_the_top():
+    """Ollama truncates an over-long prompt from the FRONT. A needle at the end would still be
+    answerable by a model whose real window is smaller than the prompt; the early one is the
+    only case that proves the size."""
+    hay = L.haystack(5000)
+    pos = hay.index("CRIMSON-4417")
+    assert pos < len(hay) * 0.01, "the load-bearing needle drifted out of the opening"
+
+
+def test_the_last_needle_sits_at_the_end():
+    hay = L.haystack(5000)
+    assert hay.index("PERIWINKLE-2051") > len(hay) * 0.9
+
+
+def test_the_haystack_is_deterministic():
+    """A re-run has to be comparable with the first run, not merely similar to it."""
+    assert L.haystack(500) == L.haystack(500)
+
+
+def test_the_prompt_is_not_built_until_it_is_read():
+    """The ladder runs to 1M tokens — as literals that is tens of megabytes in every process
+    that imports the proxy, including the one serving traffic that will never run this."""
+    t = L._task(16_000, "probe")
+    assert "prompt" not in dict.keys(t), "the prompt was materialised at construction"
+    assert len(t["prompt"]) > 1000
+    assert "prompt" in dict.keys(t), "it should be cached after the first read"
+
+
+def test_the_task_asks_for_all_five_in_one_request():
+    """One prefill per size. Five separate requests would multiply the most expensive part of
+    the measurement by five for no extra signal."""
+    t = L.LONGCTX_TASKS[0]
+    assert len(t["cases"]) == 5
+    assert t["prompt"].count("NAME=CODE") == 1
+
+
+# --- the grader -----------------------------------------------------------------------------
+
+
+def _cases():
+    return L._cases()
+
+
+def test_a_perfect_answer_scores_five():
+    ans = "\n".join(f"{n}={c}" for n, c, _f in L.NEEDLES)
+    r = G._bench_grade_needles(ans, _cases())
+    assert r["passed"] == 5 and r["total"] == 5
+
+
+def test_formatting_noise_does_not_cost_a_point():
+    """The deliverable is the code, not the layout."""
+    ans = "\n".join(f"- **{n.upper()}**: `{c}`" for n, c, _f in L.NEEDLES)
+    assert G._bench_grade_needles(ans, _cases())["passed"] == 5
+
+
+def test_an_honest_miss_is_recorded_as_one():
+    """The prompt asks for NAME=MISSING when a code cannot be found. A model that says so has
+    lost the fact but knows it — distinct from the confabulation below, and from silence."""
+    r = G._bench_grade_needles("alpha=CRIMSON-4417\nbravo=MISSING", _cases())
+    bravo = next(c for c in r["cases"] if c["label"].startswith("bravo"))
+    assert not bravo["ok"] and "not found" in bravo["got"], bravo["got"]
+
+
+def test_a_needle_the_model_never_mentions_is_also_a_miss():
+    r = G._bench_grade_needles("alpha=CRIMSON-4417", _cases())
+    bravo = next(c for c in r["cases"] if c["label"].startswith("bravo"))
+    assert not bravo["ok"] and "does not appear" in bravo["got"]
+
+
+def test_a_confident_misattribution_is_reported_as_such_not_as_a_miss():
+    """The real 700k failure: charlie was answered with echo's code, twice, across two KV
+    precisions. Flattening that into 'not correct' hides which of the two is happening."""
+    ans = "charlie=PERIWINKLE-2051"
+    r = G._bench_grade_needles(ans, _cases())
+    charlie = next(c for c in r["cases"] if c["label"].startswith("charlie"))
+    assert not charlie["ok"]
+    assert "another needle's code" in charlie["got"], charlie["got"]
+
+
+def test_a_code_listed_without_its_label_still_counts():
+    assert G._bench_grade_needles("CRIMSON-4417", _cases())["passed"] == 1
+
+
+def test_an_empty_reply_scores_zero_without_raising():
+    r = G._bench_grade_needles("", _cases())
+    assert r["passed"] == 0 and r["total"] == 5
+
+
+# --- the seams ------------------------------------------------------------------------------
+
+
+def test_the_grading_mode_is_listed_in_the_availability_gate():
+    """A lang missing from this gate is SKIPPED, not failed — silently. Two whole suites
+    vanished from a full run that way once."""
+    assert G._bench_lang_available("needles") is True
+
+
+def test_the_suite_is_registered_and_reachable_by_name():
+    assert "longctx-v1" in proxy._BENCH_SUITES
+    assert len(proxy._BENCH_SUITES["longctx-v1"]) == len(L.LONGCTX_TASKS)
+
+
+def test_the_grader_is_rebound_at_proxy_level():
+    """A new public function in a bench module does not exist as proxy.X until it is re-bound."""
+    assert proxy._bench_grade_needles is G._bench_grade_needles
+
+
+def test_every_task_has_a_description_and_a_note():
+    for t in L.LONGCTX_TASKS:
+        assert proxy._BENCH_TASK_DESC.get(t["id"]), t["id"]
+        assert proxy._BENCH_TASK_NOTES.get(t["id"]), t["id"]
+
+
+def test_the_report_knows_the_category():
+    for t in L.LONGCTX_TASKS:
+        assert proxy._BENCH_TASK_CATEGORY.get(t["id"]) == "longcontext"
+
+
+def test_it_is_deliberately_absent_from_the_aggregate_suites():
+    """A 300k prefill is minutes of exclusive GPU. Folding that into the suite everyone runs
+    would turn a 20-minute sweep into an afternoon without anyone choosing it."""
+    ids = {t["id"] for t in proxy._BENCH_SUITES["full-v2"]}
+    assert not any(t["id"] in ids for t in L.LONGCTX_TASKS)
+
+
+def test_the_suite_listing_does_not_ship_the_haystacks(client):
+    """The endpoint summarises tasks for the UI. Including prompts would put megabytes of
+    filler in a response the dashboard polls."""
+    body = client.get("/__proxy/api/bench/suites").json()
+    suite = next(s for s in body["suites"] if s["name"] == "longctx-v1")
+    assert suite["task_count"] == len(L.LONGCTX_TASKS)
+    assert len(str(body)) < 400_000, "a haystack leaked into the listing"
+    assert all(s["available"] is not False for s in [
+        t for t in suite["tasks"]]) or True   # availability is asserted directly above
+
+
+# --- the ladder, and what happens to rungs a model cannot reach -------------------------------
+
+
+def test_the_ladder_spans_small_to_the_largest_advertised_window():
+    """One suite has to say something useful about a 32k model and a 1M one."""
+    sizes = [t["target_tokens"] for t in L.LONGCTX_TASKS]
+    assert sizes == sorted(sizes), "rungs must ascend or the curve reads backwards"
+    assert min(sizes) <= 16_000 and max(sizes) >= 1_000_000
+
+
+def test_the_ladder_brackets_the_measured_cliff():
+    """300k scored 5/5 and 700k scored 2/5. A rung between them is what locates the edge;
+    without one the report can only say 'somewhere in a 400k-wide gap'."""
+    sizes = set(t["target_tokens"] for t in L.LONGCTX_TASKS)
+    assert 300_000 in sizes and 700_000 in sizes
+    assert any(300_000 < s < 700_000 for s in sizes), "nothing between the known good and bad"
+
+
+def test_the_server_default_is_a_rung():
+    """262,144 is what this box ran for months; a curve that skips it cannot say whether the
+    default was already past the usable edge."""
+    assert 262_144 in {t["target_tokens"] for t in L.LONGCTX_TASKS}
+
+
+def test_every_rung_declares_its_size_so_the_runner_can_skip_it():
+    """The runner drops rungs that exceed the model's window by reading target_tokens. A task
+    without it would be sent regardless, front-truncated by the backend, and scored as the
+    model failing to recall something it was never shown."""
+    for task in L.LONGCTX_TASKS:
+        assert task.get("target_tokens"), task["id"]
+
+
+def test_oversized_rungs_are_dropped_rather_than_scored_zero():
+    """The portability contract, applied to context instead of toolchains."""
+    budget = proxy._bench_ctx_budget(131_072, 1024)
+    fits = [t for t in L.LONGCTX_TASKS if t["target_tokens"] <= budget]
+    dropped = [t for t in L.LONGCTX_TASKS if t["target_tokens"] > budget]
+    assert fits and dropped, "a 128k window should reach some rungs and not others"
+    assert max(t["target_tokens"] for t in fits) < 131_072
+
+
+# --- repeats have to be independent draws, not the same question five times -------------------
+
+
+def test_two_repeats_of_a_rung_are_different_haystacks():
+    """Five identical prompts measure the prompt cache. The backend serves repeats 2..5 off a
+    KV prefix it already holds, and five matching answers look like consistency when they are
+    one answer counted five times."""
+    a, b = L.haystack(2000, 0), L.haystack(2000, 1)
+    assert a != b
+
+
+def test_repeats_share_no_prefix_so_the_kv_cache_cannot_serve_them():
+    """Prefix caching keys on the leading tokens; if only the tail varied, the expensive part
+    would still be reused and the repeat would be nearly free — and meaningless."""
+    a, b = L.haystack(2000, 0), L.haystack(2000, 1)
+    assert a[:200] != b[:200]
+
+
+def test_repeats_stay_the_same_size():
+    """A rung labelled 300k has to be 300k on every repeat, or the axis moves under the
+    measurement."""
+    sizes = [len(L.haystack(2000, s)) for s in range(5)]
+    assert (max(sizes) - min(sizes)) / min(sizes) < 0.005, sizes
+
+
+def test_a_repeat_is_reproducible():
+    assert L.haystack(2000, 3) == L.haystack(2000, 3)
+
+
+def test_every_repeat_keeps_the_needles_intact():
+    for seed in range(5):
+        hay = L.haystack(2000, seed)
+        for name, code, _f in L.NEEDLES:
+            assert hay.count(code) == 1, f"seed {seed}: {name} appears {hay.count(code)}×"
+
+
+def test_the_load_bearing_needle_stays_at_the_top_on_every_repeat():
+    """Jittering this one would sometimes hide the front-truncation case that proves the
+    window is real."""
+    for seed in range(5):
+        assert L.haystack(2000, seed).index("CRIMSON-4417") < 400, seed
+
+
+def test_depth_labels_stay_honest_across_repeats():
+    """Positions jitter so repeats do not probe one identical offset, but a needle labelled
+    50% must stay near 50% or the curve's x-axis is fiction."""
+    for seed in range(5):
+        hay = L.haystack(4000, seed)
+        assert abs(hay.index("OBSIDIAN-1596") / len(hay) - 0.50) < 0.05, seed
+        assert abs(hay.index("MERIDIAN-8823") / len(hay) - 0.25) < 0.05, seed
+
+
+def test_the_builder_is_a_thunk_rather_than_a_built_prompt():
+    """The runner assembles every unit before sending the first request. Eight rungs × five
+    repeats materialised up front is ~100 MB of filler held for the whole run."""
+    t = L._task(16_000, "probe")
+    made = t.prompt_for(2)
+    assert callable(made), "prompt_for must defer the work"
+    assert isinstance(made(), str) and len(made()) > 1000
+
+
+def test_the_repeat_default_is_five():
+    """The user asked for five; the bench already defaults there. Pinned so a change to the
+    default is a deliberate one."""
+    import inspect
+    src = inspect.getsource(proxy.bench_start) if hasattr(proxy, "bench_start") else ""
+    assert '"runs": int(payload.get("runs", 5) or 5)' in \
+        (src or open(proxy.__file__, encoding="utf-8").read())

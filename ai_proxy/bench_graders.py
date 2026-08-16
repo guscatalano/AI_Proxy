@@ -148,7 +148,7 @@ def _bench_lang_available(lang: str) -> bool:
     # refusal tasks on their first real sweep — the portability contract reported it
     # honestly in skipped_languages, but a grading mode is not a missing compiler.
     if lang in ("python", "html", "css", "sql", "text", "format", "refusal", "answer",
-                "langpick", None, ""):
+                "langpick", "needles", None, ""):
         return True                    # stdlib-only grading; nothing to probe
     tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
             "php": "php", "bash": "bash", "go": "go"}.get(lang)
@@ -1062,6 +1062,51 @@ def _bench_grade_answer(answer: str, cases: list) -> dict:
             "cases": results, "graded_by": "answer"}
 
 
+def _bench_grade_needles(answer: str, cases: list) -> dict:
+    """Score a long-context recall reply: one case per planted fact.
+
+    A wrong answer is recorded differently from a missing one. Measured at 700k, this model
+    reported echo's code as charlie's — the same substitution twice, across two KV cache
+    precisions — and "not correct" would have flattened a confident misattribution into the
+    same bucket as an honest "I could not find it". They mean different things about whether
+    the context is usable.
+
+    Matching is deliberately loose about surrounding punctuation and case: the deliverable is
+    the code, not the formatting, and a model that writes `- ALPHA: CRIMSON-4417` has recalled
+    it. It is strict about which code goes with which name, because that is the failure.
+    """
+    text = answer or ""
+    all_codes = {str(c.get("code")) for c in cases if c.get("code")}
+    results = []
+    for case in cases:
+        name = str(case.get("name") or "")
+        code = str(case.get("code") or "")
+        # The line the model wrote about this needle, if it wrote one.
+        said = next((ln.strip() for ln in text.splitlines()
+                     if name and name.lower() in ln.lower()), None)
+        if said and code.lower() in said.lower():
+            ok, got = True, None
+        elif said and any(c.lower() in said.lower() for c in all_codes - {code}):
+            wrong = next(c for c in all_codes - {code} if c.lower() in said.lower())
+            ok, got = False, f"said {wrong} — that is another needle's code, not {code}"
+        elif said and "missing" in said.lower():
+            # The model was asked to say MISSING when it could not find one, and did. An honest
+            # miss and a confident wrong answer are both failures, but only one of them means
+            # the model knows it lost the thread.
+            ok, got = False, f"reported {name} as not found"
+        elif said:
+            ok, got = False, f"answered {said[:60]!r}, expected {code}"
+        elif code.lower() in text.lower():
+            # Listed without its label. Still recalled; the format was not what was asked.
+            ok, got = True, None
+        else:
+            ok, got = False, f"{code} does not appear anywhere in the reply"
+        results.append({"ok": ok, "label": case.get("label") or name,
+                        **({} if ok else {"got": got})})
+    return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
+            "cases": results, "graded_by": "needles"}
+
+
 def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
                       lang: str = "python", suffix: str = "") -> dict:
     """Run one task's code against its cases in a subprocess. Blocking — call via to_thread.
@@ -1081,6 +1126,8 @@ def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,
         return _bench_grade_answer(code, cases)
     if lang == "langpick":
         return _bench_grade_langpick(code, cases)
+    if lang == "needles":
+        return _bench_grade_needles(code, cases)
     if suffix:
         code = code + "\n\n" + suffix
     if lang == "c":

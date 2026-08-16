@@ -6630,7 +6630,7 @@ def _cache_verdict(evaluated, est, ttft_ms=None, prompt_tokens=None, upstream=No
 
 
 @app.get("/__proxy/api/requests")
-def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False, client: str = ""):  # sync → threadpool
+def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False, client: str = "", ip: str = ""):  # sync → threadpool
     viewer = _client_ip(request)
     conn = db()
     conds, params = [], []
@@ -6640,6 +6640,12 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         # Match either the detected app (e.g. "claude-code") or the raw client IP.
         conds.append("(client_app = ? OR client_ip = ?)")
         params += [client, client]
+    if ip:
+        # Separate from `client` and ANDed with it: one box can run several agents and one
+        # agent name can come from several boxes, so "hermes" and "from 192.168.15.10" are
+        # different questions and you often want both at once.
+        conds.append("client_ip = ?")
+        params.append(ip)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
@@ -6657,6 +6663,17 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         "SELECT client_app AS app, COUNT(*) AS count FROM requests WHERE client_app IS NOT NULL"
         + ("" if include_shadows else " AND shadow_of IS NULL")
         + " GROUP BY client_app ORDER BY count DESC"
+    ).fetchall()
+    # Distinct source addresses, with the apps seen from each — an address alone is not
+    # memorable, and "192.168.15.10 (hermes)" is. Not gated by the PII rules: client_ip is
+    # not in the redaction set and the list already renders an address on every row, so this
+    # discloses nothing a viewer cannot already read off the screen.
+    ip_rows = conn.execute(
+        "SELECT client_ip AS ip, COUNT(*) AS count, "
+        "       GROUP_CONCAT(DISTINCT client_app) AS apps "
+        "FROM requests WHERE client_ip IS NOT NULL"
+        + ("" if include_shadows else " AND shadow_of IS NULL")
+        + " GROUP BY client_ip ORDER BY count DESC"
     ).fetchall()
     conn.close()
     items = []
@@ -6677,7 +6694,8 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         d["cache_verdict"] = _cverdict
         items.append(_redact_row(d, viewer))
     return {"total": total, "items": items,
-            "clients": [dict(r) for r in client_rows], "redacted": REDACT_PII_ENABLED}
+            "clients": [dict(r) for r in client_rows],
+            "ips": [dict(r) for r in ip_rows], "redacted": REDACT_PII_ENABLED}
 
 
 @app.get("/__proxy/api/cache")
@@ -11894,6 +11912,17 @@ _BENCH_SUITES.setdefault("langpref-v1", _bench_langpref_mod.LANGPREF_TASKS)
 _BENCH_TASK_DESC.update(_bench_langpref_mod.LANGPREF_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_langpref_mod.LANGPREF_TASK_NOTES)
 
+try:
+    from . import bench_longctx as _bench_longctx_mod
+except ImportError:          # flat-script launch
+    import bench_longctx as _bench_longctx_mod
+# longctx-v1: whether a big window holds anything. Deliberately NOT folded into full-v1 or
+# full-v2 — a 300k prefill is minutes of exclusive GPU, and quietly adding that to the suite
+# everyone runs would turn a 20-minute sweep into an afternoon. Run it on purpose.
+_BENCH_SUITES.setdefault("longctx-v1", _bench_longctx_mod.LONGCTX_TASKS)
+_BENCH_TASK_DESC.update(_bench_longctx_mod.LONGCTX_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_longctx_mod.LONGCTX_TASK_NOTES)
+
 _BENCH_SUITES.setdefault("instruct-v1", _bench_instruct_mod.INSTRUCT_TASKS)
 _BENCH_SUITES.setdefault("refusal-v1", _bench_instruct_mod.REFUSAL_TASKS)
 _BENCH_TASK_DESC.update(_bench_instruct_mod.INSTRUCT_TASK_DESC)
@@ -11927,7 +11956,8 @@ for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding
                                   ("agent-v2", "agentic"), ("security-v1", "security"),
                                   ("instruct-v1", "instruct"), ("refusal-v1", "refusal"),
                                   ("memory-v1", "memory"),
-                                  ("langpref-v1", "preference")):
+                                  ("langpref-v1", "preference"),
+                                  ("longctx-v1", "longcontext")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are
@@ -11970,17 +12000,26 @@ _bench_grade_php = _bench_graders_mod._bench_grade_php
 _bench_grade_sql = _bench_graders_mod._bench_grade_sql
 _bench_grade_bash = _bench_graders_mod._bench_grade_bash
 _bench_grade_sync = _bench_graders_mod._bench_grade_sync
+_bench_grade_needles = _bench_graders_mod._bench_grade_needles
 
 
 
-async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
+async def _bench_grade(text: str, task: dict, timeout_s: float,
+                       reasoning: str = "") -> dict:
     """Grade one response against one task definition."""
     lang = task.get("lang") or "python"
     # Analysis, format and refusal tasks are graded on the reply itself: extracting a code
     # block from an answer whose deliverable IS the answer would throw away the thing being
     # graded — and for format tasks the wrapper is precisely what is under test.
-    code = (text if lang in ("text", "answer", "format", "refusal", "langpick")
+    code = (text if lang in ("text", "answer", "format", "refusal", "langpick", "needles")
             else _bench_extract_code(text, lang))
+    # A model that answered in its reasoning field has still answered. Measured: at 700k this
+    # model returned empty content with all five codes in `reasoning`, which would score 0
+    # against a suite whose whole point is whether the context was readable. Scoped to needles
+    # rather than applied generally — for a format task the content IS the deliverable, and
+    # grading its scratchpad instead would be measuring the wrong thing.
+    if lang == "needles" and not code.strip():
+        code = reasoning or ""
     if not code.strip():
         return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
                 "score": 0.0, "error": "no code in response"}
@@ -12212,6 +12251,7 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     reasoning_words = 0
     served_model: str | None = None
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
     err: str | None = None
     status_code: int | None = None
     try:
@@ -12242,6 +12282,8 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                             if ttft_ms is None:
                                 ttft_ms = (time.perf_counter() - t0) * 1000
                             reasoning_words += len(re.findall(r"\S+", reasoning))
+                            if capture_text:
+                                reasoning_parts.append(reasoning)
                         if delta.get("content"):
                             now_ms = (time.perf_counter() - t0) * 1000
                             if ttft_ms is None:
@@ -12289,6 +12331,10 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     }
     if capture_text:
         row["text"] = "".join(text_parts)
+        # Kept apart from `text` rather than concatenated: for every other suite the content
+        # field is the deliverable and folding a scratchpad into it would change what they
+        # grade. Only the long-context grader reads this, and only when content came back empty.
+        row["reasoning_text"] = "".join(reasoning_parts)
     return row
 
 
@@ -13612,6 +13658,40 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             cfg["upstream_inferred"] = True
         env["model_loaded_at_start"] = model_meta.get("loaded")
         env["resolved_upstream"] = cfg.get("upstream")
+        # Same contract as skipped_languages, applied to context rather than toolchains: a task
+        # whose prompt cannot fit this model's window is DROPPED and recorded, never scored as a
+        # zero. Until longctx-v1 no graded task had a prompt worth checking, so a task simply
+        # too big for the model would have been sent, front-truncated by the backend, and
+        # reported as the model failing to recall something it was never shown.
+        if suite:
+            _window = model_meta.get("loaded_context") or model_meta.get("max_context")
+            if _window:
+                _budget = _bench_ctx_budget(int(_window), int(cfg.get("max_tokens") or 256))
+                _too_big = {t["id"]: int(t["target_tokens"]) for t in suite
+                            if t.get("target_tokens")
+                            and int(t["target_tokens"]) > _budget}
+                if _too_big:
+                    suite = [t for t in suite if t["id"] not in _too_big]
+                    env["skipped_context"] = {
+                        "window": int(_window),
+                        "budget": int(_budget),
+                        "tasks": {k: v for k, v in sorted(_too_big.items(), key=lambda kv: kv[1])},
+                    }
+                    total_units = (len(suite) * runs) if suite else runs
+                    _c = db()
+                    _c.execute("UPDATE bench_runs SET progress_total=? WHERE id=?",
+                               (total_units, bench_id))
+                    _c.commit()
+                    _c.close()
+                if not suite:
+                    _c = db()
+                    _c.execute("UPDATE bench_runs SET status='failed', error=?, "
+                               "finished_ts=? WHERE id=?",
+                               (f"every task in this suite needs more context than {model!r} "
+                                f"has ({int(_window):,} tokens)", time.time(), bench_id))
+                    _c.commit()
+                    _c.close()
+                    return
         for k in ("quant", "size_mb", "max_context", "loaded_context", "checkpoint",
                   "prefix_caching", "kv_cache_dtype"):
             if model_meta.get(k) is not None:
@@ -13846,8 +13926,17 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 units: list[tuple[str, dict | None]] = []
                 if suite:
                     for task in suite:
-                        for _ in range(runs):
-                            units.append((task["prompt"], task))
+                        for _rep in range(runs):
+                            # A task may vary itself per repeat. longctx does: repeating one
+                            # identical prompt measures the prompt cache, because the backend
+                            # serves repeats 2..N off a KV prefix it already holds and five
+                            # matching answers look like consistency when they are one answer
+                            # counted five times. The builder is stored UNCALLED — every unit
+                            # of the run is assembled before the first request is sent, and a
+                            # long-context ladder materialised up front is ~100 MB of filler
+                            # held for the whole run.
+                            _pf = getattr(task, "prompt_for", None)
+                            units.append((_pf(_rep) if callable(_pf) else task["prompt"], task))
                 else:
                     units = [(None, None)] * runs  # prompt built per-seq below (salting needs seq)
 
@@ -13865,6 +13954,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         idx = seq_counter + offset
                         seq = idx + 1
                         task_prompt, task = units[idx]
+                        if callable(task_prompt):
+                            task_prompt = task_prompt()   # built here so only one is resident
                         # A graded task at prompt_tokens > 0 is the same task asked from
                         # inside a long context — the axis that turns any suite into a
                         # long-context test. Episodes are excluded: their length comes from
@@ -13894,8 +13985,9 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                             if "grade" in res:
                                 pass          # agent episodes arrive graded by their runner
                             elif not res.get("error"):
-                                res["grade"] = await _bench_grade(res.get("text") or "", task,
-                                                                  grade_timeout)
+                                res["grade"] = await _bench_grade(
+                                    res.get("text") or "", task, grade_timeout,
+                                    reasoning=res.get("reasoning_text") or "")
                                 # A failing grade on a response that used its whole token
                                 # budget is a different diagnosis from wrong code, and the
                                 # report must say which one it is.

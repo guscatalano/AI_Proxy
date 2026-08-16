@@ -32,7 +32,10 @@ def _fakes(monkeypatch):
     async def fake_resident(model, upstream):
         return 2300.0
 
-    async def fake_grade(text, task, timeout):
+    # **kw so a new optional argument on the real grader does not fail this test for a reason
+    # that has nothing to do with what it measures. It broke exactly that way when `reasoning`
+    # was added, in two tests about env persistence.
+    async def fake_grade(text, task, timeout, **kw):
         return {"passed": 0, "total": 1}
 
     monkeypatch.setattr(P, "_bench_run_one", fake_run_one)
