@@ -9972,7 +9972,17 @@ async def bench_run(request: Request):
         "exclusive": bool(payload.get("exclusive", True)),
         "drain_seconds": float(payload.get("drain_seconds", 5.0) or 0.0),
         "thinking": thinking if thinking is not None else "auto",
-        "bypass_router": bool(payload.get("bypass_router", False)),
+        # Pinned by default, for the same reason as `exclusive` above: a benchmark exists to
+        # measure the model it names. Left to the router, a catch-all rule rewrites the bench's
+        # own requests, and the damage depends on luck. Pointing every request at gemma4-vllm
+        # made a nemotron run die after 5 of 357 units — auto-load saw a request for the *other*
+        # vLLM twin, tried to swap mid-bench, and refused because a bench was running, reported
+        # as "a benchmark owns the box right now", which reads like contention rather than a
+        # rewrite. The quieter outcome is worse: where the rewrite target happens to be loaded,
+        # the run completes and records another model's scores under the name that was asked for.
+        # The UI has always sent this flag; the API defaulting the other way meant scripted runs
+        # were the only ones exposed. Callers wanting to measure the routed path opt out knowingly.
+        "bypass_router": bool(payload.get("bypass_router", True)),
         "no_nudge": bool(payload.get("no_nudge", False)),
         "quiesce": bool(payload.get("quiesce", False)),
         # Unload other Ollama models before each cell, without gating traffic. Only Ollama can
