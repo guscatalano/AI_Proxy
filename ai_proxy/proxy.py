@@ -11082,35 +11082,42 @@ def bench_guide(request: Request, suite: str = "", format: str = "html"):
     finally:
         conn.close()
 
-    out = []
+    # Grouped by CATEGORY, each task once. Grouping by suite rendered 431 cards for 177 tasks:
+    # full-v2 contains coding-v3 plus agent-v2 plus security-v1 plus the rest, so parse_query
+    # appeared four times. The suites a task belongs to are a property of the task, not a reason
+    # to draw it again.
+    by_cat: dict = {}
+    seen: dict = {}
     for name in wanted:
-        tasks = _BENCH_SUITES.get(name) or []
-        if not tasks:
-            continue
-        shaped = []
-        for t in tasks:
-            # "What was asked -> what was expected", per case. _bench_case_parts already speaks
-            # every task shape: a function call, an HTML structural check, a needle at a depth.
+        for t in (_BENCH_SUITES.get(name) or []):
+            tid = t["id"]
+            if tid in seen:
+                seen[tid]["suites"].append(name)
+                continue
             good = []
             for i in range(len(t.get("cases") or [])):
                 try:
                     good.append(_bench_report_mod._bench_case_parts(t, i))
                 except Exception:
                     continue
-            shaped.append({
-                "id": t["id"], "lang": t.get("lang") or "python",
-                "category": _BENCH_TASK_CATEGORY.get(t["id"]),
-                "desc": _BENCH_TASK_DESC.get(t["id"]) or "",
-                "note": _BENCH_TASK_NOTES.get(t["id"]) or "",
-                "good": good,
-                "stats": stats.get(t["id"]) or {"runs": 0, "perfect": 0},
-            })
-        out.append({"name": name, "tasks": shaped})
+            cat = _BENCH_TASK_CATEGORY.get(tid) or "other"
+            entry = {
+                "id": tid, "lang": t.get("lang") or "python", "category": cat,
+                "desc": _BENCH_TASK_DESC.get(tid) or "",
+                "note": _BENCH_TASK_NOTES.get(tid) or "",
+                "good": good, "suites": [name],
+                "stats": stats.get(tid) or {"runs": 0, "perfect": 0},
+            }
+            seen[tid] = entry
+            by_cat.setdefault(cat, []).append(entry)
+    # Biggest category first: it is the one a reader is most likely to have come for.
+    out = [{"name": c, "tasks": sorted(v, key=lambda x: x["id"])}
+           for c, v in sorted(by_cat.items(), key=lambda kv: -len(kv[1]))]
     if not out:
         return JSONResponse({"error": f"no such suite; available: {list(_BENCH_SUITES)}"},
                             status_code=404)
     if format == "json":
-        return {"suites": out, "failures": examples, "stats": stats}
+        return {"categories": out, "failures": examples, "stats": stats}
     return Response(content=_bench_report_mod._bench_guide_html(out, examples),
                     media_type="text/html; charset=utf-8")
 

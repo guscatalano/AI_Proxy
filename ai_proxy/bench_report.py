@@ -2420,26 +2420,39 @@ _GUIDE_SUITE_BLURB = {
 }
 
 
-def _bench_guide_html(suites: list, examples: dict) -> str:
-    """One card per task: what it asks, how often it is passed, and what right and wrong look
-    like. Cards rather than table rows because these are not comparable quantities — a stat
-    line, an ask, the reason a task exists and a real failure are four different kinds of
-    thing, and a row forces them into columns sized for the widest of them.
+_GUIDE_CAT_TITLE = {
+    "coding": "Coding", "agentic": "Agentic", "security": "Security",
+    "instruct": "Instruction following", "refusal": "Refusal", "memory": "Memory",
+    "preference": "Language preference", "longcontext": "Long context", "other": "Other",
+}
+
+
+def _bench_guide_html(categories: list, examples: dict) -> str:
+    """One tab per category, one card per task, each task drawn once.
+
+    Grouping by suite drew 431 cards for 177 tasks — full-v2 contains coding-v3 plus agent-v2
+    plus security-v1 plus the rest, so parse_query appeared four times and the page read as
+    three times longer than it is. The suites a task belongs to are a property of the task, not
+    a reason to draw it again, so they became a line on the card.
 
     The failing answer is a REAL reply from a stored run. Three channels record one: a wrong
     return value, a crash inside a case, and code that never compiled. Reading only the first
-    hid every task that failed to build — the loudest failure a coding suite can have.
+    hid every task that failed to build.
     """
     kinds = {"build": ("did not build", "b-build"),
              "crash": ("crashed", "b-crash"),
              "wrong": ("wrong answer", "b-wrong")}
-    groups = []
-    for suite in suites:
-        tasks = suite.get("tasks") or []
+    tabs, panels = [], []
+    total = sum(len(c.get("tasks") or []) for c in categories)
+    for idx, cat in enumerate(categories):
+        tasks = cat.get("tasks") or []
         if not tasks:
             continue
-        cats = sorted({t.get("category") for t in tasks if t.get("category")})
-        blurb = " ".join(_GUIDE_SUITE_BLURB.get(c, "") for c in cats).strip()
+        name = cat["name"]
+        title = _GUIDE_CAT_TITLE.get(name, name.title())
+        sel = " on" if idx == 0 else ""
+        tabs.append(f'<button class="tab{sel}" data-cat="{_h(name)}">{_h(title)}'
+                    f'<span class="tcount">{len(tasks)}</span></button>')
         cards = []
         for t in tasks:
             st = t.get("stats") or {}
@@ -2462,8 +2475,10 @@ def _bench_guide_html(suites: list, examples: dict) -> str:
                             f'<code>{_h(txt)}</code></li>')
             else:
                 bad = '<li class="clean">nothing has failed this yet</li>'
+            suites = " ".join(f'<span class="suite">{_h(x)}</span>'
+                              for x in sorted(set(t.get("suites") or [])))
             hay = " ".join([t["id"], t.get("desc") or "", t.get("lang") or "",
-                            suite["name"]]).lower()
+                            " ".join(t.get("suites") or []), name]).lower()
             cards.append(
                 f'<article class="card" data-q="{_h(hay)}">'
                 f'<header><code class="tid">{_h(t["id"])}</code>'
@@ -2473,41 +2488,36 @@ def _bench_guide_html(suites: list, examples: dict) -> str:
                 f'<p class="why">{_h(t.get("note") or "")}</p>'
                 f'<div class="half"><h4>Passes with</h4><ul class="ok">{good}</ul></div>'
                 f'<div class="half"><h4>Real failures</h4><ul class="bad">{bad}</ul></div>'
+                f'<footer class="suites">{suites}</footer>'
                 f'</article>')
-        groups.append(
-            f'<section class="grp" data-suite="{_h(suite["name"].lower())}">'
-            f'<button class="ghead" aria-expanded="true">'
-            f'<span class="chev">&#9662;</span>'
-            f'<span class="gname">{_h(suite["name"])}</span>'
-            f'<span class="gcount">{len(tasks)} tasks</span>'
-            f'<span class="gblurb">{_h(blurb[:150])}</span></button>'
-            f'<div class="cards">{"".join(cards)}</div></section>')
+        panels.append(f'<section class="panel{sel}" data-cat="{_h(name)}">'
+                      f'<p class="note">{_h(_GUIDE_SUITE_BLURB.get(name, ""))}</p>'
+                      f'<div class="cards">{"".join(cards)}</div></section>')
 
     css = """
-  .toolbar { position:sticky; top:0; z-index:5; background:var(--bg); padding:10px 0 12px;
-             display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  .toolbar { position:sticky; top:0; z-index:5; background:var(--bg); padding:10px 0 0;
              border-bottom:1px solid var(--border); margin-bottom:14px; }
-  .toolbar input { flex:1; min-width:220px; background:var(--panel); color:var(--ink);
+  .toolrow { display:flex; gap:10px; align-items:center; flex-wrap:wrap; padding-bottom:10px; }
+  .toolrow input { flex:1; min-width:220px; background:var(--panel); color:var(--ink);
                    border:1px solid var(--border); border-radius:8px; padding:8px 12px;
                    font:inherit; font-size:13px; }
-  .toolbar button { background:var(--panel); color:var(--ink-dim); border:1px solid var(--border);
+  .toolrow button { background:var(--panel); color:var(--ink-dim); border:1px solid var(--border);
                     border-radius:8px; padding:7px 12px; font:inherit; font-size:12px;
                     cursor:pointer; }
-  .toolbar button.on { color:var(--bad); border-color:var(--bad); }
-  .toolbar .hits { color:var(--ink-faint); font-size:12px; font-family:var(--mono); }
-  .grp { margin:0 0 8px; }
-  .ghead { width:100%; display:flex; gap:10px; align-items:baseline; cursor:pointer;
-           background:var(--panel-2); border:1px solid var(--border); border-radius:10px;
-           padding:9px 13px; color:var(--ink); font:inherit; text-align:left; }
-  .ghead .chev { transition:transform .15s; color:var(--ink-faint); }
-  .grp.shut .ghead .chev { transform:rotate(-90deg); }
-  .grp.shut .cards { display:none; }
-  .gname { font-family:var(--mono); font-weight:600; }
-  .gcount { color:var(--ink-faint); font-size:11.5px; font-family:var(--mono); }
-  .gblurb { color:var(--ink-faint); font-size:11.5px; overflow:hidden; text-overflow:ellipsis;
-            white-space:nowrap; flex:1; }
+  .toolrow button.on { color:var(--bad); border-color:var(--bad); }
+  .hits { color:var(--ink-faint); font-size:12px; font-family:var(--mono); }
+  .tabs { display:flex; gap:4px; flex-wrap:wrap; }
+  .tab { background:none; border:none; border-bottom:2px solid transparent; color:var(--ink-faint);
+         font:inherit; font-size:12.5px; padding:7px 11px; cursor:pointer; display:flex;
+         gap:6px; align-items:center; }
+  .tab:hover { color:var(--ink); }
+  .tab.on { color:var(--ink); border-bottom-color:var(--accent); }
+  .tcount { font-family:var(--mono); font-size:10.5px; color:var(--ink-faint);
+            background:var(--panel-2); border-radius:9px; padding:1px 6px; }
+  .panel { display:none; }
+  .panel.on { display:block; }
   .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:10px;
-           padding:10px 0 4px; }
+           padding:4px 0; }
   .card { border:1px solid var(--border); border-radius:10px; background:var(--panel);
           padding:11px 13px; display:flex; flex-direction:column; gap:7px; }
   .card header { display:flex; align-items:baseline; gap:8px; }
@@ -2538,51 +2548,59 @@ def _bench_guide_html(suites: list, examples: dict) -> str:
   .b-build { background:#4a2a2a; color:#ffb4b4; }
   .b-crash { background:#4a3a20; color:#ffd8a0; }
   .b-wrong { background:#332f4a; color:#c8c0ff; }
-  .card.hide, .grp.hide { display:none; }
+  .suites { margin-top:auto; padding-top:6px; border-top:1px solid var(--border);
+            display:flex; gap:4px; flex-wrap:wrap; }
+  .suite { font-family:var(--mono); font-size:9.5px; color:var(--ink-faint);
+           border:1px solid var(--border); border-radius:4px; padding:0 5px; }
+  .card.hide { display:none; }
 """
 
     script = """
 (function () {
   var q = document.getElementById('q'), hits = document.getElementById('hits');
   var cards = [].slice.call(document.querySelectorAll('.card'));
-  var groups = [].slice.call(document.querySelectorAll('.grp'));
+  var tabs = [].slice.call(document.querySelectorAll('.tab'));
+  var panels = [].slice.call(document.querySelectorAll('.panel'));
   var failOnly = false;
+  function visible() {
+    var p = document.querySelector('.panel.on');
+    return p ? [].slice.call(p.querySelectorAll('.card')) : [];
+  }
   function apply() {
     var term = (q.value || '').trim().toLowerCase();
+    // A search spans every category — a task you cannot name is usually one you cannot place
+    // in a category either, so scoping the search to the open tab hides the answer.
+    var scope = term ? cards : visible();
+    if (term) { panels.forEach(function (p) { p.classList.add('on'); }); }
+    else {
+      panels.forEach(function (p, i) {
+        p.classList.toggle('on', tabs[i] && tabs[i].classList.contains('on'));
+      });
+    }
     var shown = 0;
     cards.forEach(function (c) {
       var hit = !term || (c.getAttribute('data-q') || '').indexOf(term) >= 0;
       if (hit && failOnly && !c.querySelector('.bad li:not(.clean)')) hit = false;
       c.classList.toggle('hide', !hit);
-      if (hit) shown++;
+      if (hit && scope.indexOf(c) >= 0) shown++;
     });
-    // A group whose cards are all filtered out is noise rather than context, and a filter that
-    // matches something inside a collapsed group has to open it or the hit is invisible.
-    groups.forEach(function (g) {
-      var any = g.querySelector('.card:not(.hide)');
-      g.classList.toggle('hide', !any);
-      if (any && (term || failOnly)) g.classList.remove('shut');
-    });
-    hits.textContent = shown + ' of ' + cards.length + ' tasks';
+    hits.textContent = shown + (term ? ' matching' : '') + ' of ' + cards.length + ' tasks';
   }
+  tabs.forEach(function (t, i) {
+    t.onclick = function () {
+      tabs.forEach(function (x) { x.classList.remove('on'); });
+      t.classList.add('on');
+      q.value = '';
+      panels.forEach(function (p, j) { p.classList.toggle('on', i === j); });
+      apply();
+    };
+  });
   q.addEventListener('input', apply);
-  document.getElementById('expand').onclick = function () {
-    groups.forEach(function (g) { g.classList.remove('shut'); });
-  };
-  document.getElementById('collapse').onclick = function () {
-    groups.forEach(function (g) { g.classList.add('shut'); });
-  };
   document.getElementById('onlyfail').onclick = function () {
     failOnly = !failOnly;
     this.classList.toggle('on', failOnly);
     apply();
   };
-  [].slice.call(document.querySelectorAll('.ghead')).forEach(function (h) {
-    h.onclick = function () {
-      var shut = h.parentNode.classList.toggle('shut');
-      h.setAttribute('aria-expanded', shut ? 'false' : 'true');
-    };
-  });
   apply();
 })();
 """
@@ -2593,18 +2611,17 @@ def _bench_guide_html(suites: list, examples: dict) -> str:
             f"<style>{_REPORT_CSS}{css}</style></head><body><main>"
             "<h1>Benchmark guide</h1>"
             "<p class=\"note\">One card per task: what it asks, how often models pass it, what a "
-            "passing answer looks like, and — where one exists — a reply that actually "
-            "failed it on this machine. The failures are real and come in three kinds: a wrong "
-            "answer, a crash inside a case, and code that never built. An invented failure would "
-            "only teach the shape of a mistake nobody made.</p>"
-            "<div class=\"toolbar\">"
-            "<input id=\"q\" type=\"search\" placeholder=\"Search tasks, suites, languages…\" "
+            "passing answer looks like, and — where one exists — a reply that actually failed it "
+            "on this machine. Failures are real and come in three kinds: a wrong answer, a crash "
+            "inside a case, and code that never built. Tasks appear once each, tagged with the "
+            "suites that include them.</p>"
+            "<div class=\"toolbar\"><div class=\"toolrow\">"
+            "<input id=\"q\" type=\"search\" placeholder=\"Search every category…\" "
             "autocomplete=\"off\">"
-            "<button id=\"expand\">Expand all</button>"
-            "<button id=\"collapse\">Collapse all</button>"
             "<button id=\"onlyfail\">Only tasks with failures</button>"
-            "<span class=\"hits\" id=\"hits\"></span></div>"
-            + "".join(groups)
+            f"<span class=\"hits\" id=\"hits\"></span></div>"
+            f"<div class=\"tabs\">{''.join(tabs)}</div></div>"
+            + "".join(panels)
             + f"<script>{script}</script></main></body></html>")
 
 

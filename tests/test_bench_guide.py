@@ -7,17 +7,36 @@ surfaced them, and nothing showed what a passing answer actually looks like.
 from ai_proxy import proxy
 
 
-def test_the_guide_covers_every_suite(client):
+def test_every_task_appears_exactly_once(client):
+    """Grouping by suite drew 431 cards for 177 tasks: full-v2 contains coding-v3 plus agent-v2
+    plus security-v1 plus the rest, so parse_query was rendered four times and the page read as
+    three times longer than it is."""
     body = client.get("/__proxy/api/bench/guide?format=json").json()
-    names = {s["name"] for s in body["suites"]}
-    assert names == set(proxy._BENCH_SUITES), names ^ set(proxy._BENCH_SUITES)
+    ids = [t["id"] for c in body["categories"] for t in c["tasks"]]
+    distinct = {t["id"] for s in proxy._BENCH_SUITES.values() for t in s}
+    assert len(ids) == len(set(ids)) == len(distinct), (len(ids), len(set(ids)), len(distinct))
+
+
+def test_a_task_names_the_suites_that_include_it(client):
+    """Which suites contain a task is a property of the task, not a reason to draw it again."""
+    body = client.get("/__proxy/api/bench/guide?format=json").json()
+    t = next(t for c in body["categories"] for t in c["tasks"] if t["id"] == "parse_query")
+    assert len(t["suites"]) >= 3, t["suites"]
+
+
+def test_categories_cover_every_task(client):
+    body = client.get("/__proxy/api/bench/guide?format=json").json()
+    cats = {c["name"] for c in body["categories"]}
+    assert {"coding", "security", "agentic", "longcontext"} <= cats, cats
+    assert sum(len(c["tasks"]) for c in body["categories"]) == len(
+        {t["id"] for s in proxy._BENCH_SUITES.values() for t in s})
 
 
 def test_every_task_carries_its_description_and_its_why(client):
     """The description says what it does; the note says why it is in the suite. The note is the
     half that cannot be reconstructed from the code."""
     body = client.get("/__proxy/api/bench/guide?format=json").json()
-    for s in body["suites"]:
+    for s in body["categories"]:
         for t in s["tasks"]:
             assert t["desc"], f"{t['id']} has no description"
             assert t["note"], f"{t['id']} has no note"
@@ -27,14 +46,14 @@ def test_a_passing_answer_is_shown_for_each_task(client):
     """Derived from the task's own cases, in the same vocabulary the report's failure examples
     use, so a reader who has seen one recognises the other."""
     body = client.get("/__proxy/api/bench/guide?format=json").json()
-    empty = [t["id"] for s in body["suites"] for t in s["tasks"] if not t["good"]]
+    empty = [t["id"] for s in body["categories"] for t in s["tasks"] if not t["good"]]
     assert not empty, f"no passing example derivable for: {empty[:8]}"
 
 
-def test_a_single_suite_can_be_asked_for(client):
+def test_a_single_suite_can_still_be_asked_for(client):
     body = client.get("/__proxy/api/bench/guide?suite=longctx-lite&format=json").json()
-    assert [s["name"] for s in body["suites"]] == ["longctx-lite"]
-    assert len(body["suites"][0]["tasks"]) == 6
+    ids = [t["id"] for c in body["categories"] for t in c["tasks"]]
+    assert len(ids) == 6 and all(i.startswith("longctx_") for i in ids)
 
 
 def test_an_unknown_suite_says_what_exists(client):
@@ -117,16 +136,23 @@ def test_the_page_is_searchable_and_groups_collapse(client):
     all filtered out hides itself rather than leaving an empty header behind."""
     html = client.get("/__proxy/api/bench/guide").text
     assert 'id="q"' in html and "type=\"search\"" in html
-    assert 'class="ghead"' in html and "shut" in html
+    assert 'class="tab' in html and 'class="panel' in html
     assert "Only tasks with failures" in html
 
 
-def test_the_suite_header_carries_its_own_row(client):
-    """The group heading is a control, not a separate section — one chevron, name, task count
-    and blurb on a single row, so the cards below it stay in one grid."""
+def test_each_category_is_a_tab_with_its_count(client):
+    """Fifteen suite groups was the overwhelming part; eight categories with counts is the
+    shape a reader can hold."""
     html = client.get("/__proxy/api/bench/guide").text
     import re as _re
-    m = _re.search(r'<button class="ghead".*?</button>', html, _re.S)
-    assert m, "the group header is gone"
-    for part in ("chev", "gname", "gcount", "gblurb"):
-        assert part in m.group(0), f"{part} missing from the header row"
+    tabs = _re.findall(r'<button class="tab[^"]*" data-cat="([^"]+)"', html)
+    assert {"coding", "security", "agentic"} <= set(tabs), tabs
+    assert html.count('class="tcount"') == len(tabs), "every tab needs its task count"
+    assert html.count('class="panel') == len(tabs)
+
+
+def test_search_spans_every_category(client):
+    """A task you cannot name is usually one you cannot place in a category either, so scoping
+    the search to the open tab would hide the answer."""
+    html = client.get("/__proxy/api/bench/guide").text
+    assert "var scope = term ? cards : visible()" in html
