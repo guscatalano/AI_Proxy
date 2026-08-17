@@ -6503,6 +6503,30 @@ async def list_models_enriched():
             if ctx:
                 e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
 
+    # Advertised aliases: names this proxy answers to but no backend actually serves. A client
+    # whose model picker only offers what /v1/models lists cannot select a name the router
+    # would happily rewrite, so the alias has to appear in the catalogue to be selectable at
+    # all. Configured under model_router.advertise as {alias: target}; the routing itself is
+    # the existing rules, this only makes the name visible.
+    try:
+        advertise = (load_rules_config().get("model_router") or {}).get("advertise") or {}
+    except Exception:
+        advertise = {}
+    for alias, target in (advertise.items() if isinstance(advertise, dict) else []):
+        alias = str(alias).strip()
+        if not alias or alias in entries:
+            continue                       # never shadow a model that genuinely exists
+        base = entries.get(str(target)) or {}
+        entries[alias] = {
+            **{k: v for k, v in base.items()
+               if k in ("context_length", "max_context_length", "max_model_len")},
+            "id": alias, "object": "model", "owned_by": "ai-proxy",
+            # Said plainly, because a name in this list that is not the model you get is the
+            # kind of thing that wastes an afternoon when it is discovered by accident.
+            "alias_of": str(target),
+            "description": f"alias — every request is served by {target}",
+        }
+
     payload = {"object": "list", "data": list(entries.values())}
     _MODELS_CACHE.update(ts=now, data=payload)
     return JSONResponse(payload)
