@@ -12025,7 +12025,8 @@ except ImportError:          # flat-script launch
 # project-v1: build the thing the spec describes, not the thing the examples show. Kept out of
 # the aggregate suites — an episode here is minutes, and the coding suite it exists to replace
 # runs in seconds per task.
-_BENCH_SUITES.setdefault("project-v1", _bench_project_mod.PROJECT_TASKS)
+_BENCH_SUITES.setdefault("project-v1", _bench_project_mod.PROJECT_TASKS
+                         + _bench_project_mod.PROJECT_EPISODE_TASKS)
 _BENCH_TASK_DESC.update(_bench_project_mod.PROJECT_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_project_mod.PROJECT_TASK_NOTES)
 _BENCH_TASK_DESC.update(_bench_longctx_mod.LONGCTX_TASK_DESC)
@@ -12353,6 +12354,30 @@ async def _bench_run_agent(client: httpx.AsyncClient, base: str, model: str,
     if exhausted:
         transcript.append(f"[step budget of {task.get('max_steps')} exhausted]")
     grade = _bench_agent_mod.grade_episode(task, world, final, steps, exhausted)
+    # A project episode is graded on what it BUILT. Run the file the model wrote against the
+    # cases it never saw, and fold the result in beside the answer and conduct cases — writing
+    # a file that does not work is a different failure from not writing one, and both are
+    # different from a clean episode that produced nothing.
+    built = task.get("build")
+    if built:
+        code = (world.state.get("files") or {}).get(built.get("path")) or ""
+        if code.strip():
+            sub = await asyncio.to_thread(
+                _bench_grade_sync, code, built.get("entry") or task.get("entry") or "",
+                task["cases"], float(built.get("timeout_s") or 30.0),
+                built.get("lang") or "python", "")
+            _bench_graders_mod._bench_split_visible(sub, task["cases"])
+            grade["cases"] = (grade.get("cases") or []) + (sub.get("cases") or [])
+            for k in ("visible_passed", "visible_total", "hidden_passed", "hidden_total",
+                      "copied_examples"):
+                grade[k] = sub.get(k)
+            if sub.get("error"):
+                grade["build_error"] = sub["error"]
+        else:
+            grade["build_error"] = f"no {built.get('path')} was written"
+        grade["passed"] = sum(1 for c in grade["cases"] if c.get("ok"))
+        grade["total"] = len(grade["cases"])
+        grade["score"] = grade["passed"] / (grade["total"] or 1)
     total_ms = (time.perf_counter() - t0) * 1000
     return {"seq": 0, "task": task["id"], "error": err, "grade": grade,
             "ttft_ms": ttft, "ttfc_ms": ttft, "total_ms": total_ms,

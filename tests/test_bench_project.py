@@ -213,3 +213,95 @@ def test_auto_is_listed_in_the_availability_gate():
     """A lang missing from the gate is SKIPPED silently, not failed — two whole suites vanished
     from a full run that way once."""
     assert G._bench_lang_available("auto") is True
+
+
+# --- episodes: the model has to actually call the tools ---------------------------------------
+
+
+def _episode(task, calls, final="DONE"):
+    from ai_proxy import bench_agent as A
+    w = A.AgentWorld(task)
+    for name, args in calls:
+        w.execute(name, args)
+    return w, A.grade_episode(task, w, final, len(calls), False)
+
+
+_WORKING_SLUGIFY = (
+    "import re\n\n\n"
+    "def slugify(title):\n"
+    "    s = re.sub(r'[^a-z0-9]+', '-', title.lower()).strip('-')\n"
+    "    return s or 'untitled'\n"
+)
+
+
+def test_writing_nothing_fails_however_good_the_narration():
+    """A model can describe a flawless implementation and never call write_file. The
+    single-turn tasks cannot tell the difference; this is why the episodes exist."""
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_calc_build")
+    _w, g = _episode(task, [], final="I have implemented calc.py exactly as specified. DONE")
+    assert g["cases"][0]["ok"] is False
+    assert "never wrote calc.py" in g["cases"][0]["got"]
+
+
+def test_writing_to_the_wrong_path_is_a_clean_episode_that_built_nothing():
+    """Conduct passes — no malformed calls, no hallucinated tools — and the deliverable is
+    still absent. Averaging the two would hide which happened."""
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_calc_build")
+    _w, g = _episode(task, [("write_file", {"path": "main.py", "contents": "def calc(e): 0"})])
+    assert g["cases"][0]["ok"] is False and "main.py" in g["cases"][0]["got"]
+    assert g["cases"][1]["ok"] is True, "conduct was clean; only the deliverable is missing"
+
+
+def test_writing_the_file_satisfies_the_deliverable():
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_calc_build")
+    _w, g = _episode(task, [("write_file", {"path": "calc.py", "contents": "def calc(e): 0"})])
+    assert g["cases"][0]["ok"] is True
+
+
+def test_the_written_file_is_what_gets_executed():
+    """The grade runs the artefact, not the transcript."""
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_slugify_fix")
+    w, _g = _episode(task, [("write_file", {"path": "slugify.py",
+                                            "contents": _WORKING_SLUGIFY})])
+    built = w.state["files"]["slugify.py"]
+    res = G._bench_grade_sync(built, "slugify", task["cases"], 30.0, "python", "")
+    G._bench_split_visible(res, task["cases"])
+    assert res["hidden_passed"] == res["hidden_total"], [
+        c for c in res["cases"] if not c.get("ok")]
+
+
+def test_the_shipped_buggy_file_actually_fails_its_hidden_cases():
+    """The starting file must be genuinely wrong, or the refactor task measures nothing."""
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_slugify_fix")
+    buggy = task["world"]["files"]["slugify.py"]
+    res = G._bench_grade_sync(buggy, "slugify", task["cases"], 30.0, "python", "")
+    G._bench_split_visible(res, task["cases"])
+    assert res["hidden_passed"] < res["hidden_total"], "the starting file already passes"
+    assert res["visible_passed"] < res["visible_total"], "even the shown examples should fail"
+
+
+def test_overwriting_a_file_is_not_counted_as_a_repeat_call():
+    """A model that writes, tests and rewrites is doing the right thing."""
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_calc_build")
+    w, g = _episode(task, [("write_file", {"path": "calc.py", "contents": "v1"}),
+                           ("write_file", {"path": "calc.py", "contents": "v2"})])
+    assert w.state["files"]["calc.py"] == "v2"
+    assert g["cases"][1]["ok"] is True, g["cases"][1].get("got")
+
+
+def test_the_refactor_episode_requires_reading_before_writing():
+    """The spec restates the requirements, so rewriting from the spec alone nearly works —
+    read_file is required precisely because guessing is so close to sufficient."""
+    task = next(t for t in P.PROJECT_EPISODE_TASKS if t["id"] == "projep_slugify_fix")
+    assert "read_file" in task["require_tools"]
+    _w, g = _episode(task, [("write_file", {"path": "slugify.py",
+                                            "contents": _WORKING_SLUGIFY})])
+    assert g["cases"][1]["ok"] is False
+    assert "read_file" in g["cases"][1]["got"]
+
+
+def test_every_episode_names_a_file_it_must_produce():
+    for t in P.PROJECT_EPISODE_TASKS:
+        assert t.get("build", {}).get("path"), t["id"]
+        assert t["build"]["path"] in t["prompt"], f"{t['id']} never names the file to write"
+        assert "write_file" in t["require_tools"], t["id"]

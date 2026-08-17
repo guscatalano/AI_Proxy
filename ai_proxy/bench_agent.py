@@ -691,6 +691,17 @@ class AgentWorld:
             return json.dumps({"keys": sorted(st["old"])})
         if name == "old_read":
             return json.dumps({"value": st["old"][str(a.get("key"))]})
+        if name == "write_file":
+            # A project episode builds a real artefact: the files land in the world and are
+            # executed after the episode against cases the model never saw. Overwriting is
+            # allowed — a model that writes, tests and rewrites is doing the right thing —
+            # so this is not counted as a repeat when the contents differ.
+            path = str(a.get("path") or "").strip()
+            if not path:
+                return json.dumps({"error": "path is required"})
+            st.setdefault("files", {})[path] = str(a.get("contents") or "")
+            return json.dumps({"ok": True, "path": path,
+                               "bytes": len(str(a.get("contents") or ""))})
         if name == "new_write":
             st.setdefault("new", {})[str(a.get("key"))] = str(a.get("value"))
             return json.dumps({"ok": True})
@@ -768,6 +779,18 @@ def grade_episode(task: dict, world: AgentWorld, final_text: str | None,
     protocol_ok = not problems
     cases = [{"ok": answer_ok, **({} if answer_ok else {"got": ans[:120] or None})},
              {"ok": protocol_ok, **({} if protocol_ok else {"got": "; ".join(problems)})}]
+    built = task.get("build")
+    if built:
+        # The deliverable is a file, so the answer case asks whether the file exists and runs —
+        # not whether the closing message said the right thing. A model can narrate a perfect
+        # implementation and never call write_file, and that has to read as a failure.
+        files = (world.state.get("files") or {})
+        want = built.get("path")
+        if want not in files:
+            cases[0] = {"ok": False,
+                        "got": f"never wrote {want} — wrote {sorted(files) or 'nothing'}"}
+        else:
+            cases[0] = {"ok": True}
     spec = task.get("memory_expect")
     if spec:
         mem_problems = _memory_problems(world, spec)

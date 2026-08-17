@@ -316,3 +316,132 @@ PROJECT_TASK_NOTES = {
                         "unprompted preferences; this asks whether the preference costs them "
                         "correctness when nothing forces the choice.",
 }
+
+
+# --- episodes: the model has to actually build the thing -------------------------------------
+#
+# The tasks above are one turn: a spec in, a function out. That measures whether a model can
+# implement a spec, and it is deliberately kept — but it is not what an agent does. An agent is
+# handed tools and has to produce an artefact, and a model can narrate a flawless implementation
+# while never calling write_file once.
+#
+# These are episodes. The model gets write_file / read_file / list_files, and the grade asks
+# three separate questions: did a file appear at the path asked for, was the conduct getting
+# there clean, and does the file it wrote pass the cases it never saw. Those fail independently
+# — a model that writes a working file through eleven malformed calls is not the same as one
+# that writes nothing cleanly, and averaging them hides which happened.
+
+try:
+    from .bench_agent import _tool
+except ImportError:          # flat-script launch
+    from bench_agent import _tool
+
+_FILE_TOOLS = [
+    _tool("write_file", "Create or overwrite a file with the given contents.",
+          {"path": {"type": "string"}, "contents": {"type": "string"}}),
+    _tool("read_file", "Read a file that exists.", {"name": {"type": "string"}}),
+    _tool("list_files", "List the files that exist.", {}),
+]
+
+_EP_CALC_SPEC = """Build a small module using the tools available to you.
+
+Write a file `calc.py` containing a function `calc(expr: str) -> int` that evaluates an integer
+arithmetic expression.
+
+Requirements:
+  1. Support + - * / and parentheses, with normal precedence.
+  2. Division truncates TOWARD ZERO, not floor division: calc("-7/2") is -3, not -4.
+  3. A unary minus is allowed anywhere a number is: calc("-(3+4)") is -7.
+  4. Division by zero raises ValueError.
+  5. Whitespace anywhere is ignored.
+  6. Do not use eval().
+
+Examples that must work:
+  calc("2+3*4")   == 14
+  calc("(2+3)*4") == 20
+  calc("10/3")    == 3
+
+You must actually write the file with write_file. When it is written, reply DONE."""
+
+_EP_FIX_SPEC = """A file already exists. Read it, find what is wrong, and write the corrected
+version back to the same path.
+
+`slugify.py` contains `slugify(title: str) -> str`, which should:
+  1. Lowercase the title.
+  2. Replace any run of non-alphanumeric characters with a single hyphen.
+  3. Strip leading and trailing hyphens.
+  4. Collapse repeated hyphens, so "a -- b" becomes "a-b".
+  5. Return "untitled" for a title with no alphanumeric characters at all.
+
+Examples that must work:
+  slugify("Hello, World!")  == "hello-world"
+  slugify("  spaced  out ") == "spaced-out"
+
+Read the file first — do not rewrite it from the spec alone. Reply DONE when it is fixed."""
+
+_BUGGY_SLUGIFY = (
+    "import re\n"
+    "\n"
+    "\n"
+    "def slugify(title):\n"
+    "    s = title.lower()\n"
+    '    s = re.sub(r"[^a-z0-9]+", "-", s)\n'
+    "    return s\n"
+)
+
+PROJECT_EPISODE_TASKS = [
+    {
+        "id": "projep_calc_build",
+        "category": "project", "tier": "build", "lang": "python", "entry": "episode",
+        "spec_size": "short", "lang_named": True, "max_steps": 10,
+        "require_tools": ["write_file"],
+        "prompt": _EP_CALC_SPEC,
+        "tools": _FILE_TOOLS,
+        "world": {"files": {}},
+        "expect": "DONE",
+        "build": {"path": "calc.py", "entry": "calc", "lang": "python"},
+        "cases": [
+            _case(["2+3*4"], 14, visible=True),
+            _case(["(2+3)*4"], 20, visible=True),
+            _case(["10/3"], 3, visible=True),
+            _case(["-7/2"], -3, label="truncates toward zero, not floor"),
+            _case(["-(3+4)"], -7, label="unary minus on a parenthesised group"),
+            _case([" 2 + 3 * 4 "], 14, label="whitespace anywhere is ignored"),
+        ],
+    },
+    {
+        "id": "projep_slugify_fix",
+        "category": "project", "tier": "refactor", "lang": "python", "entry": "episode",
+        "spec_size": "short", "lang_named": True, "max_steps": 12,
+        "require_tools": ["read_file", "write_file"],
+        "prompt": _EP_FIX_SPEC,
+        "tools": _FILE_TOOLS,
+        "world": {"files": {"slugify.py": _BUGGY_SLUGIFY}},
+        "expect": "DONE",
+        "build": {"path": "slugify.py", "entry": "slugify", "lang": "python"},
+        "cases": [
+            _case(["Hello, World!"], "hello-world", visible=True),
+            _case(["  spaced  out "], "spaced-out", visible=True),
+            _case(["a -- b"], "a-b", label="repeated hyphens collapse"),
+            _case(["!!!"], "untitled", label="a title with no alphanumerics is untitled"),
+            _case(["Trailing---"], "trailing", label="trailing hyphens are stripped"),
+        ],
+    },
+]
+
+PROJECT_TASK_DESC.update({
+    "projep_calc_build": "Build calc.py with the file tools, then reply DONE.",
+    "projep_slugify_fix": "Read a buggy slugify.py, fix it, write it back.",
+})
+
+PROJECT_TASK_NOTES.update({
+    "projep_calc_build": "The same spec as proj_calc, but the model has to CALL write_file "
+                         "rather than print a function. A model can narrate a flawless "
+                         "implementation and never write anything, which reads as a failure "
+                         "here and cannot in the single-turn version.",
+    "projep_slugify_fix": "The existing file is subtly wrong: it never strips the trailing "
+                          "hyphen its own substitution creates, and has no untitled case. The "
+                          "spec restates the requirements, so a model that rewrites from the "
+                          "spec without reading passes most cases — read_file is required "
+                          "precisely because guessing nearly works.",
+})
