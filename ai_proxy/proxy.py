@@ -15798,6 +15798,23 @@ def _anthropic_to_openai_request(body: dict) -> dict:
             out[k] = body[k]
     if body.get("stop_sequences") is not None:
         out["stop"] = body["stop_sequences"]
+    # Anthropic states thinking as a block; the OpenAI side wants reasoning_effort. Without
+    # this the field was silently dropped, so a Claude-shaped client asking for no thinking got
+    # it anyway: measured on gemma4, time to the first character of the answer was 15.80s with
+    # thinking disabled against 0.97s once the request actually said reasoning_effort=none.
+    # Every client on /v1/messages — Claude Code, the Anthropic SDK, opencode — had no working
+    # way to turn it off.
+    think = body.get("thinking")
+    if isinstance(think, dict):
+        kind = str(think.get("type") or "").lower()
+        if kind == "disabled":
+            out["reasoning_effort"] = "none"
+        elif kind == "enabled":
+            # budget_tokens is the only dial Anthropic gives, so it maps onto the three levels
+            # the OpenAI side understands rather than being passed through as a token count.
+            budget = think.get("budget_tokens") or 0
+            out["reasoning_effort"] = ("high" if budget >= 8000
+                                       else "medium" if budget >= 2000 else "low")
     # Ask upstream to include usage in stream chunks so back-translation has accurate counts.
     if out.get("stream"):
         out["stream_options"] = {"include_usage": True}
