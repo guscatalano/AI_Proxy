@@ -118,11 +118,13 @@ def test_a_tool_call_is_not_flagged(client):
     assert _row("eo_tool")["empty_output"] is None
 
 
-def test_a_zero_token_response_is_not_flagged(client):
-    """Nothing billed, nothing delivered, nothing wrong."""
+def test_a_zero_token_response_that_terminated_properly_is_not_flagged(client):
+    """Nothing billed, nothing delivered — but the stream ended cleanly, so the model simply
+    had nothing to say. That is different from a stream that stopped mid-flight."""
     _seed("eo_zero")
-    P._save_finish("eo_zero", 200, {}, None,
-                   _sse({"choices": [], "usage": {"completion_tokens": 0}}), 1000.0, None)
+    blob = (_sse({"choices": [{"delta": {}, "finish_reason": "stop"}]},
+                 {"choices": [], "usage": {"completion_tokens": 0}}) + "data: [DONE]\n")
+    P._save_finish("eo_zero", 200, {}, None, blob, 1000.0, None)
     assert _row("eo_zero")["empty_output"] is None
 
 
@@ -144,3 +146,67 @@ def test_the_list_api_exposes_it(client):
         assert row and row["empty_output"] == 1, "the badge has nothing to render from"
     finally:
         _row("eo_api")
+
+
+# --- the stream that died mid-flight ---------------------------------------------------------
+#
+# The production failure, verbatim. One chunk, a control token in the reasoning field, and then
+# nothing: no finish_reason, no usage block, no [DONE]. The client sees a 2xx with an empty
+# assistant turn and Claude Code answers it with "[Your previous response had no visible
+# output. Please continue...]". Seen 3 times in 24 hours, on gemma4 AND on nemotron.
+
+_DEAD_STREAM = ('data: {"id":"chatcmpl-660","object":"chat.completion.chunk",'
+                '"model":"gemma4:26b","choices":[{"index":0,"delta":{"role":"assistant",'
+                '"content":"","reasoning":"<|channel|>"},"finish_reason":null}]}\n')
+
+_HEALTHY = ('data: {"choices":[{"delta":{"content":"hi"},"finish_reason":"stop"}]}\n'
+            'data: [DONE]\n')
+
+
+def test_a_control_token_is_not_delivered_content():
+    """<|channel|> is protocol debris. Counted as text it reads as eleven characters
+    successfully delivered, and the failure hides behind its own symptom."""
+    assert P._response_delivered_chars(None, _DEAD_STREAM) == 0
+
+
+def test_a_stray_control_token_does_not_discard_a_real_answer():
+    blob = ('data: {"choices":[{"delta":{"content":"real answer<|end|>"},'
+            '"finish_reason":"stop"}]}\ndata: [DONE]\n')
+    assert P._response_delivered_chars(None, blob) == len("real answer")
+
+
+def test_a_stream_without_a_finish_reason_did_not_finish():
+    assert P._extract_finish_reason(_DEAD_STREAM) is None
+    assert P._extract_finish_reason(_HEALTHY) == "stop"
+
+
+def test_the_ollama_native_done_reason_counts_as_finishing():
+    assert P._extract_finish_reason('data: {"done_reason":"stop"}\n') == "stop"
+
+
+def test_the_anthropic_stop_reason_counts_as_finishing():
+    assert P._extract_finish_reason(
+        'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}\n') == "end_turn"
+
+
+def test_a_dead_stream_is_flagged_even_though_nothing_was_billed(client):
+    """The first version required completion_tokens > 0 and missed every one of these: a
+    stream that dies never gets a usage block, so nothing is billed."""
+    _seed("eo_dead")
+    P._save_finish("eo_dead", 200, {}, None, _DEAD_STREAM, 6200.0, None)
+    row = _row("eo_dead")
+    assert row["empty_output"] == 1
+    assert row["completion_tokens"] in (None, 0), "a dead stream reports no usage"
+
+
+def test_a_healthy_stream_is_not_flagged(client):
+    _seed("eo_live")
+    P._save_finish("eo_live", 200, {}, None, _HEALTHY, 1000.0, None)
+    assert _row("eo_live")["empty_output"] is None
+
+
+def test_a_slow_but_complete_stream_is_not_flagged(client):
+    """Duration is not the signal — a 180-second reply that arrives is fine."""
+    _seed("eo_slow")
+    P._save_finish("eo_slow", 200, {}, None, _HEALTHY, 180_000.0, None)
+    assert _row("eo_slow")["empty_output"] is None

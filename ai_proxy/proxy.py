@@ -3271,7 +3271,7 @@ DEFAULT_RULES_CONFIG = {
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
         "vllm_ready_timeout_s": 420,
-        # Applied when loading an LM Studio model, unless the request overrides them. A model
+    # Applied when loading an LM Studio model, unless the request overrides them. A model
         # loaded at the wrong context length or without parallelism benchmarks as a different
         # thing, so these are worth pinning per box.
         "lmstudio_context_length": None,
@@ -3297,6 +3297,18 @@ DEFAULT_RULES_CONFIG = {
             "extra_args": [],
         },
     },
+    # Ollama's /v1/chat/completions loses tool calls when streaming: the model decides to call a
+    # tool, the stream delivers `{"delta":{"content":""},"finish_reason":"stop"}`, and the call
+    # itself never arrives. The client sees a well-formed empty turn and reads it as the agent
+    # giving up. Measured here over 72 hours: 6 of 4,523 Ollama streams (0.13%) against 0 of 671
+    # on vLLM, on gemma4 and nemotron alike — an endpoint defect, not a model one, which is why
+    # this keys on the upstream rather than the model name. Ollama's own tracker recommends
+    # exactly this workaround, and it is the proxy's job rather than every client's.
+    #
+    # Only tool-bearing requests are covered. They are the ones that break, and a tool call is
+    # all-or-nothing anyway — no client can act on half of one — so the incremental delivery
+    # given up for them was never worth much. Plain prose keeps streaming token by token.
+    "tool_stream": {"enabled": True, "upstreams": ["ollama"]},
     "archive": {
         # Request bodies are ~340 KB each and arrive at ~3 GB/day, while the row describing
         # them is ~1.4 KB. Nothing analytical reads a body any more — stats, the reports and
@@ -3461,6 +3473,39 @@ def _model_quirk(model_name: str) -> dict | None:
                 or (mode == "substring" and p in ml)):
             return q
     return None
+
+
+def _tool_stream_mode(model_name: str, upstream: str | None, quirk: dict | None = None) -> str:
+    """How to treat a tool-bearing streaming request: "passthrough" or "buffer".
+
+    "buffer" holds the streamed response back instead of relaying it live, so that a reply which
+    lost its tool call on the way — Ollama's /v1 endpoint drops them from streams, see the
+    `tool_stream` rule for the measurement — can be re-fetched non-streaming before the client
+    has seen anything. The default is per-upstream, since the defect belongs to the endpoint and
+    a newly pulled Ollama model would otherwise inherit the bug silently. A model quirk overrides
+    it either way; `"tool_stream": "passthrough"` is the escape hatch for a model measured not to
+    need it, and buys back live token-by-token delivery on its tool-bearing turns.
+    """
+    q = _model_quirk(model_name) if quirk is None else quirk
+    forced = str((q or {}).get("tool_stream") or "").strip().lower()
+    if forced in ("buffer", "passthrough"):
+        return forced
+    cfg = load_rules_config().get("tool_stream") or {}
+    if not cfg.get("enabled", True):
+        return "passthrough"
+    ups = cfg.get("upstreams") or ["ollama"]
+    return "buffer" if str(upstream or "").lower() in [str(u).lower() for u in ups] else "passthrough"
+
+
+def _request_has_tools(body_json) -> bool:
+    """True when the request offers the model tools, in either wire shape."""
+    if not isinstance(body_json, dict):
+        return False
+    for key in ("tools", "functions"):
+        v = body_json.get(key)
+        if isinstance(v, list) and v:
+            return True
+    return False
 
 
 def get_setting(key: str):
@@ -17105,6 +17150,38 @@ def _extract_ttft_ms(body_text: str | None, stream_text: str | None) -> float | 
     return None
 
 
+# Special tokens a chat template should have consumed. When one reaches the wire the template
+# has lost its place, and what follows is usually nothing at all.
+_CONTROL_TOKEN_RE = re.compile(r"<\|[a-z0-9_]+\|>", re.I)
+
+
+def _extract_finish_reason(stream_text: str | None) -> str | None:
+    """The finish reason an SSE stream reported, if it reported one at all.
+
+    A stream that ends without one did not finish — it stopped. That is the difference between
+    a model choosing to say nothing and a connection dying halfway through a sentence.
+    """
+    for line in (stream_text or "").splitlines():
+        raw = line[6:] if line.startswith("data: ") else line
+        raw = raw.strip()
+        if not raw or raw == "[DONE]" or not raw.startswith("{"):
+            continue
+        try:
+            j = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for ch in (j.get("choices") or []):
+            if ch.get("finish_reason"):
+                return str(ch["finish_reason"])
+        if j.get("done_reason"):
+            return str(j["done_reason"])
+        if j.get("type") == "message_delta":
+            sr = (j.get("delta") or {}).get("stop_reason")
+            if sr:
+                return str(sr)
+    return None
+
+
 def _response_delivered_chars(body_text: str | None, stream_text: str | None) -> int:
     """How much the client actually received: content plus reasoning, across every shape.
 
@@ -17112,6 +17189,12 @@ def _response_delivered_chars(body_text: str | None, stream_text: str | None) ->
     something, and counting tokens would call it non-empty when the client got nothing — the
     upstream bills for output it then discards.
     """
+    # A control token is protocol debris, not an answer. The one production stream that died
+    # mid-flight had emitted exactly "<|channel|>" into its reasoning field and nothing else,
+    # which would otherwise read as eleven characters successfully delivered.
+    def _real(text: str) -> int:
+        return len(_CONTROL_TOKEN_RE.sub("", text or "").strip())
+
     total = 0
     for blob in (stream_text or "", body_text or ""):
         for line in blob.splitlines():
@@ -17125,15 +17208,15 @@ def _response_delivered_chars(body_text: str | None, stream_text: str | None) ->
                 continue
             for ch in (j.get("choices") or []):
                 d = ch.get("delta") or ch.get("message") or {}
-                total += len(d.get("content") or "")
-                total += len(d.get("reasoning") or d.get("reasoning_content") or "")
+                total += _real(d.get("content"))
+                total += _real(d.get("reasoning") or d.get("reasoning_content"))
             m = j.get("message")
             if isinstance(m, dict):
-                total += len(m.get("content") or "")
-                total += len(m.get("thinking") or "")
+                total += _real(m.get("content"))
+                total += _real(m.get("thinking"))
             if j.get("type") == "content_block_delta":
                 dd = j.get("delta") or {}
-                total += len(dd.get("text") or "") + len(dd.get("thinking") or "")
+                total += _real(dd.get("text")) + _real(dd.get("thinking"))
     return total
 
 
@@ -17158,13 +17241,27 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
     _empty = None
     _inflight = None
     try:
-        if status and 200 <= status < 300 and (ct or 0) > 0 and not _tools:
+        if status and 200 <= status < 300 and not _tools:
             _delivered = _response_delivered_chars(body_text, stream_text)
-            if _delivered == 0:
+            # Two different failures wear the same face — a 2xx that gave the client nothing.
+            #
+            #   billed:  the upstream counted tokens and sent no content, reasoning or tool call
+            #   died:    the stream stopped mid-flight, with no [DONE], no usage and no
+            #            finish_reason, so nothing was billed either
+            #
+            # The second is the one seen in production and the first version of this check
+            # missed it, because it required completion_tokens > 0 and a dead stream never gets
+            # a usage block. Observed 3 times in 24 hours across gemma4 AND nemotron — the last
+            # thing one of them emitted was the control token <|channel|> in its reasoning
+            # field, after which the stream simply ended.
+            _died = (bool(stream_text) and "[DONE]" not in stream_text
+                     and not _extract_finish_reason(stream_text))
+            if _delivered == 0 and ((ct or 0) > 0 or _died):
                 _empty = 1
                 _inflight = len(_INFLIGHT_REQUESTS)
-                print(f"[empty_output] {req_id} billed {ct} tokens and delivered nothing "
-                      f"({_inflight} in flight)")
+                print(f"[empty_output] {req_id} delivered nothing "
+                      f"({'stream died mid-flight' if _died else f'billed {ct} tokens'}, "
+                      f"{_inflight} in flight)")
     except Exception:
         pass
     conn = db()
@@ -17718,6 +17815,39 @@ async def proxy(full_path: str, request: Request):
     headers_out.append(("accept-encoding", "identity"))
     client: httpx.AsyncClient = request.app.state.client
 
+    # tool_stream: ask upstream for a non-streaming reply when it would lose the tool call, and
+    # rebuild the stream ourselves once it lands (see the `tool_stream` rule and
+    # _tool_stream_mode). Decided here, after routing has settled the model and upstream and
+    # after every body mutation above, so the outgoing bytes are the last word.
+    #
+    # The obvious version of this — send stream:false upstream and rebuild the stream here — was
+    # measured and rejected, and the numbers are worth keeping because the idea is a trap.
+    #
+    # Ollama sends no response headers for a non-streaming reply until generation is completely
+    # finished: curl against gemma4:26b for a 300-token answer reported time_starttransfer=5.347s
+    # and time_total=5.347s, identical to three decimal places. httpx's send() therefore would not
+    # return until the model was done — before the streamer that emits keepalives ever runs — so
+    # the client would sit in silence for the whole generation. Over 72 hours, 15.9% of
+    # tool-bearing Ollama requests ran longer than the ~30s Claude Code tolerates, p99 was 126s
+    # and the worst was 686s. That trades a 0.13% failure for a 15.9% one.
+    #
+    # So the request still streams upstream, purely to keep the keepalives flowing, and the
+    # non-streaming re-issue happens in the streamer only for the responses that actually came
+    # back broken. The slow path costs latency exactly where the alternative was a dead turn.
+    tool_stream_buffered = False
+    if (is_stream and isinstance(body_json, dict) and _request_has_tools(body_json)
+            and _tool_stream_mode(str(body_json.get("model") or ""), upstream_label) == "buffer"):
+        # Buffered rather than relayed live: the failure ends in a finish_reason of its own, and
+        # a client that has already been handed one will not always accept a second message after
+        # it. Holding the bytes back until the response is known-good keeps the re-issue invisible.
+        tool_stream_buffered = True
+        _ts_body = dict(body_json)
+        _ts_body["stream"] = False
+        # A streaming-only field: left in place on a stream:false request, Ollama rejects it
+        # outright rather than ignoring it.
+        _ts_body.pop("stream_options", None)
+        _ts_retry_body = json.dumps(_ts_body).encode("utf-8")
+
     # Pre-flight overhead = everything up to handing off to upstream.
     _overhead_samples.append((time.perf_counter() - start) * 1000)
 
@@ -17967,7 +18097,10 @@ async def proxy(full_path: str, request: Request):
     if treat_as_stream:
         do_intercept = _post_flight_active(body_json) and 200 <= upstream_resp.status_code < 300
         # Bridge translation AND tool-injection both require the full upstream stream first.
-        do_buffer = do_intercept or bridge_active or tool_injection_active
+        # tool_stream_buffered joins them because there is no stream to relay: upstream was asked
+        # for a single JSON reply, and forwarding that verbatim would hand an SSE client a bare
+        # object. It is converted below, once, and then travels the same path as everything else.
+        do_buffer = do_intercept or bridge_active or tool_injection_active or tool_stream_buffered
 
         # Emit keepalive bytes every N seconds while we're waiting on upstream. Prevents
         # client-side read timeouts during long prefills (claude-code times out after ~30s
@@ -17994,7 +18127,8 @@ async def proxy(full_path: str, request: Request):
         # translating at the end. Without this, clients with completion-event timeouts
         # (Anthropic SDK, claude-code, opencode) give up during long generations because
         # they see only keepalives — no actual content events.
-        _do_incr_bridge = bridge_active and not do_intercept and not tool_injection_active
+        _do_incr_bridge = (bridge_active and not do_intercept and not tool_injection_active
+                           and not tool_stream_buffered)
         _incr_bridge = IncrementalAnthropicBridge(bridge_original_model) if _do_incr_bridge else None
 
         # Shared finalize-state so a client disconnect (which cancels streamer() mid-yield,
@@ -18084,6 +18218,44 @@ async def proxy(full_path: str, request: Request):
                 pass
 
             full = b"".join(chunks).decode("utf-8", errors="replace")
+
+            # The Ollama /v1 streaming defect, caught and undone. The model decides to call a
+            # tool, the stream delivers {"delta":{"content":""},"finish_reason":"stop"}, and the
+            # call itself never arrives — a well-formed turn carrying nothing, which the agent
+            # driving it reads as the model giving up. Re-issuing the identical request with
+            # stream:false returns the tool call, because only the streaming path loses it.
+            #
+            # Safe to re-issue precisely here: this branch buffers, so not a byte of the failed
+            # response has reached the client and the second attempt replaces it rather than
+            # appending to it. Once, because a failure that turned out to be deterministic would
+            # otherwise loop.
+            if tool_stream_buffered and not err:
+                _ts_obj = _assemble_streaming_response(full) if full else {}
+                _ts_has_tc = any(
+                    (c.get("message") or {}).get("tool_calls")
+                    for c in ((_ts_obj or {}).get("choices") or []) if isinstance(c, dict))
+                if not _ts_has_tc and not _response_delivered_chars(None, full):
+                    print(f"[tool_stream] {req_id} streamed reply carried no content and no tool "
+                          f"call — re-issuing non-streaming ({len(full)} bytes discarded)")
+                    try:
+                        _tsr = await client.post(upstream_url, headers=dict(headers_out),
+                                                 content=_ts_retry_body)
+                        _ts_json = json.loads(_tsr.text) if _tsr.status_code == 200 else None
+                    except (httpx.HTTPError, ValueError) as _e:
+                        _ts_json = None
+                        print(f"[tool_stream] {req_id} re-issue failed: {_e!r}")
+                    if isinstance(_ts_json, dict):
+                        _sse = _synth_response_stream(_ts_json)
+                        chunks[:] = [_sse]     # replayed verbatim below when nothing transforms it
+                        full = _sse.decode("utf-8", errors="replace")
+                        _save_gate(req_id, {
+                            "verdict": "rewrite", "rule": "tool_stream",
+                            "reason": "streamed reply lost its tool call (Ollama /v1); "
+                                      "re-issued non-streaming and rebuilt the stream",
+                            "details": {"upstream": upstream_label, "model": model,
+                                        "recovered": bool(_response_delivered_chars(None, full))},
+                        })
+
             findings: list[dict] = []
             fixes: list[dict] = []
             replaced = False
