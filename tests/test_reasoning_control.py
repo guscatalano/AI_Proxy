@@ -111,3 +111,36 @@ def test_an_explicit_request_for_reasoning_is_respected(client, recorder):
     """A caller naming its own budget is deciding; the proxy must not overrule it."""
     _send(client, reasoning_effort="high")
     assert recorder.bodies[0].get("reasoning_effort") == "high"
+
+
+def _route_to_gemma(monkeypatch):
+    """The bridge only engages when a router rule sends an Anthropic request to a non-Claude
+    model; without one, claude-sonnet-4 goes to Anthropic and no translation happens."""
+    base = dict(P.load_rules_config())
+    base["model_router"] = {"enabled": True, "aliases": {}, "advertise": {},
+                            "rules": [{"if": {}, "then": "gemma4:26b"}]}
+    base["protocol_bridge"] = {"enabled": True}
+    monkeypatch.setattr(P, "load_rules_config", lambda: base)
+
+
+def test_the_bridged_path_gets_the_knob_too(client, recorder, monkeypatch):
+    _route_to_gemma(monkeypatch)
+    """The regression that made the first fix useless. _anthropic_to_openai_request builds a
+    fresh dict and carries only the fields it knows, so anything the quirk set on the Anthropic
+    body was discarded — and every claude-code turn kept thinking. Measured before the fix: 300
+    output tokens, zero content blocks."""
+    client.post("/v1/messages", json={
+        "model": "claude-sonnet-4", "stream": False, "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert recorder.bodies, "no upstream request captured"
+    assert recorder.bodies[-1].get("reasoning_effort") == "none"
+
+
+def test_a_bridged_client_asking_to_think_still_can(client, recorder, monkeypatch):
+    _route_to_gemma(monkeypatch)
+    """thinking: enabled maps to a real effort; the quirk must not stamp it back to none."""
+    client.post("/v1/messages", json={
+        "model": "claude-sonnet-4", "stream": False, "max_tokens": 64,
+        "thinking": {"type": "enabled", "budget_tokens": 10000},
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert recorder.bodies[-1].get("reasoning_effort") == "high"

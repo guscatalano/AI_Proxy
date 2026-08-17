@@ -17632,10 +17632,21 @@ async def proxy(full_path: str, request: Request):
     # The first two are the same answer: nothing the client can use. vLLM and LM Studio read
     # chat_template_kwargs, Ollama's /v1 reads reasoning_effort, so the quirk names its lever.
     _rctl = str(_quirk.get("reasoning_control") or "chat_template_kwargs.enable_thinking")
-    if _tmode in ("force_off", "default_off_optin"):
-        _want_think = False
+    def _apply_think_quirk():
+        """Set the thinking knob on whatever body is about to go upstream.
+
+        Called again after the protocol bridge, because that translation builds a NEW dict from
+        the Anthropic body and carries only the fields it knows about — so anything set here
+        beforehand is discarded. That is what happened to gemma4: the quirk fired, the bridge
+        threw the result away, and every claude-code turn kept thinking. Idempotent, so calling
+        it twice on a non-bridged request changes nothing.
+        """
+        nonlocal ornith_think, think_quirk_applied
+        if _tmode not in ("force_off", "default_off_optin") or not isinstance(body_json, dict):
+            return
+        want_think = False
         if _tmode == "default_off_optin":
-            _want_think = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
+            want_think = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
         if _rctl == "reasoning_effort":
             # Only when the client said nothing: an explicit reasoning_effort is the caller
             # asking for a specific budget, and overriding it would be the proxy deciding.
@@ -17648,26 +17659,27 @@ async def proxy(full_path: str, request: Request):
             if not isinstance(ctk, dict):
                 ctk = {}
             if "enable_thinking" not in ctk:
-                ctk["enable_thinking"] = _want_think
+                ctk["enable_thinking"] = want_think
                 body_json["chat_template_kwargs"] = ctk
-                ornith_think = _want_think
+                ornith_think = want_think
                 think_quirk_applied = True
-        if ornith_think is not None:
-            want = ornith_think
-            # The row already holds what the client asked for; this is the only place that
-            # knows what it actually got. The stored body is the client's original, so
-            # without this the audit would show "nothing requested" for a model the proxy
-            # had just silently switched off.
-            try:
-                _conn = db()
-                _conn.execute(
-                    "UPDATE requests SET thinking=?, thinking_src=? WHERE id=?",
-                    ("on" if want else "off", f"quirk:{_tmode}", req_id),
-                )
-                _conn.commit()
-                _conn.close()
-            except Exception:
-                pass
+
+    _apply_think_quirk()
+    if ornith_think is not None:
+        # The row already holds what the client asked for; this is the only place that
+        # knows what it actually got. The stored body is the client's original, so
+        # without this the audit would show "nothing requested" for a model the proxy
+        # had just silently switched off.
+        try:
+            _conn = db()
+            _conn.execute(
+                "UPDATE requests SET thinking=?, thinking_src=? WHERE id=?",
+                ("on" if ornith_think else "off", f"quirk:{_tmode}", req_id),
+            )
+            _conn.commit()
+            _conn.close()
+        except Exception:
+            pass
     # system_nudge: some reasoning-trained models (Ornith) narrate their reasoning in the *content*
     # even with the <think> block disabled. A short system-prompt instruction is the only lever
     # that curbs that (the thinking toggle can't — it's not in a think block). Appended, not replaced.
@@ -17699,6 +17711,9 @@ async def proxy(full_path: str, request: Request):
         bridge_original_model = body_json.get("model")
         body_json = _anthropic_to_openai_request(body_json)
         bridge_active = True
+        # The translation above discards anything the thinking quirk set on the Anthropic body,
+        # so it has to run again on the OpenAI-shape body that actually goes upstream.
+        _apply_think_quirk()
         # Ollama remains the default so nothing changes for an unrouted request. "anthropic" is
         # never a valid target: the translation only runs one way, so sending an OpenAI-shape
         # body back to Anthropic would 400.
