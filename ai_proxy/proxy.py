@@ -12103,6 +12103,10 @@ try:
     from . import bench_instruct as _bench_instruct_mod
 except ImportError:          # flat-script launch
     import bench_instruct as _bench_instruct_mod
+try:
+    from . import bench_transport as _bench_transport_mod
+except ImportError:          # flat-script launch
+    import bench_transport as _bench_transport_mod
 # instruct-v1: obedience and output shape — the properties a parser depends on.
 # refusal-v1: two-sided calibration — engages with security work, declines the harmful end.
 try:
@@ -12177,6 +12181,13 @@ _BENCH_SUITES.setdefault("full-v2", _BENCH_SUITES["full-v1"]
                          + _BENCH_SUITES["instruct-v1"]
                          + _BENCH_SUITES["refusal-v1"]
                          + _BENCH_SUITES["memory-v1"])
+# transport-v1 asks a different question from every other suite — whether the backend delivers
+# the tool call the model made, rather than what the model knows. Registered standalone, and
+# NOT folded into full-v2: the aggregate is the axis every cross-model comparison on this box
+# is expressed in, and changing its composition would silently make new totals incomparable
+# with every run already recorded. Run it alongside, or fold it into a future full-v3.
+_BENCH_SUITES.setdefault("transport-v1", _bench_transport_mod.TRANSPORT_TASKS)
+_BENCH_TASK_NOTES.update({t["id"]: t["note"] for t in _bench_transport_mod.TRANSPORT_TASKS})
 
 # Category per task id, defaulted by which suite a task came from so the older suites did
 # not need editing task-by-task. Read by the report to break results out by category.
@@ -12380,8 +12391,15 @@ def _bench_apply_sampling(body: dict, cfg: dict) -> None:
             body[k] = v
 
 
-def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict) -> dict:
-    """Assemble the full request body for one bench request."""
+def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict,
+                      tools: list | None = None) -> dict:
+    """Assemble the full request body for one bench request.
+
+    `tools` exists so a suite can measure a streaming request that offers tools. Nothing else
+    in the bench does: single-turn tasks stream but carry no tools, and agent episodes carry
+    tools but run stream:False. Ollama's /v1 loses tool calls only from *streamed* replies, so
+    the combination no suite exercised was exactly the one that was broken in production.
+    """
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -12389,6 +12407,8 @@ def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict) -> di
         "stream_options": {"include_usage": True},
         "max_tokens": max_tokens,
     }
+    if tools:
+        body["tools"] = tools
     _bench_apply_thinking(body, str(cfg.get("thinking") or "auto"))
     _bench_apply_sampling(body, cfg)
     return body
@@ -12509,7 +12529,8 @@ async def _bench_run_agent(client: httpx.AsyncClient, base: str, model: str,
 
 async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                          max_tokens: int, prompt: str, run_seq: int,
-                         cfg: dict | None = None, capture_text: bool = False) -> dict:
+                         cfg: dict | None = None, capture_text: bool = False,
+                         tools: list | None = None) -> dict:
     """Issue one streaming chat-completion request via the proxy and collect timings.
 
     Reasoning-aware: a thinking model emits its reasoning as `reasoning_content` deltas before
@@ -12519,7 +12540,8 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     boundaries: `ttft_ms` (first token of either kind) and `ttfc_ms` (first content token).
     """
     cfg = cfg or {}
-    body = json.dumps(_bench_build_body(model, prompt, max_tokens, cfg)).encode("utf-8")
+    body = json.dumps(_bench_build_body(model, prompt, max_tokens, cfg, tools)).encode("utf-8")
+    tool_calls = 0
     headers = _bench_headers(cfg)
     t0 = time.perf_counter()
     ttft_ms: float | None = None       # first token of ANY kind (reasoning or content)
@@ -12568,6 +12590,12 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                         if ch.get("finish_reason"):
                             finish_reason = str(ch["finish_reason"])
                         delta = ch.get("delta") or {}
+                        # Counted only where a name arrives: a streamed call is split across
+                        # deltas, and every fragment after the first carries argument text with
+                        # no name, so counting deltas would report one call as several.
+                        for _tc in (delta.get("tool_calls") or []):
+                            if isinstance(_tc, dict) and (_tc.get("function") or {}).get("name"):
+                                tool_calls += 1
                         # Engines disagree on the field name for reasoning deltas.
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         if reasoning:
@@ -12606,10 +12634,14 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     # An empty completion is a failure, not a very fast success. This is how a prompt that
     # overflows the model's context window presents (see the tokenizer-density note in
     # docs/benchmarking.md) — the request 200s and returns nothing.
-    if not err and completion_tokens == 0:
+    # A turn whose whole output is a tool call has no prose and is a success, so the emptiness
+    # check must see the call. Without this the transport suite would score every *working*
+    # backend as a failure — the exact inversion it exists to detect.
+    if not err and completion_tokens == 0 and not tool_calls:
         err = "empty completion (0 tokens) — possible context overflow or refused generation"
     row = {
         "seq": run_seq,
+        "tool_calls": tool_calls,
         "ttft_ms": ttft_ms,
         "ttfc_ms": ttfc_ms,
         "total_ms": total_ms,
@@ -14329,14 +14361,19 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                             else task_prompt if task_prompt is not None
                             else _bench_build_prompt(prompt_tokens, randomize, seq))
                         wave_tasks.append(task)
-                        if task and task.get("tools"):
+                        _stream_tools = bool((task or {}).get("stream_tools"))
+                        if task and task.get("tools") and not _stream_tools:
                             # An agent task is an episode, not a completion: its runner owns
                             # the tool loop and returns the row already graded.
                             coros.append(_bench_run_agent(client, base, model, task, cfg))
                         else:
-                            coros.append(_bench_run_one(client, base, model, max_tokens,
-                                                        prompt, seq,
-                                                        cfg=cfg, capture_text=bool(task)))
+                            # stream_tools deliberately stays on the streaming single-turn path:
+                            # the whole point is to offer tools over a *stream*, which the
+                            # episode runner cannot do because it posts stream:False.
+                            coros.append(_bench_run_one(
+                                client, base, model, max_tokens, prompt, seq,
+                                cfg=cfg, capture_text=bool(task),
+                                tools=(task or {}).get("tools") if _stream_tools else None))
                     results = await asyncio.gather(*coros, return_exceptions=False)
                     # Grade after the wave so scoring never overlaps generation — a busy CPU
                     # during generation would show up as slower decode.
@@ -14345,6 +14382,21 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                             res["task"] = task["id"]
                             if "grade" in res:
                                 pass          # agent episodes arrive graded by their runner
+                            elif task.get("stream_tools"):
+                                # Graded here rather than through _bench_grade, which scores
+                                # text: the evidence is whether a call survived the stream, and
+                                # an error row still counts as a loss — a 400 or a dropped
+                                # connection failed to deliver the call just as surely as a
+                                # well-formed empty turn did.
+                                _n = res.get("tool_calls") or 0
+                                res["grade"] = {
+                                    "ok": _n > 0, "passed": 1 if _n else 0, "total": 1,
+                                    "mode": "stream_tools",
+                                    "detail": (f"{_n} tool call(s) arrived" if _n else
+                                               "no tool call arrived over the stream"
+                                               + (f" ({res['error'][:120]})"
+                                                  if res.get("error") else "")),
+                                }
                             elif not res.get("error"):
                                 res["grade"] = await _bench_grade(
                                     res.get("text") or "", task, grade_timeout,

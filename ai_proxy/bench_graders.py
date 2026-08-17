@@ -167,7 +167,7 @@ def _bench_lang_available(lang: str) -> bool:
     # refusal tasks on their first real sweep — the portability contract reported it
     # honestly in skipped_languages, but a grading mode is not a missing compiler.
     if lang in ("python", "html", "css", "sql", "text", "format", "refusal", "answer",
-                "langpick", "needles", "auto", None, ""):
+                "langpick", "needles", "toolstream", "auto", None, ""):
         return True                    # stdlib-only grading; nothing to probe
     tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
             "php": "php", "bash": "bash", "go": "go"}.get(lang)
