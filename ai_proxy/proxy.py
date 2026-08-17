@@ -3410,6 +3410,24 @@ MODEL_QUIRKS_FILE = _resolve_state_path(
     Path(__file__).parent / "model_quirks.json", "model_quirks.json"
 )
 DEFAULT_MODEL_QUIRKS = {
+    "gemma4": {
+        "match": "prefix",
+        "thinking": "default_off_optin",
+        "reasoning_control": "reasoning_effort",
+        "notes": ("Thinks by default, and on Ollama's /v1 the reasoning is where the whole "
+                  "budget goes. Measured in production: a claude-code turn generated 1,952 "
+                  "tokens over 100 seconds, of which 4,888 characters were reasoning and ZERO "
+                  "were content — the Anthropic bridge drops the reasoning, so the client waited "
+                  "a minute and a half for an empty turn and read it as the agent giving up. "
+                  "chat_template_kwargs cannot fix it; Ollama's /v1 ignores that field entirely "
+                  "(0 content / 861 reasoning with it set, identical to sending nothing). "
+                  "reasoning_effort=none is the lever that works there: same question answered "
+                  "in 175 characters and 32 tokens instead of 200. Off by default; a client that "
+                  "asks for reasoning_effort explicitly keeps whatever it asked for. Baked in "
+                  "rather than left to model_quirks.json — the file lives inside the package and "
+                  "every deploy overwrites it, and a copy placed one directory up never loaded "
+                  "at all, which is how this went unfixed for a day."),
+    },
     "ornith": {
         "match": "prefix",
         "thinking": "default_off_optin",
@@ -17596,20 +17614,46 @@ async def proxy(full_path: str, request: Request):
     # it off but let reasoning_effort high/medium opt in. A client that set enable_thinking itself
     # is left untouched.
     ornith_think = None
+    # Tracked separately from ornith_think because it feeds body_mutated below. Without it a
+    # request whose ONLY change was the thinking quirk kept the client's original bytes and the
+    # quirk silently did nothing — which is how gemma4 went on thinking in production: the
+    # catch-all router rewrite happened to set body_mutated, so it worked by luck rather than
+    # by wiring, and would have stopped the moment that rule changed.
+    think_quirk_applied = False
     _qmodel = str(body_json.get("model") or "") if isinstance(body_json, dict) else ""
     _quirk = _model_quirk(_qmodel) or {}
     _tmode = _quirk.get("thinking")
+    # Which knob actually turns thinking off differs by engine, and using the wrong one fails
+    # silently — the request is accepted, the field ignored, and the model thinks anyway.
+    # Measured on Ollama 0.32.13 with gemma4:26b, same question, max_tokens=200:
+    #   no knob                        -> 0 chars of content, 918 of reasoning, budget exhausted
+    #   chat_template_kwargs           -> 0 chars of content, 861 of reasoning  (ignored outright)
+    #   reasoning_effort="none"        -> 175 chars of content, 0 reasoning, 32 tokens
+    # The first two are the same answer: nothing the client can use. vLLM and LM Studio read
+    # chat_template_kwargs, Ollama's /v1 reads reasoning_effort, so the quirk names its lever.
+    _rctl = str(_quirk.get("reasoning_control") or "chat_template_kwargs.enable_thinking")
     if _tmode in ("force_off", "default_off_optin"):
-        ctk = body_json.get("chat_template_kwargs")
-        if not isinstance(ctk, dict):
-            ctk = {}
-        if "enable_thinking" not in ctk:
-            want = False
-            if _tmode == "default_off_optin":
-                want = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
-            ctk["enable_thinking"] = want
-            body_json["chat_template_kwargs"] = ctk
-            ornith_think = want
+        _want_think = False
+        if _tmode == "default_off_optin":
+            _want_think = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
+        if _rctl == "reasoning_effort":
+            # Only when the client said nothing: an explicit reasoning_effort is the caller
+            # asking for a specific budget, and overriding it would be the proxy deciding.
+            if not str(body_json.get("reasoning_effort") or "").strip():
+                body_json["reasoning_effort"] = "none"
+                ornith_think = False
+                think_quirk_applied = True
+        else:
+            ctk = body_json.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            if "enable_thinking" not in ctk:
+                ctk["enable_thinking"] = _want_think
+                body_json["chat_template_kwargs"] = ctk
+                ornith_think = _want_think
+                think_quirk_applied = True
+        if ornith_think is not None:
+            want = ornith_think
             # The row already holds what the client asked for; this is the only place that
             # knows what it actually got. The stored body is the client's original, so
             # without this the audit would show "nothing requested" for a model the proxy
@@ -17786,7 +17830,7 @@ async def proxy(full_path: str, request: Request):
         or compaction_reminder_injected
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
-        or ctx_capped or usage_injected
+        or ctx_capped or usage_injected or think_quirk_applied
         or (compressed and compressed.get("action") == "compress")
     )
     if body_mutated:
