@@ -24,6 +24,15 @@ python scripts/bump_version.py minor --commit   # version is single-sourced; tes
 
 The full suite runs in about two minutes. If it appears to hang for far longer, suspect the runner rather than the tests — backgrounded pytest runs in this repo have twice died silently mid-run, both times leaving a partial log that reads like a stuck test. Re-run the suspect file in the foreground before believing it.
 
+There is a second, different hang, and the two look identical from the outside: **every test passes and then the process never exits.** Something in teardown keeps the interpreter alive, so the summary line is never printed — a backgrounded run reports exit code 0 with a log frozen partway through, and a foreground run appears to stall forever. Do not go hunting for the test that "stopped" it; there isn't one. Confirm with `-v` and count the results instead, which needs no summary line:
+
+```bash
+python -m pytest -o addopts="" -p no:randomly -v > /tmp/full.txt 2>&1   # will not exit; kill it once 100% is reached
+grep -c PASSED /tmp/full.txt; grep -c FAILED /tmp/full.txt
+```
+
+Last measured this way: 1158 passed, 0 failed, 19 skipped.
+
 ## Deploying to production (spark)
 
 Production is the GB10 box `spark`: systemd unit `ai_proxy` on `:11444`, package at `/home/crimson/ai_proxy/ai_proxy/` behind a launcher shim (`proxy.py`) that imports the package beside it.
