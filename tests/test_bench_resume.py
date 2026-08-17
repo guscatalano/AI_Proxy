@@ -313,7 +313,7 @@ def test_load_time_and_footprint_actually_reach_the_database(client, monkeypatch
     import asyncio
 
     async def fake_run_one(client_, base, model, max_tokens, prompt, seq, cfg=None,
-                           capture_text=False):
+                           capture_text=False, **_):
         return {"seq": seq, "ttft_ms": 10.0, "ttfc_ms": 10.0, "total_ms": 50.0,
                 "completion_tokens": 5, "reasoning_tokens": None, "decode_tps": 100.0,
                 "error": None, "served_model": "qwen3:4b"}
@@ -432,7 +432,7 @@ def test_a_dead_backend_trips_the_breaker_instead_of_burning_the_budget(client, 
     import asyncio
     sent = {"n": 0}
 
-    async def dead(client_, base, model, max_tokens, prompt, seq, cfg=None, capture_text=False):
+    async def dead(client_, base, model, max_tokens, prompt, seq, cfg=None, capture_text=False, **_):
         sent["n"] += 1
         return {"seq": seq, "error": "HTTP 502: upstream unreachable", "total_ms": 5.0}
 
@@ -450,7 +450,7 @@ def test_a_flaky_backend_does_not_trip_the_breaker(client, monkeypatch):
     import asyncio
     calls = {"n": 0}
 
-    async def flaky(client_, base, model, max_tokens, prompt, seq, cfg=None, capture_text=False):
+    async def flaky(client_, base, model, max_tokens, prompt, seq, cfg=None, capture_text=False, **_):
         calls["n"] += 1
         if calls["n"] % 3 == 0:
             return {"seq": seq, "error": "HTTP 502: hiccup", "total_ms": 5.0}

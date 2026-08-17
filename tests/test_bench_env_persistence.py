@@ -19,7 +19,7 @@ def _fakes(monkeypatch):
     monkeypatch.setattr(P, "_BENCH_SEM", asyncio.Semaphore(1))
 
     async def fake_run_one(client_, base, model, max_tokens, prompt, seq, cfg=None,
-                           capture_text=False):
+                           capture_text=False, **_):
         return {"seq": seq, "ttft_ms": 10.0, "ttfc_ms": 10.0, "total_ms": 50.0,
                 "completion_tokens": 5, "reasoning_tokens": None, "decode_tps": 100.0,
                 "error": None, "served_model": "qwen3:4b",

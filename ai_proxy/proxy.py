@@ -12188,6 +12188,7 @@ _BENCH_SUITES.setdefault("full-v2", _BENCH_SUITES["full-v1"]
 # with every run already recorded. Run it alongside, or fold it into a future full-v3.
 _BENCH_SUITES.setdefault("transport-v1", _bench_transport_mod.TRANSPORT_TASKS)
 _BENCH_TASK_NOTES.update({t["id"]: t["note"] for t in _bench_transport_mod.TRANSPORT_TASKS})
+_BENCH_TASK_DESC.update({t["id"]: t["desc"] for t in _bench_transport_mod.TRANSPORT_TASKS})
 
 # Category per task id, defaulted by which suite a task came from so the older suites did
 # not need editing task-by-task. Read by the report to break results out by category.

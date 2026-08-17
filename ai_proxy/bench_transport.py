@@ -75,7 +75,7 @@ _RUN_TOOL = {
 _MULTI = [_READ_TOOL, _SEARCH_TOOL, _RUN_TOOL]
 
 
-def _task(tid, prompt, tools, note):
+def _task(tid, prompt, tools, note, desc):
     return {
         "id": tid,
         "category": "transport",
@@ -92,47 +92,50 @@ def _task(tid, prompt, tools, note):
         "tools": tools,
         "prompt": prompt,
         "note": note,
+        # desc (what it does) and note (why it is in the suite) are both required: the guide
+        # endpoint asserts on each, and a task carrying only one fails the whole listing.
+        "desc": desc,
     }
 
 
 TRANSPORT_TASKS = [
     _task("ts_read_simple",
           "Read the file /etc/hosts and tell me what is in it. Use the read_file tool.",
-          [_READ_TOOL], "single tool, explicit instruction"),
+          [_READ_TOOL], "single tool, explicit instruction", "Call read_file when told to, one tool offered"),
     _task("ts_read_implicit",
           "What are the contents of /var/log/syslog?",
-          [_READ_TOOL], "single tool, no explicit instruction to call it"),
+          [_READ_TOOL], "single tool, no explicit instruction to call it", "Call read_file without being told to name it"),
     _task("ts_search_simple",
           "Find every place the string TODO appears in this codebase. Use the search tool.",
-          [_SEARCH_TOOL], "a different tool, in case one name is special"),
+          [_SEARCH_TOOL], "a different tool, in case one name is special", "Call a differently-named tool"),
     _task("ts_run_simple",
           "Show me the current directory listing. Use the run_command tool.",
-          [_RUN_TOOL], "command-shaped arguments"),
+          [_RUN_TOOL], "command-shaped arguments", "Call run_command with a shell argument"),
     _task("ts_choose_read",
           "I need to see what is inside /etc/passwd. Pick the right tool and use it.",
-          _MULTI, "three tools offered, one obviously right"),
+          _MULTI, "three tools offered, one obviously right", "Pick read_file from three offered tools"),
     _task("ts_choose_search",
           "Where in the code is the function parse_config defined? Pick the right tool.",
-          _MULTI, "three tools offered, search is the fit"),
+          _MULTI, "three tools offered, search is the fit", "Pick search from three offered tools"),
     _task("ts_choose_run",
           "Tell me how much disk space is free on this machine. Pick the right tool.",
-          _MULTI, "three tools offered, command is the fit"),
+          _MULTI, "three tools offered, command is the fit", "Pick run_command from three offered tools"),
     _task("ts_long_args",
           "Search for this exact phrase: "
           "'the quick brown fox jumps over the lazy dog and keeps on running for a while'. "
           "Use the search tool.",
-          [_SEARCH_TOOL], "long argument string spans several deltas"),
+          [_SEARCH_TOOL], "long argument string spans several deltas", "Deliver a call whose arguments span several deltas"),
     _task("ts_path_args",
           "Read /home/user/projects/deeply/nested/directory/structure/config.settings.json "
           "and summarise it. Use read_file.",
-          [_READ_TOOL], "argument full of punctuation the parser must not mangle"),
+          [_READ_TOOL], "argument full of punctuation the parser must not mangle", "Deliver a call with a punctuation-heavy path argument"),
     _task("ts_after_prose",
           "Explain in one sentence what a hosts file is, then read /etc/hosts using the tool.",
-          [_READ_TOOL], "prose BEFORE the call — the call arrives late in the stream"),
+          [_READ_TOOL], "prose BEFORE the call — the call arrives late in the stream", "Deliver a call that arrives late, after prose"),
     _task("ts_quoted_args",
           "Search for the string \"key=\\\"value\\\"\" in the codebase using the search tool.",
-          [_SEARCH_TOOL], "nested quotes, which broke argument JSON before"),
+          [_SEARCH_TOOL], "nested quotes, which broke argument JSON before", "Deliver a call with nested quotes in its arguments"),
     _task("ts_unicode_args",
           "Read the file /tmp/notes—café—2026.txt with read_file.",
-          [_READ_TOOL], "non-ASCII in arguments"),
+          [_READ_TOOL], "non-ASCII in arguments", "Deliver a call with non-ASCII arguments"),
 ]
