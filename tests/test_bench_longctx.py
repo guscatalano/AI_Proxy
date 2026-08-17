@@ -729,3 +729,18 @@ def test_the_timing_columns_keep_the_table_square():
     counts = [len(_re.findall(r"<t[hd][^>]*>", tr))
               for tr in _re.findall(r"<tr[^>]*>(.*?)</tr>", tbl, _re.S)]
     assert len(set(counts)) == 1, f"ragged after adding timing columns: {counts}"
+
+
+def test_the_guard_can_read_a_window_before_the_model_is_loaded():
+    """The preflight runs before the warm-up, so the model under test is usually not the one in
+    memory. Asking only what is RESIDENT returned the wrong model's window — measured: a
+    131,072-token model was checked while a 1M model was loaded, the guard saw nothing to
+    compare against, and three oversized rungs went through to be front-truncated."""
+    import re as _re
+    src = open(proxy.__file__, encoding="utf-8").read()
+    assert "async def _bench_declared_context" in src
+    m = _re.search(r"_window = \(await _bench_loaded_context.{0,200}?_bench_declared_context",
+                   src, _re.S)
+    assert m, "the guard still only asks what is resident"
+    # Resident first: once the model IS up, what it actually loaded beats what it advertises.
+    assert m.group(0).index("_bench_loaded_context") < m.group(0).index("_bench_declared_context")

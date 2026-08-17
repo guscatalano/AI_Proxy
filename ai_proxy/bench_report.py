@@ -2395,6 +2395,95 @@ def _bench_longctx_html(runs: list) -> str:
     </section>"""
 
 
+# ---- The guide: what every suite asks, and what right and wrong look like --------------------
+
+_GUIDE_SUITE_BLURB = {
+    "coding": "Write code that passes its tests. The model's answer is extracted, executed in a "
+              "separate process against fixed cases, and graded on what it returns — not on how "
+              "it reads.",
+    "agentic": "Drive tools across many turns and finish. Graded twice: whether the final answer "
+               "is right, and whether the conduct getting there was clean — no malformed calls, "
+               "no invented tools, no repeating the same call, inside the step budget.",
+    "security": "Two directions. Blue: find the hole in code and say what it is. Red: the model "
+                "is the thing under attack, and the question is whether a hostile tool result "
+                "can make it take orders from the data.",
+    "instruct": "Produce the shape that was asked for. Not whether the content is good — whether "
+                "the model obeyed a constraint it could see.",
+    "refusal": "Engage with security work, decline the harmful end of it. A model that refuses "
+               "everything scores the same as one that refuses nothing.",
+    "memory": "What the model chooses to write down, look up and revise. Graded on the STORE "
+              "the episode leaves behind, not only the answer it produced.",
+    "preference": "Not 'is it right' but 'what did it reach for'. The score only catches an "
+                  "outright strange pick; the profile is the point.",
+    "longcontext": "Whether a long window holds anything. Facts are planted at fixed depths "
+                   "through a haystack of known size and asked for in one request.",
+}
+
+
+def _bench_guide_html(suites: list, examples: dict) -> str:
+    """A page that says what each suite asks and what a right and wrong answer look like.
+
+    The right answer comes from the task's own cases — the same vocabulary the failure examples
+    use, so a reader who has seen one recognises the other. The wrong answer is a REAL reply
+    from a stored run wherever one exists, because an invented failure teaches the shape of a
+    mistake nobody made; the ones that actually happen are stranger and more instructive than
+    anything written to illustrate a point.
+    """
+    blocks = []
+    for suite in suites:
+        tasks = suite.get("tasks") or []
+        if not tasks:
+            continue
+        cats = sorted({t.get("category") for t in tasks if t.get("category")})
+        blurbs = "".join(
+            f'<p class="note"><b>{_h(c)}</b> — {_h(_GUIDE_SUITE_BLURB.get(c, ""))}</p>'
+            for c in cats if _GUIDE_SUITE_BLURB.get(c))
+        rows = []
+        for t in tasks:
+            good = "".join(
+                f"<li><code>{_h(w)}</code> &rarr; <code>{_h(e)}</code></li>"
+                for w, e in (t.get("good") or [])[:4]) or "<li>—</li>"
+            bad = "".join(
+                f'<li><code>{_h(b)}</code></li>' for b in (examples.get(t["id"]) or [])[:2])
+            bad = bad or ('<li class="none">no failure on record — every model that has run '
+                          'this task passed it</li>')
+            rows.append(
+                f'<tr><th scope="row"><code>{_h(t["id"])}</code>'
+                f'<div class="k">{_h(t.get("lang") or "python")}</div></th>'
+                f'<td><div class="d">{_h(t.get("desc") or "")}</div>'
+                f'<div class="why">{_h(t.get("note") or "")}</div></td>'
+                f'<td><ul class="ex ok">{good}</ul></td>'
+                f'<td><ul class="ex bad">{bad}</ul></td></tr>')
+        blocks.append(
+            f'<section><h2>{_h(suite["name"])} <span class="k">{len(tasks)} tasks</span></h2>'
+            f'{blurbs}'
+            f'<div class="tbl"><table><thead><tr><th>Task</th><th>What it asks</th>'
+            f'<th>A passing answer</th><th>A real failure</th></tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody></table></div></section>')
+
+    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Benchmark guide — what each test asks</title>
+<style>{_REPORT_CSS}
+  .ex {{ margin:0; padding-left:1.1em; }}
+  .ex li {{ margin:2px 0; font-size:12px; }}
+  .ex.ok li::marker {{ color:var(--good); }}
+  .ex.bad li::marker {{ color:var(--bad); }}
+  .ex li.none {{ color:var(--ink-faint); font-style:italic; list-style:none; margin-left:-1.1em; }}
+  .d {{ font-size:12.5px; }}
+  .why {{ font-size:11.5px; color:var(--ink-faint); margin-top:3px; }}
+  tbody th {{ vertical-align:top; white-space:nowrap; }}
+  tbody td {{ vertical-align:top; }}
+</style></head><body><main>
+<h1>Benchmark guide</h1>
+<p class="note">Every task in every suite: what it asks, why it is in the suite, what a passing
+answer looks like, and — where one exists — a reply that actually failed it on this machine.
+The failures are real. An invented one teaches the shape of a mistake nobody made, and the
+mistakes models actually make are stranger than anything written to illustrate a point.</p>
+{"".join(blocks)}
+</main></body></html>"""
+
+
 def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
 

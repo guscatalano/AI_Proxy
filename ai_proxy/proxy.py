@@ -11029,6 +11029,74 @@ async def stats_report(format: str = "html"):
                                       "x-accel-buffering": "no"})
 
 
+@app.get("/__proxy/api/bench/guide")
+def bench_guide(request: Request, suite: str = "", format: str = "html"):
+    """What every benchmark task asks, and what right and wrong answers look like.
+
+    The passing answer is derived from the task's own cases, using the same vocabulary the
+    report's failure examples use — so a reader who has seen one recognises the other. The
+    failing answer is a REAL reply pulled from stored runs, because an invented failure teaches
+    the shape of a mistake nobody made.
+    """
+    wanted = [s.strip() for s in (suite or "").split(",") if s.strip()] or list(_BENCH_SUITES)
+    # Real failures first: one pass over recent runs, keyed by task id.
+    examples: dict = {}
+    conn = db()
+    try:
+        for row in conn.execute(
+                "SELECT results_json FROM bench_runs WHERE results_json IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 40"):
+            try:
+                rows = (json.loads(row["results_json"]) or {}).get("rows") or []
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for u in rows:
+                g = u.get("grade") or {}
+                tid = u.get("task")
+                if not tid or not g or g.get("passed", 0) >= g.get("total", 0):
+                    continue
+                for i, c in enumerate(g.get("cases") or []):
+                    if c.get("ok") or c.get("got") is None:
+                        continue
+                    txt = str(c.get("got"))[:150]
+                    examples.setdefault(tid, [])
+                    if txt not in examples[tid] and len(examples[tid]) < 3:
+                        examples[tid].append(txt)
+    finally:
+        conn.close()
+
+    out = []
+    for name in wanted:
+        tasks = _BENCH_SUITES.get(name) or []
+        if not tasks:
+            continue
+        shaped = []
+        for t in tasks:
+            # "What was asked -> what was expected", per case. _bench_case_parts already speaks
+            # every task shape: a function call, an HTML structural check, a needle at a depth.
+            good = []
+            for i in range(len(t.get("cases") or [])):
+                try:
+                    good.append(_bench_report_mod._bench_case_parts(t, i))
+                except Exception:
+                    continue
+            shaped.append({
+                "id": t["id"], "lang": t.get("lang") or "python",
+                "category": _BENCH_TASK_CATEGORY.get(t["id"]),
+                "desc": _BENCH_TASK_DESC.get(t["id"]) or "",
+                "note": _BENCH_TASK_NOTES.get(t["id"]) or "",
+                "good": good,
+            })
+        out.append({"name": name, "tasks": shaped})
+    if not out:
+        return JSONResponse({"error": f"no such suite; available: {list(_BENCH_SUITES)}"},
+                            status_code=404)
+    if format == "json":
+        return {"suites": out, "failures": examples}
+    return Response(content=_bench_report_mod._bench_guide_html(out, examples),
+                    media_type="text/html; charset=utf-8")
+
+
 @app.get("/__proxy/api/bench/report")
 async def bench_report(request: Request, ids: str = "", format: str = "json"):
     """Comparison report over any number of runs. `ids` is comma-separated; a suite parent
@@ -12958,6 +13026,36 @@ async def _bench_evict_ollama(keep: str = "") -> list:
     return unloaded
 
 
+async def _bench_declared_context(model: str, upstream: str) -> int | None:
+    """The window a model declares, readable BEFORE it is loaded.
+
+    _bench_loaded_context asks what is resident, which is the right answer once the model is
+    up and useless in the context preflight — that runs before the warm-up, when the model
+    under test is usually not the one in memory. Measured: a 131,072-token model was checked
+    while a 1M model was resident, so the guard saw nothing to compare against and let three
+    oversized rungs through to be front-truncated.
+
+    Capped by the server's own per-slot setting, because Ollama will not load a larger window
+    than it is configured for however big the model says it can go.
+    """
+    try:
+        if upstream != "ollama":
+            return None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
+        if r.status_code >= 400:
+            return None
+        info = (r.json() or {}).get("model_info") or {}
+        arch = info.get("general.architecture")
+        declared = int(info.get(f"{arch}.context_length") or 0) if arch else 0
+        if not declared:
+            return None
+        server_ctx, _parallel = _bench_ollama_server_ctx()
+        return min(declared, server_ctx) if server_ctx else declared
+    except Exception:
+        return None
+
+
 async def _bench_loaded_context(model: str, upstream: str) -> int | None:
     """The context window the backend ACTUALLY loaded, read after the model is up.
 
@@ -13706,8 +13804,12 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 # backend front-truncated it and the rung scored a number that measured
                 # nothing. Ask the backend what it actually loaded, which is the same source
                 # the env snapshot uses further down.
+                _up = str(cfg.get("upstream") or "")
                 try:
-                    _window = await _bench_loaded_context(model, str(cfg.get("upstream") or ""))
+                    # What is resident first — it is the truth when the model is already up —
+                    # then what the model declares, which is readable before it loads.
+                    _window = (await _bench_loaded_context(model, _up)
+                               or await _bench_declared_context(model, _up))
                 except Exception:
                     _window = None
             if _window:
