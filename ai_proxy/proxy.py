@@ -17565,8 +17565,15 @@ async def proxy(full_path: str, request: Request):
         _inject_system_reminder(body_json, str(_nudge))
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
-    # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response
-    # gets translated back on the way out (see streaming/non-streaming branches below).
+    # non-Claude model, translate body to OpenAI shape and route to whichever OpenAI-compatible
+    # backend the router named. Response gets translated back on the way out (see
+    # streaming/non-streaming branches below).
+    #
+    # The destination used to be hardwired to OLLAMA_URL, which quietly outranked the router:
+    # pointing the catch-all at a vLLM-served model moved every client except this one, and
+    # claude-code — the only client that speaks Anthropic, and the one whose lost tool calls
+    # motivated the move — kept being sent to Ollama, where that model name does not exist.
+    # It answered 404 on every request while /v1/chat/completions worked perfectly.
     bridge_active = False
     bridge_original_model: str | None = None
     _bridge_cfg = load_rules_config().get("protocol_bridge") or {}
@@ -17578,8 +17585,14 @@ async def proxy(full_path: str, request: Request):
         bridge_original_model = body_json.get("model")
         body_json = _anthropic_to_openai_request(body_json)
         bridge_active = True
-        upstream_label = "ollama"
-        upstream_base = OLLAMA_URL
+        # Ollama remains the default so nothing changes for an unrouted request. "anthropic" is
+        # never a valid target: the translation only runs one way, so sending an OpenAI-shape
+        # body back to Anthropic would 400.
+        _bridge_up = ((request.headers.get("x-proxy-upstream") or "").strip().lower()
+                      or str((rewrite or {}).get("upstream") or "").lower())
+        _bridge_base = _UPSTREAM_BASES.get(_bridge_up) if _bridge_up != "anthropic" else None
+        upstream_label = _bridge_up if _bridge_base else "ollama"
+        upstream_base = _bridge_base or OLLAMA_URL
         full_path = "v1/chat/completions"
         upstream_url = f"{upstream_base}/{full_path}"
         if request.url.query:
