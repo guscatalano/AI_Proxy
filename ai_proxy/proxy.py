@@ -12756,13 +12756,27 @@ async def _bench_ollama_kv_preflight(model: str, meta: dict, cfg: dict) -> str |
             r = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
             if r.status_code >= 400:
                 return None                      # unknown must not mean "no"
-            info = (r.json() or {}).get("model_info") or {}
+            body = r.json() or {}
+            info = body.get("model_info") or {}
+            params = body.get("parameters") or ""
     except (httpx.RequestError, ValueError):
         return None
     per_slot, parallel = _bench_ollama_server_ctx(cfg)
     model_ctx = info.get(f"{info.get('general.architecture')}.context_length")
     if isinstance(model_ctx, (int, float)) and model_ctx:
         per_slot = min(per_slot, int(model_ctx))  # ollama clamps to the training context
+    # A model carrying its own num_ctx loads at THAT, not at the server default — which is the
+    # whole point of the derived models the proxy creates for per-model context. Without this
+    # the check priced qwen3.8-27b-ctx16k at 262,144 and refused it for a 138 GB KV cache, while
+    # the same model sat loaded at 16,384 using 17 GB. `parameters` is a text blob, not a dict.
+    for line in str(params).splitlines():
+        bits = line.split()
+        if len(bits) == 2 and bits[0] == "num_ctx":
+            try:
+                per_slot = min(per_slot, int(float(bits[1])))
+            except ValueError:
+                pass
+            break
     tokens = per_slot * parallel
     kv_mb = _bench_ollama_kv_mb(info, tokens)
     total_mb = (_mem_snapshot() or {}).get("total_mb")

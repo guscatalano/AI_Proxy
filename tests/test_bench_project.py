@@ -305,3 +305,16 @@ def test_every_episode_names_a_file_it_must_produce():
         assert t.get("build", {}).get("path"), t["id"]
         assert t["build"]["path"] in t["prompt"], f"{t['id']} never names the file to write"
         assert "write_file" in t["require_tools"], t["id"]
+
+
+def test_the_kv_preflight_reads_a_models_own_context_not_the_server_default():
+    """A derived model carries num_ctx and loads at THAT — it is the mechanism the proxy uses
+    for per-model context. The check priced qwen3.8-27b-ctx16k at the server's 262,144 and
+    refused it for a 138 GB KV cache, while the same model sat loaded at 16,384 using 17 GB.
+    /api/show returns `parameters` as a text blob, not a dict."""
+    import inspect
+    src = inspect.getsource(proxy._bench_ollama_kv_preflight)
+    assert '"parameters"' in src, "the model's own parameters are still ignored"
+    assert 'bits[0] == "num_ctx"' in src, "num_ctx is not being read"
+    assert src.index('.context_length') < src.index('num_ctx'), \
+        "the architecture max must be applied first, then narrowed by the model's own setting"
