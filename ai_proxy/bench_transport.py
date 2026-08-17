@@ -116,9 +116,15 @@ TRANSPORT_TASKS = [
     _task("ts_read_simple",
           "Read the file /etc/hosts and tell me what is in it. Use the read_file tool.",
           [_READ_TOOL], "single tool, explicit instruction", "Call read_file when told to, one tool offered"),
+    # Was "What are the contents of /var/log/syslog?", with no instruction to use the tool.
+    # It failed on the suite's first run at depth, finishing with stop and no call — the model
+    # answering in prose, which is a legitimate choice and not a transport failure. That made it
+    # the one task here that measured model discretion, exactly the confound this suite is
+    # supposed to exclude, and it would have reported a false loss on every clean backend.
     _task("ts_read_implicit",
-          "What are the contents of /var/log/syslog?",
-          [_READ_TOOL], "single tool, no explicit instruction to call it", "Call read_file without being told to name it"),
+          "Use the read_file tool to fetch /var/log/syslog, then summarise what you find.",
+          [_READ_TOOL], "call framed as a means to an end rather than the whole request",
+          "Call read_file when the call is incidental to the ask"),
     _task("ts_search_simple",
           "Find every place the string TODO appears in this codebase. Use the search tool.",
           [_SEARCH_TOOL], "a different tool, in case one name is special", "Call a differently-named tool"),
