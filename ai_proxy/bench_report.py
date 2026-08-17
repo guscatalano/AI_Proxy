@@ -2625,6 +2625,127 @@ def _bench_guide_html(categories: list, examples: dict) -> str:
             + f"<script>{script}</script></main></body></html>")
 
 
+def _bench_project_html(runs: list) -> str:
+    """The project view, because the generic tables average away everything this suite measures.
+
+    Rendered from a real four-model run, the generic report put gemma4, qwen3.8 and
+    qwen3-coder-next all at "86% fully correct" — while the actual separation was 75/78 against
+    72/78 on hidden cases, and one of the four repeated completed tool calls until its step
+    budget expired on five of six episodes. None of that survives a single percentage.
+
+    Three columns carry it. VISIBLE is the examples the spec printed: passing them proves a
+    model can copy. HIDDEN is the requirements stated in prose and demonstrated nowhere —
+    the gap between the two is the measurement. BUILT and CLEAN apply only to the episodes,
+    where the model has to call write_file rather than describe a function, and they are kept
+    apart because a model that writes a working file through eleven malformed calls is not the
+    same as one that writes nothing cleanly.
+    """
+    rows_by_model: dict = {}
+    for r in runs:
+        name = (r.get("label") or "").split(" · ")[0] or r.get("model") or "?"
+        units = (r.get("results") or {}).get("rows") or []
+        proj = [u for u in units if str(u.get("task") or "").startswith("proj")]
+        if not proj:
+            continue
+        d = rows_by_model.setdefault(name, {
+            "vp": 0, "vt": 0, "hp": 0, "ht": 0, "copied": 0,
+            "built": 0, "clean": 0, "eps": 0, "ms": [], "per": {}})
+        for u in proj:
+            g = u.get("grade") or {}
+            d["vp"] += g.get("visible_passed") or 0
+            d["vt"] += g.get("visible_total") or 0
+            d["hp"] += g.get("hidden_passed") or 0
+            d["ht"] += g.get("hidden_total") or 0
+            if g.get("copied_examples"):
+                d["copied"] += 1
+            if u.get("total_ms"):
+                d["ms"].append(u["total_ms"])
+            task = str(u.get("task"))
+            slot = d["per"].setdefault(task, [0, 0])
+            slot[0] += g.get("hidden_passed") or 0
+            slot[1] += g.get("hidden_total") or 0
+            cases = g.get("cases") or []
+            if task.startswith("projep") and len(cases) >= 2:
+                d["eps"] += 1
+                d["built"] += 1 if cases[0].get("ok") else 0
+                d["clean"] += 1 if cases[1].get("ok") else 0
+    if not rows_by_model:
+        return ""
+
+    order = sorted(rows_by_model.items(),
+                   key=lambda kv: (-(kv[1]["hp"] / kv[1]["ht"] if kv[1]["ht"] else 0),
+                                   -(kv[1]["clean"] / kv[1]["eps"] if kv[1]["eps"] else 0)))
+    tasks = sorted({t for _n, d in order for t in d["per"]},
+                   key=lambda t: (t.startswith("projep"), t))
+
+    def pct_cell(a, b, good=0.999, bad=0.8):
+        if not b:
+            return '<td class="n">&mdash;</td>'
+        f = a / b
+        cls = " win" if f >= good else (" bad" if f < bad else "")
+        return f'<td class="n{cls}">{a}/{b}</td>'
+
+    body = []
+    for name, d in order:
+        ms = sorted(d["ms"])
+        med = f"{ms[len(ms) // 2] / 1000:.1f}s" if ms else "&mdash;"
+        flag = (f'<td class="n bad">{d["copied"]}</td>' if d["copied"]
+                else '<td class="n">&mdash;</td>')
+        body.append(
+            f'<tr data-m="{_h(name)}"><th scope="row"><code class="mdl">{_h(name)}</code></th>'
+            + pct_cell(d["vp"], d["vt"])
+            + pct_cell(d["hp"], d["ht"])
+            + pct_cell(d["built"], d["eps"])
+            + pct_cell(d["clean"], d["eps"])
+            + flag
+            + f'<td class="n">{med}</td></tr>')
+
+    per_head = "".join(
+        f'<th class="n">{_h(t.replace("projep_", "ep:").replace("proj_", ""))}</th>'
+        for t in tasks)
+    per_body = []
+    for name, d in order:
+        cells = "".join(pct_cell(*d["per"].get(t, [0, 0])) for t in tasks)
+        per_body.append(f'<tr data-m="{_h(name)}">'
+                        f'<th scope="row"><code class="mdl">{_h(name)}</code></th>'
+                        f'{cells}</tr>')
+
+    return f"""
+    <section>
+      <h2>Project suite — spec in, working code out</h2>
+
+      <p>Every other coding task here is one function with fixed cases, and the suite saturated
+      on them: the two best models finished one task apart, which is inside noise. These tasks
+      hand the model a written spec instead, and the spec <em>prints a few of its own test
+      cases</em> while the grader runs others it never showed.</p>
+
+      <p><b>Read the two columns together.</b> Passing a printed example proves a model can
+      copy an example. Passing a hidden case means it read a requirement that was stated in
+      prose and demonstrated nowhere. A model at full marks on visible and poor on hidden
+      pattern-matched rather than read, and the <b>copied</b> column names that outright —
+      a single correctness percentage averages the distinction away.</p>
+
+      <p><b>built</b> and <b>clean</b> cover the episodes, where the model is given file tools
+      and has to produce an artefact rather than describe one. They are separate because they
+      fail separately: writing a working file through a mess of repeated calls is a different
+      result from writing nothing cleanly, and a model can narrate a flawless implementation
+      while never calling write_file at all.</p>
+
+      <div class="tbl"><table>
+        <thead><tr><th>Model</th><th class="n">Visible</th><th class="n">Hidden</th>
+          <th class="n">Built</th><th class="n">Clean</th><th class="n">Copied</th>
+          <th class="n">Median</th></tr></thead>
+        <tbody>{''.join(body)}</tbody>
+      </table></div>
+
+      <p class="note">Hidden cases per task — which requirement each model actually missed.</p>
+      <div class="tbl"><table>
+        <thead><tr><th>Model</th>{per_head}</tr></thead>
+        <tbody>{''.join(per_body)}</tbody>
+      </table></div>
+    </section>"""
+
+
 def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
     """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
 
@@ -3263,10 +3384,16 @@ ordinary slowness rather than a misconfiguration.</p>
     # needle ladder this IS the result, and the generic tables above it are the supporting
     # detail. Empty for every other suite, so nothing else moves.
     longctx_html = _bench_longctx_html(_all_runs)
+    # Same reasoning as the long-context section: for a project run this IS the result, and the
+    # generic tables put three models at an identical "86% fully correct" while the suite had
+    # separated them by hidden cases and by whether they behaved while using tools.
+    project_html = _bench_project_html(_all_runs)
     body = f"""
   {results}
 
   {longctx_html}
+
+  {project_html}
 
   {weighted_html}
 
