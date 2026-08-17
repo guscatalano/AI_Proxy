@@ -2997,6 +2997,9 @@ RULES_REGISTRY: dict = {}
 
 DEFAULT_RULES_CONFIG = {
     "loop_detector": {
+        # Nudge before blocking: a repeating model has usually not noticed, and an injected note
+        # is the only thing that changes its context. Blocking ends the turn; that is the escalation.
+        "nudge_at": 3,
         "enabled": True,
         "action": "block",       # "block" | "warn"
         "max_repeats": 4,         # signature appearing this many times in window blocks
@@ -3859,7 +3862,7 @@ def _rule_loop_detector(body: dict, cfg: dict):
                 out.append((fn.get("name") or "?", _normalize_args(fn.get("arguments"))))
         return out
 
-    def _detect(sigs):
+    def _detect(sigs, threshold):
         """Return (tool_name, count, trigger, args_preview) or None."""
         if not sigs:
             return None
@@ -3867,17 +3870,41 @@ def _rule_loop_detector(body: dict, cfg: dict):
         for s in sigs:
             counts[s] = counts.get(s, 0) + 1
         top_sig, top_count = max(counts.items(), key=lambda kv: kv[1])
-        if top_count >= max_repeats:
+        if top_count >= threshold:
             return (top_sig[0], top_count, "count_in_window", top_sig[1])
         if len(sigs) >= tail_n and all(s == sigs[-1] for s in sigs[-tail_n:]):
             return (sigs[-1][0], tail_n, "tail_consecutive", sigs[-1][1])
         return None
 
     # Active loop: assistant tool calls made SINCE the last user message.
+    #
+    # Two tiers, because blocking outright ends the turn and hands the problem back to the human,
+    # while the model has usually just failed to notice it is repeating itself. Observed on this
+    # box: gemma4 called Edit with byte-identical arguments six times because the edit failed and
+    # the client deduplicated the Read it tried to recover with, so nothing in its context ever
+    # changed. A nudge changes the context — which is the one thing that could break that.
+    #
+    #   nudge_at .. max_repeats-1  -> allowed through with a note telling it to stop repeating
+    #   max_repeats and above      -> blocked, because the nudge did not work
     active_msgs = messages[last_user_idx + 1:] if last_user_idx >= 0 else messages
-    active = _detect(_collect(active_msgs)[-window:])
+    nudge_at = int(cfg.get("nudge_at", 3) or 0)
+    floor = min(nudge_at, max_repeats) if nudge_at else max_repeats
+    active = _detect(_collect(active_msgs)[-window:], floor)
     if active:
         name, count, trigger, args_preview = active
+        if nudge_at and count < max_repeats:
+            note = (f"[AI Proxy loop-detector] You have now called `{name}` with the same "
+                    f"parameters {count}× in a row and it has not moved the task forward. Do NOT "
+                    f"issue that identical call again. Either change the parameters, use a "
+                    f"different tool, or explain what is blocking you. If a tool reported an "
+                    f"error, address that error rather than retrying unchanged — repeating the "
+                    f"call will be blocked.")
+            return {
+                "reason": f"Tool call {name!r} repeated {count}× — nudged (blocks at {max_repeats})",
+                "details": {"trigger": trigger, "tool_name": name, "count": count,
+                            "args_preview": args_preview[:300],
+                            "soft_unblock": True, "nudge": True, "note": note},
+            }
         return {
             "reason": f"Tool call {name!r} repeated {count}× since the last user message",
             "details": {"trigger": trigger, "tool_name": name, "count": count,
@@ -3887,7 +3914,7 @@ def _rule_loop_detector(body: dict, cfg: dict):
     # No active loop, but a loop before the last user turn means the user just interrupted one.
     # Allow through, but carry a note so the model learns why it was stopped.
     if last_user_idx >= 0:
-        prior = _detect(_collect(messages[:last_user_idx + 1])[-window:])
+        prior = _detect(_collect(messages[:last_user_idx + 1])[-window:], max_repeats)
         if prior:
             name, count, trigger, args_preview = prior
             note = (f"[AI Proxy loop-detector] Your earlier turn called the tool `{name}` with the "
