@@ -20,6 +20,15 @@ tool calling scores 0% everywhere, which is a different and equally visible shap
 Detection is statistical. At a ~2.5% loss rate, 12 tasks x runs=1 will usually see nothing;
 runs=10 gives 120 attempts and about a 95% chance of catching at least one. Run it with runs
 high, or read a clean result as "no gross breakage" rather than "no loss".
+
+KNOWN GAP, so a clean result is not over-read. The first run of this suite scored 120/120 on the
+same backend and model that was losing calls in production, and the proxy's own recovery counter
+fired zero times — the failure simply did not occur. These prompts are short and go out over
+/v1/chat/completions, while the 2.5% was measured on claude-code: prompts of 70k tokens and up,
+arriving through the Anthropic bridge. Those conditions are not reproduced here, so this suite
+currently proves the backend is not *grossly* broken rather than that it never drops a call.
+Closing that gap means a long-prompt variant and a bridged path, both of which cost real time
+per attempt — worth doing before trusting a green result as an all-clear.
 """
 
 # One tool, one obvious reason to call it. Anything cleverer risks measuring whether the model
