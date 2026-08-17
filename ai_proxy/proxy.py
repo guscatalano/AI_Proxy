@@ -16142,6 +16142,13 @@ def _openai_to_anthropic_response(o: dict, fallback_model: str | None = None) ->
     choice = (o.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     content_blocks: list[dict] = []
+    # Reasoning first, because Anthropic orders thinking ahead of the answer it produced.
+    # Dropping it was silent data loss: a gemma4 reply that was 4,888 characters of reasoning
+    # and zero characters of content reached claude-code as a well-formed EMPTY turn, after a
+    # hundred seconds of generation, and read as the model giving up for no reason.
+    reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip() and _bridge_translates_reasoning():
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
     text = msg.get("content")
     if isinstance(text, str) and text:
         content_blocks.append({"type": "text", "text": text})
@@ -16185,6 +16192,18 @@ def _openai_to_anthropic_response(o: dict, fallback_model: str | None = None) ->
     }
 
 
+def _bridge_translates_reasoning() -> bool:
+    """Whether the bridge turns upstream reasoning into Anthropic thinking blocks.
+
+    On by default because the alternative is silent data loss — the translator knew only `text`
+    and `tool_use`, so a reply made entirely of reasoning arrived as an empty turn. A flag rather
+    than a constant because it changes what block types a client sees, and any client that
+    cannot cope with `thinking` needs a way back that does not require a deploy.
+    """
+    cfg = load_rules_config().get("protocol_bridge") or {}
+    return bool(cfg.get("translate_reasoning", True))
+
+
 class IncrementalAnthropicBridge:
     """Stateful, chunk-at-a-time translator that converts an OpenAI-format SSE stream into
     Anthropic-format SSE events. Unlike the batch translator below, this one emits events
@@ -16209,13 +16228,14 @@ class IncrementalAnthropicBridge:
         self._finished = False
         # Block state — Anthropic protocol requires a strict open/close pattern.
         self._cur_block_idx = -1
-        self._cur_block_type: str | None = None  # 'text' | 'tool_use' | None
+        self._cur_block_type: str | None = None  # 'text' | 'thinking' | 'tool_use' | None
         # Tool-call accumulator: openai-tc-index → {block_idx, id, name, started}
         self._tool_calls: dict = {}
         self._next_block_idx = 0
         self._finish_reason: str | None = None
         self._input_tokens = 0
         self._output_tokens = 0
+        self._translate_reasoning = _bridge_translates_reasoning()
 
     @staticmethod
     def _event(name: str, payload: dict) -> str:
@@ -16255,6 +16275,18 @@ class IncrementalAnthropicBridge:
         }))
         self._cur_block_type = "text"
 
+    def _open_thinking_block(self, out: list):
+        if self._cur_block_type == "thinking":
+            return
+        self._close_current_block(out)
+        self._cur_block_idx = self._next_block_idx
+        self._next_block_idx += 1
+        out.append(self._event("content_block_start", {
+            "type": "content_block_start", "index": self._cur_block_idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }))
+        self._cur_block_type = "thinking"
+
     def _process_chunk(self, j: dict, out: list):
         if isinstance(j.get("model"), str) and j["model"]:
             self.model = j["model"]
@@ -16265,6 +16297,13 @@ class IncrementalAnthropicBridge:
             if c.get("finish_reason"):
                 self._finish_reason = c["finish_reason"]
             d = c.get("delta") or {}
+            reasoning = d.get("reasoning") or d.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning and self._translate_reasoning:
+                self._open_thinking_block(out)
+                out.append(self._event("content_block_delta", {
+                    "type": "content_block_delta", "index": self._cur_block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                }))
             content = d.get("content")
             if isinstance(content, str) and content:
                 self._open_text_block(out)
@@ -16373,6 +16412,7 @@ def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: 
     text = openai_chunks.decode("utf-8", errors="replace") if isinstance(openai_chunks, bytes) else str(openai_chunks)
 
     accum_text = ""
+    accum_reasoning = ""
     tcs: dict[int, dict] = {}  # index -> {id, name, args}
     tool_index_order: list[int] = []
     finish_reason: str | None = None
@@ -16397,6 +16437,9 @@ def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: 
             d = c.get("delta") or {}
             if isinstance(d.get("content"), str):
                 accum_text += d["content"]
+            _r = d.get("reasoning") or d.get("reasoning_content")
+            if isinstance(_r, str):
+                accum_reasoning += _r
             for tc in (d.get("tool_calls") or []):
                 idx = tc.get("index", 0)
                 if idx not in tcs:
@@ -16439,6 +16482,17 @@ def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: 
     })
 
     block_idx = 0
+    if accum_reasoning.strip() and _bridge_translates_reasoning():
+        evt("content_block_start", {
+            "type": "content_block_start", "index": block_idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        })
+        evt("content_block_delta", {
+            "type": "content_block_delta", "index": block_idx,
+            "delta": {"type": "thinking_delta", "thinking": accum_reasoning},
+        })
+        evt("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+        block_idx += 1
     if accum_text:
         evt("content_block_start", {
             "type": "content_block_start",
