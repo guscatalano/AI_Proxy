@@ -245,6 +245,73 @@ def test_a_failed_re_issue_leaves_the_original_response_alone(client, upstream):
     assert len(up.calls) == 2
 
 
+# --- reading a tool call, which has no characters to count ---------------------------------
+#
+# The first version of the audit reported every successful recovery as a failure, because it
+# judged success by counting delivered characters and a tool call has none. In production that
+# printed recovered=false next to a response that had in fact been rescued — the one number
+# anyone would use to decide whether this works at all.
+
+
+def test_a_delta_tool_call_is_seen():
+    assert P._stream_has_tool_call(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"Read"}}]}}]}\n')
+
+
+def test_an_assembled_tool_call_is_seen():
+    assert P._stream_has_tool_call(
+        'data: {"choices":[{"message":{"tool_calls":[{"function":{"name":"Read"}}]}}]}\n')
+
+
+def test_an_anthropic_tool_use_block_is_seen():
+    assert P._stream_has_tool_call(
+        'data: {"type":"content_block_start","content_block":{"type":"tool_use","name":"Read"}}\n')
+
+
+def test_prose_is_not_mistaken_for_a_tool_call():
+    assert not P._stream_has_tool_call(
+        'data: {"choices":[{"delta":{"content":"I could call Read here"}}]}\n')
+
+
+def test_an_empty_tool_calls_list_is_not_a_tool_call():
+    assert not P._stream_has_tool_call('data: {"choices":[{"delta":{"tool_calls":[]}}]}\n')
+
+
+def test_junk_does_not_raise():
+    assert not P._stream_has_tool_call("data: not json\ndata: [DONE]\n")
+    assert not P._stream_has_tool_call(None)
+
+
+def test_a_rescued_tool_call_is_reported_as_recovered(client, upstream):
+    """A recovery that worked must not be filed as a failure."""
+    upstream(_Upstream())
+    client.post("/v1/chat/completions", json=_REQUEST)
+    conn = P.db()
+    try:
+        row = conn.execute("SELECT gate_details FROM requests WHERE gate_rule='tool_stream' "
+                           "ORDER BY ts DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert json.loads(row["gate_details"])["recovered"] is True
+
+
+def test_an_empty_re_issue_is_reported_as_not_recovered(client, upstream):
+    """Empty twice is not the streaming defect — gemma4:26b is the MoE build, which has its own
+    reported habit of returning nothing on long prompts. The flag is what separates the two."""
+    empty = {"id": "c1", "choices": [{"index": 0, "finish_reason": "stop", "message": {
+        "role": "assistant", "content": ""}}]}
+    upstream(_Upstream(json_body=empty))
+    client.post("/v1/chat/completions", json=_REQUEST)
+    conn = P.db()
+    try:
+        row = conn.execute("SELECT gate_details, gate_reason FROM requests "
+                           "WHERE gate_rule='tool_stream' ORDER BY ts DESC LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert json.loads(row["gate_details"])["recovered"] is False
+    assert "not the streaming defect" in row["gate_reason"]
+
+
 def test_the_re_issue_is_recorded_for_the_audit(client, upstream):
     """A response the client never saw was replaced by one it did — that has to be visible, or
     the next person debugging a latency spike has no idea a second generation happened."""

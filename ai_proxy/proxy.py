@@ -3497,6 +3497,37 @@ def _tool_stream_mode(model_name: str, upstream: str | None, quirk: dict | None 
     return "buffer" if str(upstream or "").lower() in [str(u).lower() for u in ups] else "passthrough"
 
 
+def _stream_has_tool_call(sse_text: str | None) -> bool:
+    """Whether an SSE body carries a tool call, in delta or assembled form.
+
+    Needed because _response_delivered_chars counts characters and a tool call has none: a turn
+    whose entire output is one call would otherwise read as empty. That mistake is what made the
+    first version of the tool_stream audit report every successful recovery as a failure.
+    """
+    for line in (sse_text or "").splitlines():
+        raw = line[6:] if line.startswith("data: ") else line
+        raw = raw.strip()
+        if not raw or raw == "[DONE]" or not raw.startswith("{"):
+            continue
+        try:
+            j = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for ch in (j.get("choices") or []):
+            if not isinstance(ch, dict):
+                continue
+            for shape in (ch.get("delta"), ch.get("message")):
+                if isinstance(shape, dict) and shape.get("tool_calls"):
+                    return True
+        m = j.get("message")
+        if isinstance(m, dict) and m.get("tool_calls"):
+            return True
+        if j.get("type") == "content_block_start":
+            if (j.get("content_block") or {}).get("type") == "tool_use":
+                return True
+    return False
+
+
 def _request_has_tools(body_json) -> bool:
     """True when the request offers the model tools, in either wire shape."""
     if not isinstance(body_json, dict):
@@ -18230,11 +18261,7 @@ async def proxy(full_path: str, request: Request):
             # appending to it. Once, because a failure that turned out to be deterministic would
             # otherwise loop.
             if tool_stream_buffered and not err:
-                _ts_obj = _assemble_streaming_response(full) if full else {}
-                _ts_has_tc = any(
-                    (c.get("message") or {}).get("tool_calls")
-                    for c in ((_ts_obj or {}).get("choices") or []) if isinstance(c, dict))
-                if not _ts_has_tc and not _response_delivered_chars(None, full):
+                if not _stream_has_tool_call(full) and not _response_delivered_chars(None, full):
                     print(f"[tool_stream] {req_id} streamed reply carried no content and no tool "
                           f"call — re-issuing non-streaming ({len(full)} bytes discarded)")
                     try:
@@ -18248,12 +18275,22 @@ async def proxy(full_path: str, request: Request):
                         _sse = _synth_response_stream(_ts_json)
                         chunks[:] = [_sse]     # replayed verbatim below when nothing transforms it
                         full = _sse.decode("utf-8", errors="replace")
+                        # recovered=false is the signal that the re-issue came back empty too,
+                        # which means this was never the streaming defect — gemma4:26b is the MoE
+                        # build, and it has a separate reported habit of returning nothing at all
+                        # on long system prompts. Worth watching the split: a rising share of
+                        # false says the answer is a different model, not a different transport.
+                        _ts_ok = bool(_stream_has_tool_call(full)
+                                      or _response_delivered_chars(None, full))
                         _save_gate(req_id, {
                             "verdict": "rewrite", "rule": "tool_stream",
-                            "reason": "streamed reply lost its tool call (Ollama /v1); "
-                                      "re-issued non-streaming and rebuilt the stream",
+                            "reason": ("streamed reply lost its tool call (Ollama /v1); re-issued "
+                                       "non-streaming and rebuilt the stream")
+                                      if _ts_ok else
+                                      ("streamed reply was empty and the non-streaming re-issue "
+                                       "was empty too — not the streaming defect"),
                             "details": {"upstream": upstream_label, "model": model,
-                                        "recovered": bool(_response_delivered_chars(None, full))},
+                                        "recovered": _ts_ok},
                         })
 
             findings: list[dict] = []
