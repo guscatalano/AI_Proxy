@@ -554,6 +554,16 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN reasoning_effort TEXT",
     "ALTER TABLE requests ADD COLUMN thinking TEXT",
     "ALTER TABLE requests ADD COLUMN thinking_src TEXT",
+    # A response the upstream billed for and then delivered nothing of: tokens generated,
+    # no content, no reasoning, no tool call. The client sees a well-formed empty turn with a
+    # clean stop reason and no error, which reads to a human as the agent stopping for no
+    # reason. Measured on this box: 81 of 241 gemma4 replies in one six-hour window. Recorded
+    # as a column because it is invisible in every existing view — status is 200 and the token
+    # counts look healthy.
+    "ALTER TABLE requests ADD COLUMN empty_output INTEGER",
+    # What else was in flight when it happened. The failure is intermittent and survives replay,
+    # so the question is what was different at that moment rather than what was in the request.
+    "ALTER TABLE requests ADD COLUMN inflight_at_finish INTEGER",
     # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
     # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
     # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
@@ -6675,7 +6685,8 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
                   upstream, client_ip, client_app, surface, api_key_fp, gate_verdict, gate_rule, gate_reason,
-                  shadow_of, has_images, reasoning_effort, thinking, thinking_src
+                  shadow_of, has_images, reasoning_effort, thinking, thinking_src,
+                  empty_output, inflight_at_finish
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -17094,6 +17105,38 @@ def _extract_ttft_ms(body_text: str | None, stream_text: str | None) -> float | 
     return None
 
 
+def _response_delivered_chars(body_text: str | None, stream_text: str | None) -> int:
+    """How much the client actually received: content plus reasoning, across every shape.
+
+    Counting only `content` would call a thinking model's reply empty when the client did get
+    something, and counting tokens would call it non-empty when the client got nothing — the
+    upstream bills for output it then discards.
+    """
+    total = 0
+    for blob in (stream_text or "", body_text or ""):
+        for line in blob.splitlines():
+            raw = line[6:] if line.startswith("data: ") else line
+            raw = raw.strip()
+            if not raw or raw == "[DONE]" or not raw.startswith("{"):
+                continue
+            try:
+                j = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for ch in (j.get("choices") or []):
+                d = ch.get("delta") or ch.get("message") or {}
+                total += len(d.get("content") or "")
+                total += len(d.get("reasoning") or d.get("reasoning_content") or "")
+            m = j.get("message")
+            if isinstance(m, dict):
+                total += len(m.get("content") or "")
+                total += len(m.get("thinking") or "")
+            if j.get("type") == "content_block_delta":
+                dd = j.get("delta") or {}
+                total += len(dd.get("text") or "") + len(dd.get("thinking") or "")
+    return total
+
+
 def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | None,
                  stream_text: str | None, elapsed_ms: float, error: str | None,
                  ttft_ms: float | None = None):
@@ -17109,11 +17152,27 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
         _tools = _extract_tool_calls(body_text, stream_text)
     except Exception:
         _tools = []
+    # Did anything actually reach the client? Billed tokens with nothing delivered is a real
+    # failure that every other signal reports as success, so it gets recorded rather than
+    # inferred later from blobs.
+    _empty = None
+    _inflight = None
+    try:
+        if status and 200 <= status < 300 and (ct or 0) > 0 and not _tools:
+            _delivered = _response_delivered_chars(body_text, stream_text)
+            if _delivered == 0:
+                _empty = 1
+                _inflight = len(_INFLIGHT_REQUESTS)
+                print(f"[empty_output] {req_id} billed {ct} tokens and delivered nothing "
+                      f"({_inflight} in flight)")
+    except Exception:
+        pass
     conn = db()
     conn.execute(
         """UPDATE requests
            SET status=?, response_headers=?, duration_ms=?, error=?,
-               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?, tool_calls=?
+               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?, tool_calls=?,
+               empty_output=?, inflight_at_finish=?
            WHERE id=?""",
         (
             status,
@@ -17122,6 +17181,8 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
             error,
             pt, ct, tt, ttft_ms,
             json.dumps(_tools) if _tools else None,
+            _empty,
+            _inflight,
             req_id,
         ),
     )

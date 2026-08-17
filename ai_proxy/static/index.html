@@ -2212,6 +2212,12 @@ function renderList() {
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
     const imgBadge = it.has_images ? '<span class="badge" title="contains an image / non-text content" style="background:#3a2a4a;color:#d0b0f0;border-color:#5a3a6a">🖼 img</span>' : '';
+    // Billed tokens, nothing delivered. Status is 200 and the token counts look healthy, so
+    // without a badge this is invisible — and to whoever is driving the agent it reads as the
+    // model stopping for no reason.
+    const emptyBadge = it.empty_output
+      ? `<span class="badge" title="the upstream billed ${num(it.completion_tokens || 0)} tokens and delivered nothing — no content, no reasoning, no tool call${it.inflight_at_finish ? ' · ' + it.inflight_at_finish + ' requests in flight at the time' : ''}" style="background:#4a2020;color:#ff9a9a;border-color:#6a3030">⌀ empty</span>`
+      : '';
     const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
@@ -2239,7 +2245,7 @@ function renderList() {
       pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
     }
     else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${emptyBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
