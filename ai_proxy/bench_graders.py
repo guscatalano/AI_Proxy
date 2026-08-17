@@ -138,6 +138,25 @@ _BENCH_TOOLCHAIN_PROBES = {
 _BENCH_TOOLCHAIN_OK: dict = {}
 
 
+def _bench_detect_lang(answer: str) -> str | None:
+    """Which language the model actually reached for, from its own fence.
+
+    Used when a task names no language. Falls back to the bare-code shapes so an unfenced
+    reply is not simply unrunnable, and returns None when nothing recognisable came back —
+    which the caller treats as a skip, not a zero, because an ungradeable answer says nothing
+    about the model's correctness.
+    """
+    for m in _BENCH_CODE_BLOCK_RE.finditer(answer or ""):
+        tag = (m.group(1) or "").strip().lower()
+        for lang, spec in _BENCH_LANGS.items():
+            if tag and tag in spec["tags"] and tag != "":
+                return lang
+    for lang, spec in _BENCH_LANGS.items():
+        if spec["bare"].search(answer or ""):
+            return lang
+    return None
+
+
 def _bench_lang_available(lang: str) -> bool:
     """Whether this machine can grade a language — verified, not inferred. Portability
     contract: a task whose tooling is absent or broken is SKIPPED — dropped from the run and
@@ -148,7 +167,7 @@ def _bench_lang_available(lang: str) -> bool:
     # refusal tasks on their first real sweep — the portability contract reported it
     # honestly in skipped_languages, but a grading mode is not a missing compiler.
     if lang in ("python", "html", "css", "sql", "text", "format", "refusal", "answer",
-                "langpick", "needles", None, ""):
+                "langpick", "needles", "auto", None, ""):
         return True                    # stdlib-only grading; nothing to probe
     tool = {"js": "node", "c": "gcc", "cpp": "g++", "rust": "rustc", "csharp": "dotnet",
             "php": "php", "bash": "bash", "go": "go"}.get(lang)
@@ -1135,6 +1154,34 @@ def _bench_grade_needles(answer: str, cases: list) -> dict:
                         **({} if ok else {"got": got})})
     return {"passed": sum(1 for r in results if r["ok"]), "total": len(cases),
             "cases": results, "graded_by": "needles"}
+
+
+def _bench_split_visible(res: dict, cases: list) -> dict:
+    """Report the cases the spec showed apart from the ones it did not.
+
+    Passing an example the spec printed proves the model can copy it. The gap between the two
+    is the measurement: visible 3/3 with hidden 1/6 is a model that pattern-matched, and a
+    single percentage averages exactly that away.
+    """
+    out = res.get("cases") or []
+    # The executed grader returns {ok, got} and nothing else — the label and the visible flag
+    # live in the task definition and are lost crossing the subprocess boundary. Put them back:
+    # "failed: rounds half UP, not to even" names the requirement that was skipped, and a bare
+    # `got: 50` does not.
+    for c, spec in zip(out, cases):
+        c["visible"] = bool(spec.get("visible"))
+        if spec.get("label"):
+            c["label"] = spec["label"]
+    vis = [c for c, spec in zip(out, cases) if spec.get("visible")]
+    hid = [c for c, spec in zip(out, cases) if not spec.get("visible")]
+    res["visible_passed"] = sum(1 for c in vis if c.get("ok"))
+    res["visible_total"] = len(vis)
+    res["hidden_passed"] = sum(1 for c in hid if c.get("ok"))
+    res["hidden_total"] = len(hid)
+    # The signal worth naming: every example reproduced, the requirements behind them missed.
+    res["copied_examples"] = bool(
+        vis and hid and res["visible_passed"] == len(vis) and res["hidden_passed"] == 0)
+    return res
 
 
 def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float,

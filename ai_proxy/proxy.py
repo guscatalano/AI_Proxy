@@ -12017,6 +12017,17 @@ _BENCH_SUITES.setdefault("longctx-v1", _bench_longctx_mod.LONGCTX_TASKS)
 # into the report.
 _BENCH_SUITES.setdefault("longctx-deep", _bench_longctx_mod.LONGCTX_DEEP_TASKS)
 _BENCH_SUITES.setdefault("longctx-lite", _bench_longctx_mod.LONGCTX_LITE_TASKS)
+
+try:
+    from . import bench_project as _bench_project_mod
+except ImportError:          # flat-script launch
+    import bench_project as _bench_project_mod
+# project-v1: build the thing the spec describes, not the thing the examples show. Kept out of
+# the aggregate suites — an episode here is minutes, and the coding suite it exists to replace
+# runs in seconds per task.
+_BENCH_SUITES.setdefault("project-v1", _bench_project_mod.PROJECT_TASKS)
+_BENCH_TASK_DESC.update(_bench_project_mod.PROJECT_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_project_mod.PROJECT_TASK_NOTES)
 _BENCH_TASK_DESC.update(_bench_longctx_mod.LONGCTX_TASK_DESC)
 _BENCH_TASK_NOTES.update(_bench_longctx_mod.LONGCTX_TASK_NOTES)
 
@@ -12056,7 +12067,8 @@ for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding
                                   ("langpref-v1", "preference"),
                                   ("longctx-v1", "longcontext"),
                                   ("longctx-deep", "longcontext"),
-                                  ("longctx-lite", "longcontext")):
+                                  ("longctx-lite", "longcontext"),
+                                  ("project-v1", "project")):
     for _t in _BENCH_SUITES.get(_suite_name) or []:
         _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
 # The security suite's own tasks additionally carry a side; agentic security episodes are
@@ -12110,6 +12122,20 @@ async def _bench_grade(text: str, task: dict, timeout_s: float,
     # Analysis, format and refusal tasks are graded on the reply itself: extracting a code
     # block from an answer whose deliverable IS the answer would throw away the thing being
     # graded — and for format tasks the wrapper is precisely what is under test.
+    if lang == "auto":
+        # The task named no language, so the model's own choice decides how it is run. A reply
+        # with nothing recognisable in it is skipped rather than zeroed — an ungradeable answer
+        # says nothing about correctness, which is the same contract as a missing toolchain.
+        picked = _bench_graders_mod._bench_detect_lang(text)
+        if not picked:
+            return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
+                    "score": 0.0, "skipped": True,
+                    "error": "no recognisable code in the reply, and the task named no language"}
+        if not _bench_lang_available(picked):
+            return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
+                    "score": 0.0, "skipped": True,
+                    "error": f"the model chose {picked}, which this machine cannot grade"}
+        lang = picked
     code = (text if lang in ("text", "answer", "format", "refusal", "langpick", "needles")
             else _bench_extract_code(text, lang))
     # A model that answered in its reasoning field has still answered. Measured: at 700k this
@@ -12133,6 +12159,9 @@ async def _bench_grade(text: str, task: dict, timeout_s: float,
     # read as recall collapsing at 256k. Flagged rather than silently scored.
     if finish_reason == "length" and res.get("passed", 0) < total:
         res["truncated"] = True
+    if any(c.get("visible") for c in (task.get("cases") or [])):
+        _bench_graders_mod._bench_split_visible(res, task["cases"])
+        res["chose_lang"] = lang
     return res
 
 
