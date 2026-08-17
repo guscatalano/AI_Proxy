@@ -14355,14 +14355,21 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         # long-context test. Episodes are excluded: their length comes from
                         # the transcript they build, and padding the first turn would
                         # measure something else.
+                        #
+                        # stream_tools tasks are NOT episodes and must stay eligible. The
+                        # transport suite is pointless at bench prompt sizes: the tool-call
+                        # loss it hunts was measured on prompts of 70k tokens and up, and a
+                        # clean result at 2k tokens says nothing about that. Excluding every
+                        # task carrying `tools` swept these up with the episodes and left the
+                        # suite unable to reach the conditions it exists to reproduce.
+                        _stream_tools = bool((task or {}).get("stream_tools"))
+                        _is_episode = bool((task or {}).get("tools")) and not _stream_tools
                         prompt = (
                             _bench_task_at_depth(task_prompt, prompt_tokens, randomize, seq)
-                            if (task_prompt is not None and prompt_tokens
-                                and not (task or {}).get("tools"))
+                            if (task_prompt is not None and prompt_tokens and not _is_episode)
                             else task_prompt if task_prompt is not None
                             else _bench_build_prompt(prompt_tokens, randomize, seq))
                         wave_tasks.append(task)
-                        _stream_tools = bool((task or {}).get("stream_tools"))
                         if task and task.get("tools") and not _stream_tools:
                             # An agent task is an episode, not a completion: its runner owns
                             # the tool loop and returns the row already graded.

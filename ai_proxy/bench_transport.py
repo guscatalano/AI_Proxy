@@ -17,18 +17,32 @@ purpose — any model that can call a tool at all should score 100%, so anything
 transport losing calls rather than the model failing to make them. A model genuinely incapable of
 tool calling scores 0% everywhere, which is a different and equally visible shape.
 
-Detection is statistical. At a ~2.5% loss rate, 12 tasks x runs=1 will usually see nothing;
-runs=10 gives 120 attempts and about a 95% chance of catching at least one. Run it with runs
-high, or read a clean result as "no gross breakage" rather than "no loss".
+HOW MANY ATTEMPTS, AND AT WHAT SIZE. A clean run never proves the rate is zero; it puts a
+ceiling on it. With no failures in n attempts the 95% upper bound is 3/n — the rule of three:
 
-KNOWN GAP, so a clean result is not over-read. The first run of this suite scored 120/120 on the
-same backend and model that was losing calls in production, and the proxy's own recovery counter
-fired zero times — the failure simply did not occur. These prompts are short and go out over
-/v1/chat/completions, while the 2.5% was measured on claude-code: prompts of 70k tokens and up,
-arriving through the Anthropic bridge. Those conditions are not reproduced here, so this suite
-currently proves the backend is not *grossly* broken rather than that it never drops a call.
-Closing that gap means a long-prompt variant and a bridged path, both of which cost real time
-per attempt — worth doing before trusting a green result as an all-clear.
+    n =   120  ->  rate < 2.5%          n =  600  ->  rate < 0.5%
+    n = 1,200  ->  rate < 0.25%         n = 3000  ->  rate < 0.1%
+
+12 tasks x runs=10 is 120 attempts, which bounds the rate at 2.5% — the very rate being tested
+for, so the first clean run of this suite established nothing at all. Pick n from the bound you
+want: `runs=50` (600 attempts) is the first setting that says something the incident did not
+already say.
+
+SIZE MATTERS MORE THAN COUNT. The loss was measured on claude-code, whose prompts start around
+70k tokens, and 3,000 attempts at 2k tokens would still say nothing about that. Use the
+`prompt_tokens` axis to ask these same tasks from inside a real-sized context — `prompt_tokens:
+70000` puts them where the failure actually lived. It costs what it costs: ~35s per attempt at
+70k on this box, so 600 attempts is roughly six hours, and that is the honest price of a 0.5%
+bound under realistic conditions.
+
+STILL NOT COVERED: the Anthropic bridge. claude-code's traffic is translated on the way through,
+and the bench posts OpenAI-shape requests to /v1/chat/completions, so the bridged path this bug
+was measured on is not exercised here at any size or count.
+
+AND THE CHEAPER ANSWER: production already measures this continuously and under perfect
+conditions. Every recovery lands as a `tool_stream` gate rule and every undelivered turn as
+`empty_output`, across thousands of real requests a week. This suite is the pre-deployment gate;
+those counters are the evidence.
 """
 
 # One tool, one obvious reason to call it. Anything cleverer risks measuring whether the model

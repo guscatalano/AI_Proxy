@@ -140,3 +140,36 @@ def test_prose_without_a_call_is_a_loss_not_a_pass():
         {"choices": [{"delta": {}, "finish_reason": "stop"}]},
     ))
     assert row["tool_calls"] == 0
+
+
+# --- the long-context axis, which is what makes a clean result mean anything ---------------
+#
+# The loss was measured at 70k+ tokens. Bench prompts are a couple of thousand, and the depth
+# axis excluded every task carrying `tools` — sweeping these up with the agent episodes and
+# leaving the suite permanently unable to reach the conditions it exists to reproduce.
+
+
+def _depth_eligible(task, prompt_tokens=70000):
+    """Mirror of the runner's decision: is this task padded to depth, or asked as-is?"""
+    stream_tools = bool(task.get("stream_tools"))
+    is_episode = bool(task.get("tools")) and not stream_tools
+    return bool(prompt_tokens) and not is_episode
+
+
+def test_transport_tasks_can_be_asked_from_inside_a_long_context():
+    for t in P._BENCH_SUITES["transport-v1"]:
+        assert _depth_eligible(t), f"{t['id']} cannot reach the size the bug lived at"
+
+
+def test_agent_episodes_are_still_excluded_from_the_axis():
+    """Their length comes from the transcript they build; padding turn one measures something
+    else. That exclusion is the reason the rule exists and must survive."""
+    episodes = [t for t in P._BENCH_SUITES["agent-v2"] if t.get("tools")]
+    assert episodes, "expected agent-v2 to contain episodes"
+    for t in episodes:
+        assert not _depth_eligible(t), f"{t['id']} should not be padded to depth"
+
+
+def test_a_plain_task_is_still_eligible():
+    plain = next(t for t in P._BENCH_SUITES["coding-v2"] if not t.get("tools"))
+    assert _depth_eligible(plain)
