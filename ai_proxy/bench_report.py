@@ -2421,67 +2421,191 @@ _GUIDE_SUITE_BLURB = {
 
 
 def _bench_guide_html(suites: list, examples: dict) -> str:
-    """A page that says what each suite asks and what a right and wrong answer look like.
+    """One card per task: what it asks, how often it is passed, and what right and wrong look
+    like. Cards rather than table rows because these are not comparable quantities — a stat
+    line, an ask, the reason a task exists and a real failure are four different kinds of
+    thing, and a row forces them into columns sized for the widest of them.
 
-    The right answer comes from the task's own cases — the same vocabulary the failure examples
-    use, so a reader who has seen one recognises the other. The wrong answer is a REAL reply
-    from a stored run wherever one exists, because an invented failure teaches the shape of a
-    mistake nobody made; the ones that actually happen are stranger and more instructive than
-    anything written to illustrate a point.
+    The failing answer is a REAL reply from a stored run. Three channels record one: a wrong
+    return value, a crash inside a case, and code that never compiled. Reading only the first
+    hid every task that failed to build — the loudest failure a coding suite can have.
     """
-    blocks = []
+    kinds = {"build": ("did not build", "b-build"),
+             "crash": ("crashed", "b-crash"),
+             "wrong": ("wrong answer", "b-wrong")}
+    groups = []
     for suite in suites:
         tasks = suite.get("tasks") or []
         if not tasks:
             continue
         cats = sorted({t.get("category") for t in tasks if t.get("category")})
-        blurbs = "".join(
-            f'<p class="note"><b>{_h(c)}</b> — {_h(_GUIDE_SUITE_BLURB.get(c, ""))}</p>'
-            for c in cats if _GUIDE_SUITE_BLURB.get(c))
-        rows = []
+        blurb = " ".join(_GUIDE_SUITE_BLURB.get(c, "") for c in cats).strip()
+        cards = []
         for t in tasks:
-            good = "".join(
-                f"<li><code>{_h(w)}</code> &rarr; <code>{_h(e)}</code></li>"
-                for w, e in (t.get("good") or [])[:4]) or "<li>—</li>"
-            bad = "".join(
-                f'<li><code>{_h(b)}</code></li>' for b in (examples.get(t["id"]) or [])[:2])
-            bad = bad or ('<li class="none">no failure on record — every model that has run '
-                          'this task passed it</li>')
-            rows.append(
-                f'<tr><th scope="row"><code>{_h(t["id"])}</code>'
-                f'<div class="k">{_h(t.get("lang") or "python")}</div></th>'
-                f'<td><div class="d">{_h(t.get("desc") or "")}</div>'
-                f'<div class="why">{_h(t.get("note") or "")}</div></td>'
-                f'<td><ul class="ex ok">{good}</ul></td>'
-                f'<td><ul class="ex bad">{bad}</ul></td></tr>')
-        blocks.append(
-            f'<section><h2>{_h(suite["name"])} <span class="k">{len(tasks)} tasks</span></h2>'
-            f'{blurbs}'
-            f'<div class="tbl"><table><thead><tr><th>Task</th><th>What it asks</th>'
-            f'<th>A passing answer</th><th>A real failure</th></tr></thead>'
-            f'<tbody>{"".join(rows)}</tbody></table></div></section>')
+            st = t.get("stats") or {}
+            runs, perfect = st.get("runs") or 0, st.get("perfect") or 0
+            if runs:
+                pct = perfect / runs
+                cls = "hi" if pct >= 0.9 else ("lo" if pct < 0.5 else "mid")
+                stat = (f'<div class="stat {cls}"><b>{pct * 100:.0f}%</b>'
+                        f'<span>{perfect} of {runs} runs passed</span></div>')
+            else:
+                stat = '<div class="stat none"><b>&mdash;</b><span>never run</span></div>'
+            good = "".join(f"<li><code>{_h(w)}</code> <em>&rarr;</em> <code>{_h(e)}</code></li>"
+                           for w, e in (t.get("good") or [])[:4]) or "<li>&mdash;</li>"
+            fails = examples.get(t["id"]) or []
+            if fails:
+                bad = ""
+                for k, txt in fails[:3]:
+                    label, cls2 = kinds.get(k, ("failed", "b-wrong"))
+                    bad += (f'<li><span class="badge {cls2}">{label}</span>'
+                            f'<code>{_h(txt)}</code></li>')
+            else:
+                bad = '<li class="clean">nothing has failed this yet</li>'
+            hay = " ".join([t["id"], t.get("desc") or "", t.get("lang") or "",
+                            suite["name"]]).lower()
+            cards.append(
+                f'<article class="card" data-q="{_h(hay)}">'
+                f'<header><code class="tid">{_h(t["id"])}</code>'
+                f'<span class="mode">{_h(t.get("lang") or "python")}</span></header>'
+                f'{stat}'
+                f'<p class="ask">{_h(t.get("desc") or "")}</p>'
+                f'<p class="why">{_h(t.get("note") or "")}</p>'
+                f'<div class="half"><h4>Passes with</h4><ul class="ok">{good}</ul></div>'
+                f'<div class="half"><h4>Real failures</h4><ul class="bad">{bad}</ul></div>'
+                f'</article>')
+        groups.append(
+            f'<section class="grp" data-suite="{_h(suite["name"].lower())}">'
+            f'<button class="ghead" aria-expanded="true">'
+            f'<span class="chev">&#9662;</span>'
+            f'<span class="gname">{_h(suite["name"])}</span>'
+            f'<span class="gcount">{len(tasks)} tasks</span>'
+            f'<span class="gblurb">{_h(blurb[:150])}</span></button>'
+            f'<div class="cards">{"".join(cards)}</div></section>')
 
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Benchmark guide — what each test asks</title>
-<style>{_REPORT_CSS}
-  .ex {{ margin:0; padding-left:1.1em; }}
-  .ex li {{ margin:2px 0; font-size:12px; }}
-  .ex.ok li::marker {{ color:var(--good); }}
-  .ex.bad li::marker {{ color:var(--bad); }}
-  .ex li.none {{ color:var(--ink-faint); font-style:italic; list-style:none; margin-left:-1.1em; }}
-  .d {{ font-size:12.5px; }}
-  .why {{ font-size:11.5px; color:var(--ink-faint); margin-top:3px; }}
-  tbody th {{ vertical-align:top; white-space:nowrap; }}
-  tbody td {{ vertical-align:top; }}
-</style></head><body><main>
-<h1>Benchmark guide</h1>
-<p class="note">Every task in every suite: what it asks, why it is in the suite, what a passing
-answer looks like, and — where one exists — a reply that actually failed it on this machine.
-The failures are real. An invented one teaches the shape of a mistake nobody made, and the
-mistakes models actually make are stranger than anything written to illustrate a point.</p>
-{"".join(blocks)}
-</main></body></html>"""
+    css = """
+  .toolbar { position:sticky; top:0; z-index:5; background:var(--bg); padding:10px 0 12px;
+             display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+             border-bottom:1px solid var(--border); margin-bottom:14px; }
+  .toolbar input { flex:1; min-width:220px; background:var(--panel); color:var(--ink);
+                   border:1px solid var(--border); border-radius:8px; padding:8px 12px;
+                   font:inherit; font-size:13px; }
+  .toolbar button { background:var(--panel); color:var(--ink-dim); border:1px solid var(--border);
+                    border-radius:8px; padding:7px 12px; font:inherit; font-size:12px;
+                    cursor:pointer; }
+  .toolbar button.on { color:var(--bad); border-color:var(--bad); }
+  .toolbar .hits { color:var(--ink-faint); font-size:12px; font-family:var(--mono); }
+  .grp { margin:0 0 8px; }
+  .ghead { width:100%; display:flex; gap:10px; align-items:baseline; cursor:pointer;
+           background:var(--panel-2); border:1px solid var(--border); border-radius:10px;
+           padding:9px 13px; color:var(--ink); font:inherit; text-align:left; }
+  .ghead .chev { transition:transform .15s; color:var(--ink-faint); }
+  .grp.shut .ghead .chev { transform:rotate(-90deg); }
+  .grp.shut .cards { display:none; }
+  .gname { font-family:var(--mono); font-weight:600; }
+  .gcount { color:var(--ink-faint); font-size:11.5px; font-family:var(--mono); }
+  .gblurb { color:var(--ink-faint); font-size:11.5px; overflow:hidden; text-overflow:ellipsis;
+            white-space:nowrap; flex:1; }
+  .cards { display:grid; grid-template-columns:repeat(auto-fill,minmax(330px,1fr)); gap:10px;
+           padding:10px 0 4px; }
+  .card { border:1px solid var(--border); border-radius:10px; background:var(--panel);
+          padding:11px 13px; display:flex; flex-direction:column; gap:7px; }
+  .card header { display:flex; align-items:baseline; gap:8px; }
+  .card .tid { font-weight:600; font-size:13px; }
+  .card .mode { margin-left:auto; font-size:10px; letter-spacing:.06em; text-transform:uppercase;
+                color:var(--ink-faint); font-family:var(--mono); }
+  .stat { display:flex; align-items:baseline; gap:8px; border-bottom:1px solid var(--border);
+          padding-bottom:6px; }
+  .stat b { font-size:21px; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+  .stat span { font-size:11px; color:var(--ink-faint); }
+  .stat.hi b { color:var(--good); }
+  .stat.mid b { color:#d9a441; }
+  .stat.lo b { color:var(--bad); }
+  .stat.none b { color:var(--ink-faint); }
+  .card .ask { margin:0; font-size:12.5px; }
+  .card .why { margin:0; font-size:11.5px; color:var(--ink-faint); }
+  .half h4 { margin:0 0 3px; font-size:10px; letter-spacing:.07em; text-transform:uppercase;
+             color:var(--ink-faint); font-weight:500; }
+  .half ul { margin:0; padding-left:1.05em; }
+  .half li { font-size:11.5px; margin:2px 0; overflow-wrap:anywhere; }
+  .half ul.ok li::marker { color:var(--good); }
+  .half ul.bad li::marker { color:var(--bad); }
+  .half li.clean { list-style:none; margin-left:-1.05em; color:var(--ink-faint);
+                   font-style:italic; }
+  .half em { color:var(--ink-faint); font-style:normal; }
+  .badge { display:inline-block; font-size:9.5px; letter-spacing:.05em; text-transform:uppercase;
+           border-radius:4px; padding:1px 5px; margin-right:5px; font-family:var(--mono); }
+  .b-build { background:#4a2a2a; color:#ffb4b4; }
+  .b-crash { background:#4a3a20; color:#ffd8a0; }
+  .b-wrong { background:#332f4a; color:#c8c0ff; }
+  .card.hide, .grp.hide { display:none; }
+"""
+
+    script = """
+(function () {
+  var q = document.getElementById('q'), hits = document.getElementById('hits');
+  var cards = [].slice.call(document.querySelectorAll('.card'));
+  var groups = [].slice.call(document.querySelectorAll('.grp'));
+  var failOnly = false;
+  function apply() {
+    var term = (q.value || '').trim().toLowerCase();
+    var shown = 0;
+    cards.forEach(function (c) {
+      var hit = !term || (c.getAttribute('data-q') || '').indexOf(term) >= 0;
+      if (hit && failOnly && !c.querySelector('.bad li:not(.clean)')) hit = false;
+      c.classList.toggle('hide', !hit);
+      if (hit) shown++;
+    });
+    // A group whose cards are all filtered out is noise rather than context, and a filter that
+    // matches something inside a collapsed group has to open it or the hit is invisible.
+    groups.forEach(function (g) {
+      var any = g.querySelector('.card:not(.hide)');
+      g.classList.toggle('hide', !any);
+      if (any && (term || failOnly)) g.classList.remove('shut');
+    });
+    hits.textContent = shown + ' of ' + cards.length + ' tasks';
+  }
+  q.addEventListener('input', apply);
+  document.getElementById('expand').onclick = function () {
+    groups.forEach(function (g) { g.classList.remove('shut'); });
+  };
+  document.getElementById('collapse').onclick = function () {
+    groups.forEach(function (g) { g.classList.add('shut'); });
+  };
+  document.getElementById('onlyfail').onclick = function () {
+    failOnly = !failOnly;
+    this.classList.toggle('on', failOnly);
+    apply();
+  };
+  [].slice.call(document.querySelectorAll('.ghead')).forEach(function (h) {
+    h.onclick = function () {
+      var shut = h.parentNode.classList.toggle('shut');
+      h.setAttribute('aria-expanded', shut ? 'false' : 'true');
+    };
+  });
+  apply();
+})();
+"""
+
+    return ("<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            "<title>Benchmark guide</title>"
+            f"<style>{_REPORT_CSS}{css}</style></head><body><main>"
+            "<h1>Benchmark guide</h1>"
+            "<p class=\"note\">One card per task: what it asks, how often models pass it, what a "
+            "passing answer looks like, and — where one exists — a reply that actually "
+            "failed it on this machine. The failures are real and come in three kinds: a wrong "
+            "answer, a crash inside a case, and code that never built. An invented failure would "
+            "only teach the shape of a mistake nobody made.</p>"
+            "<div class=\"toolbar\">"
+            "<input id=\"q\" type=\"search\" placeholder=\"Search tasks, suites, languages…\" "
+            "autocomplete=\"off\">"
+            "<button id=\"expand\">Expand all</button>"
+            "<button id=\"collapse\">Collapse all</button>"
+            "<button id=\"onlyfail\">Only tasks with failures</button>"
+            "<span class=\"hits\" id=\"hits\"></span></div>"
+            + "".join(groups)
+            + f"<script>{script}</script></main></body></html>")
 
 
 def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:

@@ -11039,8 +11039,13 @@ def bench_guide(request: Request, suite: str = "", format: str = "html"):
     the shape of a mistake nobody made.
     """
     wanted = [s.strip() for s in (suite or "").split(",") if s.strip()] or list(_BENCH_SUITES)
-    # Real failures first: one pass over recent runs, keyed by task id.
+    # Real failures first: one pass over recent runs, keyed by task id. Three channels record
+    # a failure and only one of them is per-case `got`: a compile error lands in grade.error
+    # (18 of them across recent runs — "./task.go:7:2: errors imported and not used"), and a
+    # runtime error lands in the case's own `error` with got=null. Reading only `got` hid every
+    # task that never built, which is the loudest failure a coding suite can have.
     examples: dict = {}
+    stats: dict = {}
     conn = db()
     try:
         for row in conn.execute(
@@ -11053,15 +11058,27 @@ def bench_guide(request: Request, suite: str = "", format: str = "html"):
             for u in rows:
                 g = u.get("grade") or {}
                 tid = u.get("task")
-                if not tid or not g or g.get("passed", 0) >= g.get("total", 0):
+                if not tid or not g:
                     continue
-                for i, c in enumerate(g.get("cases") or []):
-                    if c.get("ok") or c.get("got") is None:
+                st = stats.setdefault(tid, {"runs": 0, "perfect": 0})
+                st["runs"] += 1
+                if g.get("passed", 0) >= g.get("total", 0):
+                    st["perfect"] += 1
+                    continue
+                found = []
+                if g.get("error"):
+                    found.append(("build", str(g["error"])[:200]))
+                for c in (g.get("cases") or []):
+                    if c.get("ok"):
                         continue
-                    txt = str(c.get("got"))[:150]
-                    examples.setdefault(tid, [])
-                    if txt not in examples[tid] and len(examples[tid]) < 3:
-                        examples[tid].append(txt)
+                    if c.get("error"):
+                        found.append(("crash", str(c["error"])[:160]))
+                    elif c.get("got") is not None:
+                        found.append(("wrong", str(c.get("got"))[:160]))
+                seen = examples.setdefault(tid, [])
+                for kind, txt in found:
+                    if not any(txt == t for _k, t in seen) and len(seen) < 3:
+                        seen.append((kind, txt))
     finally:
         conn.close()
 
@@ -11086,13 +11103,14 @@ def bench_guide(request: Request, suite: str = "", format: str = "html"):
                 "desc": _BENCH_TASK_DESC.get(t["id"]) or "",
                 "note": _BENCH_TASK_NOTES.get(t["id"]) or "",
                 "good": good,
+                "stats": stats.get(t["id"]) or {"runs": 0, "perfect": 0},
             })
         out.append({"name": name, "tasks": shaped})
     if not out:
         return JSONResponse({"error": f"no such suite; available: {list(_BENCH_SUITES)}"},
                             status_code=404)
     if format == "json":
-        return {"suites": out, "failures": examples}
+        return {"suites": out, "failures": examples, "stats": stats}
     return Response(content=_bench_report_mod._bench_guide_html(out, examples),
                     media_type="text/html; charset=utf-8")
 

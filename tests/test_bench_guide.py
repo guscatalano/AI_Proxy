@@ -68,4 +68,65 @@ def test_real_failures_are_used_rather_than_invented_ones(client):
     body = client.get("/__proxy/api/bench/guide?format=json").json()
     assert isinstance(body.get("failures"), dict)
     html = client.get("/__proxy/api/bench/guide").text
-    assert "no failure on record" in html or "A real failure" in html
+    assert "Real failures" in html
+    assert "nothing has failed this yet" in html, "tasks with a clean record must say so"
+
+
+def test_all_three_failure_channels_are_surfaced():
+    """Measured across recent runs on the box: 135 failures carried a per-case `got`, 18 were
+    compile errors in grade.error, and 6 were runtime errors in the case's own `error` with
+    got=null. Reading only `got` hid every task that never built — the loudest failure a coding
+    suite can have. Driven directly rather than through the endpoint, because a fresh test
+    database has no stored runs to draw a real compile error from."""
+    from ai_proxy import bench_report as R
+    suites = [{"name": "coding-v3", "tasks": [
+        {"id": "go_rle_decode", "lang": "go", "desc": "d", "note": "n", "good": [("f(1)", "2")],
+         "stats": {"runs": 4, "perfect": 1}},
+    ]}]
+    examples = {"go_rle_decode": [
+        ("build", 'compile error: ./task.go:7:2: "errors" imported and not used'),
+        ("crash", "UnboundLocalError: cannot access local variable"),
+        ("wrong", "f(1) -> 3, expected 2"),
+    ]}
+    html = R._bench_guide_html(suites, examples)
+    for label in ("did not build", "crashed", "wrong answer"):
+        assert label in html, f"the {label!r} failure kind is never shown"
+    assert "imported and not used" in html, "the compiler's own words are the useful part"
+
+
+def test_the_endpoint_collects_build_errors_not_only_case_results():
+    """The gap was in collection, not rendering: grade.error was never read."""
+    import inspect
+    from ai_proxy import proxy as P
+    src = inspect.getsource(P.bench_guide)
+    assert 'g.get("error")' in src, "compile failures are still dropped"
+    assert 'c.get("error")' in src, "per-case crashes are still dropped"
+    assert 'c.get("got")' in src
+
+
+def test_each_card_carries_a_pass_rate(client):
+    """The stat line is the point of a card. A task nobody has run says so rather than
+    showing a zero, which would read as a task everything fails."""
+    html = client.get("/__proxy/api/bench/guide").text
+    assert 'class="stat' in html
+    assert "runs passed" in html or "never run" in html
+
+
+def test_the_page_is_searchable_and_groups_collapse(client):
+    """177 tasks is too many to scroll. Search filters the cards, and a group whose cards are
+    all filtered out hides itself rather than leaving an empty header behind."""
+    html = client.get("/__proxy/api/bench/guide").text
+    assert 'id="q"' in html and "type=\"search\"" in html
+    assert 'class="ghead"' in html and "shut" in html
+    assert "Only tasks with failures" in html
+
+
+def test_the_suite_header_carries_its_own_row(client):
+    """The group heading is a control, not a separate section — one chevron, name, task count
+    and blurb on a single row, so the cards below it stay in one grid."""
+    html = client.get("/__proxy/api/bench/guide").text
+    import re as _re
+    m = _re.search(r'<button class="ghead".*?</button>', html, _re.S)
+    assert m, "the group header is gone"
+    for part in ("chev", "gname", "gcount", "gblurb"):
+        assert part in m.group(0), f"{part} missing from the header row"
