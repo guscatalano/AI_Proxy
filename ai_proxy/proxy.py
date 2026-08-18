@@ -3004,6 +3004,17 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 RULES_REGISTRY: dict = {}
 
 DEFAULT_RULES_CONFIG = {
+    # Clients reserve output budget they never use, and OpenAI-compatible engines count that
+    # reservation against the context window: vLLM rejects input+max_tokens > max_model_len
+    # outright. Claude Code asks for 64,000 output tokens, which turned a 262,144 window into a
+    # 198,144 one and 400'd every request whose transcript had grown past that — "maximum context
+    # length is 262144 tokens. However, you requested 64000 output tokens and your prompt
+    # contains at least 198145 input tokens". Measured replies on this box run 26-1,952 tokens,
+    # so the reservation buys nothing and costs a quarter of the window.
+    "output_budget": {
+        "enabled": True,
+        "max_tokens": 8192,      # generous: the largest reply seen here was 1,952 tokens
+    },
     "loop_detector": {
         # Nudge before blocking: a repeating model has usually not noticed, and an injected note
         # is the only thing that changes its context. Blocking ends the turn; that is the escalation.
@@ -17929,12 +17940,28 @@ async def proxy(full_path: str, request: Request):
             _so["include_usage"] = True
             usage_injected = True
 
+    # output_budget: clamp an oversized max_tokens reservation (see the rule for the incident).
+    # Applied after the bridge, so the Anthropic max_tokens that has been translated onto the
+    # OpenAI body is the one clamped rather than a value the translation would discard.
+    output_clamped = None
+    _ob = load_rules_config().get("output_budget") or {}
+    if (_ob.get("enabled") and isinstance(body_json, dict)
+            and upstream_label not in ("anthropic",)):
+        _cap = int(_ob.get("max_tokens", 8192) or 8192)
+        try:
+            _want = int(body_json.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            _want = 0
+        if _want > _cap:
+            body_json["max_tokens"] = _cap
+            output_clamped = {"from": _want, "to": _cap}
+
     body_mutated = bool(
         rewrite or options_inject or bridge_active or tool_injection_active
         or compaction_reminder_injected
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
-        or ctx_capped or usage_injected or think_quirk_applied
+        or ctx_capped or usage_injected or think_quirk_applied or output_clamped
         or (compressed and compressed.get("action") == "compress")
     )
     if body_mutated:
