@@ -2218,6 +2218,31 @@ function renderList() {
     const emptyBadge = it.empty_output
       ? `<span class="badge" title="the upstream billed ${num(it.completion_tokens || 0)} tokens and delivered nothing — no content, no reasoning, no tool call${it.inflight_at_finish ? ' · ' + it.inflight_at_finish + ' requests in flight at the time' : ''}" style="background:#4a2020;color:#ff9a9a;border-color:#6a3030">⌀ empty</span>`
       : '';
+    // A tool call and its result arrive in different requests, so the row that made the call
+    // could only ever say that it HAD called something — never whether it worked. That is how
+    // the same failing Edit repeated twelve times before anyone could see why. The outcome is
+    // resolved when the next turn reports back and written onto the request that asked.
+    let toolBadge = '';
+    if (it.tool_outcome) {
+      let detail = [];
+      try { detail = JSON.parse(it.tool_outcome_detail || '[]') || []; } catch (e) { detail = []; }
+      const names = detail.map(d => d.name).filter(Boolean).join(', ');
+      const failed = detail.filter(d => !d.ok);
+      // The excerpt is the whole point: "Edit failed" sends you to the transcript,
+      // "Edit: String to replace not found" does not.
+      const why = failed.map(d => `${d.name}: ${d.excerpt || 'failed'}`).join(' · ');
+      const style = {
+        ok:      'background:#1f3a24;color:#8fdc9b;border-color:#2f5a37',
+        error:   'background:#4a2020;color:#ff9a9a;border-color:#6a3030',
+        partial: 'background:#4a3a1a;color:#f0c674;border-color:#6a5a2a',
+        pending: 'background:#2a2a33;color:#9a9aa8;border-color:#3a3a48',
+      }[it.tool_outcome] || 'background:#2a2a33;color:#9a9aa8';
+      const label = { ok: '✓ tools', error: '✗ tools', partial: '± tools', pending: '⋯ tools' }[it.tool_outcome] || it.tool_outcome;
+      const tip = it.tool_outcome === 'pending'
+        ? `called ${names || 'a tool'} — no result came back, so the agent left the call unanswered`
+        : (why || `${names || 'tool call'} succeeded`);
+      toolBadge = `<span class="badge" title="${esc(tip)}" style="${style}">${label}</span>`;
+    }
     const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
@@ -2245,7 +2270,7 @@ function renderList() {
       pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
     }
     else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${emptyBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${emptyBadge}${toolBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
