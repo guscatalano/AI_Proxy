@@ -5291,6 +5291,16 @@ def evaluate_context_overflow(body, ctx) -> dict | None:
             "reason": f"prompt ~{est_tokens} tok exceeds num_ctx={num_ctx} (will be silently truncated by Ollama)"}
 
 
+def _pct_bucket(pct: int) -> str:
+    """Coarsen a percentage so the reminder text is stable across turns.
+
+    An exact figure ("~240916 tokens (~91%)") changes every request, so even a tail-appended
+    reminder would re-prefill on each turn. Ten-point buckets change a handful of times over a
+    whole conversation instead.
+    """
+    return "%d%%" % (max(0, min(100, int(pct))) // 10 * 10)
+
+
 def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
     """When the prompt is creeping toward num_ctx, return an action describing how to nudge
     the client/model to compact. Strategy depends on client_app — Claude Code respects the
@@ -5326,16 +5336,16 @@ def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
     }
     if strategy == "system_reminder":
         text = (
-            f"<system-reminder>This conversation has used ~{est} tokens "
-            f"(~{pct}% of the {num_ctx}-token context window). Strongly suggest the user "
-            f"run /compact to summarize older turns before continuing, or start a new chat.</system-reminder>"
+            f"<system-reminder>This conversation has passed {_pct_bucket(pct)} of the "
+            f"{num_ctx}-token context window. Strongly suggest the user run /compact to "
+            f"summarize older turns before continuing, or start a new chat.</system-reminder>"
         )
         return {**base, "action": "system_reminder", "text": text,
                 "reason": f"prompt ~{est} tok ({pct}%) — injecting <system-reminder> for {client_app}"}
     if strategy == "system_reminder_plain":
         text = (
-            f"NOTE: this conversation has used ~{est} tokens (~{pct}% of the available "
-            f"context). Before continuing, advise the user to summarize earlier turns or "
+            f"NOTE: this conversation has passed {_pct_bucket(pct)} of the available "
+            f"context. Before continuing, advise the user to summarize earlier turns or "
             f"start a fresh conversation. Long conversations cause silent truncation and "
             f"degrade response quality."
         )
@@ -5352,6 +5362,47 @@ def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
         return {**base, "action": "synthetic_response", "text": msg,
                 "reason": f"prompt ~{est} tok ({pct}%) — synthetic nudge for {client_app}"}
     return None
+
+
+def _inject_trailing_reminder(body: dict, reminder: str) -> bool:
+    """Append `reminder` at the END of the conversation, leaving the prefix byte-identical.
+
+    _inject_system_reminder appends to the FIRST system message, which sits at the very front of
+    the prompt. That is fatal for a nudge that fires repeatedly: every request presents a
+    different prefix, the engine's prefix cache misses, and each turn pays a full prefill.
+    Measured when the compaction nudge was first switched on here — large-context turns went from
+    a median of 8s with 70% under 30s, to a median of 235s with NONE under 30s, which is past the
+    180s Claude Code waits before hanging up. The nudge meant to reduce the cost of a long
+    conversation instead made every long turn as expensive as possible.
+
+    Appending at the tail keeps everything before it cached, so the re-prefill is the reminder
+    itself rather than the transcript. Attached to the last user message rather than added as a
+    trailing system message, because that is the shape agent clients already use for injected
+    notes and it cannot be mistaken for a new turn.
+    """
+    if not isinstance(body, dict) or not reminder:
+        return False
+    msgs = body.get("messages")
+    if isinstance(msgs, list) and msgs:
+        for m in reversed(msgs):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                if reminder in c:
+                    return False            # already carried; do not stack duplicates
+                m["content"] = c.rstrip() + (chr(10) * 2) + reminder
+                return True
+            if isinstance(c, list):
+                if any(isinstance(p, dict) and p.get("text") == reminder for p in c):
+                    return False
+                c.append({"type": "text", "text": reminder})
+                return True
+        msgs.append({"role": "user", "content": reminder})
+        return True
+    # Anthropic shape with no messages to attach to: the system field is the only place left,
+    # and a request with no turns has no prefix worth protecting.
+    return _inject_system_reminder(body, reminder)
 
 
 def _inject_system_reminder(body: dict, reminder: str) -> bool:
@@ -18103,7 +18154,7 @@ async def proxy(full_path: str, request: Request):
                   if isinstance(body_json, dict) else None)
     compaction_reminder_injected = False
     if compaction and compaction.get("action") == "system_reminder":
-        compaction_reminder_injected = _inject_system_reminder(body_json, compaction.get("text") or "")
+        compaction_reminder_injected = _inject_trailing_reminder(body_json, compaction.get("text") or "")
         if compaction_reminder_injected:
             _save_gate(req_id, {
                 "verdict": "rewrite",
