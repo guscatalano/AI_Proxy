@@ -74,6 +74,11 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
+# A second vLLM process, so two models can be resident at once and a router rule can choose
+# between them. Deliberately control="none" below: this one is started by hand, and the
+# docker-control path resolves "the container publishing VLLM_URL" — pointing it at a second
+# port would have it stop the wrong container.
+VLLM2_URL = os.environ.get("VLLM2_URL", "http://localhost:8002").rstrip("/")
 # llama.cpp's own server. Its own slot rather than borrowing LM Studio's port: both speak the
 # same OpenAI shape, so squatting works — and then every log row, bench result and report says
 # "lmstudio" for numbers that came from llama.cpp. Mislabelled measurements are worse than none.
@@ -1952,12 +1957,12 @@ async def _vllm_boot_state() -> dict:
     return info
 
 
-async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
+async def _vllm_snapshot(client: httpx.AsyncClient, base: str | None = None) -> dict:
     """vLLM OpenAI-compat: /v1/models lists the served model(s) (always 'loaded' — vLLM serves
     one config at a time); /metrics (Prometheus text) has live running/waiting counts + KV usage."""
     out = {"reachable": False, "loaded": [], "available": []}
     try:
-        r = await client.get(f"{VLLM_URL}/v1/models")
+        r = await client.get(f"{base or VLLM_URL}/v1/models")
         if r.status_code == 200:
             out["reachable"] = True
             out["state"] = "ready"
@@ -1976,7 +1981,7 @@ async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
         out.update(await _vllm_boot_state())
         return out
     try:
-        r = await client.get(f"{VLLM_URL}/metrics")
+        r = await client.get(f"{base or VLLM_URL}/metrics")
         if r.status_code == 200:
             for key, metric in (("running", "vllm:num_requests_running"),
                                 ("waiting", "vllm:num_requests_waiting"),
@@ -2667,6 +2672,9 @@ def _register_backends():
     for p in (
         _VllmProvider("vllm", "vLLM", _vllm_snapshot, lambda: VLLM_URL,
                       load_mode="fixed", control="docker"),
+        _FnProvider("vllm2", "vLLM (2nd)",
+                    lambda c: _vllm_snapshot(c, VLLM2_URL), lambda: VLLM2_URL,
+                    load_mode="fixed", control="none"),
         _LlamaCppProvider("llamacpp", "llama.cpp", _llamacpp_snapshot, lambda: LLAMACPP_URL,
                           load_mode="fixed", control="unit"),
         _LmStudioProvider("lmstudio", "LM Studio", _lmstudio_snapshot, lambda: LMSTUDIO_URL,
