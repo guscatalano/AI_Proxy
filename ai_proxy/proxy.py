@@ -566,6 +566,13 @@ MIGRATIONS = [
     # as a column because it is invisible in every existing view — status is 200 and the token
     # counts look healthy.
     "ALTER TABLE requests ADD COLUMN empty_output INTEGER",
+    # A tool call and its outcome arrive in DIFFERENT requests: the model asks in turn N, and
+    # the client reports what happened in turn N+1. Without joining them the request list shows
+    # that Edit was called and never that it failed, which is how the same failing Edit repeated
+    # twelve times before anyone could see why.
+    "ALTER TABLE requests ADD COLUMN tool_call_ids TEXT",
+    "ALTER TABLE requests ADD COLUMN tool_outcome TEXT",
+    "ALTER TABLE requests ADD COLUMN tool_outcome_detail TEXT",
     # What else was in flight when it happened. The failure is intermittent and survives replay,
     # so the question is what was different at that moment rather than what was in the request.
     "ALTER TABLE requests ADD COLUMN inflight_at_finish INTEGER",
@@ -6826,7 +6833,7 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
                   upstream, client_ip, client_app, surface, api_key_fp, gate_verdict, gate_rule, gate_reason,
                   shadow_of, has_images, reasoning_effort, thinking, thinking_src,
-                  empty_output, inflight_at_finish
+                  empty_output, inflight_at_finish, tool_outcome, tool_outcome_detail
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -15662,6 +15669,61 @@ def _thinking_intent(body) -> tuple[str | None, str | None, str | None]:
     return effort, mode, src
 
 
+def _resolve_tool_outcomes(conversation_id: str, body_json) -> int:
+    """Write the results carried by this request back onto the requests that asked for them.
+
+    A tool call and its outcome live in different requests: the model asks in turn N, the client
+    reports what happened in turn N+1. Nothing joined them, so the request list could show that
+    Edit had been called twelve times and never that all twelve failed with "String to replace
+    not found" — the reason it kept retrying was only visible by opening the *next* request's
+    body and reading the transcript by hand.
+
+    Matching is by tool_call_id, which is why the ids are stored rather than just the names.
+    Bounded to the recent history of one conversation: results reference calls from the turn
+    immediately before, and an unbounded scan would walk a 900-message transcript every request.
+    """
+    if not conversation_id or not isinstance(body_json, dict):
+        return 0
+    results = _tool_results_with_ids(body_json)
+    if not results:
+        return 0
+    by_id = {r["id"]: r for r in results}
+    updated = 0
+    try:
+        conn = db()
+        rows = conn.execute(
+            "SELECT id, tool_call_ids, tool_outcome FROM requests "
+            "WHERE conversation_id=? AND tool_call_ids IS NOT NULL "
+            "ORDER BY ts DESC LIMIT 12", (conversation_id,)).fetchall()
+        for row in rows:
+            if row["tool_outcome"] and row["tool_outcome"] != "pending":
+                continue                       # already resolved; do not rewrite history
+            try:
+                calls = json.loads(row["tool_call_ids"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            matched = [by_id[c["id"]] for c in calls
+                       if isinstance(c, dict) and c.get("id") in by_id]
+            if not matched:
+                continue
+            failed = [m for m in matched if not m["ok"]]
+            # "partial" is its own verdict: one failure among several calls is a different
+            # situation from every call failing, and flattening them would hide which.
+            outcome = ("ok" if not failed else
+                       "error" if len(failed) == len(matched) else "partial")
+            detail = [{"name": m["name"], "ok": m["ok"], "excerpt": m["excerpt"][:240]}
+                      for m in matched]
+            conn.execute("UPDATE requests SET tool_outcome=?, tool_outcome_detail=? WHERE id=?",
+                         (outcome, json.dumps(detail), row["id"]))
+            updated += 1
+        if updated:
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[tool_outcome] resolve failed: {type(e).__name__}: {e}")
+    return updated
+
+
 def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: str, body_text: str, body_json, model, is_stream: bool, upstream: str | None = None):
     conv_id = _conversation_id(body_json)
     turn = _turn_index(body_json)
@@ -15748,6 +15810,14 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     # every hindsight call. Absence of data and absence of streaming should not look alike.
     _LIVE_STREAMS[req_id] = {"prompt": None, "completion": None, "est_prompt": est or None,
                              "stream": bool(is_stream), "buf": ""}
+    # This request carries the outcomes of the calls the PREVIOUS one made. Resolving here, on
+    # the way in, is what closes the loop between a call and its result — they arrive one turn
+    # apart and nothing joined them before. Never allowed to fail a request: it is bookkeeping
+    # about a turn that has already finished.
+    try:
+        _resolve_tool_outcomes(conv_id, body_json)
+    except Exception as e:
+        print(f"[tool_outcome] {type(e).__name__}: {e}")
 
 
 _TOOL_ERROR_PATTERNS = (
@@ -15860,6 +15930,125 @@ def _tool_results_in_body(body) -> list[tuple[str, str]]:
                     text = "Error: " + text
                 pairs.append((name, text))
     return pairs
+
+
+def _extract_tool_call_ids(response_body, stream_text) -> list[dict]:
+    """The calls a response made, as [{"id", "name"}] — the id being the join key.
+
+    _extract_tool_calls returns names only, which is enough to count what was invoked but not to
+    match a result back to the call that caused it: the result in the next request references
+    tool_call_id. Same three shapes it handles, kept separate rather than widened so its many
+    existing callers keep getting a plain list of names.
+    """
+    out: list[dict] = []
+    seen: set = set()
+
+    def add(tid, name):
+        if not tid or tid in seen:
+            return
+        seen.add(tid)
+        out.append({"id": str(tid), "name": str(name or "?")})
+
+    def from_choices(choices):
+        for c in choices or []:
+            if not isinstance(c, dict):
+                continue
+            for src in (c.get("message"), c.get("delta")):
+                if not isinstance(src, dict):
+                    continue
+                for tc in (src.get("tool_calls") or []):
+                    if isinstance(tc, dict):
+                        add(tc.get("id"), (tc.get("function") or {}).get("name"))
+
+    def from_anthropic(content):
+        for blk in content or []:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                add(blk.get("id"), blk.get("name"))
+
+    for blob in (response_body, stream_text):
+        if not blob:
+            continue
+        for raw in str(blob).splitlines() or [str(blob)]:
+            line = raw[6:] if raw.startswith("data: ") else raw
+            line = line.strip()
+            if not line or line == "[DONE]" or not line.startswith("{"):
+                continue
+            try:
+                j = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            from_choices(j.get("choices"))
+            if isinstance(j.get("message"), dict):
+                from_choices([{"message": j["message"]}])
+            if isinstance(j.get("content"), list):
+                from_anthropic(j["content"])
+            # Streamed Anthropic: the id arrives on the block that opens the call.
+            if j.get("type") == "content_block_start":
+                cb = j.get("content_block") or {}
+                if cb.get("type") == "tool_use":
+                    add(cb.get("id"), cb.get("name"))
+    return out
+
+
+def _tool_results_with_ids(body) -> list[dict]:
+    """Results carried by a REQUEST body, as [{"id", "name", "ok", "excerpt"}].
+
+    The mirror of _extract_tool_call_ids: this reads what came back, that one reads what was
+    asked. Both wire shapes again — OpenAI role="tool" with tool_call_id, Anthropic tool_result
+    blocks with tool_use_id.
+    """
+    if not isinstance(body, dict):
+        return []
+    msgs = body.get("messages") or []
+    id_to_name: dict = {}
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if isinstance(tc, dict) and tc.get("id"):
+                id_to_name[tc["id"]] = (tc.get("function") or {}).get("name") or "?"
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
+                    id_to_name[blk["id"]] = blk.get("name") or "?"
+
+    def _text(v):
+        if isinstance(v, list):
+            return chr(10).join(p.get("text", "") for p in v if isinstance(p, dict))
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        try:
+            return json.dumps(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    out: list[dict] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            content = _text(m.get("content"))
+            err, excerpt = _is_tool_error(content)
+            out.append({"id": str(m["tool_call_id"]),
+                        "name": id_to_name.get(m["tool_call_id"]) or m.get("name") or "?",
+                        "ok": not err, "excerpt": excerpt or ""})
+        elif m.get("role") == "user" and isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                    continue
+                tid = blk.get("tool_use_id")
+                if not tid:
+                    continue
+                content = _text(blk.get("content"))
+                err, excerpt = _is_tool_error(content)
+                # Anthropic states it outright; trust that over sniffing the text.
+                if blk.get("is_error"):
+                    err, excerpt = True, (excerpt or content[:240])
+                out.append({"id": str(tid), "name": id_to_name.get(tid) or "?",
+                            "ok": not err, "excerpt": excerpt or ""})
+    return out
 
 
 def _extract_tool_calls(response_body, stream_text):
@@ -17483,12 +17672,16 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
                       f"{_inflight} in flight)")
     except Exception:
         pass
+    try:
+        _call_ids = _extract_tool_call_ids(body_text, stream_text)
+    except Exception:
+        _call_ids = []
     conn = db()
     conn.execute(
         """UPDATE requests
            SET status=?, response_headers=?, duration_ms=?, error=?,
                prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?, tool_calls=?,
-               empty_output=?, inflight_at_finish=?
+               empty_output=?, inflight_at_finish=?, tool_call_ids=?, tool_outcome=?
            WHERE id=?""",
         (
             status,
@@ -17499,6 +17692,11 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
             json.dumps(_tools) if _tools else None,
             _empty,
             _inflight,
+            # The calls this turn made, with their ids. "pending" until the client reports back
+            # in its next request — a turn stuck on pending means the agent walked away from a
+            # call it asked for, which is worth seeing on its own.
+            json.dumps(_call_ids) if _call_ids else None,
+            "pending" if _call_ids else None,
             req_id,
         ),
     )
