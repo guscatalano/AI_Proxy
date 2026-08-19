@@ -15897,15 +15897,26 @@ def _is_tool_error(text) -> tuple[bool, str | None]:
             if j.get("error") or j.get("success") is False or j.get("isError"):
                 msg = j.get("error") if isinstance(j.get("error"), str) else (j.get("message") or json.dumps(j.get("error") or j)[:200])
                 return True, str(msg)[:240]
+            # A structured result carrying a payload and NO error field is a success, whatever
+            # words happen to appear inside it. read_file returning a Python module was filed as
+            # an error because the module contained "is required"; the payload key is the
+            # authoritative signal and beats sniffing the text it wraps.
+            if any(k in j for k in ("content", "output", "result", "data", "stdout")):
+                return False, None
     except (json.JSONDecodeError, TypeError):
         pass
     first_line = s.split("\n", 1)[0]
     fl_lower = first_line.lower()
     if fl_lower.startswith("error") or fl_lower.startswith("exception"):
         return True, first_line[:240]
-    s_lower = s.lower()
+    # Scanned over the OPENING of the result, not all of it. These patterns are ordinary English
+    # ("is required", "failed to") and scanning the whole blob flagged successful calls whose
+    # output merely contained them: a read_file returning a Python module, and a terminal
+    # returning diff output, were both filed as errors. A tool that failed says so at the top;
+    # a match three thousand characters into a file is the file, not a failure.
+    head = s[:400].lower()
     for pat in _TOOL_ERROR_PATTERNS:
-        if pat in s_lower:
+        if pat in head:
             return True, first_line[:240]
     return False, None
 

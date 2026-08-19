@@ -154,3 +154,41 @@ def test_another_conversation_is_untouched(client):
         {"role": "tool", "tool_call_id": "shared", "content": "ok"}]}
     assert P._resolve_tool_outcomes("conv_ELSEWHERE", body) == 0
     assert _read("to_other")["tool_outcome"] == "pending"
+
+
+# --- telling a failure apart from output that merely mentions failure -------------------------
+#
+# _is_tool_error scanned the WHOLE result for ordinary English like "is required" and "failed
+# to", so successful calls were filed as errors whenever their output happened to contain those
+# words. Two real examples from this box: read_file returning a Python module, and terminal
+# returning diff output. A metric that calls successes failures is worse than no metric.
+
+
+def test_a_structured_payload_is_a_success_whatever_words_it_contains():
+    body = json.dumps({"content": "1|import ctypes\n2|# this field is required\n" + "x" * 3000})
+    assert P._is_tool_error(body)[0] is False
+
+
+def test_command_output_mentioning_failure_is_not_an_error():
+    assert P._is_tool_error(json.dumps({"output": "10c10,565\n<  failed to parse line"}))[0] is False
+
+
+def test_a_payload_explicitly_flagged_as_an_error_still_counts():
+    assert P._is_tool_error(json.dumps({"content": "ok", "isError": True}))[0] is True
+
+
+def test_a_structured_error_still_counts():
+    assert P._is_tool_error(json.dumps({"error": "content is required", "success": False}))[0] is True
+
+
+def test_an_error_announced_at_the_top_still_counts():
+    assert P._is_tool_error("Error: String to replace not found in file.")[0] is True
+
+
+def test_a_traceback_still_counts():
+    assert P._is_tool_error("Traceback (most recent call last):\n  File x")[0] is True
+
+
+def test_a_pattern_buried_deep_in_plain_text_is_not_an_error():
+    """A tool that failed says so at the top; a match three thousand characters in is content."""
+    assert P._is_tool_error("line\n" * 400 + "this field is required")[0] is False
