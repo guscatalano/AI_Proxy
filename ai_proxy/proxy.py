@@ -3018,6 +3018,14 @@ DEFAULT_RULES_CONFIG = {
     # length is 262144 tokens. However, you requested 64000 output tokens and your prompt
     # contains at least 198145 input tokens". Measured replies on this box run 26-1,952 tokens,
     # so the reservation buys nothing and costs a quarter of the window.
+    # Refuse a request that would OOM the backend instead of forwarding it. Ollama allocates
+    # weights plus KV on load, and a model that does not fit kills the service — 303 restarts in
+    # one afternoon, while the client saw only "ended the response early". One refusal is cheaper
+    # than a crash loop that takes every other request down with it.
+    "backend_fit": {
+        "enabled": True,
+        "upstreams": ["ollama"],
+    },
     "output_budget": {
         "enabled": True,
         "max_tokens": 8192,      # generous: the largest reply seen here was 1,952 tokens
@@ -4868,6 +4876,85 @@ def _live_served_model(upstream: str) -> str | None:
             name = None
     cached[upstream] = name
     return name
+
+
+_OLLAMA_FIT_CACHE: dict = {}          # model -> (checked_ts, refusal or None)
+_OLLAMA_FIT_TTL_S = 30.0
+
+
+async def _ollama_fit_refusal(model: str) -> str | None:
+    """Why forwarding this would kill Ollama, or None if it is safe to send.
+
+    The same arithmetic the bench preflight uses, applied to live traffic and measured against
+    AVAILABLE memory rather than total — the bench owns the box, a live request does not. With
+    vLLM holding 85 of 121 GB, a request for a 51 GB Ollama model made the service allocate,
+    get OOM-killed, restart, and die again on the next request: 303 restarts, and the client
+    only ever saw "ended the response early". Refusing costs one request; forwarding costs the
+    backend and every other request queued behind it.
+
+    A model already resident is always allowed: it is loaded, so no allocation is coming.
+    """
+    if not model:
+        return None
+    now = time.time()
+    hit = _OLLAMA_FIT_CACHE.get(model)
+    if hit and now - hit[0] < _OLLAMA_FIT_TTL_S:
+        return hit[1]
+
+    async def _decide() -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+                ps = await c.get(f"{OLLAMA_URL}/api/ps")
+                if ps.status_code == 200:
+                    for m in (ps.json().get("models") or []):
+                        if _norm_model_id(m.get("name")) == _norm_model_id(model):
+                            return None          # resident: nothing to allocate
+                show = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
+                if show.status_code >= 400:
+                    return None                  # unknown must not mean "no"
+                body = show.json() or {}
+                tags = await c.get(f"{OLLAMA_URL}/api/tags")
+                sizes = {}
+                if tags.status_code == 200:
+                    for t in (tags.json().get("models") or []):
+                        if t.get("size"):
+                            sizes[_norm_model_id(t.get("name"))] = t["size"] / (1024 * 1024)
+        except (httpx.RequestError, ValueError, KeyError):
+            return None                          # cannot tell: never block on ignorance
+
+        info = body.get("model_info") or {}
+        params = body.get("parameters") or ""
+        per_slot, parallel = _bench_ollama_server_ctx(None)
+        model_ctx = info.get(f"{info.get('general.architecture')}.context_length")
+        if isinstance(model_ctx, (int, float)) and model_ctx:
+            per_slot = min(per_slot, int(model_ctx))
+        for line in str(params).splitlines():
+            bits = line.split()
+            if len(bits) == 2 and bits[0] == "num_ctx":
+                try:
+                    per_slot = min(per_slot, int(float(bits[1])))
+                except ValueError:
+                    pass
+                break
+        kv_mb = _bench_ollama_kv_mb(info, per_slot * parallel)
+        size_mb = sizes.get(_norm_model_id(model))
+        avail_mb = (_mem_snapshot() or {}).get("avail_mb")
+        if kv_mb is None or not size_mb or not avail_mb:
+            return None
+        need = size_mb * _BENCH_FIT_OVERHEAD + kv_mb
+        cap = avail_mb - _BENCH_FIT_RESERVE_MB
+        if need <= cap:
+            return None
+        return (f"{model!r} cannot be loaded right now: it needs ~{size_mb / 1024:.0f} GB of "
+                f"weights plus ~{kv_mb / 1024:.0f} GB of KV cache at {per_slot:,} tokens x "
+                f"{parallel} parallel slots, and only ~{max(0, cap) / 1024:.0f} GB is free. "
+                f"Forwarding it would OOM the Ollama service rather than answer. Free memory "
+                f"(stop the vLLM container), lower OLLAMA_CONTEXT_LENGTH / OLLAMA_NUM_PARALLEL, "
+                f"or request a model that is already loaded.")
+
+    verdict = await _decide()
+    _OLLAMA_FIT_CACHE[model] = (now, verdict)
+    return verdict
 
 
 def _split_qualified_model(name: str) -> tuple[str, str | None]:
@@ -18072,6 +18159,27 @@ async def proxy(full_path: str, request: Request):
                 _conn.close()
             except Exception:
                 pass
+
+    # backend_fit: refuse rather than forward a request that would OOM the backend. Checked
+    # here, after routing has settled which model and upstream this is actually going to, and
+    # before a single byte is sent.
+    _fit_cfg = load_rules_config().get("backend_fit") or {}
+    if (_fit_cfg.get("enabled", True) and isinstance(body_json, dict)
+            and upstream_label in [str(u).lower() for u in (_fit_cfg.get("upstreams") or ["ollama"])]
+            and full_path.startswith(("v1/chat", "v1/completions", "api/chat", "api/generate"))):
+        _fit_refusal = await _ollama_fit_refusal(str(body_json.get("model") or ""))
+        if _fit_refusal:
+            _save_gate(req_id, {"verdict": "block", "rule": "backend_fit",
+                                "reason": _fit_refusal, "details": {"model": body_json.get("model"),
+                                                                    "upstream": upstream_label}})
+            elapsed = (time.perf_counter() - start) * 1000
+            _body = json.dumps({"error": {"message": _fit_refusal, "type": "insufficient_memory",
+                                          "code": "backend_fit"}})
+            _save_finish(req_id, 503, {"content-type": "application/json"}, _body, None,
+                         elapsed, "backend_fit: refused before forwarding")
+            return Response(content=_body.encode(), status_code=503,
+                            media_type="application/json",
+                            headers={"x-proxy-rule": "backend_fit"})
 
     # Auto-load (opt-in): a request for a model on a stopped backend or the other vLLM twin
     # starts what it needs and waits, Ollama-style, evicting only when it doesn't fit.
