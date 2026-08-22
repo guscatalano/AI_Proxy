@@ -4951,15 +4951,24 @@ async def _ollama_fit_refusal(model: str) -> str | None:
         kv_mb = _bench_ollama_kv_mb(info, per_slot * parallel)
         size_mb = sizes.get(key) or remembered.get("size_mb")
         avail_mb = (_mem_snapshot() or {}).get("avail_mb")
-        if kv_mb is None or not size_mb or not avail_mb:
+        if not size_mb or not avail_mb:
             return None
-        need = size_mb * _BENCH_FIT_OVERHEAD + kv_mb
+        # An unknown KV estimate must not defeat the check. _bench_ollama_kv_mb returns None for
+        # architectures whose fields it does not recognise — qwen3next among them — and the
+        # weights alone were already disqualifying: 48 GB of them into 36 GB free. Falling back
+        # to a weights-only comparison is strictly weaker and still catches that, which is the
+        # case that was crash-looping the service.
+        kv_known = kv_mb is not None
+        need = size_mb * _BENCH_FIT_OVERHEAD + (kv_mb or 0.0)
         cap = avail_mb - _BENCH_FIT_RESERVE_MB
         if need <= cap:
             return None
+        _kv_part = (f"plus ~{kv_mb / 1024:.0f} GB of KV cache at {per_slot:,} tokens x "
+                    f"{parallel} parallel slots" if kv_known else
+                    f"plus a KV cache this build could not size ({per_slot:,} tokens x "
+                    f"{parallel} slots), so this counts the weights alone")
         return (f"{model!r} cannot be loaded right now: it needs ~{size_mb / 1024:.0f} GB of "
-                f"weights plus ~{kv_mb / 1024:.0f} GB of KV cache at {per_slot:,} tokens x "
-                f"{parallel} parallel slots, and only ~{max(0, cap) / 1024:.0f} GB is free. "
+                f"weights {_kv_part}, and only ~{max(0, cap) / 1024:.0f} GB is free. "
                 f"Forwarding it would OOM the Ollama service rather than answer. Free memory "
                 f"(stop the vLLM container), lower OLLAMA_CONTEXT_LENGTH / OLLAMA_NUM_PARALLEL, "
                 f"or request a model that is already loaded.")

@@ -18,22 +18,22 @@ import pytest
 from ai_proxy import proxy as P
 
 
-def _fake_ollama(*, resident=(), size_gb=51.0, ctx=262144, arch="qwen3next"):
+def _fake_ollama(*, resident=(), size_gb=51.0, ctx=262144, arch="qwen3next",
+                 kv_measurable=True):
     """Stand in for Ollama's /api/ps, /api/show and /api/tags."""
     def handler(request: httpx.Request) -> httpx.Response:
         path = request.url.path
         if path.endswith("/api/ps"):
             return httpx.Response(200, json={"models": [{"name": n} for n in resident]})
         if path.endswith("/api/show"):
-            return httpx.Response(200, json={
-                "model_info": {"general.architecture": arch,
-                               f"{arch}.context_length": ctx,
-                               f"{arch}.block_count": 64,
-                               f"{arch}.attention.head_count_kv": 8,
-                               f"{arch}.attention.key_length": 128,
-                               f"{arch}.attention.value_length": 128,
-                               f"{arch}.embedding_length": 5120},
-                "parameters": ""})
+            info = {"general.architecture": arch, f"{arch}.context_length": ctx}
+            if kv_measurable:
+                info.update({f"{arch}.block_count": 64,
+                             f"{arch}.attention.head_count_kv": 8,
+                             f"{arch}.attention.key_length": 128,
+                             f"{arch}.attention.value_length": 128,
+                             f"{arch}.embedding_length": 5120})
+            return httpx.Response(200, json={"model_info": info, "parameters": ""})
         if path.endswith("/api/tags"):
             return httpx.Response(200, json={"models": [
                 {"name": "big-model:latest", "size": int(size_gb * 1024 ** 3)}]})
@@ -145,3 +145,15 @@ def test_a_model_never_seen_healthy_is_not_blocked(client, ollama):
         raise httpx.ConnectError("nothing listening")
     ollama(dead, avail_gb=35)
     assert asyncio.run(P._ollama_fit_refusal("never-seen:latest")) is None
+
+
+def test_weights_alone_are_enough_to_refuse(client, ollama):
+    """_bench_ollama_kv_mb returns None for architectures it does not recognise — qwen3next
+    among them — and that was letting the real crash-looping model through. 48 GB of weights
+    into 36 GB free is disqualifying whatever the KV cache turns out to be."""
+    handler = _fake_ollama(size_gb=48.0, kv_measurable=False)
+    ollama(handler, avail_gb=36)
+    P._OLLAMA_META_CACHE.clear()
+    msg = asyncio.run(P._ollama_fit_refusal("big-model:latest"))
+    assert msg, "must refuse on weights alone when the KV size is unknown"
+    assert "could not size" in msg, "the message should admit what it could not measure"
