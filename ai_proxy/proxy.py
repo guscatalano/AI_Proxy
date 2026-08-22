@@ -6821,12 +6821,18 @@ async def list_models_enriched():
     # Qualify a name only when it is genuinely ambiguous: "qwen3-coder-next" stays as it is when
     # one backend serves it, and becomes "qwen3-coder-next/vllm" and "qwen3-coder-next/ollama"
     # when two do. Suffixing everything would break every client config that names a model today.
-    _counts: dict = {}
-    for (mid, _backend) in entries:
-        _counts[mid] = _counts.get(mid, 0) + 1
+    # Ambiguity is judged on the NORMALISED name across DIFFERENT backends. Ollama tags its
+    # names and vLLM does not, so the same model reads as "qwen3-coder-next:latest" and
+    # "qwen3-coder-next" and never collides on the raw string — which is why this fired on
+    # nothing at first. Comparing normalised names catches it; requiring different backends
+    # keeps gemma4:26b and gemma4:12b, which normalise alike and are both on Ollama, unqualified
+    # — they are already tellable apart by their tags.
+    _backends_for: dict = {}
+    for (mid, backend) in entries:
+        _backends_for.setdefault(_norm_model_id(mid), set()).add(backend)
     data = []
     for (mid, backend), e in entries.items():
-        if _counts.get(mid, 0) > 1:
+        if len(_backends_for.get(_norm_model_id(mid), ())) > 1:
             e = dict(e, id="%s/%s" % (mid, backend), served_model=mid, upstream=backend)
         data.append(e)
     payload = {"object": "list", "data": data}

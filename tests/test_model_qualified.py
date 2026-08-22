@@ -52,3 +52,28 @@ def test_the_listing_qualifies_only_ambiguous_names(client):
             # have to re-parse the string to know what it selected.
             assert e["id"] == "%s/%s" % (e["served_model"], e["upstream"])
             assert e["upstream"] in P.PROVIDERS
+
+
+def test_ambiguity_is_judged_across_backends_not_on_the_raw_string(client, monkeypatch):
+    """Ollama tags its names and vLLM does not, so the same model reads as
+    "qwen3-coder-next:latest" and "qwen3-coder-next" and never collides literally. That is why
+    the first version of this qualified nothing at all."""
+    assert P._norm_model_id("qwen3-coder-next:latest") == P._norm_model_id("qwen3-coder-next")
+
+
+def test_two_tags_on_one_backend_stay_unqualified(client):
+    """gemma4:26b and gemma4:12b normalise alike but are both on Ollama — already tellable
+    apart by their tags, and qualifying them would add noise, not information."""
+    data = client.get("/v1/models").json().get("data") or []
+    by_backend = {}
+    for e in data:
+        if e.get("owned_by") == "ai-proxy":
+            continue
+        key = P._norm_model_id(e.get("served_model") or e["id"])
+        by_backend.setdefault(key, set()).add(e.get("owned_by"))
+    for e in data:
+        if e.get("owned_by") == "ai-proxy":
+            continue
+        key = P._norm_model_id(e.get("served_model") or e["id"])
+        if len(by_backend.get(key, ())) == 1:
+            assert not e.get("upstream"), "%s was qualified but is unambiguous" % e["id"]
