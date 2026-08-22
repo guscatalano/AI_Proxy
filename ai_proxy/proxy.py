@@ -4870,6 +4870,22 @@ def _live_served_model(upstream: str) -> str | None:
     return name
 
 
+def _split_qualified_model(name: str) -> tuple[str, str | None]:
+    """Split "qwen3-coder-next/vllm" into ("qwen3-coder-next", "vllm").
+
+    /v1/models qualifies a name with its backend when two backends serve the same one, so a
+    client that picks the qualified entry must be able to send it back. Only a suffix naming a
+    real provider is treated as a qualifier — model ids contain slashes routinely
+    ("hf.co/unsloth/...", "nvidia/Nemotron..."), and splitting those would break them.
+    """
+    if not name or "/" not in name:
+        return name, None
+    head, _, tail = name.rpartition("/")
+    if head and tail in PROVIDERS:
+        return head, tail
+    return name, None
+
+
 def evaluate_router(body: dict, ctx: dict) -> dict | None:
     """Apply model_router config. Returns {from, to, via, condition} or None.
     Mutates `body['model']` in place when a rewrite fires."""
@@ -6697,7 +6713,12 @@ async def list_models_enriched():
     entries: dict[str, dict] = {}
 
     def add(mid, backend, ctx=None, state=None, created=None, loaded=None):
-        if not mid or mid in entries:
+        # Keyed by (id, backend), not id alone. The same name can be served by two backends —
+        # qwen3-coder-next exists as a 51 GB GGUF in Ollama and as NVFP4 in vLLM, and they are
+        # different builds with different speeds. Deduping by name alone dropped the second one
+        # and attributed the survivor to whichever backend happened to be polled first, so the
+        # catalogue could not express "which one".
+        if not mid or (mid, backend) in entries:
             return
         e = {"id": mid, "object": "model", "created": created or 0, "owned_by": backend}
         if isinstance(ctx, int) and ctx > 0:
@@ -6709,7 +6730,7 @@ async def list_models_enriched():
             # human-readable proxy_state — LM Studio's API makes the same distinction,
             # and "answers now" vs "costs a load first" is real routing information.
             e["loaded"] = bool(loaded)
-        entries[mid] = e
+        entries[(mid, backend)] = e
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         async def _ollama():
@@ -6783,10 +6804,11 @@ async def list_models_enriched():
         advertise = {}
     for alias, target in (advertise.items() if isinstance(advertise, dict) else []):
         alias = str(alias).strip()
-        if not alias or alias in entries:
+        by_name = {k[0]: v for k, v in entries.items()}
+        if not alias or alias in by_name:
             continue                       # never shadow a model that genuinely exists
-        base = entries.get(str(target)) or {}
-        entries[alias] = {
+        base = by_name.get(str(target)) or {}
+        entries[(alias, "ai-proxy")] = {
             **{k: v for k, v in base.items()
                if k in ("context_length", "max_context_length", "max_model_len")},
             "id": alias, "object": "model", "owned_by": "ai-proxy",
@@ -6796,7 +6818,18 @@ async def list_models_enriched():
             "description": f"alias — every request is served by {target}",
         }
 
-    payload = {"object": "list", "data": list(entries.values())}
+    # Qualify a name only when it is genuinely ambiguous: "qwen3-coder-next" stays as it is when
+    # one backend serves it, and becomes "qwen3-coder-next/vllm" and "qwen3-coder-next/ollama"
+    # when two do. Suffixing everything would break every client config that names a model today.
+    _counts: dict = {}
+    for (mid, _backend) in entries:
+        _counts[mid] = _counts.get(mid, 0) + 1
+    data = []
+    for (mid, backend), e in entries.items():
+        if _counts.get(mid, 0) > 1:
+            e = dict(e, id="%s/%s" % (mid, backend), served_model=mid, upstream=backend)
+        data.append(e)
+    payload = {"object": "list", "data": data}
     _MODELS_CACHE.update(ts=now, data=payload)
     return JSONResponse(payload)
 
@@ -17892,12 +17925,23 @@ async def proxy(full_path: str, request: Request):
     body_json = None
     model = None
     is_stream = False
+    qualified_upstream = None      # set when the client named "model/backend"
     if body_text:
         try:
             body_json = json.loads(body_text)
             if isinstance(body_json, dict):
                 model = body_json.get("model")
                 is_stream = bool(body_json.get("stream"))
+                # A model picked from /v1/models may be qualified as "name/backend", which is how
+                # the catalogue distinguishes the same model served by two backends. Unqualify it
+                # here, before routing or auditing sees it, and remember the backend it named so
+                # the request goes where the client chose.
+                _bare, _qual_up = _split_qualified_model(str(model or ""))
+                if _qual_up:
+                    model = _bare
+                    body_json["model"] = _bare
+                    body_text = json.dumps(body_json)
+                    qualified_upstream = _qual_up
         except json.JSONDecodeError:
             pass
 
@@ -17992,6 +18036,10 @@ async def proxy(full_path: str, request: Request):
     _pin_upstream = (request.headers.get("x-proxy-upstream") or "").strip().lower()
     if _pin_upstream not in _UPSTREAM_BASES:
         _pin_upstream = ""
+    # "model/backend" from the catalogue is as explicit as the header, and loses to it only
+    # because a header is set deliberately per request.
+    if not _pin_upstream and qualified_upstream in _UPSTREAM_BASES:
+        _pin_upstream = qualified_upstream
     _want_upstream = _pin_upstream or ((rewrite or {}).get("upstream") or "")
     # Even an explicit x-proxy-upstream cannot make another backend answer /api/show.
     if _is_ollama_native_only(full_path):
