@@ -112,3 +112,36 @@ def test_the_rule_is_on_by_default(client):
     cfg = P.load_rules_config().get("backend_fit") or {}
     assert cfg.get("enabled") is True
     assert "ollama" in cfg.get("upstreams", [])
+
+
+# --- the guard has to work when the backend is already broken -----------------------------------
+#
+# The first version failed exactly when it mattered. Once a model has crashed Ollama, /api/tags
+# stops answering, so the guard could not learn what the model weighed, and its "never block on
+# ignorance" rule let the next request through to kill the restarted process. Remembering what
+# was learned while the backend was healthy is what breaks the loop.
+
+
+def test_it_still_refuses_once_the_backend_has_stopped_answering(client, ollama):
+    ollama(_fake_ollama(size_gb=51.0), avail_gb=35)
+    first = asyncio.run(P._ollama_fit_refusal("big-model:latest"))
+    assert first, "should refuse while healthy"
+
+    P._OLLAMA_FIT_CACHE.clear()          # force a fresh decision
+
+    def dead(request):
+        raise httpx.ConnectError("crash looping")
+    ollama(dead, avail_gb=35)
+    # The size cache is deliberately not cleared: that is the state after a crash.
+    again = asyncio.run(P._ollama_fit_refusal("big-model:latest"))
+    assert again, "must keep refusing using what it learned before the crash"
+
+
+def test_a_model_never_seen_healthy_is_not_blocked(client, ollama):
+    """Refusing something it has never been able to measure would be guessing."""
+    P._OLLAMA_META_CACHE.clear()
+
+    def dead(request):
+        raise httpx.ConnectError("nothing listening")
+    ollama(dead, avail_gb=35)
+    assert asyncio.run(P._ollama_fit_refusal("never-seen:latest")) is None

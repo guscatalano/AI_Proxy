@@ -4880,6 +4880,11 @@ def _live_served_model(upstream: str) -> str | None:
 
 _OLLAMA_FIT_CACHE: dict = {}          # model -> (checked_ts, refusal or None)
 _OLLAMA_FIT_TTL_S = 30.0
+# Sizes and shapes learned while Ollama was healthy, kept indefinitely. Without this the guard
+# is useless exactly when it is needed: once a model has crashed the service, /api/tags stops
+# answering, the guard cannot learn what the model weighs, and "never block on ignorance" lets
+# the next request through to kill the restarted process. Remembering is what breaks the loop.
+_OLLAMA_META_CACHE: dict = {}         # normalised model -> {"size_mb", "info", "params"}
 
 
 async def _ollama_fit_refusal(model: str) -> str | None:
@@ -4902,28 +4907,35 @@ async def _ollama_fit_refusal(model: str) -> str | None:
         return hit[1]
 
     async def _decide() -> str | None:
+        key = _norm_model_id(model)
+        remembered = _OLLAMA_META_CACHE.get(key) or {}
+        body, sizes = {}, {}
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
                 ps = await c.get(f"{OLLAMA_URL}/api/ps")
                 if ps.status_code == 200:
                     for m in (ps.json().get("models") or []):
-                        if _norm_model_id(m.get("name")) == _norm_model_id(model):
+                        if _norm_model_id(m.get("name")) == key:
                             return None          # resident: nothing to allocate
                 show = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
-                if show.status_code >= 400:
-                    return None                  # unknown must not mean "no"
-                body = show.json() or {}
+                if show.status_code < 400:
+                    body = show.json() or {}
                 tags = await c.get(f"{OLLAMA_URL}/api/tags")
-                sizes = {}
                 if tags.status_code == 200:
                     for t in (tags.json().get("models") or []):
                         if t.get("size"):
                             sizes[_norm_model_id(t.get("name"))] = t["size"] / (1024 * 1024)
         except (httpx.RequestError, ValueError, KeyError):
-            return None                          # cannot tell: never block on ignorance
+            pass          # fall through to what was learned while the backend was healthy
 
-        info = body.get("model_info") or {}
-        params = body.get("parameters") or ""
+        info = body.get("model_info") or remembered.get("info") or {}
+        params = body.get("parameters") or remembered.get("params") or ""
+        if info:
+            _OLLAMA_META_CACHE.setdefault(key, {}).update({"info": info, "params": params})
+        if sizes.get(key):
+            _OLLAMA_META_CACHE.setdefault(key, {})["size_mb"] = sizes[key]
+        if not info:
+            return None                          # never seen it healthy: cannot judge
         per_slot, parallel = _bench_ollama_server_ctx(None)
         model_ctx = info.get(f"{info.get('general.architecture')}.context_length")
         if isinstance(model_ctx, (int, float)) and model_ctx:
@@ -4937,7 +4949,7 @@ async def _ollama_fit_refusal(model: str) -> str | None:
                     pass
                 break
         kv_mb = _bench_ollama_kv_mb(info, per_slot * parallel)
-        size_mb = sizes.get(_norm_model_id(model))
+        size_mb = sizes.get(key) or remembered.get("size_mb")
         avail_mb = (_mem_snapshot() or {}).get("avail_mb")
         if kv_mb is None or not size_mb or not avail_mb:
             return None
