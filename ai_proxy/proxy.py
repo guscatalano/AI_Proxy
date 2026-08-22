@@ -4906,6 +4906,13 @@ def evaluate_router(body: dict, ctx: dict) -> dict | None:
             upstream = r.get("upstream")  # e.g. "lmstudio" to send this model elsewhere
             break
 
+    # A rule with an upstream and no `then` keeps the model the client asked for and only
+    # changes where it goes. That is what "reach the model I named" needs: without it the only
+    # way to select a backend was to also rewrite the name, so every request came back served by
+    # whatever the catch-all pointed at, whatever had been asked for.
+    if target is None and upstream:
+        target = original
+
     # "auto" means "whatever that upstream is serving", resolved per request. A swap of the
     # container behind the port therefore moves traffic without a config change. Falls back to
     # leaving the model untouched if the upstream cannot be reached, because rewriting the name

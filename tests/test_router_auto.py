@@ -62,3 +62,36 @@ def test_auto_is_case_and_space_insensitive(client, monkeypatch):
     _serving(monkeypatch, "live-one")
     body = {"model": "gemma4", "messages": []}
     assert P.evaluate_router(body, {"upstream": "vllm"})["to"] == "live-one"
+
+
+# --- keeping the model the client named -------------------------------------------------------
+#
+# A rule could change the model or the upstream, but not "keep this name, just send it to vLLM".
+# So selecting a backend meant also rewriting the name, and every request came back served by
+# whatever the catch-all pointed at — which is not what "reach the model I specified" means.
+
+
+def _passthrough(monkeypatch, upstream="vllm"):
+    base = dict(P.load_rules_config())
+    base["model_router"] = {"enabled": True, "aliases": {}, "advertise": {},
+                            "rules": [{"if": {}, "upstream": upstream}]}
+    monkeypatch.setattr(P, "load_rules_config", lambda: base)
+
+
+def test_the_named_model_is_kept_and_only_the_backend_changes(client, monkeypatch):
+    _passthrough(monkeypatch)
+    body = {"model": "some-candidate-model", "messages": []}
+    out = P.evaluate_router(body, {"upstream": "ollama"})
+    assert out and out["upstream"] == "vllm"
+    assert body["model"] == "some-candidate-model", "the client's choice must survive"
+    assert out["to"] == "some-candidate-model"
+
+
+def test_two_different_names_stay_different(client, monkeypatch):
+    """The symptom of the old behaviour: everything arrived as one model."""
+    _passthrough(monkeypatch)
+    a = {"model": "model-a", "messages": []}
+    b = {"model": "model-b", "messages": []}
+    P.evaluate_router(a, {"upstream": "ollama"})
+    P.evaluate_router(b, {"upstream": "ollama"})
+    assert (a["model"], b["model"]) == ("model-a", "model-b")
