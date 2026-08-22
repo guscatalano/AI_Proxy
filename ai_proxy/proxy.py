@@ -4826,6 +4826,50 @@ def _match_router_cond(cond: dict, body: dict, ctx: dict) -> bool:
     return True
 
 
+_SERVED_MODEL_CACHE: dict = {"ts": 0.0, "by_upstream": {}}
+
+
+def _live_served_model(upstream: str) -> str | None:
+    """Whichever model that upstream is serving right now, or None.
+
+    Lets a router rule say "auto" instead of naming a model, so swapping the container behind a
+    port moves traffic with it and no rules edit is needed. That matters while models are being
+    tested: every previous swap needed the catch-all rewritten, and forgetting once left traffic
+    pointed at a backend that was no longer there.
+
+    Cached for a few seconds because this is on the request path and the answer only changes when
+    a container is restarted, which takes minutes.
+    """
+    if not upstream:
+        return None
+    now = time.time()
+    if now - _SERVED_MODEL_CACHE["ts"] > 5.0:
+        _SERVED_MODEL_CACHE["by_upstream"] = {}
+        _SERVED_MODEL_CACHE["ts"] = now
+    cached = _SERVED_MODEL_CACHE["by_upstream"]
+    if upstream in cached:
+        return cached[upstream]
+    base = None
+    prov = PROVIDERS.get(upstream)
+    if prov is not None:
+        try:
+            base = prov.base_url
+        except Exception:
+            base = None
+    name = None
+    if base:
+        try:
+            with httpx.Client(timeout=2.0) as c:
+                data = (c.get(f"{base}/v1/models").json().get("data") or [])
+            # One vLLM process serves one model; if several are listed the first is the one the
+            # container was launched with.
+            name = (data[0] or {}).get("id") if data else None
+        except Exception:
+            name = None
+    cached[upstream] = name
+    return name
+
+
 def evaluate_router(body: dict, ctx: dict) -> dict | None:
     """Apply model_router config. Returns {from, to, via, condition} or None.
     Mutates `body['model']` in place when a rewrite fires."""
@@ -4861,6 +4905,16 @@ def evaluate_router(body: dict, ctx: dict) -> dict | None:
             matched_cond = cond
             upstream = r.get("upstream")  # e.g. "lmstudio" to send this model elsewhere
             break
+
+    # "auto" means "whatever that upstream is serving", resolved per request. A swap of the
+    # container behind the port therefore moves traffic without a config change. Falls back to
+    # leaving the model untouched if the upstream cannot be reached, because rewriting the name
+    # to nothing would send a request naming no model at all.
+    if isinstance(target, str) and target.strip().lower() == "auto":
+        live = _live_served_model(upstream or ctx.get("upstream") or "")
+        if not live:
+            return None
+        target = live
 
     # A rule may switch upstream without renaming the model, so a bare upstream override
     # (target == original) still counts as a rewrite.
