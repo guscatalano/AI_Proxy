@@ -194,3 +194,41 @@ def test_without_the_header_the_guard_still_applies(client, monkeypatch):
         assert why and "active use" in why
     finally:
         _cleanup()
+
+
+# --- the blocker is often Ollama itself ------------------------------------------------------------
+#
+# Eviction only ever stopped vLLM, and missed that Ollama parks up to OLLAMA_MAX_LOADED_MODELS
+# for OLLAMA_KEEP_ALIVE — three models for two hours here. A sweep that had already visited two
+# models was holding 47 GB of its own before the third was requested, so the request was refused
+# with vLLM already stopped and nothing left for eviction to do.
+
+
+def test_ollama_residents_are_released_before_stopping_a_container(client, monkeypatch):
+    """Releasing them is free; stopping vLLM costs a 400-500s restart. Try the cheap one first."""
+    _cfg(monkeypatch, enabled=True, idle_s=60)
+    _last_vllm_request(client, ago_s=3600)
+    stopped, released = [], []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    async def _release(reason=""):
+        released.append(reason)
+        return ["some-resident:latest"]
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_free_ollama_models", _release)
+    # Once the residents are gone the model fits, so no container should be stopped.
+    monkeypatch.setattr(P, "_ollama_fit_refusal", lambda m: _none())
+    try:
+        assert asyncio.run(P._evict_for_fit("r", "wanted", caller_owns=True)) is None
+        assert released, "ollama residents should be released"
+        assert stopped == [], "no container stop needed once the residents were freed"
+    finally:
+        _cleanup()
+
+
+async def _none():
+    return None

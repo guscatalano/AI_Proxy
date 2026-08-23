@@ -4981,6 +4981,20 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     if idle_for < idle_s and not bench_owns:
         return (f"{targets[0]} served a request {idle_for:.0f}s ago and idle_s is {idle_s:.0f}s; "
                 f"evicting a backend in active use would trade one stall for everybody's")
+    # Ollama's OWN residents first, because they are usually the blocker and releasing them is
+    # free. It parks up to OLLAMA_MAX_LOADED_MODELS for OLLAMA_KEEP_ALIVE — three models for two
+    # hours here — so a sweep that has already visited two models is holding 47 GB before the
+    # third is even requested. Stopping vLLM for that would pay a 400-500s restart to reclaim
+    # memory Ollama was going to give back for nothing.
+    released = await _free_ollama_models(f"to make room for {wanted_model!r}")
+    if released:
+        for _ in range(20):
+            await asyncio.sleep(1.0)
+            _OLLAMA_FIT_CACHE.pop(wanted_model, None)
+            if await _ollama_fit_refusal(wanted_model) is None:
+                print("[backend_fit] released %s; no container stop needed" % released)
+                return None
+
     stopped = []
     for name in targets:
         prov = PROVIDERS.get(name)
@@ -4992,7 +5006,8 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
         except Exception as e:
             return f"stopping {name} failed: {type(e).__name__}"
     if not stopped:
-        return "nothing to stop"
+        return ("nothing left to stop: %s" % (
+            "released %s but it was not enough" % released if released else "nothing to stop"))
     # Hold the request until the memory is actually back, rather than guessing at a fixed
     # sleep. A container does not release on exit, and the caller would rather wait through a
     # swap than be told to try again — handling it here is the whole point of doing it in the
