@@ -3025,6 +3025,17 @@ DEFAULT_RULES_CONFIG = {
     "backend_fit": {
         "enabled": True,
         "upstreams": ["ollama"],
+        # Making room means stopping the vLLM container, because Ollama evicts its own models
+        # already and holds nothing when idle. That is a real cost, not a tidy-up: a vLLM cold
+        # start on this box measured 400-500s, so an evicting request takes production down for
+        # the best part of ten minutes and it does not come back until something asks for it.
+        # Off by default for that reason. idle_s is the guard that stops a single stray request
+        # evicting a backend somebody is actively using.
+        "evict": {
+            "enabled": False,
+            "idle_s": 600,
+            "evict_upstreams": ["vllm"],
+        },
     },
     "output_budget": {
         "enabled": True,
@@ -4885,6 +4896,54 @@ _OLLAMA_FIT_TTL_S = 30.0
 # answering, the guard cannot learn what the model weighs, and "never block on ignorance" lets
 # the next request through to kill the restarted process. Remembering is what breaks the loop.
 _OLLAMA_META_CACHE: dict = {}         # normalised model -> {"size_mb", "info", "params"}
+
+
+async def _evict_for_fit(refusal: str, wanted_model: str) -> str | None:
+    """Free memory by stopping an idle backend so `wanted_model` can load. None = freed.
+
+    Returns a reason when it declines, which is then appended to the refusal — a request that
+    was refused despite eviction being enabled should say why it was not evicted for, rather
+    than looking like the setting did nothing.
+    """
+    cfg = ((load_rules_config().get("backend_fit") or {}).get("evict") or {})
+    if not cfg.get("enabled"):
+        return "eviction is off (backend_fit.evict.enabled)"
+    idle_s = float(cfg.get("idle_s", 600) or 600)
+    targets = [str(u).lower() for u in (cfg.get("evict_upstreams") or ["vllm"])]
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT MAX(ts) AS last FROM requests WHERE upstream IN (%s) AND ts > ?"
+            % ",".join("?" * len(targets)),
+            (*targets, time.time() - 86400)).fetchone()
+        conn.close()
+        last = (row["last"] if row else None) or 0
+    except Exception:
+        return "could not read recent traffic, so idleness is unknown"
+    idle_for = time.time() - last if last else idle_s + 1
+    if idle_for < idle_s:
+        return (f"{targets[0]} served a request {idle_for:.0f}s ago and idle_s is {idle_s:.0f}s; "
+                f"evicting a backend in active use would trade one stall for everybody's")
+    stopped = []
+    for name in targets:
+        prov = PROVIDERS.get(name)
+        if prov is None:
+            continue
+        try:
+            await prov.stop()
+            stopped.append(name)
+        except Exception as e:
+            return f"stopping {name} failed: {type(e).__name__}"
+    if not stopped:
+        return "nothing to stop"
+    # The memory does not come back the instant the container exits.
+    for _ in range(30):
+        await asyncio.sleep(1.0)
+        if (_mem_snapshot() or {}).get("avail_mb", 0) > 60 * 1024:
+            break
+    print(f"[backend_fit] evicted {','.join(stopped)} (idle {idle_for:.0f}s) "
+          f"to make room for {wanted_model!r}")
+    return None
 
 
 async def _ollama_fit_refusal(model: str) -> str | None:
@@ -18189,6 +18248,15 @@ async def proxy(full_path: str, request: Request):
             and upstream_label in [str(u).lower() for u in (_fit_cfg.get("upstreams") or ["ollama"])]
             and full_path.startswith(("v1/chat", "v1/completions", "api/chat", "api/generate"))):
         _fit_refusal = await _ollama_fit_refusal(str(body_json.get("model") or ""))
+        if _fit_refusal:
+            # Try to make room before refusing. Re-checked afterwards rather than assumed:
+            # stopping a container is not a promise that what is left is enough.
+            _why_not = await _evict_for_fit(_fit_refusal, str(body_json.get("model") or ""))
+            if _why_not is None:
+                _OLLAMA_FIT_CACHE.pop(str(body_json.get("model") or ""), None)
+                _fit_refusal = await _ollama_fit_refusal(str(body_json.get("model") or ""))
+            elif _fit_refusal:
+                _fit_refusal += f" (not evicted: {_why_not})"
         if _fit_refusal:
             _save_gate(req_id, {"verdict": "block", "rule": "backend_fit",
                                 "reason": _fit_refusal, "details": {"model": body_json.get("model"),
