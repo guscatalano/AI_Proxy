@@ -25,6 +25,9 @@ def _cfg(monkeypatch, *, enabled, idle_s=600):
 def _last_vllm_request(client, ago_s):
     conn = P.db()
     conn.execute("DELETE FROM requests WHERE id='evict_probe'")
+    # Other tests in this session post through the client and leave real vllm rows behind, which
+    # would make the idleness check see traffic seconds old whatever this helper inserts.
+    conn.execute("UPDATE requests SET upstream='_test_parked' WHERE upstream='vllm'")
     conn.execute("INSERT INTO requests (id, ts, method, path, upstream_url, model, is_stream, "
                  "client_ip, client_app, upstream) VALUES (?,?,?,?,?,?,?,?,?,?)",
                  ("evict_probe", time.time() - ago_s, "POST", "/v1/chat/completions",

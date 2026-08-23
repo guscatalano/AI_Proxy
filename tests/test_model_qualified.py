@@ -112,3 +112,16 @@ def test_a_qualified_request_is_answered_with_the_qualified_name(client):
             "the client asked for the qualified id and must see it back"
     finally:
         client.app.state.client = real
+
+
+def test_a_model_too_large_for_this_box_is_not_offered(client, monkeypatch):
+    """Offering it invites a sweep to select it, and with eviction on that stops the serving
+    container to attempt a load that cannot succeed. qwen3:235b-a22b is 132 GB on a 122 GB box."""
+    data = client.get("/v1/models").json().get("data") or []
+    total_mb = (P._mem_snapshot() or {}).get("total_mb") or 0
+    if not total_mb:
+        return
+    ceiling = total_mb - P._BENCH_FIT_RESERVE_MB
+    for e in data:
+        if e.get("size_mb"):
+            assert e["size_mb"] <= ceiling, "%s is larger than the box" % e["id"]

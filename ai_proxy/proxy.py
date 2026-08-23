@@ -3035,6 +3035,9 @@ DEFAULT_RULES_CONFIG = {
             "enabled": False,
             "idle_s": 600,
             "evict_upstreams": ["vllm"],
+            # How long to hold the request while the freed memory comes back. The caller would
+            # rather wait through a swap than be told to retry.
+            "release_timeout_s": 120,
         },
     },
     "output_budget": {
@@ -4990,10 +4993,16 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
             return f"stopping {name} failed: {type(e).__name__}"
     if not stopped:
         return "nothing to stop"
-    # The memory does not come back the instant the container exits.
-    for _ in range(30):
+    # Hold the request until the memory is actually back, rather than guessing at a fixed
+    # sleep. A container does not release on exit, and the caller would rather wait through a
+    # swap than be told to try again — handling it here is the whole point of doing it in the
+    # proxy instead of in every client.
+    _wait_s = float(cfg.get("release_timeout_s", 120) or 120)
+    _t0 = time.time()
+    while time.time() - _t0 < _wait_s:
         await asyncio.sleep(1.0)
-        if (_mem_snapshot() or {}).get("avail_mb", 0) > 60 * 1024:
+        _OLLAMA_FIT_CACHE.pop(wanted_model, None)
+        if await _ollama_fit_refusal(wanted_model) is None:
             break
     _why = ("caller owns the box" if caller_owns
             else "bench owns the box" if bench_owns
@@ -6965,12 +6974,21 @@ async def list_models_enriched():
             r = await client.get(OLLAMA_URL + "/api/ps")
             return r.json() if r.status_code == 200 else {}
 
+        async def _ollama_tags():
+            # /v1/models does not carry sizes; /api/tags does, and a size is what decides
+            # whether a model can ever load here.
+            r = await client.get(OLLAMA_URL + "/api/tags")
+            return r.json() if r.status_code == 200 else {}
+
         results = await asyncio.gather(
             _ollama(), _ollama_ps(), _vllm_snapshot(client), _vllm_configs(),
-            _llamacpp_snapshot(client), _lmstudio_snapshot(client),
+            _llamacpp_snapshot(client), _lmstudio_snapshot(client), _ollama_tags(),
             return_exceptions=True)
+    otags = results[6] if len(results) > 6 and isinstance(results[6], dict) else {}
+    # Slice to the first six: _ollama_tags is gathered alongside them but is read separately
+    # above, and unpacking the whole list would fail the moment another probe is added.
     odata, ops, vllm, vcfgs, lcpp, lms = (
-        r if not isinstance(r, BaseException) else {} for r in results)
+        r if not isinstance(r, BaseException) else {} for r in results[:6])
 
     resident = {str(m.get("name") or m.get("model") or "")
                 for m in ((ops or {}).get("models") or []) if isinstance(m, dict)}
@@ -7059,6 +7077,30 @@ async def list_models_enriched():
         if len(_backends_for.get(_norm_model_id(mid), ())) > 1:
             e = dict(e, id="%s/%s" % (mid, backend), served_model=mid, upstream=backend)
         data.append(e)
+    # A model larger than this box can hold is not a choice, it is a trap: offering it in a
+    # picker invites a sweep to select it, and with eviction enabled that stops the serving
+    # container to attempt a load that cannot succeed. qwen3:235b-a22b is 132 GB on a 122 GB
+    # machine. Weights alone are the test — anything needing a KV cache on top is only more
+    # impossible, and being generous here keeps a merely-tight model selectable.
+    _total_mb = (_mem_snapshot() or {}).get("total_mb") or 0
+    _sizes_mb = {}
+    for _t in (otags.get("models") or []):
+        if _t.get("size"):
+            _sizes_mb[_norm_model_id(_t.get("name"))] = _t["size"] / (1024 * 1024)
+    if _total_mb:
+        _ceiling = _total_mb - _BENCH_FIT_RESERVE_MB
+        _kept = []
+        for _e in data:
+            _sz = _sizes_mb.get(_norm_model_id(_e.get("served_model") or _e["id"]))
+            if _sz and _sz > _ceiling:
+                _e["unloadable"] = True
+                _e["size_mb"] = round(_sz)
+                continue                       # dropped from the catalogue entirely
+            if _sz:
+                _e["size_mb"] = round(_sz)
+            _kept.append(_e)
+        data = _kept
+
     payload = {"object": "list", "data": data}
     _MODELS_CACHE.update(ts=now, data=payload)
     return JSONResponse(payload)
