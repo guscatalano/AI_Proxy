@@ -5118,6 +5118,40 @@ async def _ollama_fit_refusal(model: str) -> str | None:
     return verdict
 
 
+_MODEL_HOME_CACHE: dict = {"ts": 0.0, "map": {}}
+_MODEL_HOME_TTL_S = 30.0
+
+
+async def _backend_serving(model: str) -> str | None:
+    """The one backend that serves `model`, or None if it is ambiguous or unknown.
+
+    Passthrough routing sends a request to the path default — Ollama for /v1/chat — so naming a
+    model that only vLLM serves produced "model not found" in 100ms. Four models in a sweep
+    failed that way while their containers sat stopped and startable: the proxy knew where they
+    lived and never looked. Only an unambiguous answer is used; if two backends serve the name,
+    the caller has to say which with the qualified "model/backend" form.
+    """
+    if not model:
+        return None
+    now = time.time()
+    if now - _MODEL_HOME_CACHE["ts"] > _MODEL_HOME_TTL_S:
+        try:
+            index = await _bench_model_index()
+        except Exception:
+            return None
+        homes: dict = {}
+        for key, meta in (index or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            name = _norm_model_id(meta.get("model") or "")
+            up = meta.get("upstream")
+            if name and up:
+                homes.setdefault(name, set()).add(up)
+        _MODEL_HOME_CACHE.update(ts=now, map={n: next(iter(u)) for n, u in homes.items()
+                                              if len(u) == 1})
+    return _MODEL_HOME_CACHE["map"].get(_norm_model_id(model))
+
+
 def _split_qualified_model(name: str) -> tuple[str, str | None]:
     """Split "qwen3-coder-next/vllm" into ("qwen3-coder-next", "vllm").
 
@@ -18332,6 +18366,16 @@ async def proxy(full_path: str, request: Request):
     # because a header is set deliberately per request.
     if not _pin_upstream and qualified_upstream in _UPSTREAM_BASES:
         _pin_upstream = qualified_upstream
+    # Nothing explicit said where this goes, and no rule matched. If exactly one backend serves
+    # the name, send it there rather than to the path default, which would 404 on a model it has
+    # never heard of. Explicit pins above always win; an ambiguous name is left alone so the
+    # qualified form stays the way to choose.
+    if (not _pin_upstream and not (rewrite or {}).get("upstream")
+            and isinstance(body_json, dict) and body_json.get("model")
+            and not _is_ollama_native_only(full_path)):
+        _home = await _backend_serving(str(body_json.get("model")))
+        if _home and _home != upstream_label and _home in _UPSTREAM_BASES:
+            _pin_upstream = _home
     _want_upstream = _pin_upstream or ((rewrite or {}).get("upstream") or "")
     # Even an explicit x-proxy-upstream cannot make another backend answer /api/show.
     if _is_ollama_native_only(full_path):
