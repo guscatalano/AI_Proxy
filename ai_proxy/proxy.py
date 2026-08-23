@@ -7841,6 +7841,113 @@ async def update_rules(request: Request):
     return {"ok": True, "config": cfg, "source": "db"}
 
 
+@app.get("/__proxy/api/capacity")
+async def capacity(models: str = "", context: int = 0, parallel: int = 0):
+    """What can be co-resident here, and at what context. Written to be read by another agent.
+
+    Two questions, one endpoint. Called bare it returns the primitives — weights, KV cost per
+    thousand tokens, and the largest context each model can hold alone — so a planner can do its
+    own arithmetic. Called with ?models=a,b&context=N it answers the specific question directly,
+    because the interesting failure is a combination that each member could survive alone.
+
+    The arithmetic is the one the fit guard enforces, so a plan built from this endpoint agrees
+    with what the proxy will actually allow rather than being a second opinion that drifts.
+    """
+    mem = _mem_snapshot() or {}
+    total_mb = mem.get("total_mb") or 0
+    avail_mb = mem.get("avail_mb") or 0
+    reserve_mb = _BENCH_FIT_RESERVE_MB
+    per_slot_default, parallel_default = _bench_ollama_server_ctx(None)
+    parallel = parallel or parallel_default
+
+    sizes: dict = {}
+    resident: set = set()
+    infos: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:
+            tags = await c.get(f"{OLLAMA_URL}/api/tags")
+            if tags.status_code == 200:
+                for t in (tags.json().get("models") or []):
+                    if t.get("size"):
+                        sizes[t["name"]] = t["size"] / (1024 * 1024)
+            ps = await c.get(f"{OLLAMA_URL}/api/ps")
+            if ps.status_code == 200:
+                resident = {m.get("name") for m in (ps.json().get("models") or []) if m.get("name")}
+            wanted = [m.strip() for m in models.split(",") if m.strip()] or list(sizes)
+            for name in wanted[:40]:
+                show = await c.post(f"{OLLAMA_URL}/api/show", json={"model": name})
+                if show.status_code < 400:
+                    infos[name] = show.json() or {}
+    except (httpx.RequestError, ValueError):
+        pass
+
+    def _entry(name):
+        info = (infos.get(name) or {}).get("model_info") or {}
+        size_mb = sizes.get(name)
+        kv_1k = _bench_ollama_kv_mb(info, 1000) if info else None
+        budget = avail_mb - reserve_mb
+        max_ctx = None
+        if kv_1k and size_mb is not None:
+            room = budget - size_mb * _BENCH_FIT_OVERHEAD
+            # KV is per SLOT set: Ollama allocates num_ctx x parallel.
+            max_ctx = int(max(0, room) / (kv_1k / 1000.0) / max(1, parallel))
+        return {
+            "id": name,
+            "weights_gb": round(size_mb / 1024, 2) if size_mb else None,
+            "kv_gb_per_1k_tokens": round(kv_1k / 1024, 4) if kv_1k else None,
+            "kv_measurable": kv_1k is not None,
+            "max_context_alone": max_ctx,
+            "resident": name in resident,
+        }
+
+    names = [m.strip() for m in models.split(",") if m.strip()]
+    body = {
+        "memory": {"total_gb": round(total_mb / 1024, 1),
+                   "available_gb": round(avail_mb / 1024, 1),
+                   "reserved_gb": round(reserve_mb / 1024, 1),
+                   "usable_gb": round(max(0, avail_mb - reserve_mb) / 1024, 1)},
+        "assumptions": {
+            "parallel_slots": parallel,
+            "server_context_default": per_slot_default,
+            "weights_overhead": _BENCH_FIT_OVERHEAD,
+            "formula": "weights_gb * overhead + kv_gb_per_1k_tokens * (context/1000) * "
+                       "parallel_slots <= usable_gb",
+            "note": "KV is deliberately over-estimated; sliding-window models cost less than "
+                    "this. Models whose architecture this build cannot size report "
+                    "kv_measurable=false and only their weights are known.",
+        },
+    }
+
+    if names:
+        entries = [_entry(n) for n in names]
+        ctx = context or per_slot_default
+        need = 0.0
+        unknown = []
+        for e in entries:
+            if e["weights_gb"] is None:
+                unknown.append(e["id"])
+                continue
+            need += e["weights_gb"] * _BENCH_FIT_OVERHEAD
+            if e["kv_gb_per_1k_tokens"]:
+                need += e["kv_gb_per_1k_tokens"] * (ctx / 1000.0) * parallel
+            else:
+                unknown.append(e["id"])
+        usable = max(0, avail_mb - reserve_mb) / 1024
+        body["combination"] = {
+            "models": names, "context": ctx,
+            "required_gb": round(need, 1), "usable_gb": round(usable, 1),
+            "fits": bool(need and need <= usable),
+            "unknown_kv": unknown,
+            "verdict": ("fits" if need and need <= usable else
+                        "does not fit" if need else "cannot judge"),
+        }
+        body["models"] = entries
+    else:
+        body["models"] = sorted((_entry(n) for n in sizes),
+                                key=lambda e: -(e["weights_gb"] or 0))
+    return body
+
+
 @app.get("/__proxy/api/archive")
 def archive_status():
     """Sizes, and how much would move on the next sweep."""
