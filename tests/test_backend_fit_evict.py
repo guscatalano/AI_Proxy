@@ -95,3 +95,99 @@ def test_a_failed_stop_is_reported_not_swallowed(client, monkeypatch):
         assert why and "failed" in why
     finally:
         _cleanup()
+
+
+# --- a sweep is the case eviction exists for ------------------------------------------------------
+#
+# The idle guard defeated its own purpose: a sweep moves between models, so the backend it needs
+# to evict is the one IT was using seconds ago. Every swap would be refused, and eviction would be
+# useless for the only workload that wants it. A run with exclusive=true has already quiesced live
+# traffic through panic mode, so idleness has nobody left to protect.
+
+
+def _bench_running(client, running=True):
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs WHERE id='evict_bench'")
+    if running:
+        conn.execute("INSERT INTO bench_runs (id, ts, model, status, progress, progress_total, "
+                     "config_json) VALUES (?,?,?,?,?,?,?)",
+                     ("evict_bench", time.time(), "m", "running", 1, 10, "{}"))
+    conn.commit()
+    conn.close()
+
+
+def _bench_cleanup():
+    conn = P.db()
+    conn.execute("DELETE FROM bench_runs WHERE id='evict_bench'")
+    conn.commit()
+    conn.close()
+
+
+def test_a_running_bench_evicts_a_just_used_backend(client, monkeypatch):
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    _last_vllm_request(client, ago_s=5)        # the model the sweep just finished measuring
+    _bench_running(client, True)
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_mem_snapshot", lambda: {"avail_mb": 100 * 1024,
+                                                     "total_mb": 121 * 1024, "used_mb": 21 * 1024})
+    try:
+        assert asyncio.run(P._evict_for_fit("refusal", "next-model")) is None
+        assert stopped == ["vllm"], "a sweep must be able to swap backends"
+    finally:
+        _bench_cleanup()
+        _cleanup()
+
+
+def test_without_a_bench_the_idle_guard_still_holds(client, monkeypatch):
+    """Live traffic keeps its protection — this is not a blanket exemption."""
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    _last_vllm_request(client, ago_s=5)
+    _bench_running(client, False)
+    try:
+        why = asyncio.run(P._evict_for_fit("refusal", "next-model"))
+        assert why and "active use" in why
+    finally:
+        _bench_cleanup()
+        _cleanup()
+
+
+# --- a benchmark driven from outside this proxy ---------------------------------------------------
+#
+# An external sweep has no row in bench_runs, so the internal owner check cannot see it. Whoever
+# is driving the sweep is the only party who knows the box is theirs, so they declare it per
+# request with x-proxy-evict.
+
+
+def test_a_caller_can_declare_ownership(client, monkeypatch):
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    _last_vllm_request(client, ago_s=5)        # the model the external sweep just measured
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_mem_snapshot", lambda: {"avail_mb": 100 * 1024,
+                                                     "total_mb": 121 * 1024, "used_mb": 21 * 1024})
+    try:
+        assert asyncio.run(P._evict_for_fit("r", "next", caller_owns=True)) is None
+        assert stopped == ["vllm"]
+    finally:
+        _cleanup()
+
+
+def test_without_the_header_the_guard_still_applies(client, monkeypatch):
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    _last_vllm_request(client, ago_s=5)
+    try:
+        why = asyncio.run(P._evict_for_fit("r", "next", caller_owns=False))
+        assert why and "active use" in why
+    finally:
+        _cleanup()

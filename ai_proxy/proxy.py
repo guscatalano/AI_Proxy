@@ -3315,6 +3315,9 @@ DEFAULT_RULES_CONFIG = {
         # llama.cpp). Off by default — turning it on means a request may stop the currently
         # serving twin and evict other models when the target does not fit in free memory.
         "auto_load": {"enabled": False, "ready_timeout_s": 900, "min_hold_s": 120,
+                      # Ollama keeps a model resident for keep_alive (two hours on this box),
+                      # which is enough to stop a vLLM container starting beside it.
+                      "release_ollama": True,
                       "drain_s": 120},
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
@@ -4898,7 +4901,40 @@ _OLLAMA_FIT_TTL_S = 30.0
 _OLLAMA_META_CACHE: dict = {}         # normalised model -> {"size_mb", "info", "params"}
 
 
-async def _evict_for_fit(refusal: str, wanted_model: str) -> str | None:
+async def _free_ollama_models(reason: str = "") -> list:
+    """Unload whatever Ollama is holding. Returns the models it released.
+
+    Ollama keeps a model resident for OLLAMA_KEEP_ALIVE — two hours on this box — so a sweep
+    that moves from an Ollama model back to a vLLM one finds the memory still taken and the
+    container fails to start. Setting keep_alive to 0 on each resident model releases it now
+    rather than in two hours. Best-effort throughout: a swap must not fail because a tidy-up
+    call did.
+    """
+    released = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+            ps = await c.get(f"{OLLAMA_URL}/api/ps")
+            if ps.status_code != 200:
+                return released
+            for m in (ps.json().get("models") or []):
+                name = m.get("name") or m.get("model")
+                if not name:
+                    continue
+                try:
+                    await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "keep_alive": 0})
+                    released.append(name)
+                except httpx.RequestError:
+                    pass
+    except (httpx.RequestError, ValueError):
+        return released
+    if released:
+        print(f"[backend_fit] released ollama models {released} {reason}".strip())
+    return released
+
+
+async def _evict_for_fit(refusal: str, wanted_model: str,
+                         caller_owns: bool = False) -> str | None:
     """Free memory by stopping an idle backend so `wanted_model` can load. None = freed.
 
     Returns a reason when it declines, which is then appended to the refusal — a request that
@@ -4910,6 +4946,24 @@ async def _evict_for_fit(refusal: str, wanted_model: str) -> str | None:
         return "eviction is off (backend_fit.evict.enabled)"
     idle_s = float(cfg.get("idle_s", 600) or 600)
     targets = [str(u).lower() for u in (cfg.get("evict_upstreams") or ["vllm"])]
+    # A running benchmark owns the box and the idle guard does not apply to it. A sweep exists
+    # to move between models, so the backend it needs to evict is by definition the one IT was
+    # using seconds ago — the guard would refuse every swap and make eviction useless for the
+    # only workload that wants it. An exclusive run has already quiesced live traffic through
+    # panic mode, so there is nobody left for idleness to protect.
+    # caller_owns is the x-proxy-evict header: a benchmark driven from OUTSIDE this proxy has
+    # no row in bench_runs, so the internal check cannot see it. Whoever is sweeping models is
+    # the only party who knows the box is theirs, so they say so per request.
+    bench_owns = caller_owns
+    if not bench_owns:
+        try:
+            conn = db()
+            bench_owns = bool(conn.execute(
+                "SELECT COUNT(*) FROM bench_runs WHERE status IN ('running','pending')"
+            ).fetchone()[0])
+            conn.close()
+        except Exception:
+            bench_owns = False
     try:
         conn = db()
         row = conn.execute(
@@ -4921,7 +4975,7 @@ async def _evict_for_fit(refusal: str, wanted_model: str) -> str | None:
     except Exception:
         return "could not read recent traffic, so idleness is unknown"
     idle_for = time.time() - last if last else idle_s + 1
-    if idle_for < idle_s:
+    if idle_for < idle_s and not bench_owns:
         return (f"{targets[0]} served a request {idle_for:.0f}s ago and idle_s is {idle_s:.0f}s; "
                 f"evicting a backend in active use would trade one stall for everybody's")
     stopped = []
@@ -4941,8 +4995,11 @@ async def _evict_for_fit(refusal: str, wanted_model: str) -> str | None:
         await asyncio.sleep(1.0)
         if (_mem_snapshot() or {}).get("avail_mb", 0) > 60 * 1024:
             break
-    print(f"[backend_fit] evicted {','.join(stopped)} (idle {idle_for:.0f}s) "
-          f"to make room for {wanted_model!r}")
+    _why = ("caller owns the box" if caller_owns
+            else "bench owns the box" if bench_owns
+            else "idle %.0fs" % idle_for)
+    print("[backend_fit] evicted %s (%s) to make room for %r"
+          % (",".join(stopped), _why, wanted_model))
     return None
 
 
@@ -13381,6 +13438,11 @@ async def _ensure_model_served(model: str, upstream: str) -> dict | None:
         meta = _bench_resolve_model(index, model, upstream)
         if meta.get("loaded"):
             return None                # someone else loaded it while we queued
+        # Ollama holds a model for OLLAMA_KEEP_ALIVE — two hours here — so a sweep coming back
+        # from an Ollama model to a vLLM one finds the memory still taken and the container
+        # fails to start. Releasing costs nothing when Ollama is already empty.
+        if _auto_load_cfg().get("release_ollama", True):
+            await _free_ollama_models(f"before loading {model!r} on {upstream}")
         min_hold = float(cfg.get("min_hold_s", 120))
         tgt = f"{upstream}:{model}"
         # HELD, not refused: a request that arrives inside another target's hold window
@@ -18251,7 +18313,10 @@ async def proxy(full_path: str, request: Request):
         if _fit_refusal:
             # Try to make room before refusing. Re-checked afterwards rather than assumed:
             # stopping a container is not a promise that what is left is enough.
-            _why_not = await _evict_for_fit(_fit_refusal, str(body_json.get("model") or ""))
+            _owns = (request.headers.get("x-proxy-evict") or "").strip().lower() in (
+                "1", "true", "yes")
+            _why_not = await _evict_for_fit(_fit_refusal, str(body_json.get("model") or ""),
+                                            caller_owns=_owns)
             if _why_not is None:
                 _OLLAMA_FIT_CACHE.pop(str(body_json.get("model") or ""), None)
                 _fit_refusal = await _ollama_fit_refusal(str(body_json.get("model") or ""))
