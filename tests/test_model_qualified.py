@@ -77,3 +77,38 @@ def test_two_tags_on_one_backend_stay_unqualified(client):
         key = P._norm_model_id(e.get("served_model") or e["id"])
         if len(by_backend.get(key, ())) == 1:
             assert not e.get("upstream"), "%s was qualified but is unambiguous" % e["id"]
+
+
+# --- the name that comes back --------------------------------------------------------------------
+#
+# A qualified id is what the client picked out of /v1/models, so answering with the bare name makes
+# any requested-vs-served comparison read as a mismatch. A sweep naming qwen3-coder-next/vllm was
+# reported as "the backend ignored the requested model and served a different one" — when it had
+# served exactly what was asked for, and only the selector suffix had been stripped on the way out.
+
+
+def test_a_qualified_request_is_answered_with_the_qualified_name(client):
+    import httpx
+
+    seen = {}
+
+    def handler(request: httpx.Request):
+        import json as _json
+        seen["sent"] = _json.loads(request.content or b"{}").get("model")
+        return httpx.Response(200, json={
+            "id": "c1", "object": "chat.completion", "model": seen["sent"],
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"completion_tokens": 1}}, headers={"content-type": "application/json"})
+
+    real = client.app.state.client
+    client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "some-model/vllm", "stream": False, "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert seen.get("sent") == "some-model", "the suffix must not reach the engine"
+        assert r.json().get("model") == "some-model/vllm", \
+            "the client asked for the qualified id and must see it back"
+    finally:
+        client.app.state.client = real

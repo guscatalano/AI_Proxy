@@ -18466,6 +18466,11 @@ async def proxy(full_path: str, request: Request):
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
         or ctx_capped or usage_injected or think_quirk_applied or output_clamped
+        # Stripping the "/backend" selector edits body_json, and without saying so here the
+        # ORIGINAL bytes go upstream — the engine then sees a model name it does not serve.
+        # Third time this ordering has bitten: the thinking quirk and the output clamp both
+        # mutated the body and were silently discarded for the same reason.
+        or qualified_upstream
         or (compressed and compressed.get("action") == "compress")
     )
     if body_mutated:
@@ -18811,6 +18816,14 @@ async def proxy(full_path: str, request: Request):
         out_headers["x-proxy-model-rewrite"] = f"{_rewrite_from}->{_rewrite_to}"
     _preserve_model = bool((load_rules_config().get("model_router") or {}).get("preserve_response_model_name", False))
     _restore_model_name = _rewrite_from if (_preserve_model and _rewrite_from and _rewrite_to) else None
+    # A qualified "model/backend" name is echoed back as asked, whatever preserve_response_model_name
+    # says. The suffix is this proxy's selector syntax, not a different model: the client picked that
+    # exact id out of /v1/models, and answering with the bare name makes every requested-vs-served
+    # comparison read as a mismatch. A sweep naming qwen3-coder-next/vllm was reported as "the
+    # backend ignored the requested model and served a different one" when it had served precisely
+    # what was asked for.
+    if qualified_upstream and isinstance(model, str):
+        _restore_model_name = "%s/%s" % (model, qualified_upstream)
 
     # Helper used by both streaming and non-streaming paths: iteratively call upstream,
     # execute proxy-owned tools, append tool_results, and re-call until the model stops
