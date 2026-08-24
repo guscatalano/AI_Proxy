@@ -221,7 +221,7 @@ def test_ollama_residents_are_released_before_stopping_a_container(client, monke
     monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
     monkeypatch.setattr(P, "_free_ollama_models", _release)
     # Once the residents are gone the model fits, so no container should be stopped.
-    monkeypatch.setattr(P, "_ollama_fit_refusal", lambda m: _none())
+    monkeypatch.setattr(P, "_ollama_fit_refusal", lambda m, **k: _none())
     try:
         assert asyncio.run(P._evict_for_fit("r", "wanted", caller_owns=True)) is None
         assert released, "ollama residents should be released"
@@ -232,3 +232,56 @@ def test_ollama_residents_are_released_before_stopping_a_container(client, monke
 
 async def _none():
     return None
+
+
+# --- eviction buys memory, and some models cannot be bought room ------------------------------
+#
+# qwen3.6:35b-a3b prices at ~340 GB of KV on a 122 GB box. Asking for it stopped the container
+# serving production to chase a load that could never succeed, and then held the request for the
+# full release timeout before refusing anyway. One refusal became eight minutes of outage.
+
+
+def test_a_model_bigger_than_the_machine_never_triggers_eviction(client, monkeypatch):
+    _cfg(monkeypatch, enabled=True, idle_s=60)
+    _last_vllm_request(client, ago_s=3600)      # idle, so nothing else would stop it
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    try:
+        why = asyncio.run(P._evict_for_fit("r", "huge-model", caller_owns=True, _impossible=True))
+        assert why and "no amount of eviction" in why
+        assert stopped == [], "nothing may be stopped for a load that cannot succeed"
+    finally:
+        _cleanup()
+
+
+def test_a_model_that_merely_needs_room_still_evicts(client, monkeypatch):
+    """The guard must not become a blanket refusal — this is the case eviction exists for."""
+    _cfg(monkeypatch, enabled=True, idle_s=60)
+    _last_vllm_request(client, ago_s=3600)
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    async def _fits(model, assume_avail_mb=0, pin=None):
+        return None
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_free_ollama_models", lambda reason="": _empty_list())
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _fits)
+    monkeypatch.setattr(P, "_mem_snapshot", lambda: {"avail_mb": 100 * 1024,
+                                                     "total_mb": 121 * 1024, "used_mb": 21 * 1024})
+    try:
+        assert asyncio.run(P._evict_for_fit("r", "big", caller_owns=True, _impossible=False)) is None
+    finally:
+        _cleanup()
+
+
+async def _empty_list():
+    return []

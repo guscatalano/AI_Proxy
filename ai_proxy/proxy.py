@@ -4895,7 +4895,7 @@ def _live_served_model(upstream: str) -> str | None:
     return name
 
 
-_OLLAMA_FIT_CACHE: dict = {}          # model -> (checked_ts, refusal or None)
+_OLLAMA_FIT_CACHE: dict = {}          # (model, window) -> (checked_ts, refusal or None)
 _OLLAMA_FIT_TTL_S = 30.0
 # Sizes and shapes learned while Ollama was healthy, kept indefinitely. Without this the guard
 # is useless exactly when it is needed: once a model has crashed the service, /api/tags stops
@@ -4937,7 +4937,9 @@ async def _free_ollama_models(reason: str = "") -> list:
 
 
 async def _evict_for_fit(refusal: str, wanted_model: str,
-                         caller_owns: bool = False) -> str | None:
+                         caller_owns: bool = False,
+                         _impossible: bool = False,
+                         pin: int | None = None) -> str | None:
     """Free memory by stopping an idle backend so `wanted_model` can load. None = freed.
 
     Returns a reason when it declines, which is then appended to the refusal — a request that
@@ -4954,6 +4956,14 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     # using seconds ago — the guard would refuse every swap and make eviction useless for the
     # only workload that wants it. An exclusive run has already quiesced live traffic through
     # panic mode, so there is nobody left for idleness to protect.
+    # Never evict for a model that cannot fit on an EMPTY box. Eviction buys memory, and a
+    # model needing more than the machine has cannot be bought room — qwen3.6:35b-a3b prices at
+    # ~340 GB of KV on a 122 GB box, and asking for it stopped the container serving production
+    # to chase a load that could never succeed. Refusing costs one request; this cost every
+    # request for the eight minutes vLLM took to come back.
+    if _impossible:
+        return ("no amount of eviction would help: it needs more than this machine has in total")
+
     # caller_owns is the x-proxy-evict header: a benchmark driven from OUTSIDE this proxy has
     # no row in bench_runs, so the internal check cannot see it. Whoever is sweeping models is
     # the only party who knows the box is theirs, so they say so per request.
@@ -4990,8 +5000,8 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     if released:
         for _ in range(20):
             await asyncio.sleep(1.0)
-            _OLLAMA_FIT_CACHE.pop(wanted_model, None)
-            if await _ollama_fit_refusal(wanted_model) is None:
+            _OLLAMA_FIT_CACHE.pop((wanted_model, pin or 0), None)
+            if await _ollama_fit_refusal(wanted_model, pin=pin) is None:
                 print("[backend_fit] released %s; no container stop needed" % released)
                 return None
 
@@ -5016,8 +5026,8 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     _t0 = time.time()
     while time.time() - _t0 < _wait_s:
         await asyncio.sleep(1.0)
-        _OLLAMA_FIT_CACHE.pop(wanted_model, None)
-        if await _ollama_fit_refusal(wanted_model) is None:
+        _OLLAMA_FIT_CACHE.pop((wanted_model, pin or 0), None)
+        if await _ollama_fit_refusal(wanted_model, pin=pin) is None:
             break
     _why = ("caller owns the box" if caller_owns
             else "bench owns the box" if bench_owns
@@ -5027,7 +5037,59 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     return None
 
 
-async def _ollama_fit_refusal(model: str) -> str | None:
+def _configured_num_ctx(model: str) -> int | None:
+    """The num_ctx the ollama_options rule would pin this model to, if any.
+
+    Read by both the fit gate and the swap itself so the two cannot disagree about how big the
+    request is — one refusing what the other was about to make fit.
+    """
+    cfg = (load_rules_config().get("ollama_options") or {})
+    if not cfg.get("enabled", False):
+        return None
+    for src in ((cfg.get("per_model") or {}).get(model), cfg.get("defaults") or {}):
+        if isinstance(src, dict) and src.get("num_ctx"):
+            try:
+                return int(src["num_ctx"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _body_num_ctx(body: dict) -> int | None:
+    """The num_ctx a request asks for, wherever the client put it."""
+    if not isinstance(body, dict):
+        return None
+    opts = body.get("options") if isinstance(body.get("options"), dict) else {}
+    v = body.get("num_ctx") or opts.get("num_ctx")
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _effective_num_ctx(model: str, body: dict) -> int | None:
+    """The window this request will actually load with, on the OpenAI-compatible path.
+
+    A client asking for a smaller context is asking for something Ollama's /v1 endpoint throws
+    away, so the proxy has to deliver it as a derived model — and the fit gate has to price the
+    request at it, or it refuses a load that was going to be a fraction of the size it feared.
+    The smaller of what the client asked for and what the config pins wins: a client asking for
+    MORE than the pin would undo the pin's whole purpose.
+    """
+    asked = _body_num_ctx(body)
+    # A request asking for the server default or more has nothing to deliver: that window is
+    # already what it would get. Acting on it anyway would derive a variant per model for the
+    # agents that auto-set num_ctx to the model's full training context, which is common.
+    if asked and asked >= _bench_ollama_server_ctx(None)[0]:
+        asked = None
+    pinned = _configured_num_ctx(model)
+    if asked and pinned:
+        return min(asked, pinned)
+    return asked or pinned
+
+
+async def _ollama_fit_refusal(model: str, assume_avail_mb: int = 0,
+                              pin: int | None = None) -> str | None:
     """Why forwarding this would kill Ollama, or None if it is safe to send.
 
     The same arithmetic the bench preflight uses, applied to live traffic and measured against
@@ -5042,7 +5104,10 @@ async def _ollama_fit_refusal(model: str) -> str | None:
     if not model:
         return None
     now = time.time()
-    hit = _OLLAMA_FIT_CACHE.get(model)
+    # A hypothetical ("would this fit on an empty box?") must not be cached as the real verdict,
+    # nor answered from one.
+    ckey = (model, pin or 0)
+    hit = None if assume_avail_mb else _OLLAMA_FIT_CACHE.get(ckey)
     if hit and now - hit[0] < _OLLAMA_FIT_TTL_S:
         return hit[1]
 
@@ -5095,9 +5160,18 @@ async def _ollama_fit_refusal(model: str) -> str | None:
                 except ValueError:
                     pass
                 break
+        # The window this request will really load at, decided by the caller. ollama_options
+        # rewrites the request to a context-pinned derivative later in the pipeline, and THAT
+        # is what gets loaded — qwen3.6:35b-a3b prices at 655 GB against the 262k server
+        # default and 47 GB pinned to 16k, and only the second number describes the load that
+        # would happen. Passed in rather than looked up here because the pin applies only on
+        # the OpenAI-compat path: a native /api/chat request carries its own num_ctx and is
+        # never swapped, so pricing it at the pin would wave through a 262k allocation.
+        if pin:
+            per_slot = min(per_slot, pin)
         kv_mb = _bench_ollama_kv_mb(info, per_slot * parallel)
         size_mb = sizes.get(model) or sizes.get(key) or remembered.get("size_mb")
-        avail_mb = (_mem_snapshot() or {}).get("avail_mb")
+        avail_mb = assume_avail_mb or (_mem_snapshot() or {}).get("avail_mb")
         if not size_mb or not avail_mb:
             return None
         # An unknown KV estimate must not defeat the check. _bench_ollama_kv_mb returns None for
@@ -5121,7 +5195,8 @@ async def _ollama_fit_refusal(model: str) -> str | None:
                 f"or request a model that is already loaded.")
 
     verdict = await _decide()
-    _OLLAMA_FIT_CACHE[model] = (now, verdict)
+    if not assume_avail_mb:
+        _OLLAMA_FIT_CACHE[ckey] = (now, verdict)
     return verdict
 
 
@@ -5306,16 +5381,9 @@ async def _ensure_ctx_model(base: str, num_ctx: int) -> str | None:
             if name in have:
                 _CTX_MODELS_SEEN.add(name)
                 return name
-            # A derived vision model loses its projector and then fails to load at all:
-            # deriving minicpm-v4.5 produced "Load failed" with the mmproj still being sized.
-            # Serving the base model at the default window is a worse context but a working
-            # one, which beats a variant that cannot answer.
             info = await c.post(f"{OLLAMA_URL}/api/show", json={"model": base})
             caps = (info.json() or {}).get("capabilities") or [] if info.status_code < 400 else []
-            if "vision" in [str(x).lower() for x in caps]:
-                print(f"[ollama_options] refusing to derive {name}: {base} is a vision model "
-                      f"and loses its projector when derived — serving it unpinned instead")
-                return None
+            caps = [str(x).lower() for x in caps]
             r = await c.post(f"{OLLAMA_URL}/api/create",
                              json={"model": name, "from": base,
                                    "parameters": {"num_ctx": int(num_ctx)}, "stream": False})
@@ -5323,6 +5391,21 @@ async def _ensure_ctx_model(base: str, num_ctx: int) -> str | None:
                 print(f"[ollama_options] could not derive {name} from {base}: "
                       f"HTTP {r.status_code} {r.text[:120]}")
                 return None
+            # Deriving minicpm-v4.5 once produced a variant that answered "Load failed" with its
+            # mmproj still being sized — the projector had not come across. That was a blanket
+            # ban on deriving vision models until qwen3.6:35b-a3b derived cleanly and kept
+            # vision, so the ban was costing a working config. Check the thing that actually
+            # goes wrong instead: if a capability was lost, throw the variant away.
+            if "vision" in caps:
+                after = await c.post(f"{OLLAMA_URL}/api/show", json={"model": name})
+                kept = [str(x).lower() for x in ((after.json() or {}).get("capabilities") or [])
+                        ] if after.status_code < 400 else []
+                if "vision" not in kept:
+                    await c.request("DELETE", f"{OLLAMA_URL}/api/delete",
+                                    json={"model": name})
+                    print(f"[ollama_options] {name} lost vision when derived from {base} — "
+                          f"deleted it, serving the base model unpinned instead")
+                    return None
     except (httpx.RequestError, ValueError, KeyError) as e:
         print(f"[ollama_options] could not derive {name}: {type(e).__name__}: {e}")
         return None
@@ -5342,11 +5425,7 @@ async def apply_ollama_ctx_model(body: dict, ctx: dict) -> dict | None:
     base = body.get("model")
     if not base or _ctx_derived_name(base, 1).rsplit("-ctx", 1)[0] in ("", None):
         return None
-    want = None
-    for src in ((cfg.get("per_model") or {}).get(base), cfg.get("defaults") or {}):
-        if isinstance(src, dict) and src.get("num_ctx"):
-            want = int(src["num_ctx"])
-            break
+    want = _effective_num_ctx(base, body)
     if not want:
         return None
     derived = await _ensure_ctx_model(base, want)
@@ -7835,17 +7914,64 @@ async def get_rules():
     }
 
 
+_RULES_HISTORY_KEEP = 10
+
+
 @app.post("/__proxy/api/rules")
 async def update_rules(request: Request):
+    """Replace the stored rules document.
+
+    Replace, not merge, because the dashboard posts the whole config and deleting a key has to
+    be possible. The cost is that a hand-written POST of one section silently deletes every
+    other: posting {"ollama_options": ...} from a shell dropped the model_router rule that sent
+    qwen3-coder-next to vLLM, and the next request from the main client 503'd against Ollama.
+    So each write keeps the previous document and reports what the new one dropped.
+    """
     try:
         payload = await request.json()
     except Exception as e:
         return JSONResponse({"error": f"invalid JSON body: {e}"}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"error": "rules config must be a JSON object"}, status_code=400)
+    prev_raw = (get_setting("rules") or {}).get("value")
+    dropped = []
+    if prev_raw:
+        try:
+            dropped = sorted(set(json.loads(prev_raw) or {}) - set(payload))
+        except json.JSONDecodeError:
+            pass
+        try:
+            hist = json.loads((get_setting("rules_history") or {}).get("value") or "[]")
+        except json.JSONDecodeError:
+            hist = []
+        hist.append({"ts": time.time(), "value": prev_raw})
+        set_setting("rules_history", json.dumps(hist[-_RULES_HISTORY_KEEP:]))
     set_setting("rules", json.dumps(payload, indent=2))
     cfg = load_rules_config()
-    return {"ok": True, "config": cfg, "source": "db"}
+    out = {"ok": True, "config": cfg, "source": "db"}
+    if dropped:
+        out["dropped_keys"] = dropped
+        out["warning"] = (f"this write removed {len(dropped)} section(s) that were stored "
+                          f"before it: {', '.join(dropped)}. They now fall back to the built-in "
+                          f"defaults. POST the whole config, or restore from "
+                          f"GET /__proxy/api/rules/history.")
+        print(f"[rules] write dropped stored sections: {', '.join(dropped)}")
+    return out
+
+
+@app.get("/__proxy/api/rules/history")
+async def rules_history():
+    """The last few stored rules documents, newest first, so a bad write can be undone."""
+    try:
+        hist = json.loads((get_setting("rules_history") or {}).get("value") or "[]")
+    except json.JSONDecodeError:
+        hist = []
+    return {"versions": [{"ts": h.get("ts"),
+                          "when": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                time.localtime(h.get("ts") or 0)),
+                          "keys": sorted(json.loads(h.get("value") or "{}").keys()),
+                          "config": json.loads(h.get("value") or "{}")}
+                         for h in reversed(hist)]}
 
 
 @app.get("/__proxy/api/capacity")
@@ -7892,18 +8018,25 @@ async def capacity(models: str = "", context: int = 0, parallel: int = 0):
         info = (infos.get(name) or {}).get("model_info") or {}
         size_mb = sizes.get(name)
         kv_1k = _bench_ollama_kv_mb(info, 1000) if info else None
-        budget = avail_mb - reserve_mb
-        max_ctx = None
-        if kv_1k and size_mb is not None:
-            room = budget - size_mb * _BENCH_FIT_OVERHEAD
+
+        def _ctx_for(budget_mb):
+            if not kv_1k or size_mb is None:
+                return None
+            room = budget_mb - reserve_mb - size_mb * _BENCH_FIT_OVERHEAD
             # KV is per SLOT set: Ollama allocates num_ctx x parallel.
-            max_ctx = int(max(0, room) / (kv_1k / 1000.0) / max(1, parallel))
+            return int(max(0, room) / (kv_1k / 1000.0) / max(1, parallel))
+
         return {
             "id": name,
             "weights_gb": round(size_mb / 1024, 2) if size_mb else None,
             "kv_gb_per_1k_tokens": round(kv_1k / 1024, 4) if kv_1k else None,
             "kv_measurable": kv_1k is not None,
-            "max_context_alone": max_ctx,
+            # "alone" means alone on the box, so it is measured against TOTAL memory. Measuring
+            # it against what is free right now reported max_context_alone=0 for every model
+            # whenever vLLM was up — which is precisely when a planner asks the question, and
+            # the answer it needs is what fits once the box is cleared.
+            "max_context_alone": _ctx_for(total_mb),
+            "max_context_now": _ctx_for(avail_mb),
             "resident": name in resident,
         }
 
@@ -7921,7 +8054,9 @@ async def capacity(models: str = "", context: int = 0, parallel: int = 0):
                        "parallel_slots <= usable_gb",
             "note": "KV is deliberately over-estimated; sliding-window models cost less than "
                     "this. Models whose architecture this build cannot size report "
-                    "kv_measurable=false and only their weights are known.",
+                    "kv_measurable=false and only their weights are known. "
+                    "max_context_alone assumes the box is otherwise empty; max_context_now "
+                    "measures against free memory this second.",
         },
     }
 
@@ -7940,12 +8075,20 @@ async def capacity(models: str = "", context: int = 0, parallel: int = 0):
             else:
                 unknown.append(e["id"])
         usable = max(0, avail_mb - reserve_mb) / 1024
+        on_empty = max(0, total_mb - reserve_mb) / 1024
         body["combination"] = {
             "models": names, "context": ctx,
             "required_gb": round(need, 1), "usable_gb": round(usable, 1),
             "fits": bool(need and need <= usable),
+            # Two different questions. "Can these be co-resident?" is about the box; "can I have
+            # them right now?" is about what else is holding memory this second. A planner given
+            # only the second answer cannot tell an impossible combination from a busy box.
+            "usable_gb_on_empty_box": round(on_empty, 1),
+            "fits_on_empty_box": bool(need and need <= on_empty),
             "unknown_kv": unknown,
             "verdict": ("fits" if need and need <= usable else
+                        "does not fit now, but would on an idle box"
+                        if need and need <= on_empty else
                         "does not fit" if need else "cannot judge"),
         }
         body["models"] = entries
@@ -18577,17 +18720,30 @@ async def proxy(full_path: str, request: Request):
     if (_fit_cfg.get("enabled", True) and isinstance(body_json, dict)
             and upstream_label in [str(u).lower() for u in (_fit_cfg.get("upstreams") or ["ollama"])]
             and full_path.startswith(("v1/chat", "v1/completions", "api/chat", "api/generate"))):
-        _fit_refusal = await _ollama_fit_refusal(str(body_json.get("model") or ""))
+        # A native /api/chat request keeps the model it named and carries its own num_ctx;
+        # only the OpenAI-compat path gets swapped for a context-pinned derivative. Price each
+        # for the window it will actually load at.
+        _fit_model = str(body_json.get("model") or "")
+        # Native /api/chat carries num_ctx to Ollama itself; the OpenAI path needs the swap, and
+        # either way the window is whatever this request will really load with.
+        _pin = (_body_num_ctx(body_json) if full_path.startswith("api/")
+                else _effective_num_ctx(_fit_model, body_json))
+        _fit_refusal = await _ollama_fit_refusal(_fit_model, pin=_pin)
         if _fit_refusal:
             # Try to make room before refusing. Re-checked afterwards rather than assumed:
             # stopping a container is not a promise that what is left is enough.
             _owns = (request.headers.get("x-proxy-evict") or "").strip().lower() in (
                 "1", "true", "yes")
-            _why_not = await _evict_for_fit(_fit_refusal, str(body_json.get("model") or ""),
-                                            caller_owns=_owns)
+            # Would it fit on an empty machine? If not, stopping things is pure loss.
+            _mem_all = _mem_snapshot() or {}
+            _hopeless = await _ollama_fit_refusal(
+                _fit_model, assume_avail_mb=(_mem_all.get("total_mb") or 0),
+                pin=_pin) is not None
+            _why_not = await _evict_for_fit(_fit_refusal, _fit_model, caller_owns=_owns,
+                                            _impossible=_hopeless, pin=_pin)
             if _why_not is None:
-                _OLLAMA_FIT_CACHE.pop(str(body_json.get("model") or ""), None)
-                _fit_refusal = await _ollama_fit_refusal(str(body_json.get("model") or ""))
+                _OLLAMA_FIT_CACHE.pop((_fit_model, _pin or 0), None)
+                _fit_refusal = await _ollama_fit_refusal(_fit_model, pin=_pin)
             elif _fit_refusal:
                 _fit_refusal += f" (not evicted: {_why_not})"
         if _fit_refusal:

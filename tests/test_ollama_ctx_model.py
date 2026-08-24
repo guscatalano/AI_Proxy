@@ -67,12 +67,32 @@ class _FakeClient:
 
     caps: list = []
 
+    # Capabilities of the derived model, once it exists. None means "same as the base", which
+    # is what a healthy derivation looks like.
+    derived_caps = None
+    deleted: list = []
+
+    async def request(self, method, url, json=None, **k):
+        if method == "DELETE" and url.endswith("/api/delete"):
+            _FakeClient.deleted.append(json["model"])
+            if json["model"] in _FakeClient.existing:
+                _FakeClient.existing.remove(json["model"])
+
+        class R:
+            status_code = 200
+        return R()
+
     async def post(self, url, json=None, **k):
         if url.endswith("/api/show"):
+            asked = (json or {}).get("model")
+            caps = (_FakeClient.caps if asked not in _FakeClient.existing
+                    else (_FakeClient.caps if _FakeClient.derived_caps is None
+                          else _FakeClient.derived_caps))
+
             class S:
                 status_code = 200
                 @staticmethod
-                def json(): return {"capabilities": _FakeClient.caps}
+                def json(): return {"capabilities": caps}
             return S()
 
         class R:
@@ -87,7 +107,7 @@ class _FakeClient:
 @pytest.fixture(autouse=True)
 def _fake(monkeypatch):
     _FakeClient.created, _FakeClient.existing, _FakeClient.fail = [], [], False
-    _FakeClient.caps = []
+    _FakeClient.caps, _FakeClient.derived_caps, _FakeClient.deleted = [], None, []
     monkeypatch.setattr(proxy.httpx, "AsyncClient", _FakeClient)
 
 
@@ -173,15 +193,29 @@ def test_openai_path_no_longer_claims_num_ctx_it_cannot_deliver(monkeypatch):
 
 
 @pytest.mark.anyio
-async def test_a_vision_model_is_never_derived(monkeypatch):
-    """Deriving minicpm-v4.5 produced a variant that failed to load — the projector does not
-    survive. A working default window beats a pinned model that cannot answer."""
+async def test_a_vision_model_that_derives_cleanly_keeps_its_pin(monkeypatch):
+    """This was a blanket ban until qwen3.6:35b-a3b derived with vision intact — and that model
+    cannot load at all without a pinned window, so the ban was costing the only working config."""
     _FakeClient.caps = ["completion", "vision", "tools"]
+    _rules(monkeypatch, {"enabled": True, "per_model": {"qwen3.6": {"num_ctx": 16384}}})
+    body = {"model": "qwen3.6"}
+    out = await proxy.apply_ollama_ctx_model(body, {"path": "/v1/chat/completions"})
+    assert out and body["model"] == "qwen3.6-ctx16k"
+    assert _FakeClient.deleted == []
+
+
+@pytest.mark.anyio
+async def test_a_variant_that_lost_its_projector_is_thrown_away(monkeypatch):
+    """Deriving minicpm-v4.5 once produced a variant that answered "Load failed" with its mmproj
+    still being sized. Serve the base at the default window rather than a model that cannot
+    answer — and do not leave the broken variant on disk to be found later."""
+    _FakeClient.caps = ["completion", "vision", "tools"]
+    _FakeClient.derived_caps = ["completion", "tools"]
     _rules(monkeypatch, {"enabled": True, "per_model": {"minicpm": {"num_ctx": 16384}}})
     body = {"model": "minicpm"}
     assert await proxy.apply_ollama_ctx_model(body, {"path": "/v1/chat/completions"}) is None
     assert body["model"] == "minicpm", "the base model must still be forwarded"
-    assert _FakeClient.created == [], "nothing should have been created"
+    assert _FakeClient.deleted == ["minicpm-ctx16k"]
 
 
 @pytest.mark.anyio
@@ -191,3 +225,65 @@ async def test_a_text_model_is_still_derived(monkeypatch):
     body = {"model": "nemo"}
     out = await proxy.apply_ollama_ctx_model(body, {"path": "/v1/chat/completions"})
     assert out and body["model"] == "nemo-ctx16k"
+
+
+# --- a client asking for a smaller window ----------------------------------------------------
+#
+# Ollama's /v1 endpoint throws num_ctx away, so a client that sets it gets the 262k server
+# default and an OOM instead of the small load it asked for. The proxy delivers the request it
+# was actually given, by the only mechanism that works: a derived model carrying the parameter.
+
+
+@pytest.mark.anyio
+async def test_a_client_asking_for_a_small_context_gets_one(monkeypatch):
+    _rules(monkeypatch, {"enabled": True})
+    body = {"model": "big", "num_ctx": 8192, "messages": []}
+    out = await proxy.apply_ollama_ctx_model(body, {"path": "v1/chat/completions"})
+    assert out["num_ctx"] == 8192 and body["model"] == "big-ctx8k"
+
+
+@pytest.mark.anyio
+async def test_the_nested_options_form_works_too(monkeypatch):
+    _rules(monkeypatch, {"enabled": True})
+    body = {"model": "big", "options": {"num_ctx": 4096}}
+    out = await proxy.apply_ollama_ctx_model(body, {"path": "v1/chat/completions"})
+    assert out["num_ctx"] == 4096 and body["model"] == "big-ctx4k"
+
+
+@pytest.mark.anyio
+async def test_a_client_cannot_ask_past_the_configured_pin(monkeypatch):
+    """The pin exists because the larger window does not fit; a request may go under it, not over."""
+    _rules(monkeypatch, {"enabled": True, "per_model": {"big": {"num_ctx": 16384}}})
+    body = {"model": "big", "num_ctx": 131072}
+    out = await proxy.apply_ollama_ctx_model(body, {"path": "v1/chat/completions"})
+    assert out["num_ctx"] == 16384 and body["model"] == "big-ctx16k"
+
+
+@pytest.mark.anyio
+async def test_a_client_may_ask_for_less_than_the_pin(monkeypatch):
+    _rules(monkeypatch, {"enabled": True, "per_model": {"big": {"num_ctx": 16384}}})
+    body = {"model": "big", "num_ctx": 8192}
+    out = await proxy.apply_ollama_ctx_model(body, {"path": "v1/chat/completions"})
+    assert out["num_ctx"] == 8192
+
+
+def test_the_gate_and_the_swap_agree_on_the_window(monkeypatch):
+    """Two answers to "how big is this request" is how a model gets refused and then loaded at
+    a size nobody checked."""
+    _rules(monkeypatch, {"enabled": True, "per_model": {"big": {"num_ctx": 16384}}})
+    for body in ({"model": "big"}, {"model": "big", "num_ctx": 8192},
+                 {"model": "big", "options": {"num_ctx": 32768}}):
+        assert proxy._effective_num_ctx("big", body) == min(
+            16384, proxy._body_num_ctx(body) or 16384)
+
+
+@pytest.mark.anyio
+async def test_asking_for_the_server_default_derives_nothing(monkeypatch):
+    """Agents routinely auto-set num_ctx to the model's full training context. That is the
+    window they would get anyway, so honouring it would mean a derived variant per model for
+    no change at all."""
+    _rules(monkeypatch, {"enabled": True})
+    monkeypatch.setattr(proxy, "_bench_ollama_server_ctx", lambda cfg=None: (262144, 4))
+    body = {"model": "big", "num_ctx": 262144}
+    assert await proxy.apply_ollama_ctx_model(body, {"path": "v1/chat/completions"}) is None
+    assert body["model"] == "big" and _FakeClient.created == []

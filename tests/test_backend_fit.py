@@ -157,3 +157,99 @@ def test_weights_alone_are_enough_to_refuse(client, ollama):
     msg = asyncio.run(P._ollama_fit_refusal("big-model:latest"))
     assert msg, "must refuse on weights alone when the KV size is unknown"
     assert "could not size" in msg, "the message should admit what it could not measure"
+
+
+# --- the gate and the context pin must agree -------------------------------------------------
+#
+# The fit gate runs before ollama_options rewrites the request to a context-pinned derivative,
+# so it sees the base name. Pricing that name at the 262k server default refuses a model that
+# was about to be loaded at 16k: qwen3.6:35b-a3b costs ~655 GB at the default and ~32 GB pinned,
+# and only the second number describes the load that would actually happen.
+
+
+def test_a_configured_pin_is_what_the_gate_prices(monkeypatch):
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "ollama_options": {"enabled": True, "per_model": {"big": {"num_ctx": 16384}}}})
+    assert P._configured_num_ctx("big") == 16384
+
+
+def test_an_unpinned_model_gets_no_pin(monkeypatch):
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "ollama_options": {"enabled": True, "per_model": {"other": {"num_ctx": 16384}}}})
+    assert P._configured_num_ctx("big") is None
+
+
+def test_a_disabled_rule_pins_nothing(monkeypatch):
+    """A pin that will not be applied must not be priced as though it were."""
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "ollama_options": {"enabled": False, "per_model": {"big": {"num_ctx": 16384}}}})
+    assert P._configured_num_ctx("big") is None
+
+
+def test_a_global_default_pins_every_model(monkeypatch):
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "ollama_options": {"enabled": True, "defaults": {"num_ctx": 32768}}})
+    assert P._configured_num_ctx("anything") == 32768
+
+
+# --- the window priced must be the window loaded ---------------------------------------------
+#
+# The pin only exists on the OpenAI-compat path, where ollama_options swaps the request for a
+# context-pinned derivative. A native /api/chat request keeps the model it named, so pricing it
+# at the pin would wave through the 262k allocation the pin was meant to avoid.
+
+
+def _fit_body(pin):
+    """The refusal text quotes the window it priced, which is what makes this observable."""
+    P._OLLAMA_FIT_CACHE.clear()
+    return pin
+
+
+def test_the_gate_prices_a_pinned_request_at_its_pin(client, monkeypatch):
+    seen = []
+
+    async def _spy(model, assume_avail_mb=0, pin=None):
+        seen.append(pin)
+        return None
+
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _spy)
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "backend_fit": {"enabled": True, "upstreams": ["ollama"]},
+        "ollama_options": {"enabled": True, "per_model": {"pinned": {"num_ctx": 16384}}}})
+    client.post("/v1/chat/completions", json={"model": "pinned", "messages": [{"role": "user",
+                                                                              "content": "hi"}]})
+    assert 16384 in seen
+
+
+def test_a_native_request_is_priced_at_the_num_ctx_it_carries(client, monkeypatch):
+    """Ollama honours num_ctx on /api/chat, so that — not the config pin — is the real window."""
+    seen = []
+
+    async def _spy(model, assume_avail_mb=0, pin=None):
+        seen.append(pin)
+        return None
+
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _spy)
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "backend_fit": {"enabled": True, "upstreams": ["ollama"]},
+        "ollama_options": {"enabled": True, "per_model": {"pinned": {"num_ctx": 16384}}}})
+    client.post("/api/chat", json={"model": "pinned", "messages": [{"role": "user",
+                                                                    "content": "hi"}],
+                                   "options": {"num_ctx": 65536}})
+    assert seen and seen[0] == 65536, "the config pin does not apply to a native request"
+
+
+def test_a_native_request_without_num_ctx_is_priced_at_the_server_default(client, monkeypatch):
+    seen = []
+
+    async def _spy(model, assume_avail_mb=0, pin=None):
+        seen.append(pin)
+        return None
+
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _spy)
+    monkeypatch.setattr(P, "load_rules_config", lambda: {
+        "backend_fit": {"enabled": True, "upstreams": ["ollama"]},
+        "ollama_options": {"enabled": True, "per_model": {"pinned": {"num_ctx": 16384}}}})
+    client.post("/api/chat", json={"model": "pinned", "messages": [{"role": "user",
+                                                                    "content": "hi"}]})
+    assert seen and seen[0] is None, "nothing named a smaller window, so the default stands"
