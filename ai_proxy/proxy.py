@@ -5063,8 +5063,15 @@ async def _ollama_fit_refusal(model: str) -> str | None:
                 tags = await c.get(f"{OLLAMA_URL}/api/tags")
                 if tags.status_code == 200:
                     for t in (tags.json().get("models") or []):
-                        if t.get("size"):
-                            sizes[_norm_model_id(t.get("name"))] = t["size"] / (1024 * 1024)
+                        if not t.get("size"):
+                            continue
+                        mb = t["size"] / (1024 * 1024)
+                        # Keyed by the EXACT name as well as the normalised one. Normalising
+                        # alone conflates the tags of a family: qwen3.6:35b-a3b (23 GB) and
+                        # qwen3.6:27b (16 GB) both reduce to "qwen3.6", so the 35b was priced
+                        # at the 27b's weight, judged to fit, and killed the service.
+                        sizes[t["name"]] = mb
+                        sizes.setdefault(_norm_model_id(t.get("name")), mb)
         except (httpx.RequestError, ValueError, KeyError):
             pass          # fall through to what was learned while the backend was healthy
 
@@ -5072,8 +5079,8 @@ async def _ollama_fit_refusal(model: str) -> str | None:
         params = body.get("parameters") or remembered.get("params") or ""
         if info:
             _OLLAMA_META_CACHE.setdefault(key, {}).update({"info": info, "params": params})
-        if sizes.get(key):
-            _OLLAMA_META_CACHE.setdefault(key, {})["size_mb"] = sizes[key]
+        if sizes.get(model) or sizes.get(key):
+            _OLLAMA_META_CACHE.setdefault(key, {})["size_mb"] = sizes.get(model) or sizes[key]
         if not info:
             return None                          # never seen it healthy: cannot judge
         per_slot, parallel = _bench_ollama_server_ctx(None)
@@ -5089,7 +5096,7 @@ async def _ollama_fit_refusal(model: str) -> str | None:
                     pass
                 break
         kv_mb = _bench_ollama_kv_mb(info, per_slot * parallel)
-        size_mb = sizes.get(key) or remembered.get("size_mb")
+        size_mb = sizes.get(model) or sizes.get(key) or remembered.get("size_mb")
         avail_mb = (_mem_snapshot() or {}).get("avail_mb")
         if not size_mb or not avail_mb:
             return None
@@ -13527,10 +13534,16 @@ def _bench_ollama_kv_mb(model_info: dict, tokens: int) -> float | None:
         # decoupled rope key.
         per_layer_elts = float(lora) + float(g("attention.key_length") or 64)
     else:
-        heads_kv = g("attention.head_count_kv")
+        head = g("attention.head_count")
+        # A model that does not declare head_count_kv is not using grouped-query attention, so
+        # every attention head carries its own KV: head_count IS the KV head count. Returning
+        # None instead made the whole check unusable for such models — qwen3.6:35b-a3b declares
+        # block_count, head_count and key_length and still could not be priced, so it was waved
+        # through and OOM-killed Ollama once a minute. Assuming MHA also errs high, which is the
+        # direction this estimator is meant to err in.
+        heads_kv = g("attention.head_count_kv") or head
         if not heads_kv:
             return None
-        head = g("attention.head_count")
         k_len = g("attention.key_length") or (
             (g("embedding_length") or 0) / head if head else None)
         v_len = g("attention.value_length") or k_len

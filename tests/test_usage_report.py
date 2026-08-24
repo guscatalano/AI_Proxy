@@ -387,17 +387,22 @@ def test_power_is_not_lost_when_a_request_runs_past_midnight(_clean, monkeypatch
     # The row is filed under the day it started, so the day it spilled into has no request of
     # its own. Looking that day up instead of creating it dropped the power on the floor.
     _price(monkeypatch, electricity={"usd_per_kwh": 1.0, "watts": 3600, "watts_idle": 0})
-    midnight = time.mktime(time.strptime("2026-07-25 00:00:00", "%Y-%m-%d %H:%M:%S"))
+    # Anchored to today rather than a fixed calendar date. Pinned to 2026-07-25 this passed
+    # until that date aged past the 30-day window and then failed every run afterwards, with a
+    # message about power accounting that had nothing to do with the cause.
+    _day_before = time.strftime("%Y-%m-%d", time.localtime(time.time() - 2 * 86400))
+    _day_after = time.strftime("%Y-%m-%d", time.localtime(time.time() - 86400))
+    midnight = time.mktime(time.strptime(_day_after + " 00:00:00", "%Y-%m-%d %H:%M:%S"))
     _seed([{"id": "mid", "ts": midnight - 1800, "turn": 1, "ptok": 10, "dur": 3_600_000}])
     daily = P._usage_by_day(days=30)
     dates = {d["date"]: d for d in daily["by_day"]}
-    assert "2026-07-24" in dates and "2026-07-25" in dates
-    assert dates["2026-07-24"]["busy_s"] == pytest.approx(1800, rel=0.01)
-    assert dates["2026-07-25"]["busy_s"] == pytest.approx(1800, rel=0.01)
+    assert _day_before in dates and _day_after in dates
+    assert dates[_day_before]["busy_s"] == pytest.approx(1800, rel=0.01)
+    assert dates[_day_after]["busy_s"] == pytest.approx(1800, rel=0.01)
     # 3600 W for one hour at $1/kWh = $3.60, whichever side of midnight it fell on.
     assert daily["total"]["power_cost"] == pytest.approx(3.6, rel=0.01)
     # The spilled-into day carries power but no tokens, and must not invent traffic.
-    assert dates["2026-07-25"]["n"] == 0 and dates["2026-07-25"]["input"] == 0
+    assert dates[_day_after]["n"] == 0 and dates[_day_after]["input"] == 0
 
 
 def test_idle_draw_is_assumed_from_load_when_not_measured(_clean, monkeypatch):
