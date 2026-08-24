@@ -15827,6 +15827,42 @@ def _fingerprint_client_from_system(sys_text: str) -> str | None:
     return None
 
 
+# Apps identifiable by the toolbox they hand the model, when they send nothing else that
+# names them. hermes drives the OpenAI Python SDK with no x-client-name, so it arrived as a
+# generic "openai-sdk" alongside every other script — and its traffic stopped being tellable
+# apart the moment it stopped setting the header. The system prompt is no help: subagents run
+# under their own personas ("# UX Reviewer"), not a fixed banner.
+#
+# Tools chosen for being specific rather than common: read_file or terminal would match half
+# the agents in existence, while skill_manage and read_window_below match one. Three hits are
+# required so a client that happens to share a name or two is not mislabelled.
+_CLIENT_TOOL_FINGERPRINTS = (
+    ("hermes", 3, frozenset({
+        "skill_manage", "skills_list", "skill_view", "session_search", "delegate_task",
+        "apply_layout", "focus_pane", "read_window_below", "project_switch", "project_create",
+        "cronjob", "setup_mcp", "vision_analyze", "open_preview", "read_preview",
+        "read_terminal", "close_terminal", "tour",
+    })),
+)
+
+
+def _tool_names_in_body(body: dict | None) -> set:
+    """Every tool name the request offers, in either wire shape."""
+    out: set = set()
+    if not isinstance(body, dict):
+        return out
+    for t in (body.get("tools") or []):
+        if not isinstance(t, dict):
+            continue
+        name = (t.get("function") or {}).get("name") or t.get("name")
+        if isinstance(name, str):
+            out.add(name)
+    for f in (body.get("functions") or []):
+        if isinstance(f, dict) and isinstance(f.get("name"), str):
+            out.add(f["name"])
+    return out
+
+
 def _detect_client_app(headers: dict | None, body: dict | None) -> str:
     """Heuristic identification of the client SDK / app behind a request. Walks headers
     (User-Agent, x-stainless-*, Editor-Version, etc.) and falls back to fingerprints in
@@ -15863,6 +15899,17 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
             slug = re.sub(r"[^a-z0-9._-]+", "-", v.lower())[:40].strip("-")
             if slug:
                 return slug
+
+    # Nothing named it, so identify it by what it can do. Runs after the explicit headers above,
+    # which stay authoritative — hermes-safety sets x-client-name and should keep that label
+    # rather than being flattened into "hermes" by its toolbox.
+    _offered = _tool_names_in_body(body)
+    if _offered:
+        for _label, _need, _markers in _CLIENT_TOOL_FINGERPRINTS:
+            if len(_offered & _markers) >= _need:
+                return _label
+    if "hermes agent" in sys_text.lower() or "nous research" in sys_text.lower():
+        return "hermes"
 
     # Editor / IDE integrations
     ev = (h.get("editor-version") or "").lower()
