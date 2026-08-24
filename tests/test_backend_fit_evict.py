@@ -285,3 +285,110 @@ def test_a_model_that_merely_needs_room_still_evicts(client, monkeypatch):
 
 async def _empty_list():
     return []
+
+
+# --- a backend that has only just started is not idle -----------------------------------------
+#
+# It has served nothing, which reads as maximally idle, so the first request it cannot fit stops
+# it — throwing away a load that takes five to seven minutes. This happened to vLLM a minute
+# after it came back up from the previous incident.
+
+
+def test_a_freshly_started_backend_is_not_evicted(client, monkeypatch):
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    async def _uptime(name):
+        return 30.0
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_backend_uptime_s", _uptime)
+    monkeypatch.setattr(P, "_free_ollama_models", lambda reason="": _empty_list())
+    try:
+        why = asyncio.run(P._evict_for_fit("r", "wanted"))
+        assert why and "coming up" in why
+        assert stopped == []
+    finally:
+        _cleanup()
+
+
+def test_a_long_running_idle_backend_is_still_evictable(client, monkeypatch):
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    async def _uptime(name):
+        return 40000.0
+
+    async def _fits(model, assume_avail_mb=0, pin=None):
+        return None
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_backend_uptime_s", _uptime)
+    monkeypatch.setattr(P, "_free_ollama_models", lambda reason="": _empty_list())
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _fits)
+    try:
+        assert asyncio.run(P._evict_for_fit("r", "wanted")) is None
+        assert stopped == ["vllm"]
+    finally:
+        _cleanup()
+
+
+def test_an_unknown_uptime_does_not_block_eviction(client, monkeypatch):
+    """None means "cannot tell". Treating it as young would disable eviction wherever docker
+    is not reachable."""
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    async def _uptime(name):
+        return None
+
+    async def _fits(model, assume_avail_mb=0, pin=None):
+        return None
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_backend_uptime_s", _uptime)
+    monkeypatch.setattr(P, "_free_ollama_models", lambda reason="": _empty_list())
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _fits)
+    try:
+        assert asyncio.run(P._evict_for_fit("r", "wanted")) is None
+        assert stopped == ["vllm"]
+    finally:
+        _cleanup()
+
+
+def test_a_bench_may_still_swap_a_backend_it_just_started(client, monkeypatch):
+    """A sweep starts and stops backends by design; the guard would refuse every swap."""
+    _cfg(monkeypatch, enabled=True, idle_s=600)
+    stopped = []
+
+    class _Fake:
+        async def stop(self):
+            stopped.append("vllm")
+
+    async def _uptime(name):
+        return 5.0
+
+    async def _fits(model, assume_avail_mb=0, pin=None):
+        return None
+
+    monkeypatch.setitem(P.PROVIDERS, "vllm", _Fake())
+    monkeypatch.setattr(P, "_backend_uptime_s", _uptime)
+    monkeypatch.setattr(P, "_free_ollama_models", lambda reason="": _empty_list())
+    monkeypatch.setattr(P, "_ollama_fit_refusal", _fits)
+    try:
+        assert asyncio.run(P._evict_for_fit("r", "wanted", caller_owns=True)) is None
+        assert stopped == ["vllm"]
+    finally:
+        _cleanup()

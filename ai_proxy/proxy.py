@@ -4936,6 +4936,34 @@ async def _free_ollama_models(reason: str = "") -> list:
     return released
 
 
+async def _backend_uptime_s(name: str) -> float | None:
+    """Seconds since this backend's container started, or None when that cannot be told.
+
+    None means "do not know", and every caller must treat it as no evidence rather than as
+    zero: refusing to evict a backend whose age is unknown would disable eviction on any box
+    where docker is not reachable.
+    """
+    prov = PROVIDERS.get(name)
+    if prov is None or getattr(prov, "control", "") != "docker":
+        return None
+    docker = _docker_bin()
+    container = await _vllm_container() if docker else None
+    if not container:
+        return None
+    code, out = await _run_cmd([docker, "inspect", container, "--format",
+                                "{{.State.StartedAt}}"], 15.0, max_chars=200)
+    if code != 0 or not out.strip():
+        return None
+    try:
+        # Docker prints RFC3339 with nanoseconds, which fromisoformat rejects past microseconds.
+        raw = re.sub(r"\.(\d{6})\d*", r".", out.strip().replace("Z", "+00:00"))
+        started = datetime.datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    return max(0.0, datetime.datetime.now(datetime.timezone.utc).timestamp()
+               - started.timestamp())
+
+
 async def _evict_for_fit(refusal: str, wanted_model: str,
                          caller_owns: bool = False,
                          _impossible: bool = False,
@@ -4951,11 +4979,6 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
         return "eviction is off (backend_fit.evict.enabled)"
     idle_s = float(cfg.get("idle_s", 600) or 600)
     targets = [str(u).lower() for u in (cfg.get("evict_upstreams") or ["vllm"])]
-    # A running benchmark owns the box and the idle guard does not apply to it. A sweep exists
-    # to move between models, so the backend it needs to evict is by definition the one IT was
-    # using seconds ago — the guard would refuse every swap and make eviction useless for the
-    # only workload that wants it. An exclusive run has already quiesced live traffic through
-    # panic mode, so there is nobody left for idleness to protect.
     # Never evict for a model that cannot fit on an EMPTY box. Eviction buys memory, and a
     # model needing more than the machine has cannot be bought room — qwen3.6:35b-a3b prices at
     # ~340 GB of KV on a 122 GB box, and asking for it stopped the container serving production
@@ -4964,6 +4987,12 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     if _impossible:
         return ("no amount of eviction would help: it needs more than this machine has in total")
 
+    # A running benchmark owns the box and the idle guard does not apply to it. A sweep exists
+    # to move between models, so the backend it needs to evict is by definition the one IT was
+    # using seconds ago — the guard would refuse every swap and make eviction useless for the
+    # only workload that wants it. An exclusive run has already quiesced live traffic through
+    # panic mode, so there is nobody left for idleness to protect.
+    #
     # caller_owns is the x-proxy-evict header: a benchmark driven from OUTSIDE this proxy has
     # no row in bench_runs, so the internal check cannot see it. Whoever is sweeping models is
     # the only party who knows the box is theirs, so they say so per request.
@@ -4991,6 +5020,15 @@ async def _evict_for_fit(refusal: str, wanted_model: str,
     if idle_for < idle_s and not bench_owns:
         return (f"{targets[0]} served a request {idle_for:.0f}s ago and idle_s is {idle_s:.0f}s; "
                 f"evicting a backend in active use would trade one stall for everybody's")
+    # A backend that has only just started has served nothing, which reads as maximally idle —
+    # so the first request it cannot fit stops it, throwing away a load that takes five to seven
+    # minutes. Uptime is the difference between "nobody wants this" and "nobody has had the
+    # chance to want it yet".
+    if not bench_owns:
+        up = await _backend_uptime_s(targets[0])
+        if up is not None and up < idle_s:
+            return (f"{targets[0]} started {up:.0f}s ago and idle_s is {idle_s:.0f}s; it has not "
+                    f"been idle, it has not finished coming up")
     # Ollama's OWN residents first, because they are usually the blocker and releasing them is
     # free. It parks up to OLLAMA_MAX_LOADED_MODELS for OLLAMA_KEEP_ALIVE — three models for two
     # hours here — so a sweep that has already visited two models is holding 47 GB before the
