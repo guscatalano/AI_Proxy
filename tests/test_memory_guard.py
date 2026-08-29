@@ -29,13 +29,15 @@ def _claim_env(monkeypatch, *, util="0.80", total_mb=124610, free_mb=20000.0):
 def test_boot_claim_is_utilization_times_total(monkeypatch):
     _claim_env(monkeypatch, util="0.80")
     claim = asyncio.run(P._vllm_boot_claim_mb("qwen-vllm"))
-    assert round(claim) == round(124610 * 0.80), "the claim is util × total, not weights"
+    # util × total, not weights — plus the driver reserve, because utilization turned out
+    # not to bound what vLLM actually takes.
+    assert round(claim) == round(124610 * 0.80 + P._VLLM_BOOT_RESERVE_MB)
 
 
 def test_boot_claim_defaults_to_vllms_own_090(monkeypatch):
     _claim_env(monkeypatch, util=None)
     claim = asyncio.run(P._vllm_boot_claim_mb("qwen-vllm"))
-    assert round(claim) == round(124610 * 0.90)
+    assert round(claim) == round(124610 * 0.90 + P._VLLM_BOOT_RESERVE_MB)
 
 
 def test_load_refuses_a_start_the_box_cannot_absorb(monkeypatch):

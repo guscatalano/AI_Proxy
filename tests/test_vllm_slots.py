@@ -103,3 +103,36 @@ def test_slot_urls_are_read_live(monkeypatch):
     assert P._vllm_url("vllm") == "http://a:1"
     assert P._vllm_url("vllm2") == "http://b:2"
     assert P._vllm_url(None) == "http://a:1"
+
+
+def test_a_boot_must_leave_the_driver_room(client, monkeypatch):
+    """Utilization is not an upper bound.
+
+    Two vLLMs at 0.45 and 0.35 on this box summed to 0.80 and still killed the NVIDIA
+    driver's context allocator mid-request — coder-next's weights alone are 42.7 GiB against
+    a 54.8 GB claim. Both engines exited 0 with OOMKilled=false, so nothing but the kernel
+    log said what happened. The guard prices the claim PLUS a reserve.
+    """
+    async def configs(url=None, *a, **k):
+        return [{"container": "big-vllm", "gpu_memory_utilization": 0.45}]
+
+    monkeypatch.setattr(P, "_vllm_configs", configs)
+    monkeypatch.setattr(P, "_mem_snapshot", lambda: {"total_mb": 121_700.0})
+
+    need = asyncio.run(P._vllm_boot_claim_mb("big-vllm"))
+    assert need == 121_700.0 * 0.45 + P._VLLM_BOOT_RESERVE_MB
+    # The number that matters: a box with only the bare claim free is refused, not squeezed.
+    assert need > 121_700.0 * 0.45
+
+
+def test_the_reserve_is_configurable(client, monkeypatch):
+    async def configs(url=None, *a, **k):
+        return [{"container": "big-vllm", "gpu_memory_utilization": 0.5}]
+
+    cfg = dict(P.load_rules_config())
+    cfg["model_control"] = {**(cfg.get("model_control") or {}), "vllm_boot_reserve_mb": 4096}
+    monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
+    monkeypatch.setattr(P, "_vllm_configs", configs)
+    monkeypatch.setattr(P, "_mem_snapshot", lambda: {"total_mb": 100_000.0})
+
+    assert asyncio.run(P._vllm_boot_claim_mb("big-vllm")) == 54_096.0

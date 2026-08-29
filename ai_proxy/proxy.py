@@ -2685,6 +2685,11 @@ async def _control_backend(b, action: str, container: str | None = None) -> dict
     return {"ok": False, "detail": f"{b.name} is not managed by the proxy", "via": "none"}
 
 
+# Headroom a vLLM start must leave free, on top of what it claims. See _vllm_boot_claim_mb
+# for the incident: 0.45 + 0.35 on a 122 GB box killed the NVIDIA driver's context allocator.
+_VLLM_BOOT_RESERVE_MB = 16384.0
+
+
 # Order matters only for display: this is the order the System tab shows backends in.
 PROVIDERS: dict = {}
 SIDE_SERVICES: dict = {}
@@ -3340,6 +3345,10 @@ DEFAULT_RULES_CONFIG = {
                       # which is enough to stop a vLLM container starting beside it.
                       "release_ollama": True,
                       "drain_s": 120},
+        # Free memory a vLLM start must leave behind, beyond what it claims. Utilization is
+        # not an upper bound: two servers summing to 0.80 of this box still exhausted the
+        # driver's context allocator and took both engines down. 0 uses the built-in default.
+        "vllm_boot_reserve_mb": 0,
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
         "vllm_ready_timeout_s": 420,
@@ -14361,7 +14370,15 @@ async def _vllm_boot_claim_mb(container: str | None) -> float | None:
     qwen-vllm landed on top of a resident gemma4 and wedged the machine — sshd and the
     proxy starved while the resident backends kept answering. Utilization is read from
     the container's own launch args; vLLM's default is 0.9 when the flag is absent.
-    None when there is nothing to compute with (no total, no such container)."""
+    None when there is nothing to compute with (no total, no such container).
+
+    Plus a reserve, because utilization is not an upper bound. Two vLLMs sized to
+    0.45 + 0.35 = 0.80 of a 122 GB box both died mid-request with "NVRM: Out of memory ...
+    kgrctxAllocCtxBuffers": qwen3-coder-next's weights alone are 42.7 GiB against a 54.8 GB
+    claim, so it took 61.8 GiB, and the two together left the driver nothing for CUDA
+    contexts. Both engines exited 0 with OOMKilled=false, which reads like a clean shutdown
+    from every side except the kernel log. The claim prices what vLLM asks for; the reserve
+    is what the driver and the page cache need to still be there afterwards."""
     total = (_mem_snapshot() or {}).get("total_mb")
     if not total:
         return None
@@ -14374,7 +14391,17 @@ async def _vllm_boot_claim_mb(container: str | None) -> float | None:
                 break
     except (ValueError, TypeError):
         pass
-    return float(total) * util
+    try:
+        reserve = float((load_rules_config().get("model_control") or {}).get(
+            "vllm_boot_reserve_mb") or 0)
+    except Exception:
+        # Broad on purpose: this runs on the refusal path, and a boot must still be priced
+        # when the config cannot be read. Falling through to 0 here would drop the reserve
+        # silently — the one case where it matters most.
+        reserve = 0.0
+    if reserve <= 0:
+        reserve = _VLLM_BOOT_RESERVE_MB
+    return float(total) * util + reserve
 
 
 async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
