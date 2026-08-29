@@ -21,7 +21,7 @@ def _stub(monkeypatch, *, vllm_running=True, svc_running=True, ollama=("qwen3:4b
     cfg["model_control"] = mc
     monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
 
-    async def container():
+    async def container(*a, **k):
         return "qwen-vllm"
 
     async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):

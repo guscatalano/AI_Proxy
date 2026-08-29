@@ -13,7 +13,7 @@ from ai_proxy import proxy as P
 
 
 def _configs(running=False):
-    async def fn():
+    async def fn(*a, **k):
         return [{"container": "qwen-vllm", "image": "vllm/vllm-openai", "running": running,
                  "serves_port": True, "model": "qwen3-coder", "checkpoint": "/models/qwen3",
                  "quant": "fp8", "max_model_len": "262144", "mounts": []},
@@ -316,7 +316,7 @@ def test_a_bench_start_waits_far_longer_than_the_default(client, monkeypatch):
 def test_a_dead_container_is_noticed_without_waiting_it_out(client, monkeypatch):
     """What makes the long wait safe. Without this, raising the ceiling would just mean a
     crashed container burns thirty minutes instead of seven."""
-    async def container():
+    async def container(*a, **k):
         return "qwen-vllm"
 
     async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
@@ -335,7 +335,7 @@ def test_a_dead_container_is_noticed_without_waiting_it_out(client, monkeypatch)
 
 
 def test_a_running_container_is_not_reported_as_dead(client, monkeypatch):
-    async def container():
+    async def container(*a, **k):
         return "qwen-vllm"
 
     async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):

@@ -701,7 +701,7 @@ def test_vllm_control_refuses_a_remote_server(monkeypatch):
 
 
 def test_model_control_rejects_vllm_without_a_container(client, monkeypatch):
-    async def no_container():
+    async def no_container(*a, **k):
         return None
     monkeypatch.setattr(p, "_vllm_container", no_container)
     for path in ("load", "unload"):
@@ -719,11 +719,11 @@ def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
     """Starting the vLLM container is the whole operation — the server already knows its model.
     Requiring a name here made it impossible to start vLLM through the proxy at all, which was
     only discovered after stopping it."""
-    async def fake_container():
+    async def fake_container(*a, **k):
         return "qwen-vllm"
     async def fake_run(args, timeout=120.0):
         return 0, "qwen-vllm"
-    async def fake_ready(t):
+    async def fake_ready(t, *a, **k):
         return True
     monkeypatch.setattr(p, "_vllm_container", fake_container)
     monkeypatch.setattr(p, "_run_cmd", fake_run)
@@ -741,7 +741,7 @@ def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
 def test_vllm_switch_refuses_a_container_that_does_not_publish_our_port(client, monkeypatch):
     """Starting a container that binds a different port would succeed at the Docker level and
     then never be reachable — a success message for a server the proxy cannot talk to."""
-    async def configs():
+    async def configs(*a, **k):
         return [{"container": "other-vllm", "running": False, "serves_port": False,
                  "model": "x", "checkpoint": "x", "quant": None, "max_model_len": None,
                  "kv_cache_dtype": None, "prefix_caching": False, "args": ""}]
@@ -754,7 +754,7 @@ def test_vllm_switch_refuses_a_container_that_does_not_publish_our_port(client, 
 
 
 def test_vllm_switch_reports_unknown_containers_with_the_alternatives(client, monkeypatch):
-    async def configs():
+    async def configs(*a, **k):
         return [{"container": "qwen-vllm", "running": True, "serves_port": True, "model": "q",
                  "checkpoint": "q", "quant": None, "max_model_len": None, "kv_cache_dtype": None,
                  "prefix_caching": False, "args": ""}]

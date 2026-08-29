@@ -135,7 +135,7 @@ def test_one_place_knows_how_each_backend_starts(client, monkeypatch):
         calls.append(list(args))
         return 0, ""
 
-    async def container():
+    async def container(*a, **k):
         return "qwen-vllm"
 
     cfg = dict(P.load_rules_config())

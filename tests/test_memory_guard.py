@@ -15,7 +15,7 @@ from ai_proxy import proxy as P
 
 
 def _claim_env(monkeypatch, *, util="0.80", total_mb=124610, free_mb=20000.0):
-    async def cfgs():
+    async def cfgs(*a, **k):
         return [{"container": "qwen-vllm", "serves_port": True, "running": False,
                  "model": "qwen3-coder-next",
                  "gpu_memory_utilization": util}]
@@ -134,7 +134,7 @@ def test_auto_load_refuses_when_eviction_cannot_make_room(client, monkeypatch):
     async def claim(c):
         return 97000.0
 
-    async def running():
+    async def running(*a, **k):
         return None
 
     async def snap():

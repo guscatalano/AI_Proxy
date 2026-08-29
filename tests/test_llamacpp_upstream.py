@@ -170,7 +170,7 @@ def test_a_running_llamacpp_keys_the_index_by_its_checkpoint_path(client, monkey
 
     monkeypatch.setattr(P, "system_now", fake_sysinfo)
     monkeypatch.setattr(P, "_llamacpp_cfg", lambda: {"model": path})
-    async def no_containers():
+    async def no_containers(*a, **k):
         return []
     monkeypatch.setattr(P, "_vllm_configs", no_containers)
     index = asyncio.run(P._bench_model_index())
@@ -190,7 +190,7 @@ def test_a_booting_vllm_container_is_startable_not_invisible(client, monkeypatch
         return {"ollama": {}, "lmstudio": {}, "llamacpp": {},
                 "vllm": {"reachable": False, "available": []}}
 
-    async def configs():
+    async def configs(*a, **k):
         return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "running": True,
                  "serves_port": True},
                 {"container": "ornith-vllm", "model": "ornith-nvfp4", "running": False,
@@ -224,11 +224,11 @@ def test_vllm_boot_state_names_the_model_it_is_loading(client, monkeypatch):
             return 0, ""
         return 1, ""
 
-    async def configs():
+    async def configs(*a, **k):
         return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "running": True,
                  "serves_port": True}]
 
-    async def container():
+    async def container(*a, **k):
         return "qwen-vllm"
 
     monkeypatch.setattr(P, "_docker_bin", lambda: "docker")

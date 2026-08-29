@@ -42,7 +42,7 @@ def _setup(monkeypatch, *, enabled=True, loaded=False, startable=True, size_mb=4
             meta.update(startable=True, container="qwen-vllm")
         return {"vllm:qwen3-coder-next": meta}
 
-    async def fake_container():
+    async def fake_container(*a, **k):
         return running_container
 
     async def fake_snap():

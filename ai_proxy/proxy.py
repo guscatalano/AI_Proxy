@@ -75,14 +75,28 @@ ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
 # A second vLLM process, so two models can be resident at once and a router rule can choose
-# between them. Deliberately control="none" below: this one is started by hand, and the
-# docker-control path resolves "the container publishing VLLM_URL" — pointing it at a second
-# port would have it stop the wrong container.
+# between them. It is a full twin of the first: every vLLM helper below takes the slot's URL
+# rather than reading VLLM_URL, so "the container publishing this port" resolves per slot.
+# While they shared one resolver, starting the second slot stopped the first slot's container —
+# the helpers found VLLM_URL's port no matter which backend was asking.
 VLLM2_URL = os.environ.get("VLLM2_URL", "http://localhost:8002").rstrip("/")
 # llama.cpp's own server. Its own slot rather than borrowing LM Studio's port: both speak the
 # same OpenAI shape, so squatting works — and then every log row, bench result and report says
 # "lmstudio" for numbers that came from llama.cpp. Mislabelled measurements are worse than none.
 LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://localhost:8080").rstrip("/")
+
+
+def _is_vllm(upstream: str | None) -> bool:
+    """True for either vLLM slot. Every check that used to read `upstream == "vllm"` means
+    this: the second slot runs the same server, in the same kind of container, and wants the
+    same eviction, auto-load and residency handling."""
+    return upstream in ("vllm", "vllm2")
+
+
+def _vllm_url(upstream: str | None = None) -> str:
+    """The base URL of a vLLM slot. Read through a function, not captured at import, because
+    tests patch these globals and rebuild the provider registry against them."""
+    return VLLM2_URL if upstream == "vllm2" else VLLM_URL
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 
@@ -1914,7 +1928,7 @@ _VLLM_BOOT_PHASES = (
 )
 
 
-async def _vllm_boot_state() -> dict:
+async def _vllm_boot_state(url: str | None = None) -> dict:
     """Why vLLM isn't answering: still coming up, stopped, or not there at all.
 
     Only called when /v1/models has already failed, so the docker calls never touch the healthy
@@ -1923,7 +1937,7 @@ async def _vllm_boot_state() -> dict:
     waiting for.
     """
     docker = _docker_bin()
-    name = await _vllm_container() if docker else None
+    name = await _vllm_container(url) if docker else None
     if not name:
         return {"state": "absent"}
     code, out = await _run_cmd(
@@ -1934,7 +1948,7 @@ async def _vllm_boot_state() -> dict:
     if parts[0].strip().lower() != "true":
         stopped = {"state": "stopped", "container": name}
         try:
-            for c in await _vllm_configs():
+            for c in await _vllm_configs(url):
                 if c.get("container") == name and c.get("model"):
                     stopped["model"] = c["model"]
                     break
@@ -1945,7 +1959,7 @@ async def _vllm_boot_state() -> dict:
     # "loading" without a name is half an answer: the container's own config knows which
     # model it will serve long before /v1/models can say so.
     try:
-        for c in await _vllm_configs():
+        for c in await _vllm_configs(url):
             if c.get("container") == name and c.get("model"):
                 info["model"] = c["model"]
                 break
@@ -1982,10 +1996,10 @@ async def _vllm_snapshot(client: httpx.AsyncClient, base: str | None = None) -> 
                 out["available"].append(rec)
                 out["loaded"].append(rec)
     except (httpx.RequestError, ValueError):
-        out.update(await _vllm_boot_state())
+        out.update(await _vllm_boot_state(base or VLLM_URL))
         return out
     if not out["reachable"]:
-        out.update(await _vllm_boot_state())
+        out.update(await _vllm_boot_state(base or VLLM_URL))
         return out
     try:
         r = await client.get(f"{base or VLLM_URL}/metrics")
@@ -2271,7 +2285,7 @@ class SideService:
                         15.0, max_chars=600, keep_tail=True, env=_systemctl_env(svc))
                     return f"{svc['unit']} is {st['active']}: {log.strip()[-400:]}"
         if self.control == "docker":
-            container = await _vllm_container()
+            container = await _vllm_container(self.base_url)
             if container:
                 code, out = await _run_cmd(
                     [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
@@ -2390,7 +2404,7 @@ class _FnProvider(Provider):
                 st = await _service_state(svc)
                 return {**st, "control": "unit"}
         if self.control == "docker":
-            container = await _vllm_container()
+            container = await _vllm_container(self.base_url)
             return {"running": None, "container": container, "control": "docker"}
         return {"running": None, "control": self.control}
 
@@ -2544,7 +2558,8 @@ class _VllmProvider(_FnProvider):
 
     async def load(self, payload: dict, name: str):
         wanted = (payload.get("container") or "").strip()
-        configs = await _vllm_configs()
+        url = self.base_url
+        configs = await _vllm_configs(url)
         if wanted:
             match = next((c for c in configs if c["container"] == wanted), None)
             if not match:
@@ -2553,21 +2568,23 @@ class _VllmProvider(_FnProvider):
                      "available": [c["container"] for c in configs]}, status_code=404)
             if not match["serves_port"]:
                 return JSONResponse(
-                    {"error": f"{wanted!r} does not publish {VLLM_URL} — starting it would not "
+                    {"error": f"{wanted!r} does not publish {url} — starting it would not "
                               f"make it reachable through this proxy"}, status_code=409)
             container = wanted
         else:
-            container = await _vllm_container()
+            container = await _vllm_container(url)
         if not container:
             return JSONResponse(
                 {"error": "no local vLLM container publishing this port was found",
                  "available": [c["container"] for c in configs]}, status_code=501)
         t0 = time.perf_counter()
-        # They contend for one port, so anything else running must come down first — otherwise
-        # docker start fails on the binding and the error looks unrelated.
+        # Twins contend for one port, so anything else holding it must come down first —
+        # otherwise docker start fails on the binding and the error looks unrelated. Only
+        # containers publishing THIS slot's port qualify: with a second slot on its own port,
+        # stopping every running vLLM meant loading one model evicted the other one's server.
         stopped = []
         for c in configs:
-            if c["running"] and c["container"] != container:
+            if c["running"] and c["serves_port"] and c["container"] != container:
                 await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
                 stopped.append(c["container"])
         # Last-line memory guard, on the one chokepoint every vLLM start passes through
@@ -2589,7 +2606,8 @@ class _VllmProvider(_FnProvider):
         # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
         cfg_mc = load_rules_config().get("model_control") or {}
         ready = await _vllm_ready(float(payload.get("wait_s")
-                                        or cfg_mc.get("vllm_ready_timeout_s") or 420))
+                                        or cfg_mc.get("vllm_ready_timeout_s") or 420),
+                                  self.name)
         return {"ok": ready, "started_container": container, "stopped_containers": stopped,
                 "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
                 "error": None if ready else "container started but the server did not become "
@@ -2646,7 +2664,7 @@ async def _control_backend(b, action: str, container: str | None = None) -> dict
                                    env=_systemctl_env(svc))
         return {"ok": code == 0, "detail": out[:300], "via": "systemctl"}
     if b.control == "docker":
-        container = container or await _vllm_container()
+        container = container or await _vllm_container(b.base_url)
         if not container:
             return {"ok": False, "detail": "no container publishing this backend's port"}
         docker_action = "start" if action == "start" else "stop"
@@ -2679,9 +2697,9 @@ def _register_backends():
     for p in (
         _VllmProvider("vllm", "vLLM", _vllm_snapshot, lambda: VLLM_URL,
                       load_mode="fixed", control="docker"),
-        _FnProvider("vllm2", "vLLM (2nd)",
-                    lambda c: _vllm_snapshot(c, VLLM2_URL), lambda: VLLM2_URL,
-                    load_mode="fixed", control="none"),
+        _VllmProvider("vllm2", "vLLM (2nd)",
+                      lambda c: _vllm_snapshot(c, VLLM2_URL), lambda: VLLM2_URL,
+                      load_mode="fixed", control="docker"),
         _LlamaCppProvider("llamacpp", "llama.cpp", _llamacpp_snapshot, lambda: LLAMACPP_URL,
                           load_mode="fixed", control="unit"),
         _LmStudioProvider("lmstudio", "LM Studio", _lmstudio_snapshot, lambda: LMSTUDIO_URL,
@@ -4947,7 +4965,7 @@ async def _backend_uptime_s(name: str) -> float | None:
     if prov is None or getattr(prov, "control", "") != "docker":
         return None
     docker = _docker_bin()
-    container = await _vllm_container() if docker else None
+    container = await _vllm_container(prov.base_url) if docker else None
     if not container:
         return None
     code, out = await _run_cmd([docker, "inspect", container, "--format",
@@ -7156,10 +7174,17 @@ async def list_models_enriched():
         results = await asyncio.gather(
             _ollama(), _ollama_ps(), _vllm_snapshot(client), _vllm_configs(),
             _llamacpp_snapshot(client), _lmstudio_snapshot(client), _ollama_tags(),
+            # The second vLLM slot is appended rather than inserted: the unpack below is
+            # positional, and everything after an inserted probe would shift silently.
+            _vllm_snapshot(client, VLLM2_URL), _vllm_configs(VLLM2_URL),
             return_exceptions=True)
-    otags = results[6] if len(results) > 6 and isinstance(results[6], dict) else {}
-    # Slice to the first six: _ollama_tags is gathered alongside them but is read separately
-    # above, and unpacking the whole list would fail the moment another probe is added.
+    def _at(i, default):
+        r = results[i] if len(results) > i else None
+        return r if not isinstance(r, BaseException) and r is not None else default
+    otags = _at(6, {}) if isinstance(_at(6, {}), dict) else {}
+    vllm2, vcfgs2 = _at(7, {}), _at(8, [])
+    # Slice to the first six: the probes after them are read by index above, and unpacking
+    # the whole list would fail the moment another probe is added.
     odata, ops, vllm, vcfgs, lcpp, lms = (
         r if not isinstance(r, BaseException) else {} for r in results[:6])
 
@@ -7170,15 +7195,19 @@ async def list_models_enriched():
             is_res = m.get("id") in resident
             add(m.get("id"), "ollama", created=m.get("created"), loaded=is_res,
                 state="loaded" if is_res else "available — loads on request")
-    for m in ((vllm or {}).get("available") or []):
-        add(m.get("id"), "vllm", ctx=m.get("max_context_length"),
-            state="loaded", loaded=True)
-    # A twin that is configured but not up is still one request away: the auto-loader (or a
-    # bench) boots it. Listing it is what makes it selectable at all.
-    for c in (vcfgs if isinstance(vcfgs, list) else []):
-        add(c.get("model"), "vllm", loaded=False,
-            state=("stopped — loads on first request"
-                   if str(c.get("state", "")).lower() != "running" else None))
+    for slot, snap, cfgs in (("vllm", vllm, vcfgs), ("vllm2", vllm2, vcfgs2)):
+        for m in ((snap or {}).get("available") or []):
+            add(m.get("id"), slot, ctx=m.get("max_context_length"),
+                state="loaded", loaded=True)
+        # A twin that is configured but not up is still one request away: the auto-loader (or
+        # a bench) boots it. Listing it is what makes it selectable at all. Only containers
+        # publishing this slot's port — the other slot's twins are not startable here.
+        for c in (cfgs if isinstance(cfgs, list) else []):
+            if not c.get("serves_port"):
+                continue
+            add(c.get("model"), slot, loaded=False,
+                state=("stopped — loads on first request"
+                       if str(c.get("state", "")).lower() != "running" else None))
     for m in ((lcpp or {}).get("available") or []):
         add(m.get("id"), "llamacpp", ctx=(lcpp or {}).get("n_ctx"),
             state="loaded", loaded=True)
@@ -9259,13 +9288,14 @@ async def _run_cmd(args: list, timeout: float = 120.0, max_chars: int = 800,
     return proc.returncode or 0, (text[-max_chars:] if keep_tail else text[:max_chars])
 
 
-async def _vllm_container() -> str | None:
-    """The container publishing VLLM_URL's port, running or not."""
+async def _vllm_container(url: str | None = None) -> str | None:
+    """The container publishing this vLLM slot's port, running or not."""
+    url = url or VLLM_URL
     docker = _docker_bin()
-    if not docker or not _upstream_is_local(VLLM_URL):
+    if not docker or not _upstream_is_local(url):
         return None
     try:
-        port = str(httpx.URL(VLLM_URL).port or 8000)
+        port = str(httpx.URL(url).port or 8000)
     except Exception:
         return None
     # {{.Ports}} is the LIVE port map and is empty once a container stops, so matching on it
@@ -9340,9 +9370,9 @@ async def _llamacpp_ready(timeout_s: float) -> bool:
     return await PROVIDERS["llamacpp"].ready(timeout_s)
 
 
-async def _vllm_ready(timeout_s: float) -> bool:
+async def _vllm_ready(timeout_s: float, upstream: str = "vllm") -> bool:
     """Kept as a name for existing callers; the poll itself lives on the provider now."""
-    return await PROVIDERS["vllm"].ready(timeout_s)
+    return await PROVIDERS[upstream].ready(timeout_s)
 
 
 def _lms_bin() -> str | None:
@@ -9396,23 +9426,27 @@ VLLM_ARG_SUMMARY = ("--served-model-name", "--model", "--max-model-len",
                     "--gpu-memory-utilization", "--kv-cache-dtype", "--quantization")
 
 
-async def _vllm_configs() -> list:
+async def _vllm_configs(url: str | None = None) -> list:
     """Every vLLM container on this host, running or not, with what it would serve.
+
+    `serves_port` is relative to the slot in `url`: with two slots the same container is a
+    twin of one and irrelevant to the other, and only the twins contend.
 
     Configuration is expressed as containers rather than as launch arguments the proxy templates
     into `docker run`. Defining how a server starts is Docker's job and people already do it that
     way — spark had a stopped `ornith-vllm` beside the running `qwen-vllm` before any of this
     existed. The proxy only decides which one is up, which is the part a benchmark needs.
     """
+    url = url or VLLM_URL
     docker = _docker_bin()
-    if not docker or not _upstream_is_local(VLLM_URL):
+    if not docker or not _upstream_is_local(url):
         return []
     code, out = await _run_cmd(
         [docker, "ps", "-a", "--format", "{{.Names}}	{{.Image}}	{{.State}}	{{.Ports}}"], 20.0)
     if code != 0:
         return []
     try:
-        want_port = str(httpx.URL(VLLM_URL).port or 8000)
+        want_port = str(httpx.URL(url).port or 8000)
     except Exception:
         want_port = "8000"
     named = [str(n) for n in ((load_rules_config().get("model_control") or {})
@@ -9722,7 +9756,10 @@ async def ollama_model_params(request: Request):
 async def control_vllm_configs():
     """The vLLM configurations available to switch between. They contend for one port, so at
     most one can be up — which is exactly what makes them a menu."""
-    return {"configs": await _vllm_configs(), "url": VLLM_URL}
+    return {"configs": await _vllm_configs(), "url": VLLM_URL,
+            "slots": [{"upstream": n, "url": _vllm_url(n),
+                       "configs": await _vllm_configs(_vllm_url(n))}
+                      for n in ("vllm", "vllm2")]}
 
 
 # Pulling a model is tens of gigabytes over minutes to hours, so it cannot be a request that
@@ -9855,20 +9892,24 @@ async def control_model_capabilities():
     """What can actually be loaded or unloaded, per backend, and why not when not. The UI needs
     this to avoid offering buttons that cannot work."""
     lms_ok, lms_why = _lms_available()
-    container = await _vllm_container()
-    return {
+    out = {
         "ollama": {"load": True, "unload": True, "how": "HTTP keep_alive"},
         "lmstudio": {"load": lms_ok, "unload": lms_ok,
                      "how": "lms CLI" if lms_ok else None, "reason": lms_why or None},
-        "vllm": {"load": bool(container), "unload": bool(container),
-                 "how": f"docker ({container})" if container else None,
-                 "reason": None if container else (
-                     "no container publishing this port was found"
-                     if _upstream_is_local(VLLM_URL)
-                     else f"vLLM is at {VLLM_URL}; only a local container can be controlled"),
-                 "note": "vLLM holds one model for the life of the server, so this stops and "
-                         "starts the container rather than swapping models"},
     }
+    for slot in ("vllm", "vllm2"):
+        url = _vllm_url(slot)
+        container = await _vllm_container(url)
+        out[slot] = {
+            "load": bool(container), "unload": bool(container), "url": url,
+            "how": f"docker ({container})" if container else None,
+            "reason": None if container else (
+                "no container publishing this port was found"
+                if _upstream_is_local(url)
+                else f"vLLM is at {url}; only a local container can be controlled"),
+            "note": "vLLM holds one model for the life of the server, so this stops and "
+                    "starts the container rather than swapping models"}
+    return out
 
 
 @app.post("/__proxy/api/control/models/unload")
@@ -9896,8 +9937,8 @@ async def control_model_unload(request: Request):
         if code != 0:
             return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
         return {"ok": True, "unloaded": ["all"] if payload.get("all") else [args[1]], "output": out}
-    if upstream == "vllm":
-        container = await _vllm_container()
+    if _is_vllm(upstream):
+        container = await _vllm_container(_vllm_url(upstream))
         if not container:
             return JSONResponse(
                 {"error": "no local vLLM container publishing this port was found"},
@@ -10310,49 +10351,54 @@ async def _bench_model_index() -> dict:
                     loaded_context=m.get("loaded_context_length"),
                     size_mb=round((m.get("size_bytes") or 0) / 1048576) or None,
                     parallel=m.get("parallel"))
-        vll = sysinfo.get("vllm") or {}
-        vcfg = vll.get("config") or {}
-        # A launch flag is authoritative where the checkpoint name is only a convention.
-        v_quant_from_args = _infer_quant(vll.get("launch_args"))
-        for m in (vll.get("available") or []):
-            if isinstance(m, dict):
-                put(m.get("id"), "vllm", (m.get("state") or "loaded").lower() == "loaded",
-                    max_context=m.get("max_context_length"), arch=m.get("arch"),
-                    quant=m.get("quant") or v_quant_from_args,
-                    checkpoint=m.get("root"),
-                    prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
-                                    if vcfg.get("enable_prefix_caching") is not None else None),
-                    kv_cache_dtype=vcfg.get("cache_dtype"))
-        # Containers that are configured but not running. vLLM serves exactly what its process
-        # was launched with, so a stopped container looked identical to a model that does not
-        # exist — the only way to benchmark it was to go to the System tab, start it by hand,
-        # come back, and hope you picked the right one. The proxy already knows how to start it
-        # and what it would serve, so offer it here and let the bench do it.
-        try:
-            # A container may be RUNNING but not yet serving — vLLM spends minutes loading
-            # shards. Skipping every running container made a booting model vanish from the
-            # index entirely: not loaded, not startable, so its cells failed preflight in one
-            # second ("does not serve — it has <the other twin>") instead of using the same
-            # start-and-wait path a stopped container gets. Only a container whose model the
-            # live probe actually answered for is excluded here.
-            _live_ready = {m.get("id") for m in (vll.get("available") or [])}
-            for c in await _vllm_configs():
-                if not c.get("serves_port") or not c.get("model"):
-                    continue
-                if c.get("running") and c["model"] in _live_ready:
-                    continue
-                put(c["model"], "vllm", False, startable=True, container=c["container"],
-                    quant=c.get("quant"), checkpoint=c.get("checkpoint"),
-                    max_context=int(c["max_model_len"]) if c.get("max_model_len") else None,
-                    kv_cache_dtype=c.get("kv_cache_dtype"),
-                    prefix_caching=c.get("prefix_caching"))
-        except Exception as e:
-            # Not silent: a failure here makes stopped containers vanish from the picker, which
-            # looks exactly like "that model does not exist".
+        # Both vLLM slots, identically: each has its own port, its own live probe and its own
+        # set of twins. Indexing only the first is how a model on the second slot became
+        # unbenchmarkable — the picker had no entry to select.
+        for _slot in ("vllm", "vllm2"):
+            vll = sysinfo.get(_slot) or {}
+            vcfg = vll.get("config") or {}
+            # A launch flag is authoritative where the checkpoint name is only a convention.
+            v_quant_from_args = _infer_quant(vll.get("launch_args"))
+            for m in (vll.get("available") or []):
+                if isinstance(m, dict):
+                    put(m.get("id"), _slot, (m.get("state") or "loaded").lower() == "loaded",
+                        max_context=m.get("max_context_length"), arch=m.get("arch"),
+                        quant=m.get("quant") or v_quant_from_args,
+                        checkpoint=m.get("root"),
+                        prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
+                                        if vcfg.get("enable_prefix_caching") is not None else None),
+                        kv_cache_dtype=vcfg.get("cache_dtype"))
+            # Containers that are configured but not running. vLLM serves exactly what its
+            # process was launched with, so a stopped container looked identical to a model that
+            # does not exist — the only way to benchmark it was to go to the System tab, start it
+            # by hand, come back, and hope you picked the right one. The proxy already knows how
+            # to start it and what it would serve, so offer it here and let the bench do it.
             try:
-                print(f"[bench] vLLM container scan failed: {type(e).__name__}: {e}")
-            except Exception:
-                pass
+                # A container may be RUNNING but not yet serving — vLLM spends minutes loading
+                # shards. Skipping every running container made a booting model vanish from the
+                # index entirely: not loaded, not startable, so its cells failed preflight in one
+                # second ("does not serve — it has <the other twin>") instead of using the same
+                # start-and-wait path a stopped container gets. Only a container whose model the
+                # live probe actually answered for is excluded here.
+                _live_ready = {m.get("id") for m in (vll.get("available") or [])}
+                for c in await _vllm_configs(_vllm_url(_slot)):
+                    if not c.get("serves_port") or not c.get("model"):
+                        continue
+                    if c.get("running") and c["model"] in _live_ready:
+                        continue
+                    put(c["model"], _slot, False, startable=True, container=c["container"],
+                        quant=c.get("quant"), checkpoint=c.get("checkpoint"),
+                        max_context=int(c["max_model_len"]) if c.get("max_model_len") else None,
+                        kv_cache_dtype=c.get("kv_cache_dtype"),
+                        prefix_caching=c.get("prefix_caching"))
+            except Exception as e:
+                # Not silent: a failure here makes stopped containers vanish from the picker,
+                # which looks exactly like "that model does not exist".
+                try:
+                    print(f"[bench] vLLM container scan failed ({_slot}): "
+                          f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
         lcp = sysinfo.get("llamacpp") or {}
         for m in (lcp.get("available") or []):
             if isinstance(m, dict):
@@ -10468,6 +10514,7 @@ async def _bench_model_index() -> dict:
                 _probe(c, f"{OLLAMA_URL}/api/tags", _ollama_tags),
                 _probe(c, f"{LMSTUDIO_URL}/api/v0/models", _lms_native),
                 _probe(c, f"{VLLM_URL}/v1/models", _openai_models("vllm")),
+                _probe(c, f"{VLLM2_URL}/v1/models", _openai_models("vllm2")),
             )
             # After tags, so a loaded model's entry wins over its catalogue entry.
             await _probe(c, f"{OLLAMA_URL}/api/ps", _ollama_ps)
@@ -10686,6 +10733,7 @@ async def bench_models():
         },
         "lmstudio": [i["model"] for i in items if i["upstream"] == "lmstudio"],
         "vllm": [i["model"] for i in items if i["upstream"] == "vllm"],
+        "vllm2": [i["model"] for i in items if i["upstream"] == "vllm2"],
     }
     return out
 
@@ -13809,7 +13857,7 @@ async def _ensure_model_served(model: str, upstream: str) -> dict | None:
     cfg = _auto_load_cfg()
     if not cfg.get("enabled"):
         return None
-    if upstream not in ("vllm", "llamacpp"):
+    if not (_is_vllm(upstream) or upstream == "llamacpp"):
         return None                    # ollama and lmstudio already load on demand
     index = await _bench_model_index()
     meta = _bench_resolve_model(index, model, upstream)
@@ -13853,8 +13901,8 @@ async def _ensure_model_served(model: str, upstream: str) -> dict | None:
         # The vLLM twins contend for one port: the running one must stop before the target
         # starts, and stopping it is also the cheapest way to free memory. But someone may
         # be mid-stream on it — drain in-flight requests (bounded) before pulling the plug.
-        if upstream == "vllm":
-            running = await _vllm_container()
+        if _is_vllm(upstream):
+            running = await _vllm_container(_vllm_url(upstream))
             if running and running != meta.get("container"):
                 drain_deadline = time.time() + float(cfg.get("drain_s", 120))
                 def _busy():
@@ -13870,7 +13918,7 @@ async def _ensure_model_served(model: str, upstream: str) -> dict | None:
         # unknown for containers, and want=0 skipped this check entirely, which is exactly
         # how a 97 GB boot landed beside a 22 GB resident and wedged the box.
         want = (meta.get("size_mb") or 0) * _BENCH_FIT_OVERHEAD
-        if upstream == "vllm":
+        if _is_vllm(upstream):
             claim = await _vllm_boot_claim_mb(meta.get("container"))
             if claim:
                 want = max(want, claim)
@@ -13919,7 +13967,7 @@ async def _bench_start_backend(meta: dict, persist: bool = True,
     snap = await _bench_residency_snapshot()
     want = meta.get("size_mb")
     want_free = (want * _BENCH_FIT_OVERHEAD) if want else 0
-    if upstream == "vllm":
+    if _is_vllm(upstream):
         # The utilization claim, not the checkpoint: without this, an unsized vLLM meta
         # meant want_free=0 and the bench started a ~97 GB boot without waiting for the
         # evicted memory to actually come back.
@@ -14162,9 +14210,9 @@ async def _bench_loaded_context(model: str, upstream: str) -> int | None:
                 if (m.get("name") or m.get("model")) == model:
                     return m.get("context_length") or None
             return None
-        if upstream == "vllm":
+        if _is_vllm(upstream):
             async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
-                data = (await c.get(f"{VLLM_URL}/v1/models")).json()
+                data = (await c.get(f"{_vllm_url(upstream)}/v1/models")).json()
             for m in (data.get("data") or []):
                 if m.get("id") == model or len(data.get("data") or []) == 1:
                     return m.get("max_model_len") or m.get("context_length") or None
@@ -14195,9 +14243,9 @@ async def _bench_resident_mb(model: str, upstream: str) -> float | None:
     # vLLM holds its weights inside a container that was already running, so the caller's
     # "what did the machine lose while this loaded" fallback measures nothing — it reported
     # 712 MB for a 20 GB model. Ask the container what it is holding instead.
-    if upstream == "vllm":
+    if _is_vllm(upstream):
         try:
-            name = await _vllm_container()
+            name = await _vllm_container(_vllm_url(upstream))
             docker = _docker_bin()
             if name and docker:
                 rc, out = await _run_cmd(
@@ -14257,7 +14305,7 @@ async def _bench_residency_snapshot() -> dict:
             running = st.get("running")
             container = st.get("container") if b.control == "docker" else None
             if b.control == "docker" and not container:
-                container = await _vllm_container()
+                container = await _vllm_container(b.base_url)
             if running is None and b.control == "docker":
                 # docker's state() reports the container, not whether it is up.
                 if container:
@@ -18800,7 +18848,7 @@ async def proxy(full_path: str, request: Request):
     # Auto-load (opt-in): a request for a model on a stopped backend or the other vLLM twin
     # starts what it needs and waits, Ollama-style, evicting only when it doesn't fit.
     if (isinstance(body_json, dict) and body_json.get("model")
-            and upstream_label in ("vllm", "llamacpp")
+            and (_is_vllm(upstream_label) or upstream_label == "llamacpp")
             and full_path.startswith(("v1/chat", "v1/completions"))):
         _al_err = await _ensure_model_served(str(body_json["model"]), upstream_label)
         if _al_err:

@@ -234,6 +234,7 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | `ANTHROPIC_URL` | `https://api.anthropic.com` | Anthropic upstream for `/v1/messages*` and `/v1/complete*` |
 | `LMSTUDIO_URL` | `http://localhost:1234` | LM Studio — a `model_router` routing target and a System-tab source |
 | `VLLM_URL` | `http://localhost:8001` | vLLM — same |
+| `VLLM2_URL` | `http://localhost:8002` | A second vLLM on its own port, so two models can be resident at once. A full twin of the first: routable as upstream `vllm2`, start/stop and auto-load resolve the container publishing *this* port |
 | `SD_URL` | `http://localhost:8188` | ComfyUI endpoint for the txt2img helper |
 | `SD_MODEL` | (none) | Checkpoint name for that helper |
 | `ANTHROPIC_API_KEY` | (none) | Used for proxy-originated Anthropic calls (client keys pass through untouched) |

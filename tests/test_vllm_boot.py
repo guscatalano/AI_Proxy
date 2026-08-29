@@ -37,7 +37,7 @@ def _docker(monkeypatch):
     calls = {"logs": "", "running": "true", "started": "2026-07-27T06:28:10.0Z",
              "container": "qwen-vllm", "inspect_code": 0}
 
-    async def fake_container():
+    async def fake_container(*a, **k):
         return calls["container"]
 
     async def fake_run(args, timeout=120.0, max_chars=800, keep_tail=False):
@@ -104,7 +104,7 @@ def test_stopped_container_is_not_reported_as_loading(_docker):
 
 
 def test_no_container_at_all(_docker, monkeypatch):
-    async def none_container():
+    async def none_container(*a, **k):
         return None
     monkeypatch.setattr(P, "_vllm_container", none_container)
     assert asyncio.run(P._vllm_boot_state()) == {"state": "absent"}

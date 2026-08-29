@@ -46,11 +46,14 @@ def _patch_backends(monkeypatch, vllm=None, cfgs=None, lcpp=None, lms=None):
     # The endpoint caches its sweep for a couple of seconds; tests that swap the backends
     # out from under it must start from a cold cache or they assert on the last test's fleet.
     P._MODELS_CACHE.update(ts=0.0, data=None)
-    async def _vllm(c):
-        return vllm or {}
+    async def _vllm(c, base=None):
+        # One configured slot: the second answers nothing, as on a box where VLLM2_URL
+        # points at a port with no server. Returning the same fleet for both would make
+        # every vLLM model ambiguous and qualify its name.
+        return {} if base and base != P.VLLM_URL else (vllm or {})
 
-    async def _cfgs():
-        return cfgs or []
+    async def _cfgs(url=None, *a, **k):
+        return [] if url and url != P.VLLM_URL else (cfgs or [])
 
     async def _lcpp(c):
         return lcpp or {}
@@ -69,8 +72,12 @@ def test_catalogue_unions_every_backend(client, monkeypatch):
     _patch_backends(
         monkeypatch,
         vllm={"available": [{"id": "qwen3-coder-next", "max_context_length": 262144}]},
-        cfgs=[{"container": "qwen-vllm", "model": "qwen3-coder-next", "state": "running"},
-              {"container": "ornith-vllm", "model": "ornith", "state": "exited"}],
+        # serves_port is what ties a container to a slot; the real _vllm_configs always
+        # sets it, and the catalogue lists only the twins of the slot it is describing.
+        cfgs=[{"container": "qwen-vllm", "model": "qwen3-coder-next", "state": "running",
+               "serves_port": True},
+              {"container": "ornith-vllm", "model": "ornith", "state": "exited",
+               "serves_port": True}],
         lcpp={"available": [{"id": "ds4-flash"}], "n_ctx": 65536},
     )
     d = client.get("/v1/models").json()
@@ -138,7 +145,11 @@ def test_the_catalogue_caches_its_sweep(client, monkeypatch):
     `docker inspect`, so a polling client must not turn a listing into load."""
     calls = {"n": 0}
 
-    async def counting_cfgs():
+    async def counting_cfgs(url=None, *a, **k):
+        # Once per vLLM slot per sweep — the count that matters is that it does not grow
+        # with the number of requests.
+        if url and url != P.VLLM_URL:
+            return []
         calls["n"] += 1
         return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "state": "running"}]
 
