@@ -3519,6 +3519,19 @@ DEFAULT_MODEL_QUIRKS = {
                   "coding); reasoning_effort high/medium opts in. Even with thinking off it narrates "
                   "reasoning in the content, so system_nudge curbs that (only applied when no-think)."),
     },
+    "qwen3.6": {
+        "match": "prefix",
+        "thinking": "default_off_optin",
+        "reasoning_control": "chat_template_kwargs.enable_thinking",
+        "notes": ("Same family and same knob as ornith: the template defaults thinking ON and "
+                  "reasoning_effort does nothing. Measured through the proxy on vLLM at "
+                  "max_tokens=30 — 40,036 prompt tokens in, all 30 output tokens spent on "
+                  "reasoning, content came back null. A coding client reads that as the model "
+                  "answering nothing. Needs --reasoning-parser qwen3 on the server or the "
+                  "thinking bleeds into content instead. No system_nudge here: ornith's was "
+                  "measured against ornith, and an unmeasured prompt injection is a change to "
+                  "every answer this model gives."),
+    },
 }
 _QUIRKS_CACHE: dict = {"mtime": None, "data": None}
 
