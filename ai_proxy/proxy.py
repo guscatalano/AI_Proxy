@@ -2620,6 +2620,23 @@ class _OllamaProvider(_FnProvider):
         model takes tens of seconds, so this waits for it rather than returning early — the
         caller wants to know it is actually resident, not that the request was accepted."""
         keep = payload.get("keep_alive") or "30m"
+        # Same gate live traffic passes. Ollama sizes its server at OLLAMA_CONTEXT_LENGTH ×
+        # OLLAMA_NUM_PARALLEL — 262,144 × 4 here — and a model that cannot hold that window does
+        # not fail to load, it takes the whole service down and every other resident model with
+        # it. A zero-token generate is still a full load, so "just make it resident" from the UI
+        # was a way to kill Ollama that the request path had already been taught to refuse.
+        # force:true is the deliberate override, as on the vLLM load path.
+        if not payload.get("force"):
+            try:
+                refusal = await _ollama_fit_refusal(name)
+            except Exception:
+                refusal = None
+            if refusal:
+                return JSONResponse(
+                    {"error": refusal, "model": name,
+                     "hint": "pin a smaller window for this model under ollama_options.per_model, "
+                             "free memory, or pass force:true"},
+                    status_code=409)
         t0 = time.perf_counter()
         try:
             async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
@@ -17815,6 +17832,15 @@ async def _run_shadow(primary_id: str, primary_body: dict, primary_path: str,
                 evaluate_ollama_options(shadow_body, shadow_router_ctx)
             except Exception:
                 pass
+            # ...and then carry num_ctx the only way the OpenAI-compat endpoint respects it.
+            # Injecting the option alone was a no-op here: Ollama's /v1 drops num_ctx, which is
+            # the entire reason the derived model exists, so a per_model pin configured for a
+            # shadow target silently did nothing and the shadow loaded at the server default.
+            if target["upstream_label"] == "ollama":
+                try:
+                    await apply_ollama_ctx_model(shadow_body, shadow_router_ctx)
+                except Exception as e:
+                    print(f"[shadow] ctx model swap failed: {type(e).__name__}: {e}")
             # Strip per-request volatile prefix so llama.cpp's KV cache survives between turns.
             # (For translated bodies _anthropic_to_openai_request already did this; this catches
             # passthrough OpenAI-shape shadows.)
@@ -17822,6 +17848,34 @@ async def _run_shadow(primary_id: str, primary_body: dict, primary_path: str,
                 _strip_volatile_prefix(shadow_body)
             except Exception:
                 pass
+
+        # The same fit gate the primary request passes. A shadow is best-effort for the CLIENT,
+        # never for the box: Ollama sizes its server at OLLAMA_CONTEXT_LENGTH × OLLAMA_NUM_PARALLEL
+        # — 262,144 × 4 on this machine — and a model that cannot hold that window does not fail
+        # the request, it takes the whole Ollama service down with it. Three shadow runs of a
+        # 2.5 GB model killed it three times. Refusing costs a comparison; sending cost every
+        # other model resident at the time.
+        if target["upstream_label"] == "ollama":
+            _sm = str(shadow_body.get("model") or "")
+            try:
+                _refusal = await _ollama_fit_refusal(
+                    _sm, pin=_effective_num_ctx(_sm, shadow_body))
+            except Exception:
+                _refusal = None
+            if _refusal:
+                conn = db()
+                conn.execute(
+                    """INSERT INTO requests (id, ts, method, path, upstream_url, model,
+                                             is_stream, client_ip, conversation_id, turn_index,
+                                             client_app, shadow_of, status, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (shadow_id, time.time(), "POST", "/" + shadow_path,
+                     f"{target['upstream_base']}/{shadow_path}", _sm, 0, viewer_ip,
+                     _conversation_id(primary_body), _turn_index(primary_body), "shadow",
+                     primary_id, 0, f"shadow not sent: {_refusal}"))
+                conn.commit()
+                conn.close()
+                return
 
         upstream_url = f"{target['upstream_base']}/{shadow_path}"
         body_text = json.dumps(shadow_body)
