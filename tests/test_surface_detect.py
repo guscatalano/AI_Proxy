@@ -88,3 +88,56 @@ def test_surface_is_stored_and_flows_to_conversations(client):
     conn.execute("DELETE FROM requests WHERE id='r_sf1'")
     conn.commit()
     conn.close()
+
+
+# --- the web surface -------------------------------------------------------------
+# Observed live: hermes fronts a windowed UI whose toolbox is a strict SUPERSET of the CLI
+# one — 41 tools against 25, adding panes, previews, layouts and in-page terminals. Because
+# it carries execute_code and read_file too, the cli rule matched first and both surfaces
+# logged identically: 1,103 requests in a day, every one of them labelled "cli".
+
+_CLI_TOOLS = ("browser_exec", "clarify", "computer_use", "cronjob", "delegate_task",
+              "execute_code", "memory", "patch", "process", "read_file", "search_files",
+              "terminal", "todo", "web_search", "write_file")
+_WEB_EXTRA = ("annotate_preview", "apply_layout", "close_preview", "close_terminal",
+              "drive_preview", "focus_pane", "open_preview", "read_preview",
+              "read_terminal", "read_window_below")
+
+
+def test_the_windowed_toolbox_is_web_not_cli():
+    b = _body("You are Hermes Agent.", _tools(*_CLI_TOOLS, *_WEB_EXTRA))
+    assert P._detect_surface({}, b) == "web"
+
+
+def test_the_plain_toolbox_is_still_cli():
+    """The regression guard: teaching it 'web' must not relabel the CLI."""
+    b = _body("You are Hermes Agent.", _tools(*_CLI_TOOLS))
+    assert P._detect_surface({}, b) == "cli"
+
+
+def test_one_window_tool_is_not_enough():
+    """A single name could plausibly appear in someone else's toolbox; a pair could not."""
+    b = _body("You are Hermes Agent.", _tools(*_CLI_TOOLS, "open_preview"))
+    assert P._detect_surface({}, b) == "cli"
+
+
+def test_two_window_tools_are_enough():
+    b = _body("You are Hermes Agent.", _tools(*_CLI_TOOLS, "open_preview", "focus_pane"))
+    assert P._detect_surface({}, b) == "web"
+
+
+def test_cron_still_outranks_the_windowed_toolbox():
+    """A scheduled run is a scheduled run, whatever tools happen to be loaded."""
+    b = _body("You are Hermes Agent. You are running as a scheduled cron job.",
+              _tools(*_CLI_TOOLS, *_WEB_EXTRA))
+    assert P._detect_surface({}, b) == "cron"
+
+
+def test_discord_still_outranks_the_windowed_toolbox():
+    b = _body("You are Hermes Agent.", _tools(*_CLI_TOOLS, *_WEB_EXTRA, "discord"))
+    assert P._detect_surface({}, b) == "discord"
+
+
+def test_an_explicit_surface_header_still_wins():
+    b = _body("You are Hermes Agent.", _tools(*_CLI_TOOLS, *_WEB_EXTRA))
+    assert P._detect_surface({"x-client-surface": "web-beta"}, b) == "web-beta"

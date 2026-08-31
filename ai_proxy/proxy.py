@@ -3349,6 +3349,14 @@ DEFAULT_RULES_CONFIG = {
         # not an upper bound: two servers summing to 0.80 of this box still exhausted the
         # driver's context allocator and took both engines down. 0 uses the built-in default.
         "vllm_boot_reserve_mb": 0,
+        # A fixed backend that drops the connection is usually restarting, not gone: vLLM's
+        # engine can die on a kernel fault and docker's restart policy brings it straight back,
+        # but the weights take minutes to reload. Every request arriving in that window used to
+        # get an immediate 502 — a qwen3.6 GDN kernel fault took the engine down and the next
+        # five requests were each rejected in under two seconds, when waiting would have served
+        # all of them. Hold instead, bounded, and only while the backend is actually coming up.
+        # timeout_s 0 means "use vllm_ready_timeout_s".
+        "hold_for_restart": {"enabled": True, "timeout_s": 0},
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
         "vllm_ready_timeout_s": 420,
@@ -16303,8 +16311,16 @@ def _body_system_text(body: dict | None) -> str:
     return ""
 
 
+# Tools that only mean anything inside a windowed UI. Naming them beats matching a prefix:
+# "read_preview" and "read_file" share no useful pattern, and a prefix rule would have to guess.
+_WEB_SURFACE_TOOLS = frozenset({
+    "annotate_preview", "apply_layout", "close_preview", "close_terminal", "drive_preview",
+    "focus_pane", "open_preview", "read_preview", "read_terminal", "read_window_below",
+})
+
+
 def _detect_surface(headers: dict | None, body: dict | None) -> str | None:
-    """Which surface an agentic client was driven from: 'discord', 'cron', or 'cli'.
+    """Which surface an agentic client was driven from: 'discord', 'cron', 'web' or 'cli'.
 
     One client_app can front several execution contexts (hermes runs as a Discord bot, a
     scheduled cron job, AND an interactive local session — same IP, same UA, same
@@ -16336,6 +16352,13 @@ def _detect_surface(headers: dict | None, body: dict | None) -> str | None:
     if re.search(r"^\s*-?\s*Guild:\s*`?\d", sys_text, re.M) or \
             not tools.isdisjoint({"discord", "discord_admin"}):
         return "discord"
+    # A windowed host: panes, previews, layouts, in-page terminals. Checked BEFORE cli because
+    # the web toolbox is a SUPERSET of the CLI one — it carries execute_code and read_file too,
+    # so the cli rule matched it first and 1,103 requests from both surfaces were logged
+    # identically as "cli". Two markers rather than one: a single tool name could plausibly show
+    # up in some other client's toolbox, a pair of them could not.
+    if len(tools & _WEB_SURFACE_TOOLS) >= 2:
+        return "web"
     # Local exec toolset with no discord anywhere → an interactive local/CLI session.
     if {"execute_code", "read_file"} <= tools or {"read_file", "patch"} <= tools:
         return "cli"
@@ -16402,6 +16425,38 @@ def _upstream_error_message(status: int | None, body_text: str | None) -> str | 
     if not msg:
         return None
     return f"upstream returned {status}: {str(msg)[:400]}"
+
+
+# Transport failures that mean "nothing answered". ReadTimeout is deliberately absent: that one
+# means the backend DID accept and is still thinking, and retrying it would put a second copy of
+# an expensive prefill on a box that is already busy.
+_RESTART_RETRYABLE = ("ConnectError", "ConnectTimeout", "ReadError",
+                      "RemoteProtocolError", "WriteError", "WriteTimeout")
+
+
+async def _wait_out_backend_restart(upstream: str | None, exc) -> bool:
+    """True once a fixed backend that just dropped us is serving again.
+
+    Only the fixed backends: Ollama and LM Studio load on demand, so a failure there is not a
+    restart to wait out. Provider.ready() does the waiting and already refuses to poll a
+    corpse — it consults died() from the second pass on, so a container that exited for good
+    fails fast while one docker is restarting gets its full minutes.
+    """
+    if not (_is_vllm(upstream) or upstream == "llamacpp"):
+        return False
+    if type(exc).__name__ not in _RESTART_RETRYABLE:
+        return False
+    prov = PROVIDERS.get(upstream or "")
+    if prov is None:
+        return False
+    try:
+        cfg = (load_rules_config().get("model_control") or {}).get("hold_for_restart") or {}
+        if not cfg.get("enabled", True):
+            return False
+        timeout = float(cfg.get("timeout_s") or 0)
+    except Exception:
+        return False
+    return await prov.ready(timeout or _vllm_ready_timeout())
 
 
 def _explain_upstream_error(exc, upstream: str | None, url: str | None,
@@ -19377,22 +19432,35 @@ async def proxy(full_path: str, request: Request):
     # which is why this looked like an intermittent glitch rather than a rule.)
     _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": None,
                                   "upstream": upstream_label, "cancelled": False}
-    try:
-        upstream_req = client.build_request(
-            request.method, upstream_url, headers=headers_out, content=body or None
-        )
-        upstream_resp = await client.send(upstream_req, stream=True)
-    except Exception as e:
-        _release_pri_slot()
-        elapsed = (time.perf_counter() - start) * 1000
-        explained = _explain_upstream_error(e, upstream_label, upstream_url, elapsed,
-                                            got_bytes=False)
-        _save_finish(req_id, 0, {}, None, None, elapsed, explained)
-        return JSONResponse(
-            {"error": "upstream unreachable", "upstream": upstream_base,
-             "detail": str(e), "explanation": explained},
-            status_code=502,
-        )
+    # One retry, and only across a backend restart. Nothing has been sent to the client yet and
+    # the upstream produced no bytes, so re-sending is safe — the request was never processed.
+    _held_ms = 0.0
+    for _attempt in (0, 1):
+        try:
+            upstream_req = client.build_request(
+                request.method, upstream_url, headers=headers_out, content=body or None
+            )
+            upstream_resp = await client.send(upstream_req, stream=True)
+            break
+        except Exception as e:
+            if _attempt == 0:
+                _t_hold = time.perf_counter()
+                if await _wait_out_backend_restart(upstream_label, e):
+                    _held_ms = (time.perf_counter() - _t_hold) * 1000
+                    _ent = _INFLIGHT_REQUESTS.get(req_id)
+                    if _ent is not None:          # so the Live view shows the wait, not a stall
+                        _ent["held_for_restart_ms"] = round(_held_ms)
+                    continue
+            _release_pri_slot()
+            elapsed = (time.perf_counter() - start) * 1000
+            explained = _explain_upstream_error(e, upstream_label, upstream_url, elapsed,
+                                                got_bytes=False)
+            _save_finish(req_id, 0, {}, None, None, elapsed, explained)
+            return JSONResponse(
+                {"error": "upstream unreachable", "upstream": upstream_base,
+                 "detail": str(e), "explanation": explained},
+                status_code=502,
+            )
 
     # Attach the socket to the entry registered above, so /api/control/cancel/{req_id} has
     # something to close.
