@@ -120,9 +120,13 @@ def test_a_boot_must_leave_the_driver_room(client, monkeypatch):
     monkeypatch.setattr(P, "_mem_snapshot", lambda: {"total_mb": 121_700.0})
 
     need = asyncio.run(P._vllm_boot_claim_mb("big-vllm"))
-    assert need == 121_700.0 * 0.45 + P._VLLM_BOOT_RESERVE_MB
+    assert need == 121_700.0 * 0.45 + P._vllm_boot_reserve_mb(121_700.0)
     # The number that matters: a box with only the bare claim free is refused, not squeezed.
     assert need > 121_700.0 * 0.45
+    # ...and the reserve is capped as a share of the box, so it stays sane on a small machine:
+    # a flat 16 GB doubled a 14 GB claim on a 16 GB CI runner and refused every start.
+    assert P._vllm_boot_reserve_mb(16_000.0) == 2_000.0
+    assert P._vllm_boot_reserve_mb(500_000.0) == P._VLLM_BOOT_RESERVE_MB
 
 
 def test_the_reserve_is_configurable(client, monkeypatch):

@@ -38,6 +38,12 @@ def _stub(monkeypatch, *, vllm_running=True, svc_running=True, ollama=("qwen3:4b
     monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
     monkeypatch.setattr(P, "_run_cmd", run)
     monkeypatch.setattr(P, "_free_mem_mb", lambda: free_mb)
+    # The vLLM boot guard is not what these tests are about, and left alone it prices a start
+    # against the RUNNER's memory — so they passed on a workstation and 409'd on a 16 GB CI box.
+    # None means "cannot compute a claim", which is the guard's own skip signal.
+    async def _no_claim(*a, **k):
+        return None
+    monkeypatch.setattr(P, "_vllm_boot_claim_mb", _no_claim)
 
     async def evict(keep=""):
         calls.append(["evict-ollama", keep])

@@ -729,6 +729,12 @@ def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
     monkeypatch.setattr(p, "_run_cmd", fake_run)
     monkeypatch.setattr(p, "_vllm_ready", fake_ready)
     monkeypatch.setattr(p, "_docker_bin", lambda: "/usr/bin/docker")
+    # This test is about not requiring a model name, so the memory guard must not be the thing
+    # under test. Left unstubbed it priced the boot against the RUNNER's own RAM: fine on a
+    # workstation, a 409 on a 16 GB CI box. None is the guard's own "cannot compute" skip.
+    async def _no_claim(*a, **k):
+        return None
+    monkeypatch.setattr(p, "_vllm_boot_claim_mb", _no_claim)
     r = client.post("/__proxy/api/control/models/load", json={"upstream": "vllm"})
     assert r.status_code == 200, r.text
     body = r.json()

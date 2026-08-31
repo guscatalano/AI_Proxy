@@ -2705,6 +2705,19 @@ async def _control_backend(b, action: str, container: str | None = None) -> dict
 # Headroom a vLLM start must leave free, on top of what it claims. See _vllm_boot_claim_mb
 # for the incident: 0.45 + 0.35 on a 122 GB box killed the NVIDIA driver's context allocator.
 _VLLM_BOOT_RESERVE_MB = 16384.0
+# ...but never more than this share of the machine, so the default stays sane on a small box.
+_VLLM_BOOT_RESERVE_FRACTION = 0.125
+
+
+def _vllm_boot_reserve_mb(total_mb: float) -> float:
+    """Free memory a vLLM start must leave behind, beyond what it claims.
+
+    Proportional, capped. The reserve covers CUDA contexts, the page cache and the system, all
+    of which scale with the box — a flat 16 GB is right on a 122 GB machine and absurd on a
+    16 GB one, where it doubled a 14 GB claim and made every vLLM start impossible.
+    An explicitly configured reserve is taken at face value; only this default scales.
+    """
+    return min(_VLLM_BOOT_RESERVE_MB, float(total_mb or 0) * _VLLM_BOOT_RESERVE_FRACTION)
 
 
 # Order matters only for display: this is the order the System tab shows backends in.
@@ -14425,7 +14438,7 @@ async def _vllm_boot_claim_mb(container: str | None) -> float | None:
         # silently — the one case where it matters most.
         reserve = 0.0
     if reserve <= 0:
-        reserve = _VLLM_BOOT_RESERVE_MB
+        reserve = _vllm_boot_reserve_mb(total)
     return float(total) * util + reserve
 
 
