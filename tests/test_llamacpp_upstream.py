@@ -52,6 +52,18 @@ def test_snapshot_reports_the_served_model(client):
     assert "IQ2_XXS" in (snap["model_path"] or "")
 
 
+def test_model_id_is_the_name_not_the_home_dir_path(client):
+    # llama-server sometimes reports the model id as the full GGUF PATH (under the user's home dir, with a
+    # -NNNNN-of-NNNNN shard suffix). The snapshot must surface just the model NAME — not the path; the full
+    # path stays in model_path for quant/context inference.
+    p = r"C:\Users\crimson\models\DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf"
+    snap = asyncio.run(P._llamacpp_snapshot(_Client(
+        models={"data": [{"id": p}]}, props={"model_path": p})))
+    assert snap["loaded"][0]["id"] == "DeepSeek-V4-Flash-0731-UD-IQ2_XXS"
+    assert "crimson" not in snap["loaded"][0]["id"], "the model name must not leak the home directory"
+    assert "IQ2_XXS" in (snap["model_path"] or ""), "the full path is still available for quant/context"
+
+
 def test_quantisation_is_recovered_from_the_filename(client):
     # llama-server's API never states the quant; the path is the only place it appears.
     snap = asyncio.run(P._llamacpp_snapshot(_Client(
@@ -75,10 +87,7 @@ def test_it_counts_toward_decode_rate_stats(client):
     # Left out, 100% of its traffic would be invisible in the throughput figures — exactly the
     # bug vLLM had when it was added as an upstream and this set was not updated. The set is a
     # local inside stats(), so this guards the literal rather than an importable name.
-    import inspect
-    src = inspect.getsource(P.stats)
-    line = next(l for l in src.splitlines() if "GENERATION_RATE_UPSTREAMS = " in l)
-    assert "llamacpp" in line, line
+    assert P.PROVIDERS["llamacpp"].measures_decode is True
 
 
 def test_bench_index_includes_llamacpp_models(client, monkeypatch):
@@ -98,12 +107,12 @@ def test_bench_index_includes_llamacpp_models(client, monkeypatch):
 
 
 def test_bench_lists_it_as_a_backend(client, monkeypatch):
-    # The bench's backend chips come from _BENCH_LOAD_MODES, not from the model index, so a
-    # backend missing from that table is invisible in the bench UI even when it is serving.
-    assert "llamacpp" in P._BENCH_LOAD_MODES
+    # The bench's backend chips are derived from the registry, so registering a backend is
+    # the single act that makes it appear — no second list to remember.
+    assert "llamacpp" in P.PROVIDERS
     # "fixed": one model per process, chosen on the command line — the bench can measure what
     # is up but cannot swap models there, same as vLLM.
-    assert P._BENCH_LOAD_MODES["llamacpp"] == "fixed"
+    assert P.PROVIDERS["llamacpp"].load_mode == "fixed"
 
     def fake_now():          # sync, like the real handler
         return {"llamacpp": {"reachable": True, "available": [{"id": "ds4"}]}}
@@ -125,10 +134,11 @@ def test_vllm_container_is_found_while_stopped(client, monkeypatch):
         if "ps" in args:
             return 0, "qwen-vllm\nornith-vllm\ndockpeek\n"
         if "inspect" in args:
-            # Exactly what a stopped container reports: bindings present, live ports absent.
-            return 0, ('/qwen-vllm\t{"8000/tcp":[{"HostIp":"","HostPort":"8001"}]}\n'
-                       '/ornith-vllm\t{"8000/tcp":[{"HostIp":"","HostPort":"8002"}]}\n'
-                       '/dockpeek\t{"8000/tcp":[{"HostIp":"","HostPort":"3420"}]}\n')
+            # Exactly what a stopped container reports: bindings present, live ports absent,
+            # State.Running false.
+            return 0, ('/qwen-vllm\tfalse\t{"8000/tcp":[{"HostIp":"","HostPort":"8001"}]}\n'
+                       '/ornith-vllm\tfalse\t{"8000/tcp":[{"HostIp":"","HostPort":"8002"}]}\n'
+                       '/dockpeek\tfalse\t{"8000/tcp":[{"HostIp":"","HostPort":"3420"}]}\n')
         return 1, ""
     monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
     monkeypatch.setattr(P, "_run_cmd", run)
@@ -143,3 +153,96 @@ def test_vllm_container_is_found_while_stopped(client, monkeypatch):
 def test_info_advertises_the_slot(client):
     d = client.get("/__proxy/api/info").json()
     assert d.get("llamacpp") == P.LLAMACPP_URL
+
+
+def test_a_running_llamacpp_keys_the_index_by_its_checkpoint_path(client, monkeypatch):
+    """The stopped fallback keys on the configured PATH and sweeps submit that path. When the
+    display id was cleaned for the System tab, a running llama.cpp stopped matching its own
+    cells: eleven server-context cells failed preflight in zero seconds each with
+    "does not serve <path> — it has <clean name>"."""
+    import asyncio
+    path = "/models/DeepSeek-V4-Flash-0731-UD-IQ2_XXS-00001-of-00003.gguf"
+
+    def fake_sysinfo():
+        return {"llamacpp": {"available": [{"id": "DeepSeek-V4-Flash-0731-UD-IQ2_XXS"}],
+                             "model_path": path, "n_ctx": 32768, "parallel": 1},
+                "ollama": {}, "lmstudio": {}, "vllm": {}}
+
+    monkeypatch.setattr(P, "system_now", fake_sysinfo)
+    monkeypatch.setattr(P, "_llamacpp_cfg", lambda: {"model": path})
+    async def no_containers(*a, **k):
+        return []
+    monkeypatch.setattr(P, "_vllm_configs", no_containers)
+    index = asyncio.run(P._bench_model_index())
+    key = f"llamacpp:{path}"
+    assert key in index, sorted(k for k in index if k.startswith("llamacpp"))
+    assert index[key]["loaded"] is True
+    meta = P._bench_resolve_model(index, path, "llamacpp")
+    assert meta and meta.get("loaded"), "the sweep's own model string must resolve while up"
+
+
+def test_a_booting_vllm_container_is_startable_not_invisible(client, monkeypatch):
+    """qwen-vllm spent minutes loading shards; the container scan skipped every RUNNING
+    container, so a booting model was neither loaded nor startable — its cells failed
+    preflight in one second ("does not serve — it has ornith-nvfp4") instead of taking the
+    start-and-wait path a stopped container gets."""
+    def fake_now():
+        return {"ollama": {}, "lmstudio": {}, "llamacpp": {},
+                "vllm": {"reachable": False, "available": []}}
+
+    async def configs(*a, **k):
+        return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "running": True,
+                 "serves_port": True},
+                {"container": "ornith-vllm", "model": "ornith-nvfp4", "running": False,
+                 "serves_port": True}]
+
+    monkeypatch.setattr(P, "system_now", fake_now)
+    monkeypatch.setattr(P, "_vllm_configs", configs)
+    monkeypatch.setattr(P, "_llamacpp_cfg", lambda: {})
+    idx = asyncio.run(P._bench_model_index())
+    meta = P._bench_resolve_model(idx, "qwen3-coder-next", "vllm")
+    assert meta and meta.get("startable"), "a booting container must offer the wait path"
+    assert meta.get("container") == "qwen-vllm"
+    # And once the live probe answers for it, the running container is no longer 'startable'.
+    def fake_now_ready():
+        return {"ollama": {}, "lmstudio": {}, "llamacpp": {},
+                "vllm": {"reachable": True,
+                         "available": [{"id": "qwen3-coder-next", "state": "loaded"}]}}
+    monkeypatch.setattr(P, "system_now", fake_now_ready)
+    idx2 = asyncio.run(P._bench_model_index())
+    meta2 = P._bench_resolve_model(idx2, "qwen3-coder-next", "vllm")
+    assert meta2.get("loaded") is True and not meta2.get("startable")
+
+
+def test_vllm_boot_state_names_the_model_it_is_loading(client, monkeypatch):
+    """"loading" without a name is half an answer — the container's config knows which model
+    it will serve minutes before /v1/models can say so."""
+    async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "inspect" in args and "{{.State.Running}}" in " ".join(map(str, args)):
+            return 0, "true\t2026-08-05T20:00:00Z"
+        if "logs" in args:
+            return 0, ""
+        return 1, ""
+
+    async def configs(*a, **k):
+        return [{"container": "qwen-vllm", "model": "qwen3-coder-next", "running": True,
+                 "serves_port": True}]
+
+    async def container(*a, **k):
+        return "qwen-vllm"
+
+    monkeypatch.setattr(P, "_docker_bin", lambda: "docker")
+    monkeypatch.setattr(P, "_run_cmd", run)
+    monkeypatch.setattr(P, "_vllm_configs", configs)
+    monkeypatch.setattr(P, "_vllm_container", container)
+    st = asyncio.run(P._vllm_boot_state())
+    assert st["state"] == "loading"
+    assert st["model"] == "qwen3-coder-next"
+
+    async def run_stopped(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
+        if "inspect" in args:
+            return 0, "false\t"
+        return 1, ""
+    monkeypatch.setattr(P, "_run_cmd", run_stopped)
+    st2 = asyncio.run(P._vllm_boot_state())
+    assert st2["state"] == "stopped" and st2["model"] == "qwen3-coder-next"

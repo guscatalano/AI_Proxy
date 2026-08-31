@@ -21,7 +21,7 @@ def _stub(monkeypatch, *, vllm_running=True, svc_running=True, ollama=("qwen3:4b
     cfg["model_control"] = mc
     monkeypatch.setattr(P, "load_rules_config", lambda: cfg)
 
-    async def container():
+    async def container(*a, **k):
         return "qwen-vllm"
 
     async def run(args, timeout=120.0, max_chars=800, keep_tail=False, env=None):
@@ -38,6 +38,12 @@ def _stub(monkeypatch, *, vllm_running=True, svc_running=True, ollama=("qwen3:4b
     monkeypatch.setattr(P, "_docker_bin", lambda: "/usr/bin/docker")
     monkeypatch.setattr(P, "_run_cmd", run)
     monkeypatch.setattr(P, "_free_mem_mb", lambda: free_mb)
+    # The vLLM boot guard is not what these tests are about, and left alone it prices a start
+    # against the RUNNER's memory — so they passed on a workstation and 409'd on a 16 GB CI box.
+    # None means "cannot compute a claim", which is the guard's own skip signal.
+    async def _no_claim(*a, **k):
+        return None
+    monkeypatch.setattr(P, "_vllm_boot_claim_mb", _no_claim)
 
     async def evict(keep=""):
         calls.append(["evict-ollama", keep])
@@ -67,20 +73,26 @@ def _stub(monkeypatch, *, vllm_running=True, svc_running=True, ollama=("qwen3:4b
     return calls
 
 
+def _entry(snap, name):
+    return next((e for e in snap["backends"] if e["name"] == name), None)
+
+
 def test_snapshot_discovers_what_is_running(client, monkeypatch):
     _stub(monkeypatch)
     snap = asyncio.run(P._bench_residency_snapshot())
-    assert snap["vllm"] == {"container": "qwen-vllm", "was_running": True}
-    assert snap["services"] == [{"name": "comfyui", "was_running": True}]
+    assert _entry(snap, "vllm")["was_running"] is True
+    assert _entry(snap, "comfyui")["was_running"] is True
     assert snap["ollama"] == ["qwen3:4b"]
+    # Backends the proxy cannot start are not in the list at all — there is nothing to restore.
+    assert _entry(snap, "ollama") is None
 
 
 def test_snapshot_records_what_was_already_down(client, monkeypatch):
     # Restoring must not start something the bench found stopped.
     _stub(monkeypatch, vllm_running=False, svc_running=False, ollama=())
     snap = asyncio.run(P._bench_residency_snapshot())
-    assert snap["vllm"]["was_running"] is False
-    assert snap["services"][0]["was_running"] is False
+    assert _entry(snap, "vllm")["was_running"] is False
+    assert _entry(snap, "comfyui")["was_running"] is False
     assert snap["ollama"] == []
 
 
@@ -92,7 +104,7 @@ def test_freeing_stops_everything_that_was_up(client, monkeypatch):
     assert ["systemctl", "--user", "stop", "comfyui.service"] in calls
     assert ["/usr/bin/docker", "stop", "qwen-vllm"] in calls
     assert ["evict-ollama", "target"] in calls
-    assert out["stopped_vllm"]["ok"] is True
+    assert any(x["name"] == "vllm" and x["ok"] for x in out["stopped"])
 
 
 def test_freeing_leaves_alone_what_was_already_down(client, monkeypatch):
@@ -123,14 +135,15 @@ def test_freeing_reports_when_the_memory_never_arrives(client, monkeypatch):
 
 def test_restore_puts_back_exactly_what_was_found(client, monkeypatch):
     calls = _stub(monkeypatch)
-    monkeypatch.setattr(P, "_vllm_ready", lambda t: asyncio.sleep(0, result=True))
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", lambda t=0: asyncio.sleep(0, result=True), raising=False)
     snap = asyncio.run(P._bench_residency_snapshot())
     calls.clear()
     res = asyncio.run(P._bench_restore_residency(snap))
     assert ["/usr/bin/docker", "start", "qwen-vllm"] in calls
     assert ["systemctl", "--user", "start", "comfyui.service"] in calls
     assert ["ollama-post", "qwen3:4b", "30m"] in calls
-    assert res["started_vllm"]["ready"] is True
+    assert any(x["name"] == "vllm" and x["ready"] is True for x in res["started"])
 
 
 def test_restore_does_not_start_what_was_not_running(client, monkeypatch):
@@ -147,24 +160,27 @@ def test_restore_waits_for_vllm_to_answer(client, monkeypatch):
     _stub(monkeypatch)
     waited = []
 
-    async def ready(t):
+    async def ready(t=0):
         waited.append(t)
         return False
-    monkeypatch.setattr(P, "_vllm_ready", ready)
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", ready, raising=False)
     snap = asyncio.run(P._bench_residency_snapshot())
     res = asyncio.run(P._bench_restore_residency(snap))
     assert waited, "did not wait for readiness"
-    assert res["started_vllm"]["ready"] is False
+    assert any(x["name"] == "vllm" and x["ready"] is False for x in res["started"])
 
 
 def test_quiesce_persists_the_snapshot_until_restored(client, monkeypatch):
     # A bench that stops the daily driver and dies would leave it stopped indefinitely.
     _stub(monkeypatch)
-    monkeypatch.setattr(P, "_vllm_ready", lambda t: asyncio.sleep(0, result=True))
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", lambda t=0: asyncio.sleep(0, result=True), raising=False)
     state = asyncio.run(P._bench_quiesce(True, keep=""))
     pending = P.get_setting(P._RESIDENCY_SETTING)
     assert pending, "snapshot was not persisted before anything was stopped"
-    assert json.loads(pending["value"])["vllm"]["container"] == "qwen-vllm"
+    names = {e["name"] for e in json.loads(pending["value"])["backends"]}
+    assert "vllm" in names
 
     asyncio.run(P._bench_quiesce(False, state))
     assert not P.get_setting(P._RESIDENCY_SETTING), "snapshot outlived the restore"
@@ -172,7 +188,8 @@ def test_quiesce_persists_the_snapshot_until_restored(client, monkeypatch):
 
 def test_startup_finishes_an_interrupted_restore(client, monkeypatch):
     calls = _stub(monkeypatch)
-    monkeypatch.setattr(P, "_vllm_ready", lambda t: asyncio.sleep(0, result=True))
+    for _p in P.PROVIDERS.values():
+        monkeypatch.setattr(_p, "ready", lambda t=0: asyncio.sleep(0, result=True), raising=False)
     snap = asyncio.run(P._bench_residency_snapshot())
     P._save_pending_residency(snap)          # as if the process died mid-bench
     calls.clear()

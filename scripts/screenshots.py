@@ -40,24 +40,45 @@ except ImportError:
     sys.exit(1)
 
 
+# The view slug is the whole address: the nav button carries data-view, the container is #slug,
+# and it is shown by toggling .show. The old list hard-coded button ids like "tab-req" that the
+# UI stopped using, so every click silently timed out and the shots came back on whatever tab
+# happened to be open.
 TABS = [
-    ("requests", "Requests", "tab-req"),
-    ("convs", "Conversations", "tab-convs"),
-    ("system", "System", "tab-system"),
-    ("setup", "Setup", "tab-setup"),
-    ("stats", "Stats (with traffic flow)", "tab-stats"),
-    ("audit", "Audit (rules + suggestions)", "tab-audit"),
+    ("requests", "Requests"),
+    ("convs", "Conversations"),
+    ("live", "Live view"),
+    ("bench", "Bench"),
+    ("system", "System (backend registry)"),
+    ("stats", "Stats (with traffic flow)"),
+    ("audit", "Audit (rules + suggestions)"),
+    ("artifacts", "Artifacts"),
+    ("tasks", "Tasks"),
+    ("setup", "Setup"),
 ]
 
 
-async def click_tab(page, tab_button_id: str, view_id: str) -> None:
-    await page.click(f"#{tab_button_id}")
+async def click_tab(page, view_id: str, _unused=None) -> None:
+    # Click the real nav button where there is one; fall back to the function it calls, so a
+    # view that is only reachable from elsewhere still gets captured.
+    try:
+        await page.click(f'button.snav[data-view="{view_id}"]', timeout=3000)
+    except PWTimeout:
+        await page.evaluate(f"setView('{view_id}')")
     # The view is shown by toggling .show on its container; wait for that to flip.
     try:
         await page.wait_for_selector(f"#{view_id}.show", timeout=4000)
     except PWTimeout:
         pass
-    await page.wait_for_timeout(700)  # let auto-refresh paint at least once
+    # Then wait for it to actually PAINT. 700 ms was enough when the demo DB was small; against
+    # 58k requests the Stats charts had not drawn yet and the shot came back as an empty pane
+    # under a correctly-highlighted tab — which looks like a working screenshot until you open
+    # it. Settle on the network first, then give the chart code a beat to draw.
+    try:
+        await page.wait_for_load_state("networkidle", timeout=15000)
+    except PWTimeout:
+        pass
+    await page.wait_for_timeout(2500)
 
 
 async def capture(page, out_dir: Path, name: str) -> None:
@@ -123,18 +144,29 @@ async def run(url: str, out: Path, width: int, height: int) -> None:
         )
         page = await ctx.new_page()
         await page.goto(url, wait_until="networkidle")
-        await page.wait_for_selector("#tab-req", timeout=8000)
+        await page.wait_for_selector('button.snav[data-view="requests"]', timeout=8000)
         await page.wait_for_timeout(500)
 
         # 1. Each tab.
-        for slug, label, btn in TABS:
+        for slug, label in TABS:
             print(f"[{label}]")
-            await click_tab(page, btn, slug)
+            await click_tab(page, slug)
             await capture(page, out, f"tab-{slug}")
+
+        # 1b. The Flow sub-tab of Stats — the rule pipeline diagram the README leads with.
+        # Stats opens on Trends, so capturing the tab alone gives charts, not the flow.
+        print("[Stats · Flow]")
+        await click_tab(page, "stats")
+        try:
+            await page.evaluate("setStatsTab('flow')")
+            await page.wait_for_timeout(1800)
+            await capture(page, out, "stats-flow")
+        except Exception as e:
+            print(f"  - could not open the Flow sub-tab: {e}")
 
         # 2. Request detail (latest request with a status).
         print("[Request detail]")
-        await click_tab(page, "tab-req", "requests")
+        await click_tab(page, "requests")
         rid = await first_request_id(page)
         if rid:
             await page.evaluate(f"selectItem('{rid}')")
@@ -145,7 +177,7 @@ async def run(url: str, out: Path, width: int, height: int) -> None:
 
         # 3. Conversation detail.
         print("[Conversation detail]")
-        await click_tab(page, "tab-convs", "convs")
+        await click_tab(page, "convs")
         cid = await first_conversation_id(page)
         if cid:
             await page.evaluate(f"loadConversationDetail('{cid}')")
@@ -156,7 +188,7 @@ async def run(url: str, out: Path, width: int, height: int) -> None:
 
         # 4. Shadow comparison page.
         print("[Compare view]")
-        await click_tab(page, "tab-req", "requests")
+        await click_tab(page, "requests")
         primary_id, shadow_id = await first_request_with_shadow(page)
         if primary_id and shadow_id:
             await page.evaluate(f"openCompare('{primary_id}', '{shadow_id}')")

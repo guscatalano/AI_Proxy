@@ -41,6 +41,12 @@
   .app-badge.app-unknown { background: #262d38; color: #666; }
   .app-badge.app-shadow { background: #2a3a2a; color: #68d391; border-color: #3a4a3a; }
   .app-badge.app-browser-firefox, .app-badge.app-browser-chrome, .app-badge.app-browser-edge, .app-badge.app-browser-safari, .app-badge.app-browser-other { background: #2a2630; color: #b8a8d0; border-color: #3a3640; }
+  /* Surface: where an agentic client was driven from (discord / cron / cli) — detected
+     from system-prompt fingerprints, shown beside the app badge. */
+  .surface-badge { display: inline-block; padding: 1px 6px; margin-left: 4px; border-radius: 3px; font-size: 10px; font-weight: 600; letter-spacing: 0.3px; background: #1d2430; color: #8b97a8; border: 1px solid #2c3542; }
+  .surface-badge.sf-discord { background: #2c2a45; color: #a8a8e8; border-color: #40406a; }
+  .surface-badge.sf-cron { background: #33291d; color: #d9c37a; border-color: #4a3f2a; }
+  .surface-badge.sf-cli { background: #1d3028; color: #7ac7a0; border-color: #2a4a3a; }
   .shadow-section { background: #141922; border: 1px solid #2a4a3a; border-left: 3px solid #5e8c66; border-radius: 6px; padding: 10px 14px; margin-bottom: 14px; }
   .shadow-section h3 { margin: 0 0 8px 0; font-size: 12px; text-transform: uppercase; color: #57d1e0; letter-spacing: 0.5px; }
   .shadow-row { padding: 8px 0; border-top: 1px solid #262d38; }
@@ -158,6 +164,65 @@
   #main.chat #list, #main.chat #detail, #main.chat #stats, #main.chat #audit, #main.chat #convs, #main.chat #system, #main.chat #setup, #main.chat #tasks, #main.chat #bench { display: none; }
   #main.tasks #list, #main.tasks #detail, #main.tasks #stats, #main.tasks #audit, #main.tasks #convs, #main.tasks #system, #main.tasks #setup, #main.tasks #chat, #main.tasks #bench { display: none; }
   #main.bench #list, #main.bench #detail, #main.bench #stats, #main.bench #audit, #main.bench #convs, #main.bench #system, #main.bench #setup, #main.bench #chat, #main.bench #tasks { display: none; }
+  #main.work #list, #main.work #detail, #main.work #stats, #main.work #audit, #main.work #convs, #main.work #system, #main.work #setup, #main.work #chat, #main.work #tasks, #main.work #bench { display: none; }
+  #main.work #split-handle, #main.work #artifacts { display: none; }
+  #work { display: none; flex: 1; overflow: auto; padding: 18px 22px; }
+  #work.show { display: block; }
+  /* Shared board: everyone on the network sees the same thing, so it reads as a wall of notes
+     rather than a form. Pinned notes sit on top with a marked edge. */
+  .sb-compose { display: flex; gap: 8px; align-items: flex-start; margin: 0 0 16px; max-width: 900px; }
+  .sb-compose textarea { flex: 1; min-height: 62px; background: #0a0d12; color: #dfe6f0;
+    border: 1px solid #262d38; border-radius: 6px; padding: 9px 11px; font: inherit;
+    font-size: 13px; resize: vertical; }
+  .sb-compose input { width: 130px; background: #0a0d12; color: #dfe6f0; border: 1px solid #262d38;
+    border-radius: 6px; padding: 8px 10px; font: inherit; font-size: 12.5px; }
+  .sb-btns { display: flex; flex-direction: column; gap: 6px; }
+  .sb-note { border: 1px solid #262d38; border-left: 3px solid #2f3a4a; border-radius: 7px;
+    background: #10141c; padding: 11px 13px; margin: 0 0 9px; max-width: 900px; }
+  .sb-note.pin { border-left-color: #f0c674; background: #151519; }
+  .sb-meta { display: flex; gap: 10px; align-items: center; font-size: 11.5px; color: #7d879b;
+    margin-bottom: 5px; font-family: ui-monospace, Consolas, monospace; }
+  .sb-meta .who { color: #9fb0c8; font-weight: 600; }
+  .sb-meta a { color: #6c7789; text-decoration: none; margin-left: auto; cursor: pointer; }
+  .sb-meta a:hover { color: #e08080; }
+  .sb-body { white-space: pre-wrap; word-break: break-word; font-size: 13.5px; line-height: 1.5;
+    color: #dfe6f0; }
+  .sb-empty { color: #6c7789; font-size: 13px; }
+  /* Replies sit inside their note rather than beside it: a reply read apart from what it
+     answers is worse than not reading it. */
+  .sb-reply { margin: 9px 0 0 16px; padding: 8px 11px; border-left: 2px solid #2f3a4a;
+    background: #0c1016; border-radius: 0 5px 5px 0; }
+  .sb-reply .sb-body { font-size: 13px; }
+  .sb-replybox { display: flex; gap: 6px; margin: 10px 0 0 16px; }
+  .sb-replybox textarea { flex: 1; background: #0a0d12; color: #dfe6f0; border: 1px solid #222934;
+    border-radius: 5px; padding: 6px 9px; font: inherit; font-size: 12.5px; resize: vertical;
+    min-height: 30px; }
+  .sb-replybox button { font-size: 12px; padding: 4px 12px; }
+  .sb-note.orphan { border-left-color: #6a4a2f; }
+  .sb-files { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+  .sb-file { display: inline-flex; align-items: center; gap: 8px; text-decoration: none;
+    background: #0c1016; border: 1px solid #262d38; border-radius: 5px; padding: 4px 9px;
+    font-size: 12px; color: #b8c4d4; font-family: ui-monospace, Consolas, monospace; }
+  .sb-file:hover { border-color: #3a4658; color: #e9edf4; }
+  .sb-file .sz { color: #6c7789; font-size: 11px; }
+  /* Queued-but-not-yet-posted files. Dashed, because they are not on the board until you post
+     and a chip identical to a real attachment would claim otherwise. */
+  .sb-file.pend { border-style: dashed; border-color: #3a4658; color: #9fb0c8; }
+  /* Origin chip. Legible on purpose: on a board every machine writes to, where a note came
+     from is half of what it says. */
+  .sb-ip { color: #8d99ad; background: #0c1016; border: 1px solid #232a35; border-radius: 4px;
+    padding: 1px 6px; font-size: 11px; }
+  .sb-ip.me { color: #57d1e0; border-color: #24505a; }
+  .sb-ip.none { color: #5d6675; font-style: italic; }
+  .sb-file.pend a { color: #6c7789; cursor: pointer; font-size: 12px; }
+  .sb-file.pend a:hover { color: #e08080; }
+  #sb-pending { display: flex; flex-wrap: wrap; gap: 6px; margin: -8px 0 14px; max-width: 900px; }
+  /* Drop feedback. A dashed accent outline drawn inside the element, so the layout does not
+     shift under the cursor mid-drag and retrigger dragleave. */
+  .sb-drop { outline: 2px dashed #57d1e0; outline-offset: -3px; background: #12202a; }
+  .sb-note.sb-busy { opacity: .55; pointer-events: none; }
+  .sb-drophint { color: #6c7789; font-size: 11.5px; margin: -10px 0 14px; max-width: 900px;
+    font-family: ui-monospace, Consolas, monospace; }
 
   /* ---------- Live View ---------- */
   #live{--lv-bg:#0a0d13;--lv-panel:#151b26;--lv-panel2:#1b2230;--lv-hair:#28303f;--lv-ink:#e9edf4;--lv-mute:#7d879b;
@@ -589,8 +654,143 @@
   .snav.on svg { opacity: 1; color: #57d1e0; }
   .snav.on::before { content: ""; position: absolute; left: -10px; top: 6px; bottom: 6px; width: 3px; border-radius: 2px; background: #57d1e0; }
   .snav .cntx { font-family: ui-monospace, Consolas, monospace; font-size: 9.5px; color: #5f6675; }
+  /* While a run is live the setup is not what anyone is looking at, so it folds to one line
+     and the status takes the space. Collapsed rather than hidden: the settings are still one
+     click away, and a control that vanishes reads as a bug. */
+  .bench-collapsed { display: flex; align-items: center; gap: 10px; background: #12141b;
+    border: 1px solid #262d38; border-radius: 8px; padding: 9px 12px; margin-bottom: 12px;
+    font-size: 12px; color: #9aa4b2; }
+  .bench-collapsed button { margin-left: auto; background: #1b2430; color: #c9d3e1;
+    border: 1px solid #2f3a49; border-radius: 6px; padding: 4px 11px; font-size: 11.5px;
+    cursor: pointer; }
+  .bench-collapsed button:hover { border-color: #3a4e6a; }
+  .bench-live { background: linear-gradient(180deg, #141922, #11151d);
+    border: 1px solid #2a3e5a; border-left: 3px solid #57d1e0; border-radius: 10px;
+    padding: 14px 16px; margin-bottom: 12px; }
+  .bench-live .top { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap;
+    font-size: 12px; color: #8b97a8; }
+  .bench-live .dot { width: 8px; height: 8px; border-radius: 50%; background: #57d1e0;
+    box-shadow: 0 0 8px #57d1e0; animation: shell-pulse 1.6s infinite; flex: none; }
+  .bench-live .cells { margin-left: auto; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-live .cur { font-size: 15px; color: #e9edf4; margin: 9px 0 0; letter-spacing: -.01em;
+    overflow-wrap: anywhere; }
+  .bench-live .cur b { font-family: var(--mono, ui-monospace, monospace); font-size: 13px;
+    color: #57d1e0; font-weight: 600; }
+  .bench-live .track { height: 6px; border-radius: 3px; background: #1b2430; overflow: hidden;
+    margin: 9px 0 0; border: 1px solid #262d38; }
+  .bench-live .track i { display: block; height: 100%; background: #57d1e0; transition: width .4s; }
+  .bench-live .track.sweep i { background: #3f8f5f; }
+  .bench-live .phase { color: #d9c37a; font-size: 12px; margin: 8px 0 0; }
+  .bench-live .warn { color: #f0a35a; font-size: 12px; margin: 6px 0 0; }
+  .bench-live .foot { display: flex; align-items: center; gap: 8px; margin: 11px 0 0;
+    font-size: 11.5px; color: #8b97a8; }
+  .bench-live .foot a { color: #7af; text-decoration: none; border: 1px solid #2a4458;
+    border-radius: 6px; padding: 3px 10px; }
+  @media (prefers-reduced-motion: reduce) { .bench-live .dot { animation: none; } }
+  /* A mini live view inside the card. Not an iframe: the live view brings its own polling,
+     theming and full-screen handling, and none of that belongs nested inside a status panel.
+     The /live endpoint already returns everything this needs. */
+  /* The mini live view. Given room to be worth looking at: a one-line-per-request strip told
+     you a request existed, which the counters already did. What is actually interesting is the
+     text arriving, so that is what gets the space. */
+  .bench-mini { margin: 12px 0 0; border-top: 1px solid #222a36; padding-top: 11px;
+    display: grid; gap: 8px; }
+  .bench-tile { background: #0f131a; border: 1px solid #222a36; border-left: 3px solid #3f4a5a;
+    border-radius: 8px; padding: 9px 11px; display: grid; gap: 6px; min-width: 0; }
+  .bench-tile.STREAMING { border-left-color: #57d1e0; }
+  .bench-tile.THINKING { border-left-color: #d9c37a; }
+  .bench-tile.VISION { border-left-color: #b58fe0; }
+  .bench-tile.DONE { border-left-color: #3f8f5f; opacity: .62; }
+  .bench-tile .hd { display: flex; align-items: baseline; gap: 8px; font-size: 11px;
+    color: #8b97a8; min-width: 0; }
+  .bench-tile .who { font-family: var(--mono, ui-monospace, monospace); color: #c9d3e1;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bench-tile .chip { font-family: var(--mono, ui-monospace, monospace); font-size: 9px;
+    letter-spacing: .1em; padding: 1px 6px; border-radius: 3px; border: 1px solid currentColor;
+    flex: none; }
+  .bench-tile.STREAMING .chip { color: #57d1e0; }
+  .bench-tile.THINKING .chip { color: #d9c37a; }
+  .bench-tile.VISION .chip { color: #b58fe0; }
+  .bench-tile.DONE .chip { color: #3f8f5f; }
+  .bench-tile .clock { margin-left: auto; font-family: var(--mono, ui-monospace, monospace);
+    font-variant-numeric: tabular-nums; flex: none; }
+  /* The text is the point, so it gets a real reading treatment rather than one clipped line. */
+  .bench-tile .body { font-family: var(--mono, ui-monospace, monospace); font-size: 11.5px;
+    line-height: 1.5; color: #d7dee8; white-space: pre-wrap; overflow: hidden;
+    display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical;
+    word-break: break-word; min-height: 1.5em; }
+  .bench-tile .body.ask { color: #8b97a8; }
+  .bench-tile .caret { display: inline-block; width: 7px; background: #57d1e0; height: 1em;
+    vertical-align: text-bottom; animation: benchcaret 1.05s steps(1) infinite; }
+  @keyframes benchcaret { 50% { opacity: 0; } }
+  .bench-tile .rate { display: flex; align-items: center; gap: 7px; font-size: 10.5px;
+    color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-tile .rate .bar { flex: 1 1 auto; height: 3px; border-radius: 2px; background: #1b2430;
+    overflow: hidden; }
+  .bench-tile .rate .bar i { display: block; height: 100%; background: #2f8f9c;
+    transition: width .5s; }
+  .bench-mini .idle { color: #6b7787; font-size: 11.5px; padding: 10px 0; text-align: center;
+    border: 1px dashed #222a36; border-radius: 8px; }
+  @media (prefers-reduced-motion: reduce) { .bench-tile .caret { animation: none; } }
+  /* Results so far. A four-hour sweep that shows nothing until it ends is a four-hour wait to
+     find out whether it was worth starting. */
+  .bench-lead { margin: 12px 0 0; border-top: 1px solid #222a36; padding-top: 10px; }
+  .bench-lead h4 { margin: 0 0 7px; font-size: 10px; letter-spacing: .12em; font-weight: 600;
+    text-transform: uppercase; color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-lead table { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  .bench-lead thead th { font-family: var(--mono, ui-monospace, monospace); font-size: 9.5px;
+    letter-spacing: .09em; text-transform: uppercase; color: #4d5765; font-weight: 500;
+    padding: 0 0 4px; text-align: right; white-space: nowrap; }
+  .bench-lead thead th:first-child, .bench-lead thead th:nth-child(2) { text-align: left; }
+  .bench-lead td { padding: 3px 0; color: #c9d3e1; }
+  .bench-lead td.n { text-align: right; font-family: var(--mono, ui-monospace, monospace);
+    font-variant-numeric: tabular-nums; white-space: nowrap; padding-left: 10px; }
+  .bench-lead .rk { color: #4d5765; font-family: var(--mono, ui-monospace, monospace);
+    width: 1.6em; }
+  .bench-lead .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 1px; width: 60%; }
+  .bench-lead .ax { color: #6b7787; }
+  .bench-lead .q { color: #3f8f5f; }
+  .bench-lead .q.mid { color: #d9c37a; }
+  .bench-lead .q.low { color: #e08080; }
+  .bench-lead .more { color: #7a879a; font-size: 10.5px; padding-top: 7px; background: none;
+    border: none; cursor: pointer; font-family: inherit; padding-left: 0; text-align: left;
+    text-decoration: underline; text-underline-offset: 3px; }
+  .bench-lead .more:hover { color: #9aa4b2; }
+  /* Expanded, a 38-cell sweep would push the history off the screen, so it scrolls in place. */
+  .bench-lead .scroll { max-height: 260px; overflow-y: auto; }
+  /* The queue. The order was deterministic all along and simply invisible, which is a harder
+     thing to trust than a bad order you can see. */
+  .bench-queue { margin: 11px 0 0; border-top: 1px solid #222a36; padding-top: 10px; }
+  .bench-queue h4 { margin: 0 0 6px; font-size: 10px; letter-spacing: .12em; font-weight: 600;
+    text-transform: uppercase; color: #6b7787; font-family: var(--mono, ui-monospace, monospace); }
+  .bench-queue .rule { color: #4d5765; font-size: 10.5px; margin: 0 0 7px; }
+  .bench-queue ol { margin: 0; padding: 0; list-style: none; display: grid; gap: 3px; }
+  .bench-queue li { display: flex; gap: 8px; font-size: 11.5px; color: #8b97a8;
+    font-family: var(--mono, ui-monospace, monospace); }
+  .bench-queue li .pos { color: #3f4a5a; width: 2em; text-align: right; flex: none; }
+  .bench-queue li .m { color: #c9d3e1; overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; }
+  .bench-queue li .ax { color: #6b7787; }
+  .bench-queue li.next .m { color: #57d1e0; }
+  .bench-queue .rest { color: #4d5765; font-size: 10.5px; padding-top: 5px; }
+  .bench-selall { display: flex; align-items: center; gap: 6px; margin: 0 0 6px; }
+  .bench-selall button { font-family: var(--mono, ui-monospace, monospace); font-size: 10.5px;
+    color: #9aa4b2; background: transparent; border: 1px solid #262d38; border-radius: 6px;
+    padding: 2px 9px; cursor: pointer; }
+  .bench-selall button:hover { border-color: #3a4e6a; color: #e9edf4; }
   .snav-pip { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-  .snav-pip.live { background: #68d391; box-shadow: 0 0 8px #68d391; animation: shell-pulse 1.6s infinite; }
+  /* The pip was a fixed green whether the box was idle or saturated: it said "the Live view
+     exists", not "something is happening". Tiers are the same thresholds and the same colours
+     the GPU readout inside the Live view already uses, so one colour means one thing in both
+     places. Idle is deliberately grey and still — an unmoving dot is information. */
+  .snav-pip.live { background: #68d391; box-shadow: 0 0 8px #68d391; animation: shell-pulse 1.6s infinite;
+                   transition: background .35s, box-shadow .35s; }
+  .snav-pip.live[data-load="idle"] { background: #454d5c; box-shadow: none; animation: none; }
+  .snav-pip.live[data-load="mid"]  { background: #f0c674; box-shadow: 0 0 9px #f0c674; animation-duration: 1s; }
+  .snav-pip.live[data-load="high"] { background: #f07178; box-shadow: 0 0 12px #f07178; animation-duration: .55s; }
+  .snav[data-load="mid"] .lbl2  { color: #f0c674; }
+  .snav[data-load="high"] .lbl2 { color: #f07178; }
   .snav-pip.badge { background: #f07178; box-shadow: 0 0 8px #f07178; display: none; }
   @keyframes shell-pulse { 50% { opacity: .35; } }
   .shell-foot { margin-top: auto; padding-top: 10px; border-top: 1px solid #23262f; display: flex; flex-direction: column; gap: 8px; }
@@ -932,6 +1132,7 @@ body:not(.bench-simple) .bench-preset { display:none; }
   <div class="shell-grp"><div class="gl">Work</div>
     <button class="snav" data-view="chat" onclick="setView('chat')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M8 10h8M8 13.5h5M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><span class="lbl2">Chat</span></button>
     <button class="snav" data-view="tasks" onclick="setView('tasks')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3 8-8M20 12v6a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h9"/></svg><span class="lbl2">Tasks</span><span class="cntx" id="rail-tasks-count"></span></button>
+    <button class="snav" data-view="work" onclick="setView('work')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 5h16v14H4z"/><path d="M8 9h8M8 13h5"/></svg><span class="lbl2">Work</span><span class="cntx" id="rail-work-count"></span></button>
   </div>
   <div class="shell-grp"><div class="gl">System</div>
     <button class="snav" data-view="system" onclick="setView('system')"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1L14.5 2h-4l-.3 2.6a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L4 11a7 7 0 0 0 0 2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.3 2.6h4l.3-2.6a7 7 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6a7 7 0 0 0 .1-1z"/></svg><span class="lbl2">System</span></button>
@@ -982,6 +1183,7 @@ body:not(.bench-simple) .bench-preset { display:none; }
   <div id="system"></div>
   <div id="setup"></div>
   <div id="tasks"></div>
+  <div id="work"></div>
   <div id="bench"></div>
   <div id="chat">
     <div class="chat-header">
@@ -1026,7 +1228,7 @@ body:not(.bench-simple) .bench-preset { display:none; }
         <div id="chat-pers-list" style="margin-bottom:14px"></div>
         <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px">
           <div style="font-size:12px;color:#aaa;margin-bottom:6px"><strong>+ New personality</strong></div>
-          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
+          <input id="chat-pers-name" placeholder="Name (e.g. Code reviewer)" autocomplete="off" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:6px 8px;font-size:13px;margin-bottom:6px;box-sizing:border-box">
           <textarea id="chat-pers-prompt" rows="6" placeholder="System prompt — describe how the model should respond." style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
           <button onclick="chatAddPersonality()" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Save</button>
           <span id="chat-pers-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>
@@ -1066,6 +1268,15 @@ function startLiveDetail(id) {
     const out = $('live-detail-out'), meta = $('live-detail-meta');
     if (!out) { stopLiveDetail(); return; }   // detail re-rendered without a live section
     if (j.redacted) { out.textContent = '🔒 live output hidden (PII: not on this client\'s subnet)'; }
+    else if (j.streaming === false) {
+      // Not a streaming request: the upstream sends nothing until it sends everything, so
+      // there is no incremental output and never will be. Saying so beats rendering '…' for
+      // the full 30s of a hindsight call, which reads as the live view being broken.
+      out.textContent = 'Not a streaming request — the reply arrives in one piece when it '
+        + 'finishes, so there is no live output to show.';
+      if (meta) meta.textContent = j.est_prompt_tokens != null
+        ? '~' + num(j.est_prompt_tokens) + ' prompt tokens (estimated)' : '';
+    }
     else if (j.text != null) {
       const atBottom = out.scrollHeight - out.scrollTop - out.clientHeight < 40;
       out.textContent = j.text || '…';
@@ -1084,6 +1295,8 @@ function startLiveDetail(id) {
 const $ = (id) => document.getElementById(id);
 const esc = (s) => (s == null ? '' : String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])));
 const num = (n) => (n == null ? '' : Number(n).toLocaleString());
+// Where an agentic client was driven from (discord / cron / cli), when the proxy could tell.
+const surfaceBadge = (s) => s ? ` <span class="surface-badge sf-${esc(s)}" title="Execution surface, fingerprinted from the system prompt">${esc(s)}</span>` : '';
 // Duration formatting. The requests list shows ms with thousands separators (the column header
 // supplies the "ms" unit). The detail view appends the next-biggest unit in parens for quick
 // reading, e.g. "4,080 ms (4s)" or "125,300 ms (2.1m)".
@@ -1097,17 +1310,21 @@ const fmtMsLong = (v) => {
 };
 
 const VIEW_KEY = 'ai-proxy-active-view';
-const VALID_VIEWS = new Set(['requests', 'live', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'bench']);
+// Every view that setView() can restore into on load. A tab missing from this set still
+// works when clicked and still gets written to storage — it just silently falls back to
+// Requests on the next refresh, which is how Work spent a week forgetting where you were.
+// 'artifacts' is deliberately absent: it is entered from a conversation, not from the rail.
+const VALID_VIEWS = new Set(['requests', 'live', 'stats', 'audit', 'convs', 'system', 'setup', 'chat', 'tasks', 'work', 'bench']);
 
 function setView(v) {
   view = v;
   try { if (v !== 'live' && window.stopLive) stopLive(); } catch {}
-  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','bench','live']) {
+  for (const t of ['req','stats','audit','convs','system','setup','chat','tasks','work','bench','live']) {
     const b = $('tab-' + t);
     if (b) b.classList.toggle('active', v === (t === 'req' ? 'requests' : t));
   }
   try { syncShellNav(v); } catch {}
-  for (const c of ['stats','audit','convs','artifacts','system','setup','chat','tasks','bench','live']) {
+  for (const c of ['stats','audit','convs','artifacts','system','setup','chat','tasks','work','bench','live']) {
     $('main').classList.toggle(c, v === c);
     $(c).classList.toggle('show', v === c);
   }
@@ -1124,9 +1341,354 @@ function setView(v) {
   else if (v === 'setup') loadSetup();
   else if (v === 'chat') loadChat();
   else if (v === 'tasks') loadTasks();
+  else if (v === 'work') loadWork();
   else if (v === 'bench') loadBench();
   else if (v === 'live') loadLive();
   else refresh();
+}
+
+// ---------- Work: the shared scratchboard ----------
+// Deliberately unredacted, unlike everything else in this dashboard: these notes are written
+// by the people looking at them, not captured from someone else's traffic, and a board each
+// subnet sees a different version of would not be shared. Agents can read it over MCP.
+const SB_AUTHOR_KEY = 'proxy.scratch.author';
+
+let SB_MY_IP = null;
+
+async function loadWork() {
+  const host = $('work');
+  if (!host) return;
+  let items = [];
+  try {
+    items = (await (await fetch('/__proxy/api/scratchboard')).json()).items || [];
+  } catch { host.innerHTML = '<p class="sb-empty">Could not reach the scratchboard.</p>'; return; }
+  // Which address the proxy sees us as, so your own notes are marked on a board everybody
+  // shares. Fetched once — it does not change while the page is open.
+  if (SB_MY_IP === null) {
+    try { SB_MY_IP = (await (await fetch('/__proxy/api/whoami')).json()).ip || ''; }
+    catch { SB_MY_IP = ''; }
+  }
+
+  const who = localStorage.getItem(SB_AUTHOR_KEY) || '';
+  // Attachments render as a row of download chips. Size is shown because "report.zip" tells
+  // you nothing about whether it is worth clicking on a slow link.
+  const filesOf = n => (n.files || []).length ? `<div class="sb-files">` + (n.files || []).map(f =>
+      `<a class="sb-file" href="/__proxy/api/scratchboard/files/${esc(f.id)}" download>
+         <span>📎 ${esc(f.name)}</span><span class="sz">${sbFmtSize(f.size || 0)}</span></a>`
+    ).join('') + `</div>` : '';
+
+  // Every note and reply is its own drop target, so a dropped file lands where it was aimed
+  // rather than on whatever was posted most recently.
+  const drop = id => `ondragover="sbDragOver(this, event)" ondragleave="sbDragLeave(this, event)"`
+                   + ` ondrop="sbDropNote(this, event, '${esc(id)}')"`;
+
+  const reply = r => {
+    const when = new Date((r.ts || 0) * 1000).toLocaleString();
+    return `<div class="sb-reply" data-text="${esc(r.text || '')}" ${drop(r.id)}>
+      <div class="sb-meta">
+        <span class="who">${esc(r.author || 'anonymous')}</span>
+        <span>${esc(when)}</span>
+        ${sbOrigin(r)}
+        <a onclick="sbCopy(this)">copy</a>
+        <a onclick="sbDelete('${esc(r.id)}')" style="margin-left:10px">delete</a>
+      </div>
+      <div class="sb-body">${esc(r.text || '')}</div>
+      ${filesOf(r)}
+    </div>`;
+  };
+
+  const notes = items.map(n => {
+    const when = new Date((n.ts || 0) * 1000).toLocaleString();
+    const reps = (n.replies || []).map(reply).join('');
+    const count = (n.replies || []).length;
+    return `<div class="sb-note${n.pinned ? ' pin' : ''}${n.orphaned ? ' orphan' : ''}" data-text="${esc(n.text || '')}" ${drop(n.id)}>
+      <div class="sb-meta">
+        ${n.pinned ? '<span title="pinned">📌</span>' : ''}
+        ${n.orphaned ? '<span title="the note this answered was deleted">↳ orphaned reply</span>' : ''}
+        <span class="who">${esc(n.author || 'anonymous')}</span>
+        <span>${esc(when)}</span>
+        ${sbOrigin(n)}
+        ${count ? `<span style="color:#57d1e0">${count} repl${count === 1 ? 'y' : 'ies'}</span>` : ''}
+        <a onclick="sbCopy(this)">copy</a>
+        <a href="/__proxy/api/scratchboard/${esc(n.id)}/zip" download style="margin-left:10px"
+           title="one zip: every attachment on this note and its replies, plus the text as note.txt">download</a>
+        <a onclick="sbAttach('${esc(n.id)}')" style="margin-left:10px">attach</a>
+        <a onclick="sbPin('${esc(n.id)}', ${n.pinned ? 'false' : 'true'})" style="margin-left:10px">${n.pinned ? 'unpin' : 'pin'}</a>
+        <a onclick="sbDelete('${esc(n.id)}')" style="margin-left:10px">delete</a>
+      </div>
+      <div class="sb-body">${esc(n.text || '')}</div>
+      ${filesOf(n)}
+      ${reps}
+      <div class="sb-replybox">
+        <textarea id="sb-r-${esc(n.id)}" rows="1" placeholder="Reply…"></textarea>
+        <button onclick="sbReply('${esc(n.id)}')">Reply</button>
+      </div>
+    </div>`;
+  }).join('') || '<p class="sb-empty">Nothing on the board yet. Anything posted here is visible from every machine on the network, and readable by agents over MCP.</p>';
+
+  host.innerHTML = `
+    <h2 style="margin:0 0 4px">Work</h2>
+    <p class="note" style="color:#7d879b;font-size:12.5px;margin:0 0 14px;max-width:76ch">
+      A shared scratchboard. Unlike the rest of this dashboard it is never redacted by subnet —
+      every machine sees the same notes — and agents can read it through the MCP endpoint
+      (<code>read_scratchboard</code>). Pin a note to keep it at the top as standing context.
+      <a href="/__proxy/api/scratchboard/zip" download style="color:#57d1e0;text-decoration:none"
+         title="the whole board as one zip: a folder per note with its attachments, plus notes.txt">
+        ⤓ download the whole board</a>
+    </p>
+    <div class="sb-compose" ondragover="sbDragOver(this, event)" ondragleave="sbDragLeave(this, event)"
+         ondrop="sbDropCompose(this, event)">
+      <textarea id="sb-text" placeholder="What are you working on? What should nobody else touch?"></textarea>
+      <div class="sb-btns">
+        <input id="sb-author" placeholder="your name" value="${esc(who)}">
+        <input type="file" id="sb-files" multiple style="display:none" onchange="sbComposeFiles()">
+        <button onclick="document.getElementById('sb-files').click()" id="sb-attach-btn"
+                title="Files are uploaded after the note is posted">Attach…</button>
+        <button onclick="sbPost(false)">Post</button>
+        <button onclick="sbPost(true)" title="Keep at the top as standing context">Post pinned</button>
+      </div>
+    </div>
+    <div id="sb-pending"></div>
+    <p class="sb-drophint">Drop files on the box above to post them with a note, or on any note to
+      attach them to it.</p>
+    ${notes}`;
+  sbRenderPending();   // a queued file must survive the re-render that follows every action
+}
+
+// Where a note came from. It was always recorded, but drawn in #4d5666 on a #10141c card it
+// was effectively invisible — the board looked anonymous. On a shared board the origin is
+// half the message: "who said don't touch this" is the point of reading it.
+function sbOrigin(n) {
+  const ip = n.client_ip;
+  if (!ip) return `<span class="sb-ip none" title="posted through a path that carried no client address (an MCP call without a request context)">origin unknown</span>`;
+  const me = ip === SB_MY_IP ? ' me' : '';
+  return `<span class="sb-ip${me ? ' me' : ''}" title="posted from ${esc(ip)}${me ? ' — this machine' : ''}">${esc(ip)}${me}</span>`;
+}
+
+const sbFmtSize = b => b >= 1048576 ? (b / 1048576).toFixed(1) + ' MB'
+                     : b >= 1024 ? Math.round(b / 1024) + ' KB' : b + ' B';
+
+// --- drag and drop ---------------------------------------------------------------------
+// Dropped anywhere the page does not handle, a file makes the browser navigate away and
+// replace the dashboard with it, losing whatever was half-typed. So the Work view swallows
+// file drops wholesale and only acts on the two places that mean something.
+
+function sbHasFiles(ev) {
+  const t = (ev.dataTransfer || {}).types || [];
+  return Array.prototype.indexOf.call(t, 'Files') >= 0;
+}
+
+function sbDragOver(el, ev) {
+  if (!sbHasFiles(ev)) return;          // dragging selected text should not arm a drop target
+  ev.preventDefault();
+  ev.stopPropagation();
+  ev.dataTransfer.dropEffect = 'copy';
+  el.classList.add('sb-drop');
+}
+
+function sbDragLeave(el, ev) {
+  // dragleave also fires when the pointer crosses into a child, so the highlight would flicker
+  // off over every button and attachment chip inside the target.
+  if (ev.relatedTarget && el.contains(ev.relatedTarget)) return;
+  el.classList.remove('sb-drop');
+}
+
+// A dropped folder arrives as a zero-byte File that would upload as an empty attachment. There
+// is no recursive directory read here, so say what was skipped instead of posting junk.
+function sbFilesFrom(ev) {
+  const dt = ev.dataTransfer || {};
+  const items = Array.from(dt.items || []);
+  const files = [], dirs = [];
+  if (items.length && items[0].webkitGetAsEntry) {
+    for (const it of items) {
+      if (it.kind !== 'file') continue;
+      const entry = it.webkitGetAsEntry();      // must be read before any await
+      const f = it.getAsFile();
+      if (entry && entry.isDirectory) { dirs.push(entry.name); continue; }
+      if (f) files.push(f);
+    }
+  } else {
+    files.push(...Array.from(dt.files || []));
+  }
+  if (dirs.length) {
+    alert('Folders are not uploaded: ' + dirs.join(', ') +
+          '\nDrop the files inside it, or zip it first.');
+  }
+  return files;
+}
+
+function sbDropCompose(el, ev) {
+  ev.preventDefault();
+  ev.stopPropagation();
+  el.classList.remove('sb-drop');
+  sbPending = sbPending.concat(sbFilesFrom(ev));
+  sbRenderPending();
+}
+
+async function sbDropNote(el, ev, noteId) {
+  ev.preventDefault();
+  ev.stopPropagation();   // a reply sits inside its note; without this both would take the drop
+  el.classList.remove('sb-drop');
+  const files = sbFilesFrom(ev);
+  if (!files.length) return;
+  el.classList.add('sb-busy');   // uploads are one at a time and can be slow on a big file
+  for (const f of files) {
+    if (!await sbUpload(noteId, f)) break;
+  }
+  loadWork();
+}
+
+// The catch-all. Both handlers above stopPropagation, so these only see drops nothing claimed —
+// and those are exactly the ones that would otherwise navigate the dashboard away.
+document.addEventListener('dragover', ev => { if (sbHasFiles(ev)) ev.preventDefault(); });
+document.addEventListener('drop', ev => { if (sbHasFiles(ev)) ev.preventDefault(); });
+
+// Files waiting to go up with the next post. The file input cannot hold this: its FileList is
+// read-only, so a second drop or a second trip through the picker would discard the first.
+let sbPending = [];
+
+// The compose box shows what will be attached before you commit to posting, because a picker
+// that reports nothing back leaves you unsure whether it took.
+function sbComposeFiles() {
+  const inp = $('sb-files');
+  if (inp && inp.files && inp.files.length) {
+    sbPending = sbPending.concat(Array.from(inp.files));
+    inp.value = '';   // else picking the same file twice fires no change event at all
+  }
+  sbRenderPending();
+}
+
+function sbRenderPending() {
+  const host = $('sb-pending'), btn = $('sb-attach-btn');
+  if (btn) btn.textContent = sbPending.length ? `Attach… (${sbPending.length})` : 'Attach…';
+  if (!host) return;
+  host.innerHTML = sbPending.map((f, i) =>
+    `<span class="sb-file pend"><span>📎 ${esc(f.name)}</span>
+       <span class="sz">${sbFmtSize(f.size || 0)}</span>
+       <a onclick="sbUnqueue(${i})" title="remove">✕</a></span>`).join('');
+}
+
+function sbUnqueue(i) { sbPending.splice(i, 1); sbRenderPending(); }
+
+async function sbPost(pinned) {
+  const t = $('sb-text'), a = $('sb-author');
+  let text = (t && t.value || '').trim();
+  // Dropping files and hitting Post with nothing typed is a real intent, but the board requires
+  // text, so name the files rather than rejecting the post.
+  if (!text && sbPending.length) {
+    text = 'Attached: ' + sbPending.map(f => f.name).join(', ');
+  }
+  if (!text) return;
+  const author = (a && a.value || '').trim();
+  if (author) localStorage.setItem(SB_AUTHOR_KEY, author);
+  try {
+    const r = await fetch('/__proxy/api/scratchboard', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, author, pinned: !!pinned }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.error || ('HTTP ' + r.status)); return; }
+    // Files need the note's id, so they go up after it exists. A failure here leaves the note
+    // posted and says which file failed, rather than discarding what was written.
+    const id = (await r.json()).id;
+    for (const file of sbPending) {
+      if (!await sbUpload(id, file)) break;
+    }
+    if (t) t.value = '';
+    sbPending = [];
+    loadWork();
+  } catch { alert('Could not post — the proxy is unreachable.'); }
+}
+
+async function sbDelete(id) {
+  try { await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(id), { method: 'DELETE' }); } catch {}
+  loadWork();
+}
+
+// Copy the note's text, not the rendered DOM — the reader wants what was written, without
+// the author line, timestamp and attachment chips wrapped around it.
+async function sbCopy(el) {
+  const host = el.closest('.sb-note, .sb-reply');
+  const text = host ? (host.getAttribute('data-text') || '') : '';
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Clipboard API needs a secure context; over plain http to an IP it is often unavailable.
+    const ta = document.createElement('textarea');
+    ta.value = text; document.body.appendChild(ta); ta.select();
+    try { document.execCommand('copy'); } catch {}
+    ta.remove();
+  }
+  const was = el.textContent; el.textContent = 'copied';
+  setTimeout(() => { el.textContent = was; }, 1200);
+}
+
+// Attach to an existing note. Files are uploaded one at a time so a single rejection (too
+// large, too many) reports which file failed instead of failing the whole batch silently.
+function sbAttach(noteId) {
+  const inp = document.createElement('input');
+  inp.type = 'file'; inp.multiple = true;
+  inp.onchange = async () => {
+    for (const f of Array.from(inp.files || [])) {
+      const ok = await sbUpload(noteId, f);
+      if (!ok) break;
+    }
+    loadWork();
+  };
+  inp.click();
+}
+
+// Mirrors _SCRATCH_MAX_FILE_BYTES. Checked here as well because base64ing an oversized file in
+// the browser costs real seconds and a third of its size again, all to earn a 413.
+const SB_MAX_FILE = 8 * 1024 * 1024;
+
+async function sbUpload(noteId, file) {
+  if (file.size > SB_MAX_FILE) {
+    alert(`${file.name} is ${sbFmtSize(file.size)} — the limit is ${sbFmtSize(SB_MAX_FILE)}.`);
+    return false;
+  }
+  const b64 = await new Promise((res, rej) => {
+    const fr = new FileReader();
+    fr.onload = () => res(String(fr.result).split(',')[1] || '');
+    fr.onerror = rej;
+    fr.readAsDataURL(file);
+  });
+  try {
+    const r = await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(noteId) + '/files', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: file.name, mime: file.type, data_b64: b64 }),
+    });
+    if (!r.ok) {
+      const d = await r.json().catch(() => ({}));
+      alert(`${file.name}: ${d.error || ('HTTP ' + r.status)}`);
+      return false;
+    }
+    return true;
+  } catch { alert('Upload failed — the proxy is unreachable.'); return false; }
+}
+
+async function sbReply(parentId) {
+  const t = $('sb-r-' + parentId);
+  const text = (t && t.value || '').trim();
+  if (!text) return;
+  const author = localStorage.getItem(SB_AUTHOR_KEY) || '';
+  try {
+    const r = await fetch('/__proxy/api/scratchboard', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ text, author, parent_id: parentId }),
+    });
+    if (!r.ok) { const d = await r.json().catch(() => ({})); alert(d.error || ('HTTP ' + r.status)); return; }
+    loadWork();
+  } catch { alert('Could not reply — the proxy is unreachable.'); }
+}
+
+async function sbPin(id, pinned) {
+  try {
+    await fetch('/__proxy/api/scratchboard/' + encodeURIComponent(id) + '/pin', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ pinned }),
+    });
+  } catch {}
+  loadWork();
 }
 
 // ---------- Console shell (alternate skin) ----------
@@ -1221,6 +1783,18 @@ async function shellVitals() {
       tps = Math.round(tiles.reduce((a, t) => a + (t.tps || 0), 0));
     } catch {}
   }
+  // Live pip: colour and pulse rate by how many requests are actually in flight. `active` is
+  // already computed above for the vitals strip; it just had no other consumer.
+  try {
+    const tier = active >= 6 ? 'high' : active >= 3 ? 'mid' : active >= 1 ? 'low' : 'idle';
+    const pip = document.querySelector('.snav-pip.live');
+    const btn = document.querySelector('.snav[data-view="live"]');
+    if (pip) {
+      pip.dataset.load = tier;
+      pip.title = active ? `${active} request${active === 1 ? '' : 's'} in flight` : 'idle';
+    }
+    if (btn) btn.dataset.load = tier;
+  } catch {}
   // version once; error-rate (last 1h) refreshed every ~20s (perf is server-cached)
   // Re-checked on every vitals tick, not just once: the point is to notice a deploy that
   // happens while this tab is sitting open.
@@ -1434,7 +2008,7 @@ function tickLive(){
   }
 }
 function lvCols(n){return n<=1?1:n<=2?2:n<=4?2:n<=6?3:n<=9?3:4;}
-function lvSig(t){return [t.state,t.done,t.fresh,t.client,t.model,t.prompt,t.response,t.redacted,t.has_image,t.turn,Math.round((t.ptok||0)/1000),t.upstream].join('|');}
+function lvSig(t){return [t.state,t.done,t.fresh,t.client,t.surface,t.model,t.prompt,t.response,t.redacted,t.has_image,t.turn,Math.round((t.ptok||0)/1000),t.upstream].join('|');}
 function lvInner(t){
   const slow=t.state==='THINKING'&&t.elapsed_ms>25000;
   const call=t.done?`✓ done · ${(t.elapsed_ms/1000).toFixed(1)}s${t.cache==='hit'?' · ⚡ cache hit':t.cache==='partial'?' · ⚡ partial cache':''}`
@@ -1448,7 +2022,7 @@ function lvInner(t){
   else if(t.response) body=`<div class="lv-resp"><div class="lv-scroll">${lvEsc(t.response)}</div></div>`;
   else body=`<div class="lv-prompt"><div class="lv-scroll">${lvEsc(t.prompt||'')}</div></div>`;
   const out=t.state==='STREAMING'?`<div class="lv-ml" style="margin-top:6px"><span>output</span><span><b class="lv-otok">${(t.otok||0).toLocaleString()}</b> tok${t.tps?` · ${t.tps}/s`:''}</span></div>`:'';
-  return `<div class="lv-top"><span class="lv-dot"></span><span class="lv-client">${lvEsc(t.client)}</span><span class="lv-model">${lvEsc(t.model)}</span></div>
+  return `<div class="lv-top"><span class="lv-dot"></span><span class="lv-client">${lvEsc(t.client)}</span>${t.surface?`<span class="surface-badge sf-${lvEsc(t.surface)}">${lvEsc(t.surface)}</span>`:''}<span class="lv-model">${lvEsc(t.model)}</span></div>
     <div class="lv-st">${t.done?'':'<span class="lv-spin"></span>'}<span class="lv-lbl">${t.state}</span><span class="lv-timer${slow?' slow':''}">${(t.elapsed_ms/1000).toFixed(1)}<span style="font-size:11px;color:var(--lv-mute)">s</span></span></div>
     <div class="lv-call">${call}</div>
     <div class="lv-body">${body}</div>
@@ -1501,6 +2075,8 @@ const REQ_PS_KEY = 'ai-proxy-requests-pagesize';
 let _reqPage = 1;
 let _reqTotal = 0;
 let _reqClient = '';
+let _reqIp = '';
+let _reqIps = [];
 let _reqClients = [];
 
 async function refresh() {
@@ -1508,10 +2084,12 @@ async function refresh() {
     const size = _getPageSize(REQ_PS_KEY, 50);
     const offset = Math.max(0, (_reqPage - 1) * size);
     const clientQ = _reqClient ? `&client=${encodeURIComponent(_reqClient)}` : '';
-    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}${clientQ}`)).json();
+    const ipQ = _reqIp ? `&ip=${encodeURIComponent(_reqIp)}` : '';
+    const d = await (await fetch(`/__proxy/api/requests?limit=${size}&offset=${offset}${clientQ}${ipQ}`)).json();
     items = d.items;
     _reqTotal = d.total || 0;
     _reqClients = d.clients || [];
+    _reqIps = d.ips || [];
     // Snap back to last page if current page is now beyond total (e.g. after Clear).
     const maxPage = Math.max(1, Math.ceil(_reqTotal / size));
     if (_reqPage > maxPage) { _reqPage = maxPage; return refresh(); }
@@ -1525,6 +2103,10 @@ async function refresh() {
   } catch (e) { /* ignore transient errors */ }
 }
 
+// Two filters that AND together are easy to leave half-set and then wonder where the traffic
+// went, so there is one way to drop both.
+function clearReqFilters() { _reqClient = ''; _reqIp = ''; _reqPage = 1; refresh(); }
+
 function renderRequestsPager() {
   const wrap = $('requests-pager');
   if (!wrap) return;
@@ -1535,10 +2117,18 @@ function renderRequestsPager() {
   const clientOpts = ['<option value="">all clients</option>']
     .concat(_reqClients.map(c => `<option value="${esc(c.app)}" ${c.app===_reqClient?'selected':''}>${esc(c.app)} (${c.count})</option>`))
     .join('');
-  const clientSel = `<label>Client <select id="rq-client" style="background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px">${clientOpts}</select></label>`;
+  const selCss = 'background:#0c0f15;color:#e9edf4;border:1px solid #313a48;padding:2px 4px;border-radius:3px;font-size:11px';
+  const ipOpts = ['<option value="">all sources</option>']
+    .concat(_reqIps.map(r => `<option value="${esc(r.ip)}" ${r.ip===_reqIp?'selected':''}>${esc(r.ip)}</option>`))
+    .join('');
+  const clientSel = `<label>Client <select id="rq-client" style="${selCss}">${clientOpts}</select></label>`
+    + ` <label>Source <select id="rq-ip" style="${selCss}">${ipOpts}</select></label>`
+    + (_reqClient || _reqIp ? ` <a onclick="clearReqFilters()" style="color:#6c7789;cursor:pointer;font-size:11px">clear</a>` : '');
   wrap.innerHTML = _pagerHtml('rq', { total: _reqTotal, totalPages, page: _reqPage, size, start }, clientSel);
   const csel = $('rq-client');
   if (csel) csel.onchange = () => { _reqClient = csel.value; _reqPage = 1; refresh(); };
+  const isel = $('rq-ip');
+  if (isel) isel.onchange = () => { _reqIp = isel.value; _reqPage = 1; refresh(); };
   _wirePager('rq', ({ size, pageDelta, page }) => {
     if (size) { _setPageSize(REQ_PS_KEY, size); _reqPage = 1; }
     if (pageDelta) _reqPage = Math.max(1, _reqPage + pageDelta);
@@ -1550,6 +2140,24 @@ function renderRequestsPager() {
 function fmt(ts) {
   const d = new Date(ts * 1000);
   return d.toLocaleTimeString([], { hour12: false }) + '.' + String(d.getMilliseconds()).padStart(3, '0');
+}
+
+// Start and end as wall-clock times, not just a duration. "took 691s" does not tell you which
+// eleven minutes of the afternoon the GPU was busy, which is the question you are actually
+// asking when a request overlaps something else. End is derived: the row stores when the
+// request arrived and how long it ran, never a finish timestamp.
+function timingLine(d) {
+  const start = d.ts;
+  if (!start) return '<span style="color:#6c7789">unknown</span>';
+  const day = new Date(start * 1000).toLocaleDateString();
+  const s = `<code title="${esc(day)}">${fmt(start)}</code>`;
+  if (d.duration_ms == null) {
+    // Still running: the end has not happened yet, so show how long it has been going.
+    const secs = Math.max(0, Math.round(Date.now() / 1000 - start));
+    return `${s} → <span style="color:#f0c674">in flight, ${fmtMsLong(secs * 1000)} so far</span>`;
+  }
+  const end = start + d.duration_ms / 1000;
+  return `${s} → <code>${fmt(end)}</code> <span style="color:#6c7789">· ${esc(day)}</span>`;
 }
 
 // Detail sidebar: drag the split handle to resize, click the chevron (or double-click the
@@ -1604,6 +2212,37 @@ function renderList() {
     else status = `<span class="status-${String(it.status)[0]}">${it.status}</span>`;
     const stream = it.is_stream ? '<span class="badge">SSE</span>' : '';
     const imgBadge = it.has_images ? '<span class="badge" title="contains an image / non-text content" style="background:#3a2a4a;color:#d0b0f0;border-color:#5a3a6a">🖼 img</span>' : '';
+    // Billed tokens, nothing delivered. Status is 200 and the token counts look healthy, so
+    // without a badge this is invisible — and to whoever is driving the agent it reads as the
+    // model stopping for no reason.
+    const emptyBadge = it.empty_output
+      ? `<span class="badge" title="the upstream billed ${num(it.completion_tokens || 0)} tokens and delivered nothing — no content, no reasoning, no tool call${it.inflight_at_finish ? ' · ' + it.inflight_at_finish + ' requests in flight at the time' : ''}" style="background:#4a2020;color:#ff9a9a;border-color:#6a3030">⌀ empty</span>`
+      : '';
+    // A tool call and its result arrive in different requests, so the row that made the call
+    // could only ever say that it HAD called something — never whether it worked. That is how
+    // the same failing Edit repeated twelve times before anyone could see why. The outcome is
+    // resolved when the next turn reports back and written onto the request that asked.
+    let toolBadge = '';
+    if (it.tool_outcome) {
+      let detail = [];
+      try { detail = JSON.parse(it.tool_outcome_detail || '[]') || []; } catch (e) { detail = []; }
+      const names = detail.map(d => d.name).filter(Boolean).join(', ');
+      const failed = detail.filter(d => !d.ok);
+      // The excerpt is the whole point: "Edit failed" sends you to the transcript,
+      // "Edit: String to replace not found" does not.
+      const why = failed.map(d => `${d.name}: ${d.excerpt || 'failed'}`).join(' · ');
+      const style = {
+        ok:      'background:#1f3a24;color:#8fdc9b;border-color:#2f5a37',
+        error:   'background:#4a2020;color:#ff9a9a;border-color:#6a3030',
+        partial: 'background:#4a3a1a;color:#f0c674;border-color:#6a5a2a',
+        pending: 'background:#2a2a33;color:#9a9aa8;border-color:#3a3a48',
+      }[it.tool_outcome] || 'background:#2a2a33;color:#9a9aa8';
+      const label = { ok: '✓ tools', error: '✗ tools', partial: '± tools', pending: '⋯ tools' }[it.tool_outcome] || it.tool_outcome;
+      const tip = it.tool_outcome === 'pending'
+        ? `called ${names || 'a tool'} — no result came back, so the agent left the call unanswered`
+        : (why || `${names || 'tool call'} succeeded`);
+      toolBadge = `<span class="badge" title="${esc(tip)}" style="${style}">${label}</span>`;
+    }
     const ms = it.duration_ms ? num(Math.round(it.duration_ms)) : '';
     let tokens = it.total_tokens ? num(it.total_tokens) : (it.completion_tokens ? num(it.completion_tokens) : '');
     if (tokens && it.tokens_live) {
@@ -1612,7 +2251,7 @@ function renderList() {
     }
     const sel = it.id === selected ? 'selected' : '';
     const appBadge = it.client_app
-      ? `<div style="margin-top:2px"><span class="app-badge app-${esc(it.client_app)}" title="Detected client SDK / app">${esc(it.client_app)}</span></div>`
+      ? `<div style="margin-top:2px"><span class="app-badge app-${esc(it.client_app)}" title="Detected client SDK / app">${esc(it.client_app)}</span>${surfaceBadge(it.surface)}</div>`
       : '';
     const ipCell = `<code style="font-size:11px">${esc(it.client_ip || '')}</code>${appBadge}`;
     let rowCls = sel;
@@ -1631,7 +2270,7 @@ function renderList() {
       pathExtra = ` <span class="verdict rewrite" title="${esc(it.gate_reason || '')}">${esc(badge)}</span>`;
     }
     else if (it.gate_verdict === 'intercept') { rowCls += ' row-intercept'; pathExtra = ` <span class="verdict intercept" title="${esc(it.gate_reason || '')}">${esc(it.gate_rule || 'intercepted')}</span>`; }
-    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
+    return `<tr class="${rowCls}" data-id="${it.id}"><td>${fmt(it.ts)}</td><td>${ipCell}</td><td class="method">${esc(it.method)}</td><td class="path" title="${esc(it.path)}">${esc(it.path)}${stream}${imgBadge}${emptyBadge}${toolBadge}${pathExtra}</td><td>${esc(it.model || '')}</td><td>${status}</td><td class="num">${tokens}</td><td class="ms">${ms}</td></tr>`;
   }).join('');
   for (const tr of $('rows').querySelectorAll('tr')) {
     tr.onclick = () => selectItem(tr.dataset.id);
@@ -1806,7 +2445,13 @@ function analyzeRequest(bodyText) {
 // Walk a response body or SSE stream and extract finish reason + invoked tool calls + assistant content length.
 // Handles three response shapes: OpenAI chat.completion(.chunk), Ollama native /api/chat, and Anthropic /v1/messages.
 function analyzeResponse(respBody, streamChunks) {
-  const out = { finish_reason: null, tool_calls: [], content_chars: 0, content: '' };
+  // reasoning is collected separately from content because models put the answer in either
+  // one: a 700k-token request came back with empty content and the entire reply in reasoning,
+  // which read as "the model returned nothing" until the raw JSON was opened by hand.
+  const out = { finish_reason: null, tool_calls: [], content_chars: 0, content: '', reasoning: '' };
+  const reasoningOf = (m) => (typeof m.reasoning === 'string' ? m.reasoning
+                            : typeof m.reasoning_content === 'string' ? m.reasoning_content
+                            : typeof m.thinking === 'string' ? m.thinking : '');
 
   function fromObj(j) {
     if (!j || typeof j !== 'object') return;
@@ -1815,6 +2460,7 @@ function analyzeResponse(respBody, streamChunks) {
       if (c.finish_reason) out.finish_reason = c.finish_reason;
       const msg = c.message || c.delta || {};
       if (typeof msg.content === 'string') out.content += msg.content;
+      out.reasoning += reasoningOf(msg);
       for (const tc of (msg.tool_calls || [])) {
         const fn = tc.function || {};
         out.tool_calls.push({ name: fn.name || '?', arguments: fn.arguments || '' });
@@ -1823,6 +2469,7 @@ function analyzeResponse(respBody, streamChunks) {
     // Ollama native shape
     if (j.message && typeof j.message === 'object') {
       if (typeof j.message.content === 'string') out.content += j.message.content;
+      out.reasoning += reasoningOf(j.message);
       for (const tc of (j.message.tool_calls || [])) {
         const fn = tc.function || {};
         out.tool_calls.push({ name: fn.name || '?', arguments: fn.arguments ? JSON.stringify(fn.arguments) : '' });
@@ -1835,6 +2482,7 @@ function analyzeResponse(respBody, streamChunks) {
       for (const blk of j.content) {
         if (!blk || typeof blk !== 'object') continue;
         if (blk.type === 'text' && typeof blk.text === 'string') out.content += blk.text;
+        else if (blk.type === 'thinking' && typeof blk.thinking === 'string') out.reasoning += blk.thinking;
         else if (blk.type === 'tool_use') {
           out.tool_calls.push({
             name: blk.name || '?',
@@ -1862,6 +2510,7 @@ function analyzeResponse(respBody, streamChunks) {
         if (c.finish_reason) out.finish_reason = c.finish_reason;
         const delta = c.delta || c.message || {};
         if (typeof delta.content === 'string') out.content += delta.content;
+        out.reasoning += reasoningOf(delta);
         for (const tc of (delta.tool_calls || [])) {
           const idx = tc.index ?? Object.keys(tcByIdx).length;
           const slot = tcByIdx[idx] = tcByIdx[idx] || { name: '', arguments: '' };
@@ -1984,14 +2633,26 @@ function analyzeThinking(d) {
     }
   }
   if (!thought && (/<think>/.test(d.response_body || '') || /<think>/.test(sc))) thought = true;
+  // The recorded columns win over anything parsed out of the body: they carry the proxy's own
+  // quirk decision, and the stored body is the client's original, captured before the quirks
+  // run. A model whose thinking the proxy switched off looks untouched in the blob.
+  let by = 'client';
+  if (d.thinking) {
+    requested = d.thinking === 'off' ? 'off' : (d.reasoning_effort || 'on');
+    signal = d.thinking_src || signal;
+    if (String(d.thinking_src || '').startsWith('quirk:')) by = 'proxy';
+  } else if (d.reasoning_effort) {
+    requested = d.reasoning_effort;
+  }
   if (!isGen && !thought && requested === 'default') return null;
-  return { requested, thought, reasoningTokens, signal };
+  return { requested, thought, reasoningTokens, signal, by };
 }
 
 function renderAnalysis(d) {
   const req = analyzeRequest(d.request_body);
   const resp = analyzeResponse(d.response_body, d.stream_chunks);
-  if (!req && (!resp.tool_calls.length && !resp.finish_reason && !resp.content_chars) && !d.proxy_tool_log) return '';
+  if (!req && (!resp.tool_calls.length && !resp.finish_reason && !resp.content_chars
+               && !resp.reasoning) && !d.proxy_tool_log) return '';
 
   let reqHtml = '';
   if (req) {
@@ -2045,6 +2706,44 @@ function renderAnalysis(d) {
     `;
   }
 
+  // The counterpart to "Latest User Message": what the model actually said, in plain text,
+  // for every request rather than only streaming ones. Non-streaming replies used to be
+  // readable only as raw JSON, and reasoning was not shown anywhere at all.
+  let replyHtml = '';
+  {
+    const body = resp.content || '';
+    const think = resp.reasoning || '';
+    const CAP = 8000;
+    const clip = (t) => esc(t.slice(0, CAP)) + (t.length > CAP ? '\n…' : '');
+    if (body) {
+      replyHtml += `<div class="section"><h3>Assistant Reply (${num(body.length)} chars)</h3>`
+        + `<pre data-k="reply" class="stream-text" style="max-height:340px">${clip(body)}</pre></div>`;
+    }
+    if (think) {
+      // Collapsed: it is usually longer than the answer and is not what you came to read,
+      // but it is where the answer hides when the content field comes back empty.
+      replyHtml += `<div class="section"><h3>Model Reasoning (${num(think.length)} chars)</h3>`
+        + `<details${body ? '' : ' open'}><summary style="cursor:pointer;color:#888;font-size:11px">show</summary>`
+        + `<pre data-k="reasoning" class="stream-text" style="max-height:300px;margin-top:6px">${clip(think)}</pre>`
+        + `</details></div>`;
+    }
+    // Nothing came back. Say why, because "no reply" and "a reply you cannot see" look
+    // identical here, and the difference is usually the token cap.
+    if (!body && !think) {
+      const why = resp.tool_calls.length
+        ? `the model answered with ${resp.tool_calls.length} tool call${resp.tool_calls.length === 1 ? '' : 's'} and no prose — see Tool Calls Invoked below`
+        : resp.finish_reason === 'length'
+          ? 'generation hit max_tokens before anything was emitted — an unterminated tool call is discarded whole, so the tokens are billed and nothing arrives'
+          : (d.status && d.status >= 400) ? 'the request failed; see the error above'
+          : (!d.status && !d.error) ? 'still in flight'
+          : 'the response carried no assistant text';
+      if (d.status || d.error) {
+        replyHtml += `<div class="section"><h3>Assistant Reply</h3>`
+          + `<div style="color:#9098a8;font-size:12.5px">(empty) — ${esc(why)}</div></div>`;
+      }
+    }
+  }
+
   let respHtml = '';
   if (resp.finish_reason || resp.tool_calls.length || resp.content_chars) {
     const tcRows = resp.tool_calls.map(t => {
@@ -2090,7 +2789,7 @@ function renderAnalysis(d) {
     }
   }
 
-  return reqHtml + respHtml + toolLogHtml;
+  return reqHtml + replyHtml + respHtml + toolLogHtml;
 }
 
 // Heuristic: does this tool-result content look like an error? Returns { isError, excerpt }.
@@ -2577,22 +3276,28 @@ async function loadDetail(id) {
   const think = analyzeThinking(d);
   if (think) {
     const lvlTxt = ['low','medium','high'].includes(think.requested) ? ': ' + think.requested : '';
+    // Who settled it. Saying "client sent" about a decision the proxy made on the client's
+    // behalf sends you looking through the client's config for a setting that isn't there.
+    const byTxt = think.signal
+      ? (think.by === 'proxy' ? ' (proxy quirk: ' + think.signal.replace('quirk:', '') + ')'
+                              : ' (client sent ' + think.signal + ')')
+      : '';
     let col, txt, tip;
     if (think.thought) {
       col = '#c8a8f0';
       const tok = think.reasoningTokens ? ' · ' + num(think.reasoningTokens) + ' tok' : '';
       txt = '💭 thinking' + lvlTxt + tok;
-      tip = 'model produced reasoning'
-        + (think.signal ? ' (client sent ' + think.signal + ')' : '')
+      tip = 'model produced reasoning' + byTxt
         + (think.reasoningTokens ? ' — ' + think.reasoningTokens + ' reasoning tokens' : '');
     } else if (think.requested === 'off') {
       col = '#8b93a0';
       txt = '🚫 no-think';
-      tip = 'thinking explicitly disabled by the client' + (think.signal ? ' (' + think.signal + ')' : '');
+      tip = (think.by === 'proxy' ? 'thinking disabled by a model quirk in the proxy'
+                                  : 'thinking explicitly disabled by the client') + byTxt;
     } else if (think.requested !== 'default') {
       col = '#f0c674';
       txt = '💭 think' + (lvlTxt || ': on') + ' (req)';
-      tip = 'client requested thinking (' + think.signal + ') but no reasoning was detected in the response';
+      tip = 'thinking was requested' + byTxt + ' but no reasoning was detected in the response';
     } else {
       col = '#8b93a0';
       txt = 'no-think';
@@ -2734,9 +3439,10 @@ async function loadDetail(id) {
     <div class="summary">
       <div class="row"><span class="label">Request ID</span> <code style="user-select:all">${esc(d.id || '?')}</code></div>
       <div class="row"><span class="label">Request</span> <strong class="method">${esc(d.method)}</strong> <code>${esc(d.path)}</code></div>
-      <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}</div>
+      <div class="row"><span class="label">Client</span> <code>${esc(d.client_ip || '(unknown)')}</code>${d.client_app ? ` <span class="app-badge app-${esc(d.client_app)}">${esc(d.client_app)}</span>` : ''}${surfaceBadge(d.surface)}</div>
       <div class="row"><span class="label">Upstream</span> <code>${esc(d.upstream_url)}</code>${upstreamBadge}${cacheBadge}</div>
       <div class="row"><span class="label">Status</span> <span class="status-${String(status)[0]}">${esc(status)}</span> · ${fmtMsLong(d.duration_ms)}${d.is_stream ? ' · <span class="badge">SSE</span>' : ''}${killBtn}</div>
+      <div class="row"><span class="label">Timing</span> ${timingLine(d)}</div>
       <div class="row"><span class="label">Model</span> <code>${esc(d.model || '(none)')}</code>${thinkBadge}</div>
       ${tokensLine}
       ${downsizeLine}
@@ -3458,8 +4164,8 @@ async function loadAudit() {
       <h2>🔀 Routing mode</h2>
       <div class="desc">Quick toggle between passthrough, shadow comparison, and full redirect to a local model. Edits the rules config below — saves apply immediately, no restart needed.</div>
       <div class="routing-row">
-        <label>From <input type="text" id="routing-from" value="claude-opus-4-7" placeholder="claude-opus-4-7"></label>
-        <label>To <input type="text" id="routing-to" value="qwen3-coder-next:latest" placeholder="qwen3-coder-next:latest"></label>
+        <label>From <input type="text" id="routing-from" value="claude-opus-4-7" placeholder="claude-opus-4-7" autocomplete="off"></label>
+        <label>To <input type="text" id="routing-to" value="qwen3-coder-next:latest" placeholder="qwen3-coder-next:latest" autocomplete="off"></label>
       </div>
       <div class="routing-row">
         <button class="routing-mode-btn mode-passthrough" id="mode-btn-passthrough" onclick="setRoutingMode('passthrough')">Passthrough · Claude → Claude</button>
@@ -3931,7 +4637,7 @@ function renderConversationsList() {
       <td class="num">${num(c.turns)}</td>
       <td class="num">${num(c.total_tokens)}</td>
       <td>${esc((c.models || '').split(',').slice(0,3).join(', '))}</td>
-      <td><code style="font-size:11px">${esc((c.clients || '').split(',')[0] || '')}</code></td>
+      <td><code style="font-size:11px">${esc((c.clients || '').split(',')[0] || '')}</code>${surfaceBadge((c.surfaces || '').split(',')[0])}</td>
       <td>${span}</td>
       <td style="color:#aaa;font-size:11px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(c.preview || '')}</td>
     </tr>`;
@@ -4403,6 +5109,26 @@ async function toggleRule(name, enabled) {
   loadAudit();
 }
 
+async function updateOllama(btn) {
+  if (!confirm('Update Ollama now? The service restarts, so loaded models unload and ' +
+               'in-flight requests fail. Benchmarks block this automatically.')) return;
+  btn.disabled = true; btn.textContent = 'Updating…';
+  try {
+    const r = await fetch('/__proxy/api/control/ollama/update', { method: 'POST' });
+    const d = await r.json();
+    if (!r.ok) { alert(d.error || ('update failed (' + r.status + ')')); return; }
+    alert(d.changed
+      ? `Updated: v${d.version_before} → v${d.version_after}`
+      : `Updater ran (v${d.version_before || '?'} → v${d.version_after || '?'})` +
+        (d.note ? ` — ${d.note}` : ''));
+    loadSystem();
+  } catch (e) {
+    alert('update failed: ' + e);
+  } finally {
+    btn.disabled = false; btn.textContent = 'Update Ollama';
+  }
+}
+
 function ollamaConfigSection(ollama) {
   const env = ollama.env || {};
   const keys = Object.keys(env).sort();
@@ -4415,6 +5141,14 @@ function ollamaConfigSection(ollama) {
         ? `<span style="background:#4a4020;color:#f0c674;border:1px solid #6a5a3a;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)} · upgrade ≥ v${esc(ollama.recommended_version || '')} recommended</span>`
         : `<span style="background:#1e3a26;color:#68d391;border:1px solid #2e5a36;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.version)}</span>`)
     : '';
+  // "An update exists" and "this proxy can apply it" are separate facts: the pill shows
+  // whenever GitHub has something newer; the button only when an updater command is set up.
+  const updatePill = ollama.update_available
+    ? `<span style="background:#243a4a;color:#7cc7f0;border:1px solid #33566b;padding:1px 6px;border-radius:3px;font-size:11px">v${esc(ollama.latest_version)} available</span>`
+    : '';
+  const updateBtn = (ollama.update_available && ollama.update_configured)
+    ? `<button onclick="event.preventDefault();updateOllama(this)" style="background:#262d38;border:1px solid #33566b;color:#7cc7f0;border-radius:4px;padding:2px 10px;font-size:11px;cursor:pointer">Update Ollama</button>`
+    : '';
   const meta = [
     ollama.pid ? 'pid ' + ollama.pid : null,
     ollama.env_source ? 'from ' + ollama.env_source : null,
@@ -4423,13 +5157,47 @@ function ollamaConfigSection(ollama) {
     <details class="stats-section" open>
       <summary style="cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;margin:0 0 8px 0">
         <span style="color:#888;font-size:10px;width:10px">▾</span>
-        <h2 style="margin:0">Ollama Server Config ${versionLabel} <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
+        <h2 style="margin:0">Ollama Server Config ${versionLabel} ${updatePill} ${updateBtn} <span style="color:#666;font-weight:normal;font-size:11px">${esc(meta)}</span></h2>
       </summary>
       <table style="width:100%">
         <thead><tr><th>Variable</th><th>Value</th></tr></thead>
         <tbody>${envRows}</tbody>
       </table>
+      <div style="margin-top:10px;padding:10px 12px;border:1px solid #313a48;border-radius:6px;background:#161b24">
+        <div style="font-size:12px;color:#aab4c3;margin-bottom:6px"><b>Model defaults</b> — bake a per-model context window (works for all clients, incl. OpenAI-style; the global env var stays untouched)</div>
+        <input id="omp-model" list="omp-models" placeholder="model tag" autocomplete="off" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:220px">
+        <datalist id="omp-models">${(ollama.tags || []).map(t => `<option value="${esc(t.name || t.model || '')}">`).join('')}</datalist>
+        <input id="omp-ctx" type="number" min="256" step="1024" placeholder="num_ctx" style="background:#0f1218;border:1px solid #313a48;color:#e9edf4;border-radius:4px;padding:4px 8px;font-size:12px;width:110px;margin-left:6px">
+        <button onclick="applyOllamaParams(this)" style="margin-left:6px;background:#262d38;border:1px solid #33566b;color:#7cc7f0;border-radius:4px;padding:4px 12px;font-size:12px;cursor:pointer">Apply</button>
+        <span id="omp-result" style="margin-left:8px;font-size:11.5px;color:#888"></span>
+      </div>
     </details>`;
+}
+
+async function applyOllamaParams(btn) {
+  const model = $('omp-model').value.trim();
+  const ctx = parseInt($('omp-ctx').value, 10);
+  const out = $('omp-result');
+  if (!model || !ctx) { out.textContent = 'model and num_ctx required'; return; }
+  btn.disabled = true; out.textContent = 'applying…';
+  try {
+    let r = await fetch('/__proxy/api/control/models/ollama-params', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, num_ctx: ctx }) });
+    let d = await r.json();
+    if (!r.ok && (d.error || '').includes('force:true')) {
+      if (confirm(d.error + '\n\nSet it anyway?')) {
+        r = await fetch('/__proxy/api/control/models/ollama-params', {
+          method: 'POST', headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ model, num_ctx: ctx, force: true }) });
+        d = await r.json();
+      }
+    }
+    out.textContent = r.ok
+      ? `set ✓ ${d.kv_note ? '(' + d.kv_note + ')' : ''} — applies on next load`
+      : (d.error || `failed (${r.status})`);
+  } catch (e) { out.textContent = 'failed: ' + e; }
+  finally { btn.disabled = false; }
 }
 
 function sparklinePath(values, w, h) {
@@ -4492,6 +5260,13 @@ function renderProxyHealth(hp) {
   const db = hp.db || {};
   const proc = hp.process || {};
   const oh = hp.overhead_ms || {};
+  // Every file, not just the main database. The archive and the two write-ahead logs are
+  // usually the bulk of it, and none of them used to appear anywhere in this tab.
+  const disk = db.disk || {};
+  const diskFiles = disk.files || [];
+  const diskRows = diskFiles
+    .map(f => `<tr><td>${esc(f.label)}</td><td class="num">${fmtBytes(f.bytes)}</td>
+               <td style="color:#666;font-size:11px"><code>${esc(f.path)}</code></td></tr>`).join('');
   const tableRows = Object.entries(db.table_sizes || {})
     .map(([name, sz]) => `<tr><td><code>${esc(name)}</code></td><td class="num">${fmtBytes(sz)}</td></tr>`).join('') ||
     '<tr><td colspan="2" style="color:#666;font-size:11px;padding:4px 8px">(per-table sizes unavailable — SQLite was built without dbstat)</td></tr>';
@@ -4501,9 +5276,10 @@ function renderProxyHealth(hp) {
       <h2>Proxy Health</h2>
       <div class="cards" style="grid-template-columns:repeat(auto-fill,minmax(220px,1fr))">
         <div class="gauge">
-          <div class="l">Database</div>
-          <div class="v">${fmtBytes(db.size_bytes)}</div>
-          <div class="s">${num(db.request_count || 0)} requests · ${num(db.metric_count || 0)} metric rows</div>
+          <div class="l">On disk (all files)</div>
+          <div class="v">${fmtBytes(disk.total_bytes != null ? disk.total_bytes : db.size_bytes)}</div>
+          <div class="s">${num(db.request_count || 0)} requests · ${num(db.metric_count || 0)} metric rows${
+            diskFiles.length > 1 ? ` · main file ${fmtBytes(db.size_bytes)}` : ''}</div>
         </div>
         <div class="gauge">
           <div class="l">Proxy memory (RSS)</div>
@@ -4516,6 +5292,17 @@ function renderProxyHealth(hp) {
           <div class="s">avg ${oh.avg_ms != null ? oh.avg_ms.toFixed(2) : '—'} · p95 ${oh.p95_ms != null ? oh.p95_ms.toFixed(2) : '—'} · p99 ${oh.p99_ms != null ? oh.p99_ms.toFixed(2) : '—'} (${num(oh.samples || 0)} samples)</div>
         </div>
       </div>
+      ${diskRows ? `
+        <details style="margin-bottom:14px" open>
+          <summary style="cursor:pointer;color:#888;font-size:12px">Files on disk — ${fmtBytes(disk.total_bytes)} total</summary>
+          <table style="width:auto;min-width:420px;margin-top:6px">
+            <thead><tr><th>File</th><th class="num">Size</th><th>Path</th></tr></thead>
+            <tbody>${diskRows}</tbody>
+          </table>
+          <div style="color:#666;font-size:11px;margin-top:4px">Write-ahead logs grow while rows
+            are being deleted and shrink at the next checkpoint — a clear makes this total rise
+            before it falls.</div>
+        </details>` : ''}
       ${Object.keys(db.table_sizes || {}).length ? `
         <details style="margin-bottom:14px">
           <summary style="cursor:pointer;color:#888;font-size:12px">Per-table sizes</summary>
@@ -4578,7 +5365,12 @@ async function resetDb(btn) {
     btn._armed = true;
     btn.textContent = `Delete ${targets.join(' + ')}?`;
     btn.style.background = '#6a3030';
-    _resetSay('This cannot be undone. Click again to confirm, or wait to cancel.', '#e0a080');
+    // Say what it costs, not just that it is irreversible: on a large database this runs for
+    // minutes and competes with live traffic for the write lock. A clear once returned 500s
+    // to a real request and knocked out metrics collection, with nothing warning beforehand.
+    _resetSay('This cannot be undone, and on a large database it runs for several minutes — '
+      + 'proxied requests may fail while it works. Click again to confirm, or wait to cancel.',
+      '#e0a080');
     btn._t = setTimeout(() => { _resetDisarm(btn); _resetSay(''); }, 5000);
     return;
   }
@@ -4600,7 +5392,17 @@ async function resetDb(btn) {
       if (s.state !== 'running') return;
       const el = s.elapsed_s != null ? ` · ${s.elapsed_s.toFixed(0)}s` : '';
       const slow = vacuum ? ' <span style="color:#666">(rewrites the whole file — minutes on a large database)</span>' : '';
-      _resetSay(`<span style="color:#f0c674">${esc(s.step || 'working')}</span>${el}${s.step === 'compacting the database' ? slow : ''}`);
+      // Rows done / total within the step. Without it, "deleting request bodies" sat unchanged
+      // for seven minutes and was indistinguishable from a wedged job.
+      const p = s.progress || {};
+      const pct = (p.total ? ` <span style="color:#888">${num(p.done || 0)} / ${num(p.total)}`
+        + ` (${Math.floor(100 * (p.done || 0) / p.total)}%)</span>` : '');
+      // Deletes land in the write-ahead log first, so disk climbs during a clear. Showing the
+      // total makes that legible instead of alarming.
+      const dk = s.disk && s.disk.total_bytes
+        ? ` <span style="color:#666">· ${fmtBytes(s.disk.total_bytes)} on disk</span>` : '';
+      _resetSay(`<span style="color:#f0c674">${esc(s.step || 'working')}</span>${pct}${el}${dk}`
+        + `${s.step === 'compacting the database' ? slow : ''}`);
     } catch {}
   }, 700);
 
@@ -4979,12 +5781,18 @@ function renderSystem() {
   // The tab dot carries the same three-way state, so a backend that is coming up is visible
   // without opening its panel.
   const _pTab = (id, label, snap, n) => `<button class="sysprov-tab ${activeProv===id?'on':''}" onclick="setSysProv('${id}')"><span class="reach-dot ${snap.reachable ? 'ok' : (snap.state === 'loading' ? 'warn' : 'bad')}"></span>${label}<span class="sysprov-n">${n}</span></button>`;
+  // Built from the registry the server reports, so registering a backend is the only step
+  // needed for it to appear here. Hand-listing these is what hid llama.cpp twice.
+  const _backendMeta = (now.backends_meta && now.backends_meta.length) ? now.backends_meta : [
+    { name: 'vllm', label: 'vLLM' }, { name: 'lmstudio', label: 'LM Studio' },
+    { name: 'ollama', label: 'Ollama' }, { name: 'llamacpp', label: 'llama.cpp' },
+    { name: 'comfyui', label: 'ComfyUI' }];
+  const _count = (id, snap) => id === 'ollama' ? (snap.ps || []).length
+    : id === 'comfyui' ? ((snap.queue_running || 0) + (snap.queue_pending || 0))
+    : (snap.loaded || []).length;
   const provBar = `<div class="sysprov-bar">
-      ${_pTab('vllm','vLLM',vllm,(vllm.loaded||[]).length)}
-      ${_pTab('lmstudio','LM Studio',lmstudio,(lmstudio.loaded||[]).length)}
-      ${_pTab('ollama','Ollama',ollama,(ollama.ps||[]).length)}
-      ${_pTab('llamacpp','llama.cpp',llamacpp,(llamacpp.loaded||[]).length)}
-      ${_pTab('comfyui','ComfyUI',comfyui,(comfyui.queue_running||0)+(comfyui.queue_pending||0))}
+      ${_backendMeta.map(b => _pTab(b.name, b.label, now[b.name] || {},
+                                    _count(b.name, now[b.name] || {}))).join('')}
     </div>`;
 
   // Launch args (docker command line): pair each --flag with its value; bare flags = "on".
@@ -5028,7 +5836,8 @@ function renderSystem() {
     unknown: ['bad',  '#666',    'unreachable'],
   };
   const vState = vllm.state || (vllm.reachable ? 'ready' : 'unknown');
-  const [vDot, vColour, vLabel] = vStates[vState] || vStates.unknown;
+  let [vDot, vColour, vLabel] = vStates[vState] || vStates.unknown;
+  if (vState === 'loading' && vllm.model) vLabel = `loading ${vllm.model}`;
   let vllmNote = '';
   if (vState === 'loading') {
     const since = vllm.started_at ? (Date.now() - Date.parse(vllm.started_at)) / 1000 : null;
@@ -5036,13 +5845,13 @@ function renderSystem() {
       ? `${Math.floor(since / 60)}m ${Math.floor(since % 60)}s in` : '';
     vllmNote = `<div style="margin:6px 0 2px;padding:8px 10px;border:1px solid #5a4a20;border-radius:4px;background:#2a2410;color:#f0c674;font-size:12px">
         <span class="spin" style="display:inline-block;margin-right:6px">◐</span>
-        ${esc(vllm.phase || 'starting up')}${elapsed ? ` · ${esc(elapsed)}` : ''}
+        loading <b>${esc(vllm.model || vllm.container || 'model')}</b> — ${esc(vllm.phase || 'starting up')}${elapsed ? ` · ${esc(elapsed)}` : ''}
         <div style="color:#9a8a5a;font-size:11px;margin-top:3px">Requests will fail until this
           finishes — weights are read from disk, so it takes minutes, not seconds.</div>
       </div>`;
   } else if (vState === 'stopped') {
     vllmNote = `<div style="margin:6px 0 2px;padding:8px 10px;border:1px solid #4a2020;border-radius:4px;background:#2a1010;color:#e08080;font-size:12px">
-        Container <code>${esc(vllm.container || '?')}</code> exists but is not running.
+        Container <code>${esc(vllm.container || '?')}</code>${vllm.model ? ` (serves <b>${esc(vllm.model)}</b>)` : ''} exists but is not running.
       </div>`;
   }
   const vllmPanel = `
@@ -5088,7 +5897,7 @@ function renderSystem() {
     <div class="stats-section">
       <h2>Ollama Available (top 25)</h2>
       <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-        <input id="pull-model" placeholder="e.g. llama3:70b-instruct" spellcheck="false"
+        <input id="pull-model" placeholder="e.g. llama3:70b-instruct" spellcheck="false" autocomplete="off"
           style="flex:1;min-width:240px;background:#161a20;color:#ddd;border:1px solid #333;border-radius:4px;padding:5px 9px;font-size:12px;font-family:ui-monospace,monospace">
         <button onclick="startPull(this)" id="pull-btn"
           style="background:#2e3a4a;color:#8ab4e8;border:1px solid #3a4a5a;padding:5px 14px;border-radius:4px;cursor:pointer;font-size:12px">Pull</button>
@@ -5144,7 +5953,23 @@ function renderSystem() {
         </table>
       ` : `<div style="color:#888;font-size:12px;padding:6px">Probed at <code>${esc(llamacpp.url || '')}</code> — nothing serving. Start <code>llama-server</code> there and it becomes a routable upstream like any other.</div>`}
     </div>`;
+  // A backend registered without a bespoke panel gets a usable generic one rather than a
+  // blank tab, so the registry alone is enough to make it visible and controllable.
+  const _genericPanel = (b) => {
+    const snap = now[b.name] || {};
+    const rows = (snap.loaded || []).map(m => `<tr><td><code>${esc(m.id || m.name || '?')}</code></td>
+        <td>${esc(m.quant || '—')}</td>
+        <td class="num">${m.max_context_length ? num(m.max_context_length) : '—'}</td></tr>`).join('')
+      || '<tr><td colspan="3" style="color:#666;padding:6px 0">no model served</td></tr>';
+    return `<div class="stats-section">
+      <h2><span class="reach-dot ${snap.reachable ? 'ok' : 'bad'}"></span>${esc(b.label || b.name)}
+        <span style="color:${snap.reachable ? '#68d391' : '#666'};font-weight:normal;font-size:11px">${snap.reachable ? 'serving' : 'offline'}</span>${_svcBtn(b.name, snap.reachable)}</h2>
+      <table style="width:100%"><thead><tr><th>Served model</th><th>Quant</th><th class="num">Max context</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+    </div>`;
+  };
   const provPanels = { vllm: vllmPanel, llamacpp: lcpPanel, lmstudio: lmsPanel, ollama: ollamaPanel, comfyui: renderComfyUISection(comfyui) };
+  for (const b of _backendMeta) if (!provPanels[b.name]) provPanels[b.name] = _genericPanel(b);
 
   $('system').innerHTML = `
     ${renderProxyHealth(systemHealthCache)}
@@ -5910,7 +6735,7 @@ function chatRenderPersonalityList() {
   wrap.innerHTML = chatPersonalities.map(p => `
     <div style="background:#12141b;border:1px solid #262d38;border-radius:6px;padding:10px;margin-bottom:6px">
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" style="flex:1;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
+        <input data-pers-name="${esc(p.id)}" value="${esc(p.name)}" autocomplete="off" style="flex:1;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:4px 8px;font-size:13px;font-weight:600">
         <button data-pers-save="${esc(p.id)}" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Save</button>
         <button data-pers-del="${esc(p.id)}" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">🗑 Delete</button>
       </div>
@@ -6482,6 +7307,11 @@ async function loadBench() {
           <button type="button" class="bench-mode" data-mode="advanced" aria-pressed="false">Advanced</button>
         </div>
       </div>
+      <div id="bench-active"></div>
+      <div id="bench-collapsed" class="bench-collapsed" style="display:none">
+        <span id="bench-collapsed-what"></span>
+        <button type="button" id="bench-expand">Change settings</button>
+      </div>
       <div class="bench-form">
         <div class="bench-lede">
           Compares models on <strong>speed</strong> and, with a graded suite, on <strong>whether the code they return actually works</strong>. Timing separates <strong>TTFT</strong> (first token of any kind) from <strong>TTFC</strong> (first content token) — the gap between them is the model thinking.
@@ -6494,13 +7324,17 @@ async function loadBench() {
             <button type="button" class="bench-preset-opt" data-preset="long" aria-pressed="false">Long context <span class="cost" style="opacity:.7"></span></button>
           </div>
           <div id="bench-preset-desc"></div>
+          <div class="bench-row stack" style="margin-top:9px">
+            <label for="bench-suite-simple">Graded suite <span class="bench-hint">— what the answers are scored against</span></label>
+            <select id="bench-suite-simple"><option value="">none — measure speed only</option></select>
+          </div>
           <label class="bench-check" style="margin-top:9px" title="Other clients keep their connections and resume as soon as the benchmark finishes — they wait, they don't fail. Without this, whatever else is using the model gets measured along with it.">
             <input type="checkbox" id="bench-hold" checked>
             <span>Hold other proxy clients while it runs<em>they queue until it finishes — required for numbers that mean anything</em></span>
           </label>
-          <label class="bench-check" title="Unloads other Ollama models before each cell so the model being measured is not sharing VRAM with an idle one. LM Studio has no unload API and vLLM serves a fixed model, so neither can be evicted — only Ollama can.">
-            <input type="checkbox" id="bench-evict-simple">
-            <span>Unload other Ollama models<em>only Ollama can be evicted; LM Studio and vLLM keep whatever they hold</em></span>
+          <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run, and say so in the report. Changing any setting changes the cell, so it is measured again. Untick to force a fresh measurement of everything.">
+            <input type="checkbox" id="bench-resume-simple" checked>
+            <span>Reuse completed cells<em>skip what an earlier run already measured — a long run survives a restart</em></span>
           </label>
         </div>
         <div class="bench-groups">
@@ -6513,16 +7347,29 @@ async function loadBench() {
             </div>
             <div class="bench-row stack">
               <label id="bench-model-label">Models</label>
+              <div class="bench-selall">
+                <button type="button" id="bench-sel-all">Select all</button>
+                <button type="button" id="bench-sel-none">None</button>
+                <span id="bench-sel-cost" class="bench-hint"></span>
+              </div>
               <div id="bench-model" class="bench-list" role="group" aria-labelledby="bench-model-label"></div>
               <div class="bench-legend">
                 <span><b style="color:#3f8f5f">●</b> in memory, ready to measure</span>
                 <span><b style="color:#4d5765">○</b> not loaded — loads on first use</span>
+                <span><b style="color:#d9c37a">◐</b> stopped — the bench starts it, then stops it again</span>
                 <span>right-hand text: quantization · context window</span>
               </div>
             </div>
             <div class="bench-adv bench-row stack">
-              <label id="bench-prompt-label">Prompt size <span class="bench-hint">— how much context to send</span></label>
+              <label id="bench-prompt-label">Prompt size <span class="bench-hint">— how many tokens each request sends</span></label>
               <div id="bench-prompt" class="bench-toggles" role="group" aria-labelledby="bench-prompt-label"></div>
+            </div>
+            <div class="bench-adv bench-row stack">
+              <label id="bench-serverctx-label">Server context <span class="bench-hint">— the window the backend is launched with, restarted per value</span></label>
+              <div id="bench-serverctx" class="bench-toggles" role="group" aria-labelledby="bench-serverctx-label"></div>
+              <div class="bench-legend">
+                <span>a different question from prompt size: does the model slow down merely because a larger KV cache is allocated? picking more than one restarts the backend between groups</span>
+              </div>
             </div>
             <div class="bench-adv bench-row stack">
               <label id="bench-thinking-label">Thinking <span class="bench-hint">— whether the model reasons before answering</span></label>
@@ -6533,7 +7380,7 @@ async function loadBench() {
             </div>
             <div class="bench-adv bench-row">
               <label for="bench-temp">Temperature</label>
-              <input id="bench-temp" type="text" placeholder="engine default, or 0, 0.2">
+              <input id="bench-temp" type="text" placeholder="engine default, or 0, 0.2" autocomplete="off">
             </div>
           </div>
 
@@ -6545,7 +7392,7 @@ async function loadBench() {
             </div>
             <div class="bench-row stack">
               <label for="bench-maxtok">Max tokens <span class="bench-hint">— cap per response</span></label>
-              <input id="bench-maxtok" type="number" value="256" min="16" max="8192">
+              <input id="bench-maxtok" type="number" value="" placeholder="auto — 1024 graded, 256 speed-only" min="16" max="8192">
             </div>
             <div class="bench-row stack">
               <label for="bench-concur">Concurrency <span class="bench-hint">— parallel requests per cell</span></label>
@@ -6582,9 +7429,9 @@ async function loadBench() {
               <input type="checkbox" id="bench-exclusive" checked>
               <span>Hold other clients<em>they queue until it finishes</em></span>
             </label>
-            <label class="bench-check" title="Unloads other Ollama models before each cell so the model being measured is not sharing VRAM with one that isn't. LM Studio has no unload API and vLLM serves a fixed model, so neither can be evicted this way.">
-              <input type="checkbox" id="bench-evict">
-              <span>Unload other Ollama models<em>before each cell, so nothing idle holds VRAM</em></span>
+            <label class="bench-check" title="Cells an earlier run already measured with identical settings are copied instead of re-run, and say so in the report. Changing any setting changes the cell, so it is measured again. Untick to force a fresh measurement of everything.">
+              <input type="checkbox" id="bench-resume" checked>
+              <span>Reuse completed cells<em>skip what an earlier run already measured with the same settings</em></span>
             </label>
             <label class="bench-check" title="As above, and additionally blocks all proxied traffic with 503 for the duration. Stronger than holding clients, which only queues them.">
               <input type="checkbox" id="bench-quiesce">
@@ -6605,7 +7452,7 @@ async function loadBench() {
       </div>
       <div id="bench-compare-bar" style="display:none;background:#12141b;border:1px solid #2a3e5a;border-radius:6px;padding:8px 10px;margin-bottom:10px;font-size:12px;align-items:center;gap:8px">
         <span style="flex:1" id="bench-compare-label"></span>
-        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Compare ↔</button>
+        <button id="bench-compare-btn" style="background:#2a3e5a;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Report ↗</button>
         <button id="bench-compare-clear" style="background:#262d38;border:none;color:#c9d3e1;border-radius:4px;padding:4px 10px;font-size:11px;cursor:pointer">Clear</button>
       </div>
       <div id="bench-compare-view"></div>
@@ -6617,11 +7464,17 @@ async function loadBench() {
     // 3-context × 2-thinking sweep is 24 cells, which is worth seeing before you start it.
     // The axis widgets keep their own state and call _benchUpdatePlan directly; these are the
     // plain form controls that still need a listener.
-    ['bench-temp', 'bench-runs', 'bench-maxtok', 'bench-suite', 'bench-warmup', 'bench-concur', 'bench-evict']
+    ['bench-temp', 'bench-runs', 'bench-maxtok', 'bench-suite', 'bench-warmup', 'bench-concur']
       .forEach(id => { const el = $(id); if (el) el.addEventListener('change', _benchUpdatePlan); });
     const tempEl = $('bench-temp');
     if (tempEl) tempEl.addEventListener('input', _benchUpdatePlan);
-    $('bench-compare-btn').onclick = _benchRenderCompare;
+    // The selection opens the report — the same whitepaper as any run, over the selected
+    // ids. The old in-page A/B comparison view rendered broken and is retired.
+    $('bench-compare-btn').onclick = () => {
+      if (!_benchSelected.size) return;
+      window.open('/__proxy/api/bench/report?format=html&ids='
+                  + encodeURIComponent([..._benchSelected].join(',')), '_blank');
+    };
     $('bench-compare-clear').onclick = () => { _benchSelected.clear(); _benchUpdateCompareBar(); loadBench(); };
     for (const b of document.querySelectorAll('.bench-mode')) {
       b.onclick = () => _benchSetMode(b.dataset.mode);
@@ -6639,13 +7492,15 @@ async function loadBench() {
     _benchRenderPresetCosts();
     const _hold = $('bench-hold');
     if (_hold) _hold.addEventListener('change', _benchUpdatePlan);
-    const _ev = $('bench-evict-simple');
-    if (_ev) _ev.addEventListener('change', _benchUpdatePlan);
     let _mode = 'simple';
     try { _mode = localStorage.getItem('ai-proxy-bench-mode') || 'simple'; } catch {}
     _benchSetMode(_mode);
     _benchRenderAxes();
-    await _benchPopulateModels();
+    _benchBindSelectAll();
+    // The running-bench banner is the headline; the model list can arrive after it.
+    // Serializing history behind the (slow) models fetch left the page blind to an
+    // ongoing bench for seconds after load.
+    _benchPopulateModels();
   }
   await _benchRefreshHistory();
   if (_benchTimer) clearInterval(_benchTimer);
@@ -6678,8 +7533,18 @@ async function _benchPopulateModels() {
     const sel2 = $('bench-suite');
     // Copy matches the static markup it replaces — the two drifting apart is how a control ends
     // up describing itself two different ways depending on whether a fetch succeeded.
-    if (sel2) sel2.innerHTML = '<option value="">none — measure speed only</option>' +
+    const opts = '<option value="">none — measure speed only</option>' +
       (s.suites || []).map(x => `<option value="${esc(x.name)}">${esc(x.name)} — ${x.task_count} tasks / ${x.case_count} cases</option>`).join('');
+    for (const id of ['bench-suite', 'bench-suite-simple']) {
+      const el = $(id);
+      if (!el) continue;
+      const had = el.value;
+      el.innerHTML = opts;
+      // Preserve a choice across refreshes; otherwise fall back to what the presets have
+      // always used, so adding a suite never silently changes what a run measures.
+      const hasV1 = (s.suites || []).some(x => x.name === 'coding-v1');
+      el.value = had || (hasV1 ? 'coding-v1' : '');
+    }
     _benchRenderPresetCosts();   // task count is only known once the suites have loaded
   } catch { /* suites are optional */ }
   _benchUpdatePlan();
@@ -6732,6 +7597,72 @@ function _benchModelCount() {
   lab.innerHTML = `Models <span class="bench-hint"${hidden ? ' style="color:#f0a35a"' : ''}>${esc(legend)}</span>`;
 }
 
+// What the current selection would cost, from what these models have actually taken before.
+// A "test everything" run is hours, and finding that out an hour in is the failure this
+// prevents. Models never benchmarked fall back to the median of those that have.
+// llama.cpp names a model by its full path, and a split GGUF adds a shard suffix. Fine in the
+// picker, unreadable in a one-line summary.
+// Simple and advanced modes have their own copy of this control, and only one is on screen.
+// Reading just the advanced one meant every preset run silently said "no".
+function _benchResumeOn() {
+  return ['bench-resume', 'bench-resume-simple'].some(id => {
+    const el = $(id);
+    return el && el.offsetParent !== null && el.checked;
+  });
+}
+
+function _benchShortModel(name) {
+  let s = String(name || '').trim();
+  if (!s) return '';
+  const cut = Math.max(s.lastIndexOf('/'), s.lastIndexOf('\\'));
+  if (cut >= 0) s = s.slice(cut + 1);
+  return s.replace(/\.gguf$/i, '').replace(/-\d{4,5}-of-\d{4,5}$/, '');
+}
+
+function _benchSelectionCost() {
+  const el = $('bench-sel-cost');
+  if (!el) return;
+  const picked = Array.from(_benchModelSel).map(k => _benchModelIndex[k]).filter(Boolean);
+  if (!picked.length) { el.textContent = ''; return; }
+  const b = _benchBody();
+  const perModel = Math.max(1, _benchPlanCounts(b).cells / Math.max(1, picked.length));
+  let secs = 0;
+  for (const m of picked) secs += (m.est_cell_s || 0) * perModel;
+  // Each backend beyond the first costs a stop and a full model load.
+  const switches = Math.max(0, new Set(picked.map(m => m.upstream)).size - 1);
+  secs += switches * 420;
+  if (!secs) { el.textContent = ''; return; }
+  const already = picked.filter(m => m.measured_before).length;
+  el.textContent = `≈ ${_benchEta(secs)}` + (switches ? ` · ${switches} backend switch${switches > 1 ? 'es' : ''}` : '')
+    + (already ? ` · ${already} measured before — "Reuse" skips them` : '');
+}
+
+function _benchBindSelectAll() {
+  const all = $('bench-sel-all'), none = $('bench-sel-none');
+  const exp = $('bench-expand');
+  if (exp) exp.onclick = () => {
+    // Sticky either way for the session: the panel must never fold itself away on the next
+    // poll while someone is halfway through changing something, and must never be stuck open.
+    _benchUserExpanded = !_benchUserExpanded;
+    document.querySelector('.bench-form').style.display = _benchUserExpanded ? '' : 'none';
+    exp.textContent = _benchUserExpanded ? 'Hide settings' : 'Change settings';
+  };
+  const ss = $('bench-suite-simple');
+  if (ss) ss.addEventListener('change', _benchUpdatePlan);
+  if (all) all.onclick = () => {
+    // Everything currently listed: with a backend filter on, "all" means all of what you can
+    // see, not a silent sweep of things scrolled out of view.
+    const items = (_benchUpFilter ? _benchModels.filter(m => m.upstream === _benchUpFilter) : _benchModels)
+      .filter(m => m.fits !== false && m.benchable !== false);
+    for (const m of items) _benchModelSel.add(m.key);
+    _benchRenderModels(); _benchUpdatePlan();
+  };
+  if (none) none.onclick = () => {
+    _benchDefaulted = true;            // clearing must stay cleared
+    _benchModelSel.clear(); _benchRenderModels(); _benchUpdatePlan();
+  };
+}
+
 function _benchRenderModels() {
   const host = $('bench-model');
   if (!host) return;
@@ -6743,9 +7674,15 @@ function _benchRenderModels() {
     return;
   }
   // Default to something already resident, so the obvious first run measures a warm model.
-  if (!_benchModelSel.size) {
-    const first = items.find(i => i.loaded) || items[0];
+  // Pre-select something resident on the first render only. This used to run on every render,
+  // so "None" re-added a model the instant it cleared one, and a tick nobody chose could ride
+  // along into a sweep — which is how a run meant for one model spent fourteen minutes on
+  // another. An empty selection is now a state the user can actually be in.
+  if (!_benchModelSel.size && !_benchDefaulted && items.length) {
+    const usable = items.filter(i => i.fits !== false && i.benchable !== false);
+    const first = usable.find(i => i.loaded) || usable[0];
     if (first) _benchModelSel.add(first.key);
+    _benchDefaulted = true;
   }
   const ctx = n => n == null ? '' : (n >= 1024 ? Math.round(n / 1024) + 'K' : String(n));
   const byUp = {};
@@ -6760,16 +7697,46 @@ function _benchRenderModels() {
     return head + byUp[up].map(it => {
       const on = _benchModelSel.has(it.key);
       // Quant and window are the two facts you need beside a benchmark number.
-      const meta = [it.quant, ctx(it.loaded_context || it.max_context)].filter(Boolean).join(' · ');
-      return `<label class="bench-list-row${on ? ' on' : ''}" title="${esc(it.model)}${it.loaded ? ' — loaded' : ' — not loaded'}">
+      // "vision" means it also accepts images, not that it is bad at text: gemma3, gemma4,
+      // llama4 and qwen3.6 all report it and all code perfectly well. Stated as a fact, never
+      // as a warning — a blanket "this will not code well" would have been wrong for five of
+      // the six models on this box that carry the flag.
+      // Same weights reachable through another engine: selecting both is the only controlled
+      // way to ask which engine is faster here, and it is otherwise findable only by noticing
+      // that two rows happen to be the same checkpoint.
+      const alsoOn = (it.also_on || []).length ? 'also on ' + it.also_on.join('/') : '';
+      const meta = [it.quant, it.vision ? 'vision' : '', alsoOn,
+                    ctx(it.loaded_context || it.max_context)].filter(Boolean).join(' · ');
+      // Three states, not two: loaded, startable (a configured container the proxy can bring
+      // up), and merely catalogued. A stopped container used to look identical to a model that
+      // does not exist here.
+      const st = it.loaded ? 'loaded' : (it.startable ? 'startable' : 'cold');
+      const dot = {loaded: ['#3f8f5f', '●'], startable: ['#d9c37a', '◐'], cold: ['#4d5765', '○']}[st];
+      const tip = {loaded: ' — loaded', startable: ' — stopped; the bench starts it',
+                   cold: ' — not loaded'}[st];
+      // A model larger than the machine cannot be measured, so it is not offered. Shown rather
+      // than hidden, with the reason: a model missing from the list is indistinguishable from
+      // one that was never pulled.
+      const blocked = it.fits === false ? (it.fit_detail || "won't fit")
+        : it.benchable === false ? (it.bench_detail || "cannot answer a chat request") : '';
+      if (blocked) {
+        return `<label class="bench-list-row" style="opacity:.5;cursor:not-allowed" title="${esc(it.model)} — ${esc(blocked)}">
+          <input type="checkbox" disabled>
+          <span class="dot" style="color:#7a4a4a">⊘</span>
+          <span class="nm" style="text-decoration:line-through">${esc(it.model)}</span>
+          <span class="meta" style="color:#a06868">${esc(blocked)}</span>
+        </label>`;
+      }
+      return `<label class="bench-list-row${on ? ' on' : ''}" title="${esc(it.model)}${tip}">
         <input type="checkbox" data-key="${esc(it.key)}"${on ? ' checked' : ''}>
-        <span class="dot" style="color:${it.loaded ? '#3f8f5f' : '#4d5765'}">${it.loaded ? '●' : '○'}</span>
+        <span class="dot" style="color:${dot[0]}">${dot[1]}</span>
         <span class="nm">${esc(it.model)}</span>
         <span class="meta">${esc(meta)}</span>
       </label>`;
     }).join('');
   }).join('');
   _benchModelCount();
+  _benchSelectionCost();
   for (const cb of host.querySelectorAll('input[data-key]')) {
     cb.onchange = () => {
       if (cb.checked) _benchModelSel.add(cb.dataset.key);
@@ -6788,6 +7755,10 @@ function _benchRenderModels() {
 const _BENCH_PROMPT_SIZES = [
   ['0', 'short'], ['2000', '2K'], ['4000', '4K'], ['8000', '8K'], ['16000', '16K'],
   ['32000', '32K'], ['65536', '64K'], ['131072', '128K'], ['262144', '256K'],
+];
+// The window llama.cpp is launched with, not the prompt. Empty selection = leave it alone.
+const _BENCH_SERVER_CTX = [
+  ['32768', '32K'], ['65536', '64K'], ['131072', '128K'], ['262144', '256K'],
 ];
 const _BENCH_THINK_OPTS = [
   ['auto', 'auto', "Leave the proxy's per-model quirks in place — what production traffic sees"],
@@ -6818,12 +7789,15 @@ function _benchRenderToggles(hostId, opts, sel) {
 
 function _benchRenderAxes() {
   _benchRenderToggles('bench-prompt', _BENCH_PROMPT_SIZES, _benchPromptSel);
+  _benchRenderToggles('bench-serverctx', _BENCH_SERVER_CTX, _benchServerCtxSel);
   _benchRenderToggles('bench-thinking', _BENCH_THINK_OPTS, _benchThinkSel);
 }
 
 let _benchModelSel = new Set();
+let _benchDefaulted = false;   // the pre-selection is a first-render courtesy, not a floor
 let _benchPromptSel = new Set(['0']);
 let _benchThinkSel = new Set(['auto']);
+let _benchServerCtxSel = new Set();
 let _benchModels = [], _benchUpstreams = [], _benchUpFilter = '';
 
 let _benchModelIndex = {};
@@ -6840,39 +7814,39 @@ function _benchTemps() {
 // both were produced the same way, and picking sizes by hand each time guarantees they weren't.
 const _BENCH_COMMON = {
   runs: 3,
-  max_tokens: 512,
+  max_tokens: 1024,
   suite: 'coding-v1',
   warmup: true,
   bypass_router: true,
   no_nudge: true,
   temperature: 0,
-  // Freeing the GPU entirely (unloading Ollama models) stays opt-in — it evicts models other
-  // people may be mid-conversation with. Holding proxy traffic is different: it delays other
-  // clients rather than disrupting them, and without it the numbers measure whatever else
-  // happened to be running.
+  // Unloading other Ollama models is no longer a choice — a run that leaves them resident
+  // measures a contended box — so the bench evicts before and reloads after. Holding proxy
+  // traffic is still a choice: it delays other clients rather than disrupting them.
   quiesce: false,
   drain_seconds: 5,
 };
 const _BENCH_PRESETS = {
   quick: Object.assign({}, _BENCH_COMMON, {
-    prompt_tokens: 32000, thinking: 'off', cache: 'cached', concurrency: 1,
+    thinking: 'off', cache: 'cached', concurrency: [1, 4],
   }),
   // The shape of a real comparison: context depth, what reasoning costs, whether the prompt
   // cache is doing anything, and how throughput holds up under load. One press instead of a
   // dozen submissions collated by hand afterwards.
   full: Object.assign({}, _BENCH_COMMON, {
-    prompt_tokens: [0, 8000, 32000],
     thinking: ['off', 'on'],
     cache: ['cold', 'cached'],
     concurrency: [1, 4],
   }),
-  // Depth only. Cold prefill at 128K–256K runs into minutes per request, so this drops the
-  // thinking and concurrency axes rather than multiplying them by it.
+  // Depth only, and for a graded suite depth means the window the server was launched with —
+  // the suite sends its own task prompts, so prompt size cannot vary anything. Each value costs
+  // a backend restart and a full model reload, which is why the thinking and concurrency axes
+  // are dropped rather than multiplied by it.
   long: Object.assign({}, _BENCH_COMMON, {
-    prompt_tokens: [32000, 131072, 262144],
+    server_context: [32768, 131072, 262144],
     thinking: 'off',
     cache: ['cold', 'cached'],
-    concurrency: 1,
+    concurrency: [1, 4],
     runs: 2,
   }),
 };
@@ -6880,11 +7854,15 @@ function _benchPreset() {
   const el = document.querySelector('.bench-preset-opt[aria-pressed="true"]');
   const base = _BENCH_PRESETS[(el && el.dataset.preset) || 'quick'] || _BENCH_PRESETS.quick;
   const hold = $('bench-hold');
-  const evict = $('bench-evict-simple');
-  return Object.assign({}, base, {
-    exclusive: !hold || hold.checked,
-    evict_others: !!(evict && evict.checked),
-  });
+  const suiteEl = $('bench-suite-simple');
+  const out = Object.assign({}, base, { exclusive: !hold || hold.checked,
+                                        resume: _benchResumeOn() });
+  if (suiteEl) {
+    // Explicit, including the empty choice: "" means speed only, and must not fall back to
+    // the preset's default.
+    out.suite = suiteEl.value || undefined;
+  }
+  return out;
 }
 
 function _benchSimple() { return document.body.classList.contains('bench-simple'); }
@@ -6938,28 +7916,34 @@ function _benchBody() {
   if (_benchSimple()) return Object.assign({models}, _benchPreset());
   // Sorted so the sweep runs smallest-context-first and the cell order is predictable.
   const prompts = Array.from(_benchPromptSel).map(v => parseInt(v, 10) || 0).sort((a, b) => a - b);
+  const servers = Array.from(_benchServerCtxSel).map(v => parseInt(v, 10) || 0).filter(Boolean).sort((a, b) => a - b);
   const thinking = Array.from(_benchThinkSel);
   const temps = _benchTemps();
+  // Read before the body: prompt size is conditional on it.
+  const suite = $('bench-suite').value;
   const body = {
     models,
     runs: parseInt($('bench-runs').value, 10) || 5,
-    max_tokens: parseInt($('bench-maxtok').value, 10) || 256,
-    prompt_tokens: prompts.length > 1 ? prompts : (prompts[0] || 0),
+    max_tokens: parseInt($('bench-maxtok').value, 10) || undefined,
+    // A graded suite sends its own task prompts, so prompt size has nothing to act on. Sent
+    // as 0 rather than dropped, so the run records that it was not an axis.
+    prompt_tokens: suite ? 0 : (prompts.length > 1 ? prompts : (prompts[0] || 0)),
+    // Omitted entirely when nothing is picked, so the backend is left exactly as found.
+    server_context: servers.length > 1 ? servers : (servers[0] || undefined),
     thinking: thinking.length > 1 ? thinking : (thinking[0] || 'auto'),
     concurrency: parseInt($('bench-concur').value, 10) || 1,
     drain_seconds: parseFloat($('bench-drain').value) || 0,
     randomize: $('bench-randomize').checked,
     exclusive: $('bench-exclusive').checked,
     quiesce: $('bench-quiesce').checked,
-    evict_others: $('bench-evict').checked,
     bypass_router: $('bench-bypass').checked,
     no_nudge: $('bench-nonudge').checked,
     warmup: $('bench-warmup').checked,
+    resume: _benchResumeOn(),
   };
   if (temps) body.temperature = temps.length > 1 ? temps : temps[0];
   // No top-level `upstream`: each selected model already carries its own, which is what makes
   // a mixed-backend sweep possible.
-  const suite = $('bench-suite').value;
   if (suite) body.suite = suite;
   return body;
 }
@@ -6971,6 +7955,7 @@ function _benchPlanCounts(b) {
   const cells = Math.max(1, (b.models || []).length) * n(b.prompt_tokens) * n(b.thinking) *
                 (b.temperature === undefined ? 1 : n(b.temperature)) *
                 (b.cache === undefined ? 1 : n(b.cache)) *
+                (b.server_context === undefined ? 1 : n(b.server_context)) *
                 (b.concurrency === undefined ? 1 : n(b.concurrency));
   const sel = $('bench-suite');
   const opt = b.suite && sel ? Array.from(sel.options).find(o => o.value === b.suite) : null;
@@ -6993,14 +7978,25 @@ function _benchUpdatePlan() {
   const metas = b.models.map(m => _benchModelIndex[`${m.upstream}:${m.model}`]).filter(Boolean);
   const ups = [...new Set(metas.map(m => m.upstream))];
   const route = ups.length ? ` → ${ups.join(' + ')}` : '';
+  // Which models, by name. A count cannot tell you that one of them is a 14-minute model you
+  // did not mean to select.
+  const names = (b.models || []).map(m => _benchShortModel(m.model)).filter(Boolean);
+  const who = (names.length ? `${names.length} model${names.length > 1 ? 's' : ''}: ${names.join(', ')}` : '')
+    + (b.suite ? ` — graded by ${b.suite}` : ' — speed only, nothing graded');
   const warns = [];
   const cold = metas.filter(m => !m.loaded);
   // vLLM can't load anything on demand — the server serves what it was launched with, so an
   // unloaded model there isn't a slow start, it's a guaranteed failure.
-  const impossible = cold.filter(m => m.load_mode === 'fixed').map(m => m.model);
-  const loadable = cold.filter(m => m.load_mode !== 'fixed').map(m => m.model);
+  // A fixed-model backend cannot load a model on request -- unless the proxy can start the
+  // container that already serves it, which it now can. Those are startable, not impossible.
+  const startable = cold.filter(m => m.startable).map(m => m.model);
+  const impossible = cold.filter(m => m.load_mode === 'fixed' && !m.startable).map(m => m.model);
+  const loadable = cold.filter(m => m.load_mode !== 'fixed' && !m.startable).map(m => m.model);
   if (impossible.length) {
     warns.push({level: 'bad', text: `${impossible.join(', ')} not loaded on vLLM — it only serves what its server was launched with, so this will fail`});
+  }
+  if (startable.length) {
+    warns.push({level: 'info', text: `↻ ${startable.join(', ')} is configured but not running — the bench starts it first (a few minutes) and stops it again afterwards`});
   }
   if (loadable.length) {
     warns.push(b.warmup
@@ -7008,12 +8004,24 @@ function _benchUpdatePlan() {
       : {level: 'bad', text: `⚠ ${loadable.join(', ')} not loaded and warm-up is off — load time will land in the first measurement`});
   }
   // A prompt bigger than the model's window returns an empty completion, not an error — worth
-  // catching before you spend a sweep discovering it.
+  // catching before you spend a sweep discovering it. Backends whose window is a launch
+  // argument get resized to fit instead, so those are told apart here: one is a warning, the
+  // other is just something that is about to happen.
   const ctxSizes = Array.isArray(b.prompt_tokens) ? b.prompt_tokens : [b.prompt_tokens];
   const biggest = Math.max(...ctxSizes.map(Number), 0);
+  const canResize = new Set(_benchUpstreams.filter(u => u.resizable_context).map(u => u.upstream));
   const tooSmall = metas.filter(m => (m.max_context || 0) > 0 && biggest > m.max_context * 0.9);
-  if (tooSmall.length) {
-    warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${tooSmall.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — expect empty completions`});
+  const fixable = tooSmall.filter(m => canResize.has(m.upstream));
+  const stuck = tooSmall.filter(m => !canResize.has(m.upstream));
+  if (stuck.length) {
+    warns.push({level: 'bad', text: `⚠ ${biggest.toLocaleString()} prompt tokens is at or over the window of ${stuck.map(m => m.model + ' (' + m.max_context.toLocaleString() + ')').join(', ')} — the run will be refused rather than return empty completions`});
+  }
+  const svc = Array.isArray(b.server_context) ? b.server_context : (b.server_context ? [b.server_context] : []);
+  if (svc.length > 1) {
+    warns.push({level: 'info', text: `↻ ${svc.length} server-context values — the backend restarts and reloads once per value, which dominates the run time`});
+  }
+  if (fixable.length) {
+    warns.push({level: 'info', text: `↻ ${fixable.map(m => m.upstream).filter((v, i, a) => a.indexOf(v) === i).join(', ')} will be restarted at a larger window to fit ${biggest.toLocaleString()} tokens, then put back — this adds several minutes`});
   }
   // Warnings go on their own line: inline they read as part of the sentence, and the ones that
   // matter ("this will fail") deserve to be seen before the button is pressed, not skimmed past.
@@ -7027,18 +8035,303 @@ function _benchUpdatePlan() {
     grading = `<div style="color:#667;margin-top:2px">grades by executing the returned code in an isolated subprocess with a timeout</div>`;
   }
   let iso = '';
-  if (b.exclusive || b.quiesce || b.evict_others) {
-    const bits = [];
+  // Always true now, so it is stated rather than conditioned on a checkbox that no longer
+  // exists: leaving other models resident measures a contended box, not the model.
+  const always = 'other Ollama models are unloaded first and reloaded afterwards';
+  if (b.exclusive || b.quiesce) {
+    const bits = [always];
     if (b.exclusive) bits.push('other proxy clients queue until this finishes');
-    if (b.evict_others || b.quiesce) bits.push('other Ollama models are unloaded before each cell');
+    if (b.quiesce) bits.push('every backend is stopped and restored around the run');
     if (b.quiesce) bits.push('all proxied traffic is blocked for the duration');
     iso = `<div style="color:#d9c37a;margin-top:2px">⏸ ${esc(bits.join(' · '))}</div>`;
   } else {
-    iso = `<div style="color:#f0a35a;margin-top:2px">⚠ other traffic keeps running — it will be measured along with the model</div>`;
+    iso = `<div style="color:#d9c37a;margin-top:2px">⏸ ${esc(always)}</div>`
+        + `<div style="color:#f0a35a;margin-top:2px">⚠ other traffic keeps running — it will be measured along with the model</div>`;
   }
-  el.innerHTML = scale + esc(route) + warns.map(w =>
+  const whoLine = who ? `<div style="color:#9aa4b2;margin-top:2px">${esc(who)}</div>` : '';
+  el.innerHTML = scale + esc(route) + whoLine + warns.map(w =>
     `<div style="color:${w.level === 'bad' ? '#f0a35a' : '#667'};margin-top:2px">${esc(w.text)}</div>`).join('')
     + iso + grading;
+}
+
+// The server refuses a second submission outright; this is so the button says so before it is
+// pressed rather than after. Server-side stays authoritative — this is the same answer arriving
+// earlier, not a substitute for it.
+// The running card, and folding the setup away behind it. Driven from the same poll as the
+// history so the two can never disagree about whether something is running.
+function _benchRenderActive(it) {
+  const card = $('bench-active');
+  const form = document.querySelector('.bench-form');
+  const strip = $('bench-collapsed');
+  if (!card || !form || !strip) return;
+  if (!it) {
+    card.innerHTML = '';
+    _benchMiniSetRunning(false);
+    _benchLeadSetRunning('');
+    // Back to the ordinary layout, and the toggle forgets itself: the next run should start
+    // collapsed regardless of what was expanded during the last one.
+    form.style.display = '';
+    strip.style.display = 'none';
+    _benchUserExpanded = false;
+    return;
+  }
+  _benchMiniSetRunning(true);
+  _benchLeadSetRunning(it.id);
+  const c = it.cells || {};
+  const n = c.now || {};
+  const cfg = it.config || {};
+  const total = c.total || it.progress_total || 0;
+  const done = (c.done || 0) + (c.failed || 0) + (c.skipped || 0);
+  const sweepPct = total ? Math.round(done / total * 100) : 0;
+  const cellPct = n.progress_total ? Math.round((n.progress || 0) / n.progress_total * 100) : 0;
+  // The axes, not the model path — the model is the same across most cells of a sweep.
+  const axes = String(n.label || '').split(' · ');
+  const who = _benchShortModel(axes[0] || it.model || '');
+  // Always here: this is the one line saying what is running right now, and "which engine" is
+  // part of that even when the sweep only touches one.
+  const rest = axes.slice(1).filter(Boolean).join(' · ');
+  card.innerHTML = `
+    <div class="bench-live">
+      <div class="top"><span class="dot"></span><span>Running</span>
+        ${cfg.suite ? `<span>· ${esc(cfg.suite)}</span>` : '<span>· speed only</span>'}
+        <span class="cells">${done} / ${total} cells${c.eta_s > 0 ? ` · ~${_benchEta(c.eta_s)} left` : ''}</span>
+      </div>
+      <div class="track sweep"><i style="width:${sweepPct}%"></i></div>
+      ${n.label ? `<p class="cur"><b>${esc(who)}</b>${rest ? ' · ' + esc(rest) : ''}
+         <span style="float:right;color:#8b97a8;font-size:12px">${n.progress || 0}/${n.progress_total || '?'}</span></p>
+        <div class="track"><i style="width:${cellPct}%"></i></div>` : ''}
+      ${n.phase ? `<p class="phase">⏳ ${esc(n.phase)}</p>` : ''}
+      ${it.phase && !n.phase ? `<p class="phase">⏳ ${esc(it.phase)}</p>` : ''}
+      ${it.memory_warning ? `<p class="warn">⚠ measured under memory pressure — ${esc(it.memory_warning)}</p>` : ''}
+      <div class="bench-mini" id="bench-mini"></div>
+      <div class="bench-lead" id="bench-lead"></div>
+      <div class="bench-queue" id="bench-queue"></div>
+      <div class="foot">
+        ${c.failed ? `<span style="color:#e08080">${c.failed} failed</span>` : ''}
+        <a href="#" onclick="event.preventDefault();setView('live')" title="Watch the requests as they run">Live ↗</a>
+      </div>
+    </div>`;
+  _benchMiniRender();
+  _benchLeadRender();
+  _benchQueueRender();
+  // The strip is always present while a run is live; only the form comes and goes. Hiding the
+  // strip on expand left no way back, because the strip held the only control that could undo
+  // it.
+  strip.style.display = 'flex';
+  form.style.display = _benchUserExpanded ? '' : 'none';
+  const models = (cfg.models || []).length || 1;
+  $('bench-collapsed-what').textContent =
+    `${models} model${models > 1 ? 's' : ''} · ${cfg.suite || 'speed only'} · ${cfg.runs || 1} run${(cfg.runs || 1) > 1 ? 's' : ''}`;
+  const btn = $('bench-expand');
+  if (btn) btn.textContent = _benchUserExpanded ? 'Hide settings' : 'Change settings';
+}
+
+let _benchUserExpanded = false;
+let _benchMiniTiles = [];
+let _benchLeadRows = [];
+let _benchLeadAll = false;
+let _benchLeadTimer = null;
+let _benchLeadFor = '';
+
+// Cells that have finished already carry full results, and the report endpoint expands a
+// running parent to its children — so the standings exist long before the sweep does. Held
+// outside the card for the same reason as the tiles: the card is rebuilt on every history poll.
+// The '@backend' token in a cell label was being stripped as noise. On a mixed run it is the
+// only thing telling qwen3-coder-next on Ollama from the same weights on vLLM — without it the
+// standings show what looks like one model listed twice.
+function _benchCellBits(label, showBackend) {
+  const parts = String(label || '').split(' · ').slice(1);
+  return parts.filter(x => x && (showBackend || !x.startsWith('@')));
+}
+
+function _benchBackendsIn(rows) {
+  const ups = new Set();
+  for (const r of rows || []) {
+    const at = String(r.label || '').split(' · ').find(x => x.startsWith('@'));
+    if (at) ups.add(at);
+  }
+  return ups.size;
+}
+
+function _benchLeadRender() {
+  const host = $('bench-lead');
+  if (!host) return;
+  const rows = (_benchLeadRows || []).filter(r => r.decode_p50 != null);
+  if (!rows.length) { host.innerHTML = ''; return; }
+  const graded = rows.some(r => r.perfect_rate != null);
+  // Quality first, speed as the tiebreak: the question a benchmark answers is "which of these
+  // is good", and among the good ones, "which is quickest".
+  rows.sort((a, b) => (b.perfect_rate ?? -1) - (a.perfect_rate ?? -1)
+                   || (b.decode_p50 || 0) - (a.decode_p50 || 0));
+  const multi = _benchBackendsIn(rows) > 1;
+  const top = _benchLeadAll ? rows : rows.slice(0, 6);
+  // The columns were bare numbers: "100%" and "63.7 tok/s" with nothing saying what either
+  // measured. The rate is specifically output tokens after the first one — prefill excluded —
+  // which is not guessable from the figure.
+  host.innerHTML = `<h4>Standings — ${rows.length} cell${rows.length > 1 ? 's' : ''} in</h4>
+    <div class="${_benchLeadAll ? 'scroll' : ''}"><table>
+    <thead><tr><th></th><th></th>
+      ${graded ? '<th class="n" title="Share of tasks where every test case passed">correct</th>' : ''}
+      <th class="n" title="Output tokens per second, measured after the first token — prefill is not counted">output tok/s</th>
+    </tr></thead>
+    <tbody>${top.map((r, i) => {
+      const bits = _benchCellBits(r.label, multi);
+      const q = r.perfect_rate;
+      const cls = q == null ? '' : (q >= 0.9 ? 'q' : q >= 0.6 ? 'q mid' : 'q low');
+      return `<tr>
+        <td class="rk">${i + 1}</td>
+        <td class="nm">${esc(_benchShortModel(r.model || ''))}
+          ${bits.length ? `<span class="ax">· ${esc(bits.join(' · '))}</span>` : ''}</td>
+        ${graded ? `<td class="n ${cls}">${q == null ? '—' : Math.round(q * 100) + '%'}</td>` : ''}
+        <td class="n">${(r.decode_p50 || 0).toFixed(1)} tok/s</td>
+      </tr>`;
+    }).join('')}</tbody></table></div>
+    ${rows.length > 6
+      ? `<button type="button" class="more" id="bench-lead-more">${
+          _benchLeadAll ? 'Show the top 6' : `See all ${rows.length} results`}</button>`
+      : ''}`;
+  const more = $('bench-lead-more');
+  // Rebound on every render because the table is replaced wholesale; a listener attached once
+  // would be lost the first time a cell finished.
+  if (more) more.onclick = () => {
+    _benchLeadAll = !_benchLeadAll;
+    _benchLeadRender();
+    _benchQueueRender();
+  };
+}
+
+// What is coming, in the order it will actually happen. The rows arrive from the report in
+// run order, so the ones without results are the queue — no extra polling, and it cannot
+// disagree with what the runner will do because it is the same list.
+function _benchQueueRender() {
+  const host = $('bench-queue');
+  if (!host) return;
+  const pending = (_benchLeadRows || []).filter(r => r.decode_p50 == null);
+  if (!pending.length) { host.innerHTML = ''; return; }
+  const multi = _benchBackendsIn(_benchLeadRows) > 1;
+  const show = _benchLeadAll ? pending : pending.slice(0, 5);
+  host.innerHTML = `<h4>Up next — ${pending.length} to go</h4>
+    <p class="rule">backend, then context window, then model name, then cold before cached</p>
+    <ol>${show.map((r, i) => {
+      const bits = _benchCellBits(r.label, multi);
+      return `<li class="${i === 0 ? 'next' : ''}">
+        <span class="pos">${i + 1}</span>
+        <span class="m">${esc(_benchShortModel(r.model || ''))}</span>
+        <span class="ax">${esc(bits.join(' · '))}</span>
+      </li>`;
+    }).join('')}</ol>
+    ${pending.length > show.length ? `<div class="rest">+ ${pending.length - show.length} more</div>` : ''}`;
+}
+
+async function _benchLeadPoll() {
+  if (!_benchLeadFor) return;
+  try {
+    const r = await fetch('/__proxy/api/bench/report?format=json&ids=' + encodeURIComponent(_benchLeadFor));
+    const d = await r.json();
+    _benchLeadRows = d.rows || [];
+  } catch { /* leave the last standings up rather than blanking them */ }
+  _benchLeadRender();
+  _benchQueueRender();
+}
+
+function _benchLeadSetRunning(id) {
+  // Slower than the live strip on purpose: this rebuilds every child's summary server-side, and
+  // standings that change once a cell finishes do not need a two-second refresh.
+  if (id && _benchLeadFor !== id) {
+    _benchLeadFor = id;
+    _benchLeadRows = [];
+    _benchLeadAll = false;
+    _benchLeadPoll();
+  }
+  if (id && !_benchLeadTimer) {
+    _benchLeadTimer = setInterval(_benchLeadPoll, 15000);
+  } else if (!id && _benchLeadTimer) {
+    clearInterval(_benchLeadTimer);
+    _benchLeadTimer = null;
+    _benchLeadFor = '';
+    _benchLeadRows = [];
+  }
+}
+let _benchMiniTimer = null;
+
+// The card is rebuilt on every history poll, so the tiles are held outside it and repainted
+// into whatever the current DOM node is. Rendering straight from the fetch would blank the
+// strip every time the slower history poll came back.
+function _benchMiniRender() {
+  const host = $('bench-mini');
+  if (!host) return;
+  const tiles = (_benchMiniTiles || []).slice(0, 4);
+  if (!tiles.length) {
+    host.innerHTML = '<div class="idle">nothing in flight</div>';
+    return;
+  }
+  // Scale the rate bars against the fastest thing on screen rather than a fixed ceiling: a
+  // 300 tok/s model and a 6 tok/s one both need to look like they are doing something.
+  const peak = Math.max(...tiles.map(t => t.tps || 0), 1);
+  host.innerHTML = tiles.map(t => {
+    const st = t.done ? 'DONE' : (t.state || 'THINKING');
+    const streaming = !t.done && st === 'STREAMING';
+    // Prompt while it is still reading, response once it is producing one. Mid-stream the
+    // prompt tells you nothing you did not already know.
+    const showResp = t.done || streaming;
+    const body = showResp ? (t.response || '') : (t.prompt || '');
+    const text = t.redacted
+      ? '<i style="color:#4d5765">redacted for this viewer</i>'
+      : esc((body || '').slice(-260)) + (streaming ? '<span class="caret"></span>' : '');
+    const rate = t.tps ? `${t.tps} tok/s out` : (t.itps ? `${t.itps} tok/s in` : '');
+    const pct = t.tps ? Math.max(4, Math.round(t.tps / peak * 100)) : 0;
+    return `<div class="bench-tile ${esc(st)}">
+      <div class="hd">
+        <span class="chip">${esc(st)}</span>
+        <span class="who">${esc(_benchShortModel(t.model || '?'))}${t.upstream ? ` <span style="color:#6b7787">@${esc(t.upstream)}</span>` : ''}</span>
+        <span class="clock">${((t.elapsed_ms || 0) / 1000).toFixed(1)}s</span>
+      </div>
+      <div class="body${showResp ? '' : ' ask'}">${text || '<span style="color:#4d5765">…</span>'}</div>
+      ${rate ? `<div class="rate"><span>${esc(rate)}</span>
+        <span class="bar"><i style="width:${pct}%"></i></span>
+        <span>${t.otok || 0} tok</span></div>` : ''}
+    </div>`;
+  }).join('');
+}
+
+
+async function _benchMiniPoll() {
+  try {
+    const d = await (await fetch('/__proxy/api/live')).json();
+    _benchMiniTiles = d.tiles || [];
+  } catch { _benchMiniTiles = []; }
+  _benchMiniRender();
+}
+
+function _benchMiniSetRunning(on) {
+  // Only polls while a run is actually on screen: a second 2s poll running forever, for a panel
+  // nobody is looking at, is exactly the sort of thing that ends up blamed on the box.
+  if (on && !_benchMiniTimer) {
+    _benchMiniPoll();
+    _benchMiniTimer = setInterval(_benchMiniPoll, 2000);
+  } else if (!on && _benchMiniTimer) {
+    clearInterval(_benchMiniTimer);
+    _benchMiniTimer = null;
+    _benchMiniTiles = [];
+  }
+}
+
+function _benchSetGoState(active) {
+  const btn = $('bench-go');
+  if (!btn) return;
+  if (active) {
+    btn.disabled = true;
+    btn.textContent = 'Benchmark running…';
+    btn.title = `${active.label || active.model} is still running — one bench at a time`;
+  } else if (btn.disabled) {
+    btn.disabled = false;
+    btn.textContent = 'Run benchmark';
+    btn.title = '';
+    // Clear a stale "already running" refusal so the panel does not accuse the user of
+    // something that stopped being true while they were reading it.
+    const errEl = $('bench-go-err');
+    if (errEl && /already running/.test(errEl.textContent)) errEl.textContent = '';
+  }
 }
 
 async function _benchSubmit() {
@@ -7078,13 +8371,33 @@ async function _benchRefreshHistory() {
     const empty = wrap.querySelector('[data-bench-empty]');
     if (empty) empty.remove();
     _benchSyncRows(wrap, items);
+    const live = items.find(i => i.status === 'running' || i.status === 'pending');
+    _benchSetGoState(live);
+    _benchRenderActive(live);
   } catch (e) {
     wrap.innerHTML = `<div style="color:#f07178">${esc(e.message)}</div>`;
   }
 }
 
+// Coarse on purpose: a bench ETA that reads "7m 42s" claims a precision the estimate does not
+// have, and watching seconds tick invites treating it as a promise.
+function _benchEta(sec) {
+  const m = Math.round(sec / 60);
+  if (m < 1) return 'under a minute';
+  if (m < 60) return `${m} min`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${String(m % 60).padStart(2, '0')}m`;
+}
+
 function _benchRowSig(it) {
+  // The cell rollup belongs here: a sweep's row is otherwise only redrawn when the parent's
+  // own counters move, so "3 done, 1 failed" would freeze while the matrix kept running.
+  const c = it.cells || {}, n = c.now || {};
   return [it.status, it.progress, it.progress_total, it.error || '',
+          c.total, c.done, c.failed, c.skipped, c.running, c.pending,
+          // Bucketed: the raw value moves every poll and would redraw the row each time.
+          c.eta_s === undefined ? '' : Math.round(c.eta_s / 60),
+          n.label, n.progress, n.progress_total, n.phase, it.phase, it.memory_warning,
           _benchSelected.has(it.id) ? 1 : 0].join('|');
 }
 
@@ -7093,13 +8406,45 @@ function _benchRowHead(it) {
   const isSelected = _benchSelected.has(it.id);
   let summaryLine = '';
   let resultsBlock = '';
+  // A sweep's cells are not listed separately any more, so its outcome has to be legible from
+  // the one row: "done" alone hides a matrix that skipped or failed half of itself.
+  const cells = it.cells;
+  let cellNote = '';
+  if (cells && cells.total) {
+    const bits = [];
+    if (cells.done) bits.push(`${cells.done} done`);
+    if (cells.failed) bits.push(`<span style="color:#e08080">${cells.failed} failed</span>`);
+    if (cells.skipped) bits.push(`<span style="color:#d9c37a">${cells.skipped} skipped</span>`);
+    const pend = (cells.pending || 0) + (cells.running || 0);
+    if (pend) bits.push(`${pend} to go`);
+    if (cells.eta_s > 0) bits.push(`~${_benchEta(cells.eta_s)} left`);
+    cellNote = ` · <span style="color:#888">${cells.total} cells: ${bits.join(', ')}</span>`;
+    // Which cell is in flight. Without this the row sits at "0 done" for the length of a
+    // whole cell, which on a graded 262k sweep is many minutes of looking stuck.
+    if (cells.now) {
+      const n = cells.now;
+      const frac = n.progress_total ? ` ${n.progress || 0}/${n.progress_total}` : '';
+      // The label leads with the model path on llama.cpp runs; the axes are the useful part.
+      const short = String(n.label || '').split(' · ').slice(1).join(' · ') || n.label || '';
+      cellNote += `<div style="color:#7af;margin-top:2px">▸ ${esc(short)}${frac}</div>`;
+      // Loading 90 GB of weights looks exactly like a hang: a counter that does not move and
+      // nothing saying why. Say what it is doing instead.
+      if (n.phase) cellNote += `<div style="color:#d9c37a;margin-top:2px">⏳ ${esc(n.phase)}</div>`;
+    }
+  }
   if (it.status === 'running' || it.status === 'pending') {
     const total = it.progress_total || cfg.runs || 0;
-    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}`;
+    const own = (it.phase && !(cells && cells.now && cells.now.phase))
+      ? `<div style="color:#d9c37a;margin-top:2px">⏳ ${esc(it.phase)}</div>` : '';
+    summaryLine = `<span style="color:#7af">${esc(it.status)}</span> · ${it.progress || 0}/${total}${cellNote}${own}`;
   } else if (it.status === 'failed') {
     summaryLine = `<span style="color:#e08080">failed</span> · ${esc(it.error || '')}`;
   } else if (it.status === 'done') {
-    summaryLine = `<span style="color:#5a5">✓ done</span>`;
+    summaryLine = `<span style="color:#5a5">✓ done</span>${cellNote}`;
+  }
+  // Ran but short of memory: the numbers exist and should not be trusted as a comparison.
+  if (it.memory_warning) {
+    summaryLine += `<div style="color:#f0a35a;margin-top:2px">⚠ measured under memory pressure — ${esc(it.memory_warning)}</div>`;
   }
   return `
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px">
@@ -7111,6 +8456,7 @@ function _benchRowHead(it) {
         <span style="margin-left:auto;color:#888">${_benchAgo(it.ts)}</span>
         <span>${summaryLine}</span>
         ${it.status === 'done' ? `<a href="/__proxy/api/bench/report?format=html&ids=${encodeURIComponent(it.id)}" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="Standalone HTML report — print it to PDF from the browser" style="color:#57d1e0;font-size:11px;text-decoration:none;border:1px solid #2a4a52;border-radius:3px;padding:2px 8px">Report ↗</a>` : ''}
+        ${it.status === 'running' || it.status === 'pending' ? `<a href="#" onclick="event.stopPropagation();event.preventDefault();setView('live')" title="Watch the bench's requests as they run — they appear as ai-proxy-bench" style="color:#7af;font-size:11px;text-decoration:none;border:1px solid #2a4458;border-radius:3px;padding:2px 8px">Live ↗</a>` : ''}
         <button type="button" data-bench-del title="Delete this run" style="background:none;border:1px solid #4a2020;color:#e08080;border-radius:3px;padding:2px 8px;font-size:11px;cursor:pointer">🗑</button>
       </div>`;
 }
@@ -7265,9 +8611,10 @@ function _benchUpdateCompareBar() {
   const bar = $('bench-compare-bar');
   if (_benchSelected.size === 0) { bar.style.display = 'none'; return; }
   bar.style.display = 'flex';
-  $('bench-compare-label').textContent = `${_benchSelected.size} selected for comparison`;
-  // Two runs get a delta column; more than two get a ranked table. One is never useful.
-  $('bench-compare-btn').disabled = _benchSelected.size < 2;
+  $('bench-compare-label').textContent =
+    `${_benchSelected.size} selected — one report over all of them`;
+  // Even a single selection is a valid report; it is the same page a finished run links to.
+  $('bench-compare-btn').disabled = _benchSelected.size < 1;
 }
 
 async function _benchRenderCompare() {
@@ -7517,7 +8864,7 @@ async function loadTasks() {
         <textarea id="t2-prompt" rows="3" placeholder="What should it do?" style="width:100%;background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:4px;padding:8px;font-family:inherit;font-size:13px;resize:vertical;box-sizing:border-box;margin-bottom:6px"></textarea>
         <div style="display:flex;gap:8px;flex-wrap:wrap;font-size:12px;margin-bottom:6px;align-items:center">
           <label id="t2-model-wrap">Model <select id="t2-model" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px;min-width:220px"></select></label>
-          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
+          <input id="t2-schedule" placeholder="schedule: blank, 'every 30m', cron" autocomplete="off" style="background:#0a0d12;border:1px solid #262d38;color:#c9d3e1;border-radius:3px;padding:3px 6px;font-size:12px;flex:1;min-width:200px">
         </div>
         <button id="t2-add" style="background:#2a3e5a;border:1px solid #3a4e6a;color:#c9d3e1;border-radius:4px;padding:6px 14px;font-size:13px;cursor:pointer">Queue task</button>
         <span id="t2-err" style="color:#e08080;font-size:11px;margin-left:8px"></span>

@@ -543,20 +543,38 @@ def test_startup_fails_runs_left_queued_by_a_restart(tmp_path, monkeypatch):
 
 # ---- report theming / usage report ---------------------------------------------------------
 
-def test_reports_share_the_dashboard_theme():
-    """Reports are read next to the UI they came from; a different skin reads as a different
-    tool. Both report types render from one shell, dark by default with a light counterpart."""
+def test_reports_are_whitepapers_in_both_themes():
+    """Reports became documents rather than dashboard panels: paper-light by default, dark via
+    the viewer's OS preference, printable either way. Both report types share the one shell,
+    and the charts take their colours from the same tokens — including the label halo, which
+    strokes in --bg so text stays legible on top of data on either ground."""
     run = {"id": "b", "ts": 1785000000.0, "label": "m", "model": "m", "config": {}, "env": {},
            "results": {"summary": {"n_total": 1, "n_success": 1}}}
     bench = p._bench_report_html([run], [p._bench_report_row(run)])
     usage = p._stats_report_html({"overall": {"count": 0}}, {})
     for html in (bench, usage):
-        assert "--accent:#57d1e0" in html, "dashboard accent missing"
-        assert "prefers-color-scheme: light" in html, "no light counterpart"
+        assert "--bg:#FFFFFF" in html, "light paper default missing"
+        assert "prefers-color-scheme: dark" in html, "no dark counterpart"
+        assert "--bg:#121418" in html, "dark tokens missing"
         assert "@media print" in html, "not printable"
         # Self-contained: no external fetches of any kind.
         for external in ('src="http', 'href="http', "@import", "fonts.googleapis"):
             assert external not in html
+    assert 'stroke="var(--bg)"' in p._SVG_HALO, "halo must stroke in the page colour"
+
+
+def test_the_theme_toggle_and_the_media_query_cannot_disagree():
+    """The OS preference applies a theme via the media query; the button stamps data-theme,
+    which must win in both directions. Both paths are emitted from the same constants, and the
+    toggle ships as the page's one self-contained script."""
+    css = p._REPORT_CSS
+    assert css.count(p._REPORT_TOKENS_DARK) == 2, "media-query and data-theme dark drifted"
+    assert css.count(p._REPORT_TOKENS_LIGHT) == 2
+    assert ':root[data-theme="dark"]' in css and ':root[data-theme="light"]' in css
+    head = p._report_head("t", "e")
+    assert 'id="themeflip"' in head
+    assert "localStorage" in head
+    assert "prefers-color-scheme: dark" in head
 
 
 def test_usage_report_survives_an_empty_database():
@@ -683,7 +701,7 @@ def test_vllm_control_refuses_a_remote_server(monkeypatch):
 
 
 def test_model_control_rejects_vllm_without_a_container(client, monkeypatch):
-    async def no_container():
+    async def no_container(*a, **k):
         return None
     monkeypatch.setattr(p, "_vllm_container", no_container)
     for path in ("load", "unload"):
@@ -701,16 +719,22 @@ def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
     """Starting the vLLM container is the whole operation — the server already knows its model.
     Requiring a name here made it impossible to start vLLM through the proxy at all, which was
     only discovered after stopping it."""
-    async def fake_container():
+    async def fake_container(*a, **k):
         return "qwen-vllm"
     async def fake_run(args, timeout=120.0):
         return 0, "qwen-vllm"
-    async def fake_ready(t):
+    async def fake_ready(t, *a, **k):
         return True
     monkeypatch.setattr(p, "_vllm_container", fake_container)
     monkeypatch.setattr(p, "_run_cmd", fake_run)
     monkeypatch.setattr(p, "_vllm_ready", fake_ready)
     monkeypatch.setattr(p, "_docker_bin", lambda: "/usr/bin/docker")
+    # This test is about not requiring a model name, so the memory guard must not be the thing
+    # under test. Left unstubbed it priced the boot against the RUNNER's own RAM: fine on a
+    # workstation, a 409 on a 16 GB CI box. None is the guard's own "cannot compute" skip.
+    async def _no_claim(*a, **k):
+        return None
+    monkeypatch.setattr(p, "_vllm_boot_claim_mb", _no_claim)
     r = client.post("/__proxy/api/control/models/load", json={"upstream": "vllm"})
     assert r.status_code == 200, r.text
     body = r.json()
@@ -723,7 +747,7 @@ def test_starting_vllm_does_not_require_a_model_name(client, monkeypatch):
 def test_vllm_switch_refuses_a_container_that_does_not_publish_our_port(client, monkeypatch):
     """Starting a container that binds a different port would succeed at the Docker level and
     then never be reachable — a success message for a server the proxy cannot talk to."""
-    async def configs():
+    async def configs(*a, **k):
         return [{"container": "other-vllm", "running": False, "serves_port": False,
                  "model": "x", "checkpoint": "x", "quant": None, "max_model_len": None,
                  "kv_cache_dtype": None, "prefix_caching": False, "args": ""}]
@@ -736,7 +760,7 @@ def test_vllm_switch_refuses_a_container_that_does_not_publish_our_port(client, 
 
 
 def test_vllm_switch_reports_unknown_containers_with_the_alternatives(client, monkeypatch):
-    async def configs():
+    async def configs(*a, **k):
         return [{"container": "qwen-vllm", "running": True, "serves_port": True, "model": "q",
                  "checkpoint": "q", "quant": None, "max_model_len": None, "kv_cache_dtype": None,
                  "prefix_caching": False, "args": ""}]
@@ -780,3 +804,35 @@ def test_explicit_container_list_excludes_everything_else(monkeypatch):
     monkeypatch.setattr(p, "load_rules_config",
                         lambda: {"model_control": {"vllm_containers": ["qwen-vllm", "ornith-vllm"]}})
     assert {c["container"] for c in asyncio.run(p._vllm_configs())} == {"qwen-vllm", "ornith-vllm"}
+
+
+def test_vllm_container_prefers_the_running_one(monkeypatch):
+    """qwen-vllm and ornith-vllm are both configured for port 8001, one running at a time.
+    Returning the first match made "stop vLLM" target whichever sorted first — the bench once
+    stopped the already-exited container, reported success, and left the running one's ~45 GB
+    resident while a 123B model tried to load beside it."""
+    monkeypatch.setattr(p, "VLLM_URL", "http://localhost:8001")
+    monkeypatch.setattr(p, "_docker_bin", lambda: "docker")
+
+    async def fake_run(cmd, timeout, max_chars=200000):
+        if cmd[1] == "ps":
+            return 0, "qwen-vllm\nornith-vllm\n"
+        return 0, ('/qwen-vllm\tfalse\t{"8000/tcp":[{"HostPort":"8001"}]}\n'
+                   '/ornith-vllm\ttrue\t{"8000/tcp":[{"HostPort":"8001"}]}\n')
+
+    monkeypatch.setattr(p, "_run_cmd", fake_run)
+    assert asyncio.run(p._vllm_container()) == "ornith-vllm"
+
+
+def test_vllm_container_falls_back_to_first_configured_when_none_runs(monkeypatch):
+    monkeypatch.setattr(p, "VLLM_URL", "http://localhost:8001")
+    monkeypatch.setattr(p, "_docker_bin", lambda: "docker")
+
+    async def fake_run(cmd, timeout, max_chars=200000):
+        if cmd[1] == "ps":
+            return 0, "qwen-vllm\nornith-vllm\n"
+        return 0, ('/qwen-vllm\tfalse\t{"8000/tcp":[{"HostPort":"8001"}]}\n'
+                   '/ornith-vllm\tfalse\t{"8000/tcp":[{"HostPort":"8001"}]}\n')
+
+    monkeypatch.setattr(p, "_run_cmd", fake_run)
+    assert asyncio.run(p._vllm_container()) == "qwen-vllm"

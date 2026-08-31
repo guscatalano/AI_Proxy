@@ -9,7 +9,7 @@ Built around two ideas:
 1. **Observability without changing your client** — set `ANTHROPIC_BASE_URL` (or `OPENAI_BASE_URL`, or `OLLAMA_HOST`) to the proxy and every request, response, tool call, token count, and conversation thread is captured automatically.
 2. **Rules that improve model behavior** — pre/post-flight hooks catch loops, fix malformed tool calls, prune unused tools, compress bloated context, prevent silent context-window truncation, route requests across models, and more.
 
-![Live traffic flow with rule pipeline](docs/screenshots/tab-stats.png)
+![Live traffic flow with rule pipeline](docs/screenshots/stats-flow.png)
 
 ---
 
@@ -40,7 +40,9 @@ Built around two ideas:
 - **Identify the client app** — distinguishes Claude Code, VS Code Copilot Chat, Cursor, Continue, Cline, Anthropic SDK, OpenAI SDK, LangChain, Hermes Agent, browsers, etc. via header, User-Agent, and system-prompt fingerprinting.
 - **Track artifacts** — every file, URL, directory, and image the model touched through a tool call, extracted from request bodies and aggregated by path. Drill down by conversation, browse the file tree, see each write's content size, and read the captured content inline.
 - **Aggregate stats** — per-model, per-client, per-app, per-tool counts, tokens, latency percentiles, and throughput, plus trend charts over time.
-- **System metrics** — CPU, memory, GPU utilization and VRAM, loaded models on Ollama / LM Studio / vLLM, Ollama's server config, and an update check against a minimum version.
+- **System metrics** — CPU, memory, GPU utilization and VRAM, loaded models per backend, Ollama's server config, and an update check against a minimum version.
+- **Know whether a tool call worked** — each request row records the outcome of the tool calls it made, joined to the result that came back a turn later, so a call that silently failed is visible instead of being filed as a success.
+- **Tell one surface from another** — a single agent can arrive as a Discord bot, a cron job, a CLI session and a windowed UI with identical IP, User-Agent and client name. The context leaks into the request anyway, and the proxy reads it, so the four are counted separately.
 
 ### Intervene
 
@@ -50,6 +52,11 @@ Built around two ideas:
 - **Compress context** — a deterministic compressor squeezes bulky tool outputs and JSON blobs already in the history, with a shadow mode that measures the savings before you commit to it.
 - **Handle model quirks** — per-model reasoning control (force thinking off, make it opt-in, or leave it alone) and system nudges, matched by model-name pattern and hot-reloaded from a JSON file.
 - **Shadow runs** — send the same request to a primary upstream *and* a local model in parallel, store both, and get an automatic side-by-side comparison (latency delta, token delta, tool-call agreement, text similarity).
+- **Run the local backends** — Ollama, LM Studio, llama.cpp and two independent vLLM servers are all first-class. Each knows how to start and stop itself, appears in the model catalogue whether it is up or not, and can be driven from the UI.
+- **Load on demand, even for fixed backends** — vLLM and llama.cpp serve exactly what they were launched with, so a request for a stopped model used to 404. Opt in to auto-load and the proxy starts what is needed, waits for it to actually serve, and evicts another model only when the target does not fit in free memory.
+- **Refuse instead of wedging the box** — a request that cannot fit is answered with the arithmetic rather than forwarded. Model weights, KV cache and a vLLM boot's real memory claim are all priced, because a start the machine cannot absorb starves the proxy and sshd first, and nothing can undo it afterwards.
+- **Hold through a restart** — a backend that drops the connection is usually restarting, not gone. Rather than returning 502 to everything that arrives while it reloads, the proxy waits for it to serve again and re-sends, bounded, and only while it is genuinely coming up.
+- **Send a model where it actually lives** — name a model and it goes to whichever backend serves it, without a routing rule; where two backends serve the same name, the qualified `model/backend` form picks one.
 - **Take control** — kill a specific in-flight request to free the GPU slot, or flip panic mode to 503 all proxied traffic while keeping the dashboard up.
 
 ### Automate
@@ -194,13 +201,23 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | **Artifacts** | Files, URLs, directories, and images touched via tool calls — by conversation, by folder, or ranked by activity, with inline content viewing and per-write content sizes. |
 | **Stats** | KPI strip plus a tabbed breakdown by model, client, app, and tool; a Trends tab with per-chart enlarge. |
 | **Audit** | Gate verdict log, the rules editor, routing-mode toggle, and the auditor's automatic suggestions. |
-| **System** | CPU, memory, GPU, loaded models per upstream, Ollama config and update check, access badge, and the restart button. |
+| **System** | CPU, memory, GPU, and a panel per backend built from the registry — what each is serving, whether it is up, and start/stop where the proxy can manage it. Plus Ollama config, update check, access badge, and the restart button. |
 | **Bench** | Queue and inspect benchmark runs and sweeps, with graded quality scoring and N-way comparison. |
 | **Tasks** | One-shot and scheduled prompt runs. |
 | **Chat** | A minimal chat client that talks through the proxy, so you can exercise a model without another tool. |
+| **Work** | A shared scratchboard: working notes and dropped files that every machine on the network sees the same view of. Deliberately exempt from the PII gate — the notes are written by the viewers rather than captured from them, and a board each machine sees differently is not a shared board. |
 | **Setup** | Client configuration snippets. |
 
 ### Screenshots
+
+Regenerate these against a running proxy with `python scripts/screenshots.py --url http://host:port/__proxy/`.
+
+#### Shadow comparison — the same request answered by a big model and a small local one, side by side
+A rule fans the request out to a second model in parallel. The client gets the primary answer
+unchanged; the proxy keeps both and works out what differed — here a 35B MoE on vLLM against a 4B
+model on Ollama, 2.3× the latency for 21% text overlap.
+
+![Compare view](docs/screenshots/compare-view.png)
 
 #### Requests list — every API call, with client app badges
 ![Requests list](docs/screenshots/tab-requests.png)
@@ -211,14 +228,20 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 #### Conversations — threaded turns with TOC navigation
 ![Conversation detail](docs/screenshots/conversation-detail.png)
 
-#### Shadow comparison — side-by-side primary vs local model
-![Compare view](docs/screenshots/compare-view.png)
+#### Live — one tile per active conversation, updating as the model generates
+![Live view](docs/screenshots/tab-live.png)
+
+#### Stats — KPI strip, trend charts, and a tabbed breakdown by model, app, client and tool
+![Stats tab](docs/screenshots/tab-stats.png)
+
+#### Bench — models × context × thinking mode in one sweep, graded against executable tasks
+![Bench tab](docs/screenshots/tab-bench.png)
+
+#### System — one panel per backend, from the registry: what it serves, whether it is up, start/stop
+![System tab](docs/screenshots/tab-system.png)
 
 #### Audit tab — routing toggle, rule editor, automatic suggestions
 ![Audit tab](docs/screenshots/tab-audit.png)
-
-#### System — CPU, memory, GPU, loaded models, restart button
-![System tab](docs/screenshots/tab-system.png)
 
 ---
 
@@ -234,6 +257,7 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | `ANTHROPIC_URL` | `https://api.anthropic.com` | Anthropic upstream for `/v1/messages*` and `/v1/complete*` |
 | `LMSTUDIO_URL` | `http://localhost:1234` | LM Studio — a `model_router` routing target and a System-tab source |
 | `VLLM_URL` | `http://localhost:8001` | vLLM — same |
+| `VLLM2_URL` | `http://localhost:8002` | A second vLLM on its own port, so two models can be resident at once. A full twin of the first: routable as upstream `vllm2`, start/stop and auto-load resolve the container publishing *this* port |
 | `SD_URL` | `http://localhost:8188` | ComfyUI endpoint for the txt2img helper |
 | `SD_MODEL` | (none) | Checkpoint name for that helper |
 | `ANTHROPIC_API_KEY` | (none) | Used for proxy-originated Anthropic calls (client keys pass through untouched) |
@@ -249,6 +273,7 @@ Everything lives under `/__proxy/`. The navigation rail groups the views; on a p
 | `PROXY_SSL_CERT` / `PROXY_SSL_KEY` | (none) | Cert and key for that listener — both required, plus a non-zero HTTPS port |
 | `PROXY_SSL_KEY_PASSWORD` | (none) | Passphrase for an encrypted key |
 | `PROXY_GRACEFUL_SHUTDOWN` | `10` | Seconds uvicorn waits for connections to drain, so a lingering SSE stream can't hang a restart |
+| `PROXY_STARTUP_TIMEOUT_S` | `120` | How long the HTTPS listener waits for HTTP startup (migrations, backfills) before refusing to start. Raise it if startup is legitimately slow; it never opens HTTPS against a half-initialised app |
 
 #### State
 
@@ -378,6 +403,10 @@ New-Service -Name "AIProxy" `
 ### HTTPS
 
 Set `PROXY_SSL_CERT`, `PROXY_SSL_KEY`, and a non-zero `PROXY_HTTPS_PORT` to run a second listener alongside HTTP. Both share one FastAPI app, one lifespan, and one database — the HTTP listener owns startup, the HTTPS one attaches to the running state.
+
+Because the HTTPS listener borrows that state, it does not open until HTTP startup has actually completed, and refuses to start at all if that takes longer than `PROXY_STARTUP_TIMEOUT_S`. If either listener stops, the other is brought down with it rather than left serving against a torn-down client and database.
+
+`GET /__proxy/api/health` reports the certificate under `tls` — `days_remaining`, `expired`, `expiring_soon` — and the log warns hourly once expiry is within 14 days. Expiry is otherwise a silent, scheduled outage: nothing reports it until every HTTPS client is already failing.
 
 ---
 

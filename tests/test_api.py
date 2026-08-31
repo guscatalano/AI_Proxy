@@ -79,15 +79,13 @@ def test_generation_rate_includes_every_streaming_local_upstream():
     which silently emptied the decode metric on any box whose daily driver had moved to vLLM —
     the dashboard then fell back to a completion-over-total-time figure roughly 6x lower, which
     reads as a broken model rather than a missing filter."""
-    import inspect
     import ai_proxy.proxy as p
-    src = inspect.getsource(p.stats)
-    assert "GENERATION_RATE_UPSTREAMS" in src
-    line = next(l for l in src.splitlines() if "GENERATION_RATE_UPSTREAMS = " in l)
-    for engine in ("ollama", "lmstudio", "vllm"):
-        assert engine in line, f"{engine} missing from the decode-rate upstreams"
-    # Anthropic batches its SSE, so (duration - ttft) is transfer time there, not decode time.
-    assert "anthropic" not in line
+    # Derived from the backend registry now, so assert on that rather than on a source
+    # literal that no longer exists — and every registered provider is covered, not just
+    # the ones someone remembered to add to a set.
+    measured = {n for n, pr in p.PROVIDERS.items() if pr.measures_decode}
+    assert {"ollama", "lmstudio", "vllm", "llamacpp"} <= measured
+
 
 
 def test_health_skips_the_full_database_scan_by_default(client):

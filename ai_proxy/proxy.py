@@ -14,18 +14,38 @@ import subprocess
 import tempfile
 import collections
 import gzip
+import ssl
 import struct
 import threading
 import ipaddress
 import math
 import datetime
 from contextlib import asynccontextmanager
+from html.parser import HTMLParser
 from pathlib import Path
 
 import httpx
 from fastapi import FastAPI, Request
 
-from ._version import __version__
+try:
+    from . import bench_report as _bench_report_mod
+except ImportError:
+    import bench_report as _bench_report_mod  # flat-script launch
+try:
+    from . import bench_graders as _bench_graders_mod
+except ImportError:
+    import bench_graders as _bench_graders_mod  # flat-script launch
+try:
+    from . import bench_suites as _bench_suites_mod
+except ImportError:
+    import bench_suites as _bench_suites_mod  # flat-script launch
+try:
+    from ._version import __version__
+except ImportError:
+    # Deployed as a flat script (scp proxy.py + systemd ExecStart python proxy.py) rather
+    # than as the installed package. The version string is cosmetic; refusing to boot the
+    # proxy over it took production down in a restart loop.
+    __version__ = "0.0.0+standalone"
 from fastapi.responses import StreamingResponse, JSONResponse, FileResponse, Response
 
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434").rstrip("/")
@@ -54,10 +74,29 @@ REDACT_PLACEHOLDER = "[REDACTED — PII hidden: viewer IP not on same subnet as 
 ADMIN_IPS = {ip.strip() for ip in os.environ.get("PROXY_ADMIN_IPS", "").split(",") if ip.strip()}
 LMSTUDIO_URL = os.environ.get("LMSTUDIO_URL", "http://localhost:1234").rstrip("/")
 VLLM_URL = os.environ.get("VLLM_URL", "http://localhost:8001").rstrip("/")
+# A second vLLM process, so two models can be resident at once and a router rule can choose
+# between them. It is a full twin of the first: every vLLM helper below takes the slot's URL
+# rather than reading VLLM_URL, so "the container publishing this port" resolves per slot.
+# While they shared one resolver, starting the second slot stopped the first slot's container —
+# the helpers found VLLM_URL's port no matter which backend was asking.
+VLLM2_URL = os.environ.get("VLLM2_URL", "http://localhost:8002").rstrip("/")
 # llama.cpp's own server. Its own slot rather than borrowing LM Studio's port: both speak the
 # same OpenAI shape, so squatting works — and then every log row, bench result and report says
 # "lmstudio" for numbers that came from llama.cpp. Mislabelled measurements are worse than none.
 LLAMACPP_URL = os.environ.get("LLAMACPP_URL", "http://localhost:8080").rstrip("/")
+
+
+def _is_vllm(upstream: str | None) -> bool:
+    """True for either vLLM slot. Every check that used to read `upstream == "vllm"` means
+    this: the second slot runs the same server, in the same kind of container, and wants the
+    same eviction, auto-load and residency handling."""
+    return upstream in ("vllm", "vllm2")
+
+
+def _vllm_url(upstream: str | None = None) -> str:
+    """The base URL of a vLLM slot. Read through a function, not captured at import, because
+    tests patch these globals and rebuild the provider registry against them."""
+    return VLLM2_URL if upstream == "vllm2" else VLLM_URL
 PROXY_HOST = os.environ.get("PROXY_HOST", "0.0.0.0")
 PROXY_PORT = int(os.environ.get("PROXY_PORT", "8000"))
 
@@ -121,6 +160,10 @@ ANALYTICS_CACHE_TTL_S = float(os.environ.get("PROXY_ANALYTICS_CACHE_TTL", "5") o
 # Cap uvicorn's graceful shutdown so a lingering connection (e.g. the UI's live SSE feed
 # or an in-flight stream) can't hang a `systemctl restart` forever. 0 = wait indefinitely.
 GRACEFUL_SHUTDOWN_S = int(float(os.environ.get("PROXY_GRACEFUL_SHUTDOWN", "10") or 0))
+# How long the HTTPS listener waits for the HTTP listener's lifespan (init_db, migrations,
+# backfills, shared httpx client) before giving up. Generous by default: a slow start is a
+# reason to keep waiting, not a reason to start serving against half-built state.
+STARTUP_TIMEOUT_S = float(os.environ.get("PROXY_STARTUP_TIMEOUT_S", "120") or 120)
 _last_request_prune = 0.0
 _last_archive_sweep = 0.0
 _ANALYTICS_CACHE: dict = {}
@@ -161,6 +204,14 @@ _PANIC_MODE: bool = False
 # (which signals Ollama to abort generation).
 #   {req_id: {ts, upstream_resp, cancel_evt}}
 _INFLIGHT_REQUESTS: dict = {}
+
+# Upstream responses whose request row has already been finalized but whose socket was never
+# closed. _save_finish is sync (it runs in the threadpool), so it cannot await aclose() itself —
+# and popping the registry entry throws away the ONLY reference to the response, after which the
+# connection can never be returned to the pool and nothing can even see that it is held. That is
+# how 101 sockets to vLLM accumulated unnoticed and wedged every proxied request on 2026-08-08.
+# Hand them here instead; the zombie killer drains this on its next tick.
+_ORPHANED_RESPONSES: list = []
 
 
 # request_dedup: when two identical streaming requests arrive close together (some clients —
@@ -317,6 +368,37 @@ CREATE TABLE IF NOT EXISTS request_blobs (
     stream_chunks TEXT,
     images_data TEXT
 );
+-- Shared working notes. Deliberately not scoped to a conversation, a client or a subnet: the
+-- point is a board every machine on the network sees the same view of. Unlike request bodies,
+-- nothing here arrives from a third party, so the PII gate that redacts cross-subnet viewers
+-- would only hide the notes from the people who wrote them.
+CREATE TABLE IF NOT EXISTS scratchboard (
+    id TEXT PRIMARY KEY,
+    ts REAL NOT NULL,
+    author TEXT,
+    text TEXT NOT NULL,
+    client_ip TEXT,
+    pinned INTEGER DEFAULT 0,
+    -- Replies hang off a root note. One level only: a note and the answers to it. Deeper
+    -- nesting turns a board into a forum, and the thing being replied to here is usually a
+    -- question with an answer — "run this command" / "here is what it printed".
+    parent_id TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scratchboard_ts ON scratchboard(ts DESC);
+-- Attachments live in the database rather than on disk. A board that is 500 notes deep with a
+-- hard per-file cap cannot grow the way request bodies did, and keeping the bytes in SQLite
+-- means deletes cascade and there are no filesystem paths to get wrong — which, given the week
+-- this file has had, is worth something on its own.
+CREATE TABLE IF NOT EXISTS scratchboard_files (
+    id TEXT PRIMARY KEY,
+    note_id TEXT NOT NULL,
+    ts REAL NOT NULL,
+    name TEXT NOT NULL,
+    mime TEXT,
+    size INTEGER,
+    data BLOB NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_scratchboard_files_note ON scratchboard_files(note_id);
 CREATE TABLE IF NOT EXISTS proxy_memory (
     conversation_id TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -358,7 +440,8 @@ CREATE TABLE IF NOT EXISTS bench_runs (
     parent_id TEXT,                      -- set on children of a matrix suite
     axes_json TEXT,                      -- the axis values this cell represents
     env_json TEXT,                       -- machine/engine snapshot taken at run time
-    label TEXT                            -- human-readable cell label
+    label TEXT,                           -- human-readable cell label
+    phase TEXT                            -- what it is doing between measurements
 );
 
 CREATE TABLE IF NOT EXISTS proxy_personalities (
@@ -437,12 +520,23 @@ MIGRATIONS = [
     "ALTER TABLE requests ADD COLUMN conversation_id TEXT",
     "ALTER TABLE requests ADD COLUMN turn_index INTEGER",
     "ALTER TABLE requests ADD COLUMN client_app TEXT",
+    # Which surface an agentic client was driven from (discord / cron / cli). Detected at
+    # ingest from system-prompt fingerprints — see _detect_surface. NULL when unknown.
+    "ALTER TABLE requests ADD COLUMN surface TEXT",
+    # A non-reversible id for the credential the caller presented (sha256 prefix + last 4).
+    # Distinguishes callers that share an IP and a client label without putting a usable
+    # secret in a file that gets copied, archived and shared. See _credential_fingerprint.
+    "ALTER TABLE requests ADD COLUMN api_key_fp TEXT",
     "ALTER TABLE requests ADD COLUMN shadow_of TEXT",
     "ALTER TABLE proxy_tasks ADD COLUMN creator_ip TEXT",
     "ALTER TABLE requests ADD COLUMN proxy_tool_log TEXT",
     "ALTER TABLE system_metrics ADD COLUMN comfyui_json TEXT",
     "ALTER TABLE system_metrics ADD COLUMN vllm_json TEXT",
     "ALTER TABLE system_metrics ADD COLUMN llamacpp_json TEXT",
+    # One blob keyed by backend name, so adding a backend is a registry entry rather than
+    # a migration plus four edits to the INSERT — the shape that silently dropped the
+    # llamacpp value and stopped telemetry dead for an hour.
+    "ALTER TABLE system_metrics ADD COLUMN backends_json TEXT",
     "ALTER TABLE requests ADD COLUMN ttft_ms REAL",
     "ALTER TABLE requests ADD COLUMN upstream TEXT",
     # Chars-based estimate of the prompt token count, stored at request time. Compared against
@@ -464,6 +558,38 @@ MIGRATIONS = [
     "ALTER TABLE bench_runs ADD COLUMN axes_json TEXT",
     "ALTER TABLE bench_runs ADD COLUMN env_json TEXT",
     "ALTER TABLE bench_runs ADD COLUMN label TEXT",
+    # What the run is doing when it is not measuring. Stopping a backend, loading 90 GB of
+    # weights and waiting for a server to answer take minutes each, and all of them looked
+    # identical to a hang: a counter that does not move and nothing saying why.
+    "ALTER TABLE bench_runs ADD COLUMN phase TEXT",
+    # The scratchboard shipped without replies. Databases created since then already have the
+    # column from SCHEMA; this is for the ones that do not.
+    "ALTER TABLE scratchboard ADD COLUMN parent_id TEXT",
+    # Thinking, recorded at write time. It was only ever knowable by parsing the stored body
+    # in the browser, so nothing could filter or count by it — and the stored body is the
+    # client's original, taken before the model quirks run, so it cannot show what the proxy
+    # itself decided. Three separate values because they answer three different questions:
+    # what the client asked for, what actually happened, and who settled it.
+    "ALTER TABLE requests ADD COLUMN reasoning_effort TEXT",
+    "ALTER TABLE requests ADD COLUMN thinking TEXT",
+    "ALTER TABLE requests ADD COLUMN thinking_src TEXT",
+    # A response the upstream billed for and then delivered nothing of: tokens generated,
+    # no content, no reasoning, no tool call. The client sees a well-formed empty turn with a
+    # clean stop reason and no error, which reads to a human as the agent stopping for no
+    # reason. Measured on this box: 81 of 241 gemma4 replies in one six-hour window. Recorded
+    # as a column because it is invisible in every existing view — status is 200 and the token
+    # counts look healthy.
+    "ALTER TABLE requests ADD COLUMN empty_output INTEGER",
+    # A tool call and its outcome arrive in DIFFERENT requests: the model asks in turn N, and
+    # the client reports what happened in turn N+1. Without joining them the request list shows
+    # that Edit was called and never that it failed, which is how the same failing Edit repeated
+    # twelve times before anyone could see why.
+    "ALTER TABLE requests ADD COLUMN tool_call_ids TEXT",
+    "ALTER TABLE requests ADD COLUMN tool_outcome TEXT",
+    "ALTER TABLE requests ADD COLUMN tool_outcome_detail TEXT",
+    # What else was in flight when it happened. The failure is intermittent and survives replay,
+    # so the question is what was different at that moment rather than what was in the request.
+    "ALTER TABLE requests ADD COLUMN inflight_at_finish INTEGER",
     # NOTE: images_data (full-fidelity image payloads) now lives in the request_blobs side
     # table, not `requests`. Do NOT re-add it here — the blob-split migration DROPs it from
     # `requests`, and re-adding would collide with request_blobs.images_data in the requests_v
@@ -1077,7 +1203,18 @@ def _live_update_from_chunk(req_id: str, chunk_text: str) -> None:
     if not chunk_text or req_id not in _LIVE_STREAMS:
         return
     state = _LIVE_STREAMS[req_id]
-    for line in chunk_text.split("\n"):
+    # aiter_raw() yields whatever came off the socket, which splits SSE lines mid-event as
+    # often as not. Parsing each chunk in isolation dropped every fragment that didn't happen
+    # to begin with "data: ", so live text silently lost pieces of the reply. Carry the
+    # trailing partial line into the next chunk and only parse what is complete.
+    chunk_text = (state.get("buf") or "") + chunk_text
+    lines = chunk_text.split("\n")
+    # A chunk ending exactly on "\n" leaves "" here, which is the correct empty carry-over.
+    state["buf"] = lines.pop() if lines else ""
+    # A pathological upstream that never emits a newline must not grow this without bound.
+    if len(state["buf"]) > 65536:
+        state["buf"] = ""
+    for line in lines:
         data = None
         if line.startswith("data: "):
             data = line[6:]
@@ -1214,7 +1351,16 @@ async def lifespan(app: FastAPI):
     _refresh_archive_active()
     _load_panic_mode()
     app.state.started_at = time.time()
-    app.state.client = httpx.AsyncClient(timeout=httpx.Timeout(None))
+    # Read/write stay unbounded — a 200k-token prefill legitimately takes minutes and cutting
+    # generation off is worse than waiting. The POOL wait must NOT be unbounded, though: with
+    # httpx's default 100-connection cap and no pool timeout, exhaustion presents as every
+    # proxied request hanging forever, with no error, no log, and no failing health check —
+    # the management routes don't share this client, so /api/health answered in 3ms while
+    # nothing else was served at all. A bounded pool wait turns that silence into a 504.
+    app.state.client = httpx.AsyncClient(
+        timeout=httpx.Timeout(None, pool=15.0),
+        limits=httpx.Limits(max_connections=256, max_keepalive_connections=32),
+    )
     app.state.metrics_client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
     app.state.metrics_task = asyncio.create_task(_metrics_loop(app))
     app.state.task_worker = asyncio.create_task(_task_worker_loop(app))
@@ -1536,6 +1682,43 @@ def _model_parallelism(runtime: str, arch: str | None = None, name: str | None =
     return {"parallel": None, "reason": "unknown runtime"}
 
 
+# Latest released Ollama, from GitHub, cached for an hour: the System tab polls its snapshot
+# every few seconds and the answer changes a few times a month.
+_OLLAMA_LATEST: dict = {"ts": 0.0, "version": None}
+
+
+async def _ollama_latest_version(client: httpx.AsyncClient) -> str | None:
+    now = time.time()
+    if now - _OLLAMA_LATEST["ts"] < 3600:
+        return _OLLAMA_LATEST["version"]
+    try:
+        r = await client.get("https://api.github.com/repos/ollama/ollama/releases/latest",
+                             timeout=8.0)
+        if r.status_code == 200:
+            tag = str((r.json() or {}).get("tag_name") or "").lstrip("v") or None
+            _OLLAMA_LATEST.update(ts=now, version=tag)
+            return tag
+    except (httpx.RequestError, ValueError):
+        pass
+    _OLLAMA_LATEST["ts"] = now      # a failed probe also waits an hour before retrying
+    return _OLLAMA_LATEST["version"]
+
+
+def _ollama_update_cmd() -> list | None:
+    """The command that updates Ollama, if this deployment has set one up.
+
+    The proxy's user cannot run the installer directly — it needs root — so the contract is a
+    root-owned script the sudoers file allows without a password, e.g.:
+        /usr/local/sbin/ollama-update  containing  `curl -fsSL https://ollama.com/install.sh | sh`
+        sudoers: crimson ALL=(root) NOPASSWD: /usr/local/sbin/ollama-update
+    Configured via model_control.ollama_update_cmd (a list); absent means the button hides.
+    """
+    cmd = (load_rules_config().get("model_control") or {}).get("ollama_update_cmd")
+    if isinstance(cmd, list) and cmd and all(isinstance(a, str) for a in cmd):
+        return cmd
+    return None
+
+
 async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
     out: dict = {"reachable": False, "ps": [], "tags": [], "env": {}, "env_source": None,
                  "pid": None, "version": None, "recommended_version": OLLAMA_RECOMMENDED_VERSION,
@@ -1561,6 +1744,12 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
         pass
     if out["version"] and OLLAMA_RECOMMENDED_VERSION:
         out["outdated"] = _semver_tuple(out["version"]) < _semver_tuple(OLLAMA_RECOMMENDED_VERSION)
+    latest = await _ollama_latest_version(client)
+    out["latest_version"] = latest
+    out["update_available"] = bool(
+        out["version"] and latest
+        and _semver_tuple(latest) > _semver_tuple(out["version"]))
+    out["update_configured"] = bool(_ollama_update_cmd())
     try:
         r = await client.get(f"{OLLAMA_URL}/api/ps")
         if r.status_code == 200:
@@ -1603,6 +1792,21 @@ async def _ollama_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
+def _display_model_id(mid: str | None) -> str | None:
+    """llama-server can report a model's id as the full GGUF path (often under the user's home dir, sometimes
+    with a `-NNNNN-of-NNNNN` shard suffix). Surface just the model NAME: the filename without the directory,
+    the `.gguf` extension, and any shard suffix. The full path is kept in `model_path`, and llama.cpp routing
+    (one model per process) doesn't depend on this name, so cleaning it is display-only. An already-clean id
+    (no path/extension) is returned unchanged."""
+    if not mid:
+        return mid
+    base = os.path.basename(str(mid).replace("\\", "/"))
+    base = re.sub(r"-\d{4,5}-of-\d{4,5}\.gguf$", "", base, flags=re.IGNORECASE)
+    if base.lower().endswith(".gguf"):
+        base = base[:-5]
+    return base or mid
+
+
 async def _llamacpp_snapshot(client: httpx.AsyncClient) -> dict:
     """llama-server: /v1/models lists what it was launched with (one model per process), and
     /props carries the loaded context size and the model path — which is the only place the
@@ -1614,8 +1818,9 @@ async def _llamacpp_snapshot(client: httpx.AsyncClient) -> dict:
             return out
         out["reachable"] = True
         for m in (r.json().get("data") or []):
-            rec = {"id": m.get("id"), "state": "loaded", "arch": "llama.cpp",
-                   "quant": _infer_quant(m.get("id"))}
+            raw_id = m.get("id")
+            rec = {"id": _display_model_id(raw_id), "state": "loaded", "arch": "llama.cpp",
+                   "quant": _infer_quant(raw_id)}
             out["available"].append(rec)
             out["loaded"].append(rec)
     except (httpx.RequestError, ValueError):
@@ -1723,7 +1928,7 @@ _VLLM_BOOT_PHASES = (
 )
 
 
-async def _vllm_boot_state() -> dict:
+async def _vllm_boot_state(url: str | None = None) -> dict:
     """Why vLLM isn't answering: still coming up, stopped, or not there at all.
 
     Only called when /v1/models has already failed, so the docker calls never touch the healthy
@@ -1732,7 +1937,7 @@ async def _vllm_boot_state() -> dict:
     waiting for.
     """
     docker = _docker_bin()
-    name = await _vllm_container() if docker else None
+    name = await _vllm_container(url) if docker else None
     if not name:
         return {"state": "absent"}
     code, out = await _run_cmd(
@@ -1741,8 +1946,25 @@ async def _vllm_boot_state() -> dict:
         return {"state": "unknown", "container": name}
     parts = (out.strip().split("\t") + ["", ""])[:2]
     if parts[0].strip().lower() != "true":
-        return {"state": "stopped", "container": name}
+        stopped = {"state": "stopped", "container": name}
+        try:
+            for c in await _vllm_configs(url):
+                if c.get("container") == name and c.get("model"):
+                    stopped["model"] = c["model"]
+                    break
+        except Exception:
+            pass
+        return stopped
     info = {"state": "loading", "container": name, "started_at": parts[1].strip() or None}
+    # "loading" without a name is half an answer: the container's own config knows which
+    # model it will serve long before /v1/models can say so.
+    try:
+        for c in await _vllm_configs(url):
+            if c.get("container") == name and c.get("model"):
+                info["model"] = c["model"]
+                break
+    except Exception:
+        pass
     # The tail is enough: these lines are emitted continuously while it comes up.
     code, logs = await _run_cmd([docker, "logs", "--tail", "40", name], 15.0,
                                 max_chars=20000, keep_tail=True)
@@ -1756,12 +1978,12 @@ async def _vllm_boot_state() -> dict:
     return info
 
 
-async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
+async def _vllm_snapshot(client: httpx.AsyncClient, base: str | None = None) -> dict:
     """vLLM OpenAI-compat: /v1/models lists the served model(s) (always 'loaded' — vLLM serves
     one config at a time); /metrics (Prometheus text) has live running/waiting counts + KV usage."""
     out = {"reachable": False, "loaded": [], "available": []}
     try:
-        r = await client.get(f"{VLLM_URL}/v1/models")
+        r = await client.get(f"{base or VLLM_URL}/v1/models")
         if r.status_code == 200:
             out["reachable"] = True
             out["state"] = "ready"
@@ -1774,13 +1996,13 @@ async def _vllm_snapshot(client: httpx.AsyncClient) -> dict:
                 out["available"].append(rec)
                 out["loaded"].append(rec)
     except (httpx.RequestError, ValueError):
-        out.update(await _vllm_boot_state())
+        out.update(await _vllm_boot_state(base or VLLM_URL))
         return out
     if not out["reachable"]:
-        out.update(await _vllm_boot_state())
+        out.update(await _vllm_boot_state(base or VLLM_URL))
         return out
     try:
-        r = await client.get(f"{VLLM_URL}/metrics")
+        r = await client.get(f"{base or VLLM_URL}/metrics")
         if r.status_code == 200:
             for key, metric in (("running", "vllm:num_requests_running"),
                                 ("waiting", "vllm:num_requests_waiting"),
@@ -2000,38 +2222,569 @@ async def _comfyui_snapshot(client: httpx.AsyncClient) -> dict:
     return out
 
 
-async def _collect_once(app: FastAPI):
-    cpu = _cpu_pct()
-    mem = _mem_snapshot()
-    gpus = _gpu_snapshot()
-    ollama, lmstudio, comfyui, vllm, llamacpp = await asyncio.gather(
-        _ollama_snapshot(app.state.metrics_client),
-        _lmstudio_snapshot(app.state.metrics_client),
-        _comfyui_snapshot(app.state.metrics_client),
-        _vllm_snapshot(app.state.metrics_client),
-        _llamacpp_snapshot(app.state.metrics_client),
-        return_exceptions=False,
-    )
-    ts = time.time()
+# ---- Backend registry -------------------------------------------------------------------
+# Every backend used to be wired by hand into ten separate places: the metrics gather, the
+# INSERT column list, the INSERT *values* (forgetting that one killed telemetry for an hour),
+# system_now, GENERATION_RATE_UPSTREAMS, _BENCH_LOAD_MODES, the bench index, the router's
+# upstream table, a System-tab provider tab and its panel. Every UI bug in this area has been a
+# missed site rather than a logic error, and adding a fifth backend meant finding all ten.
+#
+# A SideService is something the proxy can start and stop but does not send inference to
+# (ComfyUI). A Provider is a SideService that also serves models. The registry is the single
+# list; the fan-out sites read from it instead of repeating themselves.
+#
+# Deliberately delegating to the existing functions rather than reimplementing them: the point
+# of this step is to change where the knowledge lives, not what it does, so the behaviour is
+# provably identical while the call sites move over one at a time.
+
+
+class SideService:
+    """Startable, stoppable, and able to say whether it is up. No models."""
+
+    name: str = ""
+    label: str = ""
+    #  "unit"   -> systemd (see model_control.services)
+    #  "docker" -> a container publishing the backend's port
+    #  "none"   -> not managed by the proxy
+    control: str = "none"
+
+    async def probe(self, client) -> dict:
+        """Reachability plus whatever the backend reports about itself."""
+        return {"reachable": False}
+
+    async def state(self) -> dict:
+        """Everything needed to render a control: running, and why not if not."""
+        return {"running": False, "control": self.control}
+
+    async def start(self, container: str | None = None) -> dict:
+        """Bring it up. Returns {ok, detail}; readiness is a separate question.
+
+        `container` names the specific docker container to start, for backends where several
+        are configured for the same port. Restore paths pass the one their snapshot recorded;
+        without it, discovery falls back to the first configured match."""
+        return await _control_backend(self, "start", container=container)
+
+    async def stop(self) -> dict:
+        return await _control_backend(self, "stop")
+
+    async def died(self) -> str | None:
+        """Why the process is gone, if it is. None means "still up, or can't tell".
+
+        Only ever used to stop waiting early, so an uncertain answer must be None: claiming a
+        healthy backend died would abort a load that was merely slow.
+        """
+        if self.control == "unit":
+            svc = _service_def(self.name)
+            if svc:
+                st = await _service_state(svc)
+                # "activating" and "reloading" are still on their way up. Only a terminal state
+                # means no amount of further waiting will help.
+                if st.get("active") in ("failed", "inactive"):
+                    _code, log = await _run_cmd(
+                        _systemctl_args(svc, "status", "--no-pager", "-n", "8"),
+                        15.0, max_chars=600, keep_tail=True, env=_systemctl_env(svc))
+                    return f"{svc['unit']} is {st['active']}: {log.strip()[-400:]}"
+        if self.control == "docker":
+            container = await _vllm_container(self.base_url)
+            if container:
+                code, out = await _run_cmd(
+                    [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
+                    15.0, max_chars=100)
+                if code == 0 and out.strip().lower() == "false":
+                    _c, log = await _run_cmd(
+                        [_docker_bin(), "logs", "--tail", "12", container],
+                        20.0, max_chars=600, keep_tail=True)
+                    return f"{container} is not running: {log.strip()[-400:]}"
+        return None
+
+
+class Provider(SideService):
+    """A SideService that serves models and can be benchmarked."""
+
+    #  "on-demand" -> the backend loads whatever is asked for (Ollama)
+    #  "jit"       -> loads on first use, evicts on its own schedule (LM Studio)
+    #  "fixed"     -> one model per process, chosen at launch (vLLM, llama.cpp)
+    load_mode: str = "fixed"
+    # Whether decode-rate statistics can be attributed to this backend. A backend left out of
+    # this is not merely missing from a chart — 100% of its traffic silently vanishes from the
+    # throughput figures, which is what happened to vLLM once already.
+    measures_decode: bool = True
+    # Whether load() needs a model name. The fixed-model backends are launched with one, so the
+    # operation is "start this server", not "load that model" — a blanket name check at the
+    # endpoint made starting them impossible.
+    requires_model_name: bool = True
+
+    @property
+    def base_url(self) -> str:
+        raise NotImplementedError
+
+    async def ready(self, timeout_s: float = 900.0) -> bool:
+        """Serving, not merely started. Both fixed-model backends take minutes to load their
+        weights, and every caller that reported success on the process starting was reporting
+        a lie — this is the same poll _vllm_ready and _llamacpp_ready each had separately."""
+        deadline = time.time() + timeout_s
+        checks = 0
+        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+            while time.time() < deadline:
+                try:
+                    if (await c.get(f"{self.base_url}/v1/models")).status_code == 200:
+                        return True
+                except httpx.RequestError:
+                    pass
+                checks += 1
+                # A process that has exited will never answer, and polling a corpse for the
+                # whole timeout turns a fast, explicable failure — "the KV pool did not fit" —
+                # into a quarter-hour of silence. Skip the first pass: a unit that has just
+                # been restarted is legitimately not up yet.
+                if checks > 1 and await self.died():
+                    return False
+                await asyncio.sleep(5.0)
+        return False
+
+    def models(self, snapshot: dict) -> list:
+        """Rows for the bench index, from a probe snapshot."""
+        return [m for m in (snapshot.get("available") or []) if isinstance(m, dict)]
+
+    async def load(self, payload: dict, name: str):
+        """Make this backend serve `name`, and wait until it actually does.
+
+        The mechanisms have nothing in common — a CLI, a docker start, a systemd drop-in
+        rewrite, an HTTP warm-up — so this is the one method that genuinely differs per
+        backend rather than being shared. Returns the endpoint's response body directly, or a
+        JSONResponse to set a status code.
+        """
+        return JSONResponse({"error": f"{self.name} cannot load models on request"},
+                            status_code=501)
+
+    # Whether the served context window can be changed by relaunching. vLLM bakes max_model_len
+    # into the container's arguments, so changing it means recreating the container rather than
+    # restarting it — a different and much less safe operation.
+    resizable_context: bool = False
+
+    async def context_window(self) -> tuple[int, int]:
+        """(tokens per slot, slot count) as currently served. (0, 1) when unknown."""
+        return 0, 1
+
+    async def resize_context(self, per_slot: int, concurrency: int = 1,
+                             exact: bool = False) -> dict:
+        """Relaunch serving at least `per_slot` tokens, with room for `concurrency` requests.
+
+        Returns {ok, changed, detail, previous}. `previous` is whatever must be handed back to
+        restore the old window, or None when nothing was changed.
+        """
+        return {"ok": False, "changed": False, "previous": None,
+                "detail": f"{self.name} cannot change its context window"}
+
+
+class _FnProvider(Provider):
+    """Adapter over the existing module-level snapshot functions.
+
+    Each backend keeps its current probe verbatim; only the ownership moves. Replacing these
+    with real implementations is the next step and can be done one at a time.
+    """
+
+    def __init__(self, name, label, probe_fn, url_fn, load_mode="fixed",
+                 control="none", measures_decode=True):
+        self.name, self.label = name, label
+        self._probe, self._url = probe_fn, url_fn
+        self.load_mode, self.control = load_mode, control
+        self.measures_decode = measures_decode
+
+    @property
+    def base_url(self) -> str:
+        return self._url()
+
+    async def probe(self, client) -> dict:
+        return await self._probe(client)
+
+    async def state(self) -> dict:
+        if self.control == "unit":
+            svc = _service_def(self.name)
+            if svc:
+                st = await _service_state(svc)
+                return {**st, "control": "unit"}
+        if self.control == "docker":
+            container = await _vllm_container(self.base_url)
+            return {"running": None, "container": container, "control": "docker"}
+        return {"running": None, "control": self.control}
+
+
+class _LmStudioProvider(_FnProvider):
+    async def load(self, payload: dict, name: str):
+        ok, why = _lms_available()
+        if not ok:
+            return JSONResponse({"error": why}, status_code=501)
+        args = ["load", name, "--yes"]
+        # These matter for real workloads: a model loaded at the wrong context length or without
+        # parallelism benchmarks as a different thing entirely. The request wins over the
+        # per-box defaults in model_control.
+        mc = load_rules_config().get("model_control") or {}
+        ctx = payload.get("context_length") or mc.get("lmstudio_context_length")
+        par = payload.get("parallel") or mc.get("lmstudio_parallel")
+        gpu = payload.get("gpu") or mc.get("lmstudio_gpu")
+        if ctx:
+            args += ["--context-length", str(int(ctx))]
+        if par:
+            args += ["--parallel", str(int(par))]
+        if gpu:
+            args += ["--gpu", str(gpu)]
+        if payload.get("ttl_s"):
+            args += ["--ttl", str(int(payload["ttl_s"]))]
+        t0 = time.perf_counter()
+        code, out = await _lms_run(args)
+        if code != 0:
+            return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
+        return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
+                "load_ms": round((time.perf_counter() - t0) * 1000)}
+
+
+# How long a bench-driven resize waits for the server to serve again. Generous enough for a
+# 90 GB model to load from disk, short enough that an over-large pool is diagnosed and rolled
+# back inside a bench rather than after it.
+_BENCH_RESIZE_READY_S = 900.0
+# How long a bench waits for a backend it started to begin serving. Deliberately generous: the
+# run has hours to spend and a stalled start is now detected by died(), not by this expiring.
+_BENCH_START_READY_S = 1800.0
+
+
+def _load_result(res) -> tuple[bool, str]:
+    """Read a load() outcome. It returns a response body on success and a JSONResponse to set a
+    status code, and callers inside the process need both read the same way."""
+    if isinstance(res, JSONResponse):
+        try:
+            body = json.loads(bytes(res.body).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            body = {}
+        return False, str(body.get("error") or f"HTTP {res.status_code}")
+    d = res or {}
+    return bool(d.get("ok")), str(d.get("error") or d.get("note") or d.get("detail") or "")
+
+
+class _LlamaCppProvider(_FnProvider):
+    requires_model_name = False
+    resizable_context = True
+
+    async def context_window(self) -> tuple[int, int]:
+        snap = await _llamacpp_snapshot(app.state.metrics_client)
+        return int(snap.get("n_ctx") or 0), max(1, int(snap.get("parallel") or 1))
+
+    async def resize_context(self, per_slot: int, concurrency: int = 1,
+                             exact: bool = False) -> dict:
+        """`--ctx-size` is the whole KV pool, divided across `--parallel` slots, so the window a
+        single request actually gets is total/parallel. That makes lowering parallel the usual
+        way to buy a bigger window: one slot of 36k costs less memory than four of 32k, not
+        more. Sizing the pool to the concurrency being measured rather than to whatever the
+        server happens to be running is the whole point.
+        """
+        per_slot, want_par = int(per_slot), max(1, int(concurrency))
+        cur_slot, cur_par = await self.context_window()
+        fits = (cur_slot == per_slot and cur_par == want_par) if exact else (
+            cur_slot >= per_slot and cur_par >= want_par)
+        if fits:
+            return {"ok": True, "changed": False, "previous": None,
+                    "detail": f"already serving {cur_slot:,} per slot across {cur_par}",
+                    "per_slot": cur_slot, "parallel": cur_par}
+        if not cur_slot:
+            # Without a readable current window there is no way back, and a bench that cannot
+            # undo its own change to the box must not make it. This is why a sweep once left
+            # llama.cpp at 291,784/1: the probe came back empty, the resize went ahead anyway,
+            # and the restore had nothing to restore to.
+            return {"ok": False, "changed": False, "previous": None,
+                    "detail": "could not read the current context window, so a resize could "
+                              "not be undone — refusing to change it"}
+        prev = {"context_length": cur_slot * cur_par, "parallel": cur_par}
+        # Bounded, unlike load()'s 1800s default. The usual reason a resize never becomes ready
+        # is that the pool did not fit in memory, and waiting half an hour to find that out —
+        # before even starting the rollback — is the whole cost of the mistake.
+        ok, detail = _load_result(
+            await self.load({"context_length": per_slot * want_par, "parallel": want_par,
+                             "ready_timeout_s": _BENCH_RESIZE_READY_S}, ""))
+        if not ok:
+            # Why it died beats "did not become ready in time" — the usual answer is that the
+            # KV pool did not fit, and that is actionable where a timeout is not.
+            why = await self.died()
+            # A server that did not come back is worse than a bench that did not run: roll the
+            # drop-in back rather than leaving the box with nothing serving on port 8080.
+            rolled = None
+            if prev:
+                rolled = _load_result(
+                    await self.load(dict(prev, ready_timeout_s=_BENCH_RESIZE_READY_S), ""))[0]
+            return {"ok": False, "changed": False, "previous": None, "rolled_back": rolled,
+                    "detail": why or detail
+                    or f"llama.cpp did not come back at {per_slot * want_par:,} context"}
+        return {"ok": True, "changed": True, "previous": prev, "detail": detail,
+                "per_slot": per_slot, "parallel": want_par}
+
+    async def load(self, payload: dict, name: str):
+        cfg = _llamacpp_cfg()
+        svc = _service_def("llamacpp") or {"unit": str(cfg.get("unit") or "llamacpp.service"),
+                                           "scope": cfg.get("scope") or "user",
+                                           "name": "llamacpp"}
+        ctx = int(payload.get("context_length") or payload.get("ctx") or 0)
+        par = int(payload.get("parallel") or 0)
+        if ctx or par:
+            # Carry over whatever was not specified so changing one does not silently reset
+            # the other to a default the caller never asked for.
+            cur = await _llamacpp_snapshot(app.state.metrics_client)
+            par = par or int(cur.get("parallel") or 1)
+            ctx = ctx or int((cur.get("n_ctx") or 0) * max(1, par)) or 65536
+            ok, detail = _write_llamacpp_override(ctx, par)
+            if not ok:
+                return JSONResponse({"error": detail}, status_code=400)
+            # daemon-reload takes no unit — _systemctl_args always appends one, which
+            # systemctl rejects with "Too many arguments."
+            reload_args = [a for a in _systemctl_args(svc, "daemon-reload")
+                           if a != svc["unit"]]
+            code, out = await _run_cmd(reload_args, 30.0, env=_systemctl_env(svc))
+            if code != 0:
+                return JSONResponse({"error": f"daemon-reload failed: {out[:200]}"},
+                                    status_code=502)
+        t0 = time.perf_counter()
+        code, out = await _run_cmd(_systemctl_args(svc, "restart"), 120.0,
+                                   env=_systemctl_env(svc))
+        if code != 0:
+            return JSONResponse({"error": f"restart failed: {out[:300]}"}, status_code=502)
+        # Module-level rather than self.ready() on purpose: it is the seam the tests patch, and
+        # it already delegates here.
+        ready = await _llamacpp_ready(float(payload.get("ready_timeout_s") or 1800))
+        return {"ok": ready, "upstream": "llamacpp", "ready": ready,
+                "context_length": ctx or None, "parallel": par or None,
+                "load_ms": round((time.perf_counter() - t0) * 1000),
+                "note": None if ready else "restarted, but the server did not answer in time"}
+
+
+class _VllmProvider(_FnProvider):
+    requires_model_name = False
+
+    async def load(self, payload: dict, name: str):
+        wanted = (payload.get("container") or "").strip()
+        url = self.base_url
+        configs = await _vllm_configs(url)
+        if wanted:
+            match = next((c for c in configs if c["container"] == wanted), None)
+            if not match:
+                return JSONResponse(
+                    {"error": f"no vLLM container named {wanted!r}",
+                     "available": [c["container"] for c in configs]}, status_code=404)
+            if not match["serves_port"]:
+                return JSONResponse(
+                    {"error": f"{wanted!r} does not publish {url} — starting it would not "
+                              f"make it reachable through this proxy"}, status_code=409)
+            container = wanted
+        else:
+            container = await _vllm_container(url)
+        if not container:
+            return JSONResponse(
+                {"error": "no local vLLM container publishing this port was found",
+                 "available": [c["container"] for c in configs]}, status_code=501)
+        t0 = time.perf_counter()
+        # Twins contend for one port, so anything else holding it must come down first —
+        # otherwise docker start fails on the binding and the error looks unrelated. Only
+        # containers publishing THIS slot's port qualify: with a second slot on its own port,
+        # stopping every running vLLM meant loading one model evicted the other one's server.
+        stopped = []
+        for c in configs:
+            if c["running"] and c["serves_port"] and c["container"] != container:
+                await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
+                stopped.append(c["container"])
+        # Last-line memory guard, on the one chokepoint every vLLM start passes through
+        # (auto-load, bench, UI). Priced by the utilization claim — see _vllm_boot_claim_mb
+        # for why checkpoint size is the wrong number. Callers that made room first pass
+        # trivially; a blind start onto a full box is refused with the arithmetic.
+        claim = await _vllm_boot_claim_mb(container)
+        free = _free_mem_mb()
+        if claim and free and free < claim and not payload.get("force"):
+            return JSONResponse(
+                {"error": f"starting {container!r} will claim ~{claim / 1024:.0f} GB "
+                          f"(gpu-memory-utilization × total) but only {free / 1024:.0f} GB "
+                          f"is free — that combination starves the box (it has wedged sshd "
+                          f"and this proxy before). Free memory first, or pass force:true.",
+                 "claim_mb": round(claim), "free_mb": round(free)}, status_code=409)
+        code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
+        if code != 0:
+            return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
+        # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
+        cfg_mc = load_rules_config().get("model_control") or {}
+        ready = await _vllm_ready(float(payload.get("wait_s")
+                                        or cfg_mc.get("vllm_ready_timeout_s") or 420),
+                                  self.name)
+        return {"ok": ready, "started_container": container, "stopped_containers": stopped,
+                "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
+                "error": None if ready else "container started but the server did not become "
+                                            "ready in time — it may still be loading"}
+
+
+class _OllamaProvider(_FnProvider):
+    async def load(self, payload: dict, name: str):
+        """A zero-token generate is how you ask Ollama to make a model resident. Loading a large
+        model takes tens of seconds, so this waits for it rather than returning early — the
+        caller wants to know it is actually resident, not that the request was accepted."""
+        keep = payload.get("keep_alive") or "30m"
+        # Same gate live traffic passes. Ollama sizes its server at OLLAMA_CONTEXT_LENGTH ×
+        # OLLAMA_NUM_PARALLEL — 262,144 × 4 here — and a model that cannot hold that window does
+        # not fail to load, it takes the whole service down and every other resident model with
+        # it. A zero-token generate is still a full load, so "just make it resident" from the UI
+        # was a way to kill Ollama that the request path had already been taught to refuse.
+        # force:true is the deliberate override, as on the vLLM load path.
+        if not payload.get("force"):
+            try:
+                refusal = await _ollama_fit_refusal(name)
+            except Exception:
+                refusal = None
+            if refusal:
+                return JSONResponse(
+                    {"error": refusal, "model": name,
+                     "hint": "pin a smaller window for this model under ollama_options.per_model, "
+                             "free memory, or pass force:true"},
+                    status_code=409)
+        t0 = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
+                r = await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "prompt": "", "keep_alive": keep})
+                if r.status_code >= 400:
+                    return JSONResponse({"error": f"ollama said {r.status_code}: {r.text[:200]}"},
+                                        status_code=502)
+        except httpx.RequestError as e:
+            return JSONResponse({"error": f"ollama unreachable: {e}"}, status_code=502)
+        return {"ok": True, "model": name, "keep_alive": keep,
+                "load_ms": round((time.perf_counter() - t0) * 1000)}
+
+
+class _FnSideService(SideService):
+    def __init__(self, name, label, probe_fn, control="none"):
+        self.name, self.label, self._probe, self.control = name, label, probe_fn, control
+
+    async def probe(self, client) -> dict:
+        return await self._probe(client)
+
+    async def state(self) -> dict:
+        if self.control == "unit":
+            svc = _service_def(self.name)
+            if svc:
+                return {**(await _service_state(svc)), "control": "unit"}
+        return {"running": None, "control": self.control}
+
+
+async def _control_backend(b, action: str, container: str | None = None) -> dict:
+    """The three start/stop mechanisms, in one place.
+
+    They were previously re-derived from the backend's name at every call site — the residency
+    handshake, the load endpoint and the UI each knew that vLLM means docker and ComfyUI means
+    systemd. Adding llama.cpp meant teaching all of them again.
+    """
+    if b.control == "unit":
+        svc = _service_def(b.name)
+        if not svc:
+            return {"ok": False, "detail": f"{b.name} has no unit configured"}
+        code, out = await _run_cmd(_systemctl_args(svc, action), 120.0,
+                                   env=_systemctl_env(svc))
+        return {"ok": code == 0, "detail": out[:300], "via": "systemctl"}
+    if b.control == "docker":
+        container = container or await _vllm_container(b.base_url)
+        if not container:
+            return {"ok": False, "detail": "no container publishing this backend's port"}
+        docker_action = "start" if action == "start" else "stop"
+        if docker_action == "start":
+            # Same guard as the load path: every docker start is a utilization-sized claim
+            # on unified memory, and a start the box cannot absorb starves sshd and this
+            # proxy first — refusal is the only failure mode anyone can still see.
+            claim = await _vllm_boot_claim_mb(container)
+            free = _free_mem_mb()
+            if claim and free and free < claim:
+                return {"ok": False, "via": "memory-guard",
+                        "detail": f"refused to start {container}: it will claim "
+                                  f"~{claim / 1024:.0f} GB and only {free / 1024:.0f} GB is "
+                                  f"free — free memory first"}
+        code, out = await _run_cmd([_docker_bin(), docker_action, container], 180.0)
+        return {"ok": code == 0, "detail": out[:300], "via": "docker",
+                "container": container}
+    return {"ok": False, "detail": f"{b.name} is not managed by the proxy", "via": "none"}
+
+
+# Headroom a vLLM start must leave free, on top of what it claims. See _vllm_boot_claim_mb
+# for the incident: 0.45 + 0.35 on a 122 GB box killed the NVIDIA driver's context allocator.
+_VLLM_BOOT_RESERVE_MB = 16384.0
+# ...but never more than this share of the machine, so the default stays sane on a small box.
+_VLLM_BOOT_RESERVE_FRACTION = 0.125
+
+
+def _vllm_boot_reserve_mb(total_mb: float) -> float:
+    """Free memory a vLLM start must leave behind, beyond what it claims.
+
+    Proportional, capped. The reserve covers CUDA contexts, the page cache and the system, all
+    of which scale with the box — a flat 16 GB is right on a 122 GB machine and absurd on a
+    16 GB one, where it doubled a 14 GB claim and made every vLLM start impossible.
+    An explicitly configured reserve is taken at face value; only this default scales.
+    """
+    return min(_VLLM_BOOT_RESERVE_MB, float(total_mb or 0) * _VLLM_BOOT_RESERVE_FRACTION)
+
+
+# Order matters only for display: this is the order the System tab shows backends in.
+PROVIDERS: dict = {}
+SIDE_SERVICES: dict = {}
+
+
+def _register_backends():
+    """Built once at import. Kept as a function so tests can rebuild it after patching URLs."""
+    PROVIDERS.clear()
+    SIDE_SERVICES.clear()
+    for p in (
+        _VllmProvider("vllm", "vLLM", _vllm_snapshot, lambda: VLLM_URL,
+                      load_mode="fixed", control="docker"),
+        _VllmProvider("vllm2", "vLLM (2nd)",
+                      lambda c: _vllm_snapshot(c, VLLM2_URL), lambda: VLLM2_URL,
+                      load_mode="fixed", control="docker"),
+        _LlamaCppProvider("llamacpp", "llama.cpp", _llamacpp_snapshot, lambda: LLAMACPP_URL,
+                          load_mode="fixed", control="unit"),
+        _LmStudioProvider("lmstudio", "LM Studio", _lmstudio_snapshot, lambda: LMSTUDIO_URL,
+                          load_mode="jit"),
+        _OllamaProvider("ollama", "Ollama", _ollama_snapshot, lambda: OLLAMA_URL,
+                        load_mode="on-demand"),
+    ):
+        PROVIDERS[p.name] = p
+    for s in (_FnSideService("comfyui", "ComfyUI", _comfyui_snapshot, control="unit"),):
+        SIDE_SERVICES[s.name] = s
+
+
+def backend(name: str):
+    return PROVIDERS.get(name) or SIDE_SERVICES.get(name)
+
+
+# Built at import, immediately after the snapshot functions it references.
+_register_backends()
+
+
+def _host_snapshot() -> tuple:
+    """CPU, load, memory and GPU — gathered together so it can be run off the event loop.
+
+    _gpu_snapshot shells out to nvidia-smi three times with a 3-second timeout each, so this is
+    up to nine seconds of blocking work. Called straight from the async collector it stopped the
+    proxy *accepting* connections for that long: the dashboard looked dead, requests piled up in
+    the socket's accept queue, and it cleared on its own once the box quietened down — which
+    made it look like load rather than a bug. nvidia-smi is slowest exactly when a benchmark is
+    hammering the GPU, so it failed when it was most likely to be watched.
+    """
+    return _cpu_pct(), _load_avg(), _mem_snapshot(), _gpu_snapshot()
+
+
+def _write_metrics_sample(ts: float, cpu, load, mem: dict, gpus: list, backends: dict) -> None:
+    """The sample write plus its retention deletes. Also blocking, also off-thread."""
     conn = db()
     conn.execute(
         """INSERT OR REPLACE INTO system_metrics
            (ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb, gpu_json,
-            ollama_json, lmstudio_json, comfyui_json, vllm_json, llamacpp_json)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            backends_json)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             ts,
             cpu,
-            _load_avg(),
+            load,
             mem.get("total_mb"),
             mem.get("used_mb"),
             mem.get("avail_mb"),
             json.dumps(gpus) if gpus else None,
-            json.dumps(ollama),
-            json.dumps(lmstudio),
-            json.dumps(comfyui),
-            json.dumps(vllm),
-            json.dumps(llamacpp),
+            json.dumps(backends),
         ),
     )
     # Retention
@@ -2052,6 +2805,27 @@ async def _collect_once(app: FastAPI):
     conn.commit()
     conn.close()
     _maybe_sweep_archive(ts)
+
+
+async def _collect_once(app: FastAPI):
+    # Everything blocking goes to a thread; only the backend probes, which are genuinely async
+    # HTTP, run on the loop.
+    cpu, load, mem, gpus = await asyncio.to_thread(_host_snapshot)
+    # Probe whatever is registered. return_exceptions=True because one unreachable backend
+    # must not abort the whole sample — losing every metric because a single probe raised is
+    # how the collector became a single point of failure before.
+    entries = list(PROVIDERS.items()) + list(SIDE_SERVICES.items())
+    results = await asyncio.gather(
+        *(b.probe(app.state.metrics_client) for _n, b in entries),
+        return_exceptions=True,
+    )
+    backends = {}
+    for (name, _b), res in zip(entries, results):
+        if isinstance(res, BaseException):
+            backends[name] = {"reachable": False, "error": f"{type(res).__name__}: {res}"}
+        else:
+            backends[name] = res
+    await asyncio.to_thread(_write_metrics_sample, time.time(), cpu, load, mem, gpus, backends)
     # Artifact sweep: extract file/url/image touches from recent requests (off-thread so the
     # metrics loop never blocks on DB work). Dedup makes it idempotent.
     try:
@@ -2290,7 +3064,43 @@ app = FastAPI(lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None
 RULES_REGISTRY: dict = {}
 
 DEFAULT_RULES_CONFIG = {
+    # Clients reserve output budget they never use, and OpenAI-compatible engines count that
+    # reservation against the context window: vLLM rejects input+max_tokens > max_model_len
+    # outright. Claude Code asks for 64,000 output tokens, which turned a 262,144 window into a
+    # 198,144 one and 400'd every request whose transcript had grown past that — "maximum context
+    # length is 262144 tokens. However, you requested 64000 output tokens and your prompt
+    # contains at least 198145 input tokens". Measured replies on this box run 26-1,952 tokens,
+    # so the reservation buys nothing and costs a quarter of the window.
+    # Refuse a request that would OOM the backend instead of forwarding it. Ollama allocates
+    # weights plus KV on load, and a model that does not fit kills the service — 303 restarts in
+    # one afternoon, while the client saw only "ended the response early". One refusal is cheaper
+    # than a crash loop that takes every other request down with it.
+    "backend_fit": {
+        "enabled": True,
+        "upstreams": ["ollama"],
+        # Making room means stopping the vLLM container, because Ollama evicts its own models
+        # already and holds nothing when idle. That is a real cost, not a tidy-up: a vLLM cold
+        # start on this box measured 400-500s, so an evicting request takes production down for
+        # the best part of ten minutes and it does not come back until something asks for it.
+        # Off by default for that reason. idle_s is the guard that stops a single stray request
+        # evicting a backend somebody is actively using.
+        "evict": {
+            "enabled": False,
+            "idle_s": 600,
+            "evict_upstreams": ["vllm"],
+            # How long to hold the request while the freed memory comes back. The caller would
+            # rather wait through a swap than be told to retry.
+            "release_timeout_s": 120,
+        },
+    },
+    "output_budget": {
+        "enabled": True,
+        "max_tokens": 8192,      # generous: the largest reply seen here was 1,952 tokens
+    },
     "loop_detector": {
+        # Nudge before blocking: a repeating model has usually not noticed, and an injected note
+        # is the only thing that changes its context. Blocking ends the turn; that is the escalation.
+        "nudge_at": 3,
         "enabled": True,
         "action": "block",       # "block" | "warn"
         "max_repeats": 4,         # signature appearing this many times in window blocks
@@ -2557,10 +3367,30 @@ DEFAULT_RULES_CONFIG = {
         # they contend for it and only one can be up.
         #   "vllm_containers": ["qwen-vllm", "ornith-vllm"]
         "vllm_containers": [],
+        # Auto-load: Ollama-style on-demand loading for the fixed backends (vLLM containers,
+        # llama.cpp). Off by default — turning it on means a request may stop the currently
+        # serving twin and evict other models when the target does not fit in free memory.
+        "auto_load": {"enabled": False, "ready_timeout_s": 900, "min_hold_s": 120,
+                      # Ollama keeps a model resident for keep_alive (two hours on this box),
+                      # which is enough to stop a vLLM container starting beside it.
+                      "release_ollama": True,
+                      "drain_s": 120},
+        # Free memory a vLLM start must leave behind, beyond what it claims. Utilization is
+        # not an upper bound: two servers summing to 0.80 of this box still exhausted the
+        # driver's context allocator and took both engines down. 0 uses the built-in default.
+        "vllm_boot_reserve_mb": 0,
+        # A fixed backend that drops the connection is usually restarting, not gone: vLLM's
+        # engine can die on a kernel fault and docker's restart policy brings it straight back,
+        # but the weights take minutes to reload. Every request arriving in that window used to
+        # get an immediate 502 — a qwen3.6 GDN kernel fault took the engine down and the next
+        # five requests were each rejected in under two seconds, when waiting would have served
+        # all of them. Hold instead, bounded, and only while the backend is actually coming up.
+        # timeout_s 0 means "use vllm_ready_timeout_s".
+        "hold_for_restart": {"enabled": True, "timeout_s": 0},
         # vLLM takes minutes to load weights and build its KV cache. This is how long to wait for
         # /v1/models to answer before reporting that it started but is not ready.
         "vllm_ready_timeout_s": 420,
-        # Applied when loading an LM Studio model, unless the request overrides them. A model
+    # Applied when loading an LM Studio model, unless the request overrides them. A model
         # loaded at the wrong context length or without parallelism benchmarks as a different
         # thing, so these are worth pinning per box.
         "lmstudio_context_length": None,
@@ -2586,6 +3416,18 @@ DEFAULT_RULES_CONFIG = {
             "extra_args": [],
         },
     },
+    # Ollama's /v1/chat/completions loses tool calls when streaming: the model decides to call a
+    # tool, the stream delivers `{"delta":{"content":""},"finish_reason":"stop"}`, and the call
+    # itself never arrives. The client sees a well-formed empty turn and reads it as the agent
+    # giving up. Measured here over 72 hours: 6 of 4,523 Ollama streams (0.13%) against 0 of 671
+    # on vLLM, on gemma4 and nemotron alike — an endpoint defect, not a model one, which is why
+    # this keys on the upstream rather than the model name. Ollama's own tracker recommends
+    # exactly this workaround, and it is the proxy's job rather than every client's.
+    #
+    # Only tool-bearing requests are covered. They are the ones that break, and a tool call is
+    # all-or-nothing anyway — no client can act on half of one — so the incremental delivery
+    # given up for them was never worth much. Plain prose keeps streaming token by token.
+    "tool_stream": {"enabled": True, "upstreams": ["ollama"]},
     "archive": {
         # Request bodies are ~340 KB each and arrive at ~3 GB/day, while the row describing
         # them is ~1.4 KB. Nothing analytical reads a body any more — stats, the reports and
@@ -2687,6 +3529,24 @@ MODEL_QUIRKS_FILE = _resolve_state_path(
     Path(__file__).parent / "model_quirks.json", "model_quirks.json"
 )
 DEFAULT_MODEL_QUIRKS = {
+    "gemma4": {
+        "match": "prefix",
+        "thinking": "default_off_optin",
+        "reasoning_control": "reasoning_effort",
+        "notes": ("Thinks by default, and on Ollama's /v1 the reasoning is where the whole "
+                  "budget goes. Measured in production: a claude-code turn generated 1,952 "
+                  "tokens over 100 seconds, of which 4,888 characters were reasoning and ZERO "
+                  "were content — the Anthropic bridge drops the reasoning, so the client waited "
+                  "a minute and a half for an empty turn and read it as the agent giving up. "
+                  "chat_template_kwargs cannot fix it; Ollama's /v1 ignores that field entirely "
+                  "(0 content / 861 reasoning with it set, identical to sending nothing). "
+                  "reasoning_effort=none is the lever that works there: same question answered "
+                  "in 175 characters and 32 tokens instead of 200. Off by default; a client that "
+                  "asks for reasoning_effort explicitly keeps whatever it asked for. Baked in "
+                  "rather than left to model_quirks.json — the file lives inside the package and "
+                  "every deploy overwrites it, and a copy placed one directory up never loaded "
+                  "at all, which is how this went unfixed for a day."),
+    },
     "ornith": {
         "match": "prefix",
         "thinking": "default_off_optin",
@@ -2705,6 +3565,19 @@ DEFAULT_MODEL_QUIRKS = {
                   "return empty content when thinking is on, so default OFF (bench-optimal for "
                   "coding); reasoning_effort high/medium opts in. Even with thinking off it narrates "
                   "reasoning in the content, so system_nudge curbs that (only applied when no-think)."),
+    },
+    "qwen3.6": {
+        "match": "prefix",
+        "thinking": "default_off_optin",
+        "reasoning_control": "chat_template_kwargs.enable_thinking",
+        "notes": ("Same family and same knob as ornith: the template defaults thinking ON and "
+                  "reasoning_effort does nothing. Measured through the proxy on vLLM at "
+                  "max_tokens=30 — 40,036 prompt tokens in, all 30 output tokens spent on "
+                  "reasoning, content came back null. A coding client reads that as the model "
+                  "answering nothing. Needs --reasoning-parser qwen3 on the server or the "
+                  "thinking bleeds into content instead. No system_nudge here: ornith's was "
+                  "measured against ornith, and an unmeasured prompt injection is a change to "
+                  "every answer this model gives."),
     },
 }
 _QUIRKS_CACHE: dict = {"mtime": None, "data": None}
@@ -2750,6 +3623,70 @@ def _model_quirk(model_name: str) -> dict | None:
                 or (mode == "substring" and p in ml)):
             return q
     return None
+
+
+def _tool_stream_mode(model_name: str, upstream: str | None, quirk: dict | None = None) -> str:
+    """How to treat a tool-bearing streaming request: "passthrough" or "buffer".
+
+    "buffer" holds the streamed response back instead of relaying it live, so that a reply which
+    lost its tool call on the way — Ollama's /v1 endpoint drops them from streams, see the
+    `tool_stream` rule for the measurement — can be re-fetched non-streaming before the client
+    has seen anything. The default is per-upstream, since the defect belongs to the endpoint and
+    a newly pulled Ollama model would otherwise inherit the bug silently. A model quirk overrides
+    it either way; `"tool_stream": "passthrough"` is the escape hatch for a model measured not to
+    need it, and buys back live token-by-token delivery on its tool-bearing turns.
+    """
+    q = _model_quirk(model_name) if quirk is None else quirk
+    forced = str((q or {}).get("tool_stream") or "").strip().lower()
+    if forced in ("buffer", "passthrough"):
+        return forced
+    cfg = load_rules_config().get("tool_stream") or {}
+    if not cfg.get("enabled", True):
+        return "passthrough"
+    ups = cfg.get("upstreams") or ["ollama"]
+    return "buffer" if str(upstream or "").lower() in [str(u).lower() for u in ups] else "passthrough"
+
+
+def _stream_has_tool_call(sse_text: str | None) -> bool:
+    """Whether an SSE body carries a tool call, in delta or assembled form.
+
+    Needed because _response_delivered_chars counts characters and a tool call has none: a turn
+    whose entire output is one call would otherwise read as empty. That mistake is what made the
+    first version of the tool_stream audit report every successful recovery as a failure.
+    """
+    for line in (sse_text or "").splitlines():
+        raw = line[6:] if line.startswith("data: ") else line
+        raw = raw.strip()
+        if not raw or raw == "[DONE]" or not raw.startswith("{"):
+            continue
+        try:
+            j = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for ch in (j.get("choices") or []):
+            if not isinstance(ch, dict):
+                continue
+            for shape in (ch.get("delta"), ch.get("message")):
+                if isinstance(shape, dict) and shape.get("tool_calls"):
+                    return True
+        m = j.get("message")
+        if isinstance(m, dict) and m.get("tool_calls"):
+            return True
+        if j.get("type") == "content_block_start":
+            if (j.get("content_block") or {}).get("type") == "tool_use":
+                return True
+    return False
+
+
+def _request_has_tools(body_json) -> bool:
+    """True when the request offers the model tools, in either wire shape."""
+    if not isinstance(body_json, dict):
+        return False
+    for key in ("tools", "functions"):
+        v = body_json.get(key)
+        if isinstance(v, list) and v:
+            return True
+    return False
 
 
 def get_setting(key: str):
@@ -3054,7 +3991,7 @@ def _rule_loop_detector(body: dict, cfg: dict):
                 out.append((fn.get("name") or "?", _normalize_args(fn.get("arguments"))))
         return out
 
-    def _detect(sigs):
+    def _detect(sigs, threshold):
         """Return (tool_name, count, trigger, args_preview) or None."""
         if not sigs:
             return None
@@ -3062,17 +3999,41 @@ def _rule_loop_detector(body: dict, cfg: dict):
         for s in sigs:
             counts[s] = counts.get(s, 0) + 1
         top_sig, top_count = max(counts.items(), key=lambda kv: kv[1])
-        if top_count >= max_repeats:
+        if top_count >= threshold:
             return (top_sig[0], top_count, "count_in_window", top_sig[1])
         if len(sigs) >= tail_n and all(s == sigs[-1] for s in sigs[-tail_n:]):
             return (sigs[-1][0], tail_n, "tail_consecutive", sigs[-1][1])
         return None
 
     # Active loop: assistant tool calls made SINCE the last user message.
+    #
+    # Two tiers, because blocking outright ends the turn and hands the problem back to the human,
+    # while the model has usually just failed to notice it is repeating itself. Observed on this
+    # box: gemma4 called Edit with byte-identical arguments six times because the edit failed and
+    # the client deduplicated the Read it tried to recover with, so nothing in its context ever
+    # changed. A nudge changes the context — which is the one thing that could break that.
+    #
+    #   nudge_at .. max_repeats-1  -> allowed through with a note telling it to stop repeating
+    #   max_repeats and above      -> blocked, because the nudge did not work
     active_msgs = messages[last_user_idx + 1:] if last_user_idx >= 0 else messages
-    active = _detect(_collect(active_msgs)[-window:])
+    nudge_at = int(cfg.get("nudge_at", 3) or 0)
+    floor = min(nudge_at, max_repeats) if nudge_at else max_repeats
+    active = _detect(_collect(active_msgs)[-window:], floor)
     if active:
         name, count, trigger, args_preview = active
+        if nudge_at and count < max_repeats:
+            note = (f"[AI Proxy loop-detector] You have now called `{name}` with the same "
+                    f"parameters {count}× in a row and it has not moved the task forward. Do NOT "
+                    f"issue that identical call again. Either change the parameters, use a "
+                    f"different tool, or explain what is blocking you. If a tool reported an "
+                    f"error, address that error rather than retrying unchanged — repeating the "
+                    f"call will be blocked.")
+            return {
+                "reason": f"Tool call {name!r} repeated {count}× — nudged (blocks at {max_repeats})",
+                "details": {"trigger": trigger, "tool_name": name, "count": count,
+                            "args_preview": args_preview[:300],
+                            "soft_unblock": True, "nudge": True, "note": note},
+            }
         return {
             "reason": f"Tool call {name!r} repeated {count}× since the last user message",
             "details": {"trigger": trigger, "tool_name": name, "count": count,
@@ -3082,7 +4043,7 @@ def _rule_loop_detector(body: dict, cfg: dict):
     # No active loop, but a loop before the last user turn means the user just interrupted one.
     # Allow through, but carry a note so the model learns why it was stopped.
     if last_user_idx >= 0:
-        prior = _detect(_collect(messages[:last_user_idx + 1])[-window:])
+        prior = _detect(_collect(messages[:last_user_idx + 1])[-window:], max_repeats)
         if prior:
             name, count, trigger, args_preview = prior
             note = (f"[AI Proxy loop-detector] Your earlier turn called the tool `{name}` with the "
@@ -3968,6 +4929,443 @@ def _match_router_cond(cond: dict, body: dict, ctx: dict) -> bool:
     return True
 
 
+_SERVED_MODEL_CACHE: dict = {"ts": 0.0, "by_upstream": {}}
+
+
+def _live_served_model(upstream: str) -> str | None:
+    """Whichever model that upstream is serving right now, or None.
+
+    Lets a router rule say "auto" instead of naming a model, so swapping the container behind a
+    port moves traffic with it and no rules edit is needed. That matters while models are being
+    tested: every previous swap needed the catch-all rewritten, and forgetting once left traffic
+    pointed at a backend that was no longer there.
+
+    Cached for a few seconds because this is on the request path and the answer only changes when
+    a container is restarted, which takes minutes.
+    """
+    if not upstream:
+        return None
+    now = time.time()
+    if now - _SERVED_MODEL_CACHE["ts"] > 5.0:
+        _SERVED_MODEL_CACHE["by_upstream"] = {}
+        _SERVED_MODEL_CACHE["ts"] = now
+    cached = _SERVED_MODEL_CACHE["by_upstream"]
+    if upstream in cached:
+        return cached[upstream]
+    base = None
+    prov = PROVIDERS.get(upstream)
+    if prov is not None:
+        try:
+            base = prov.base_url
+        except Exception:
+            base = None
+    name = None
+    if base:
+        try:
+            with httpx.Client(timeout=2.0) as c:
+                data = (c.get(f"{base}/v1/models").json().get("data") or [])
+            # One vLLM process serves one model; if several are listed the first is the one the
+            # container was launched with.
+            name = (data[0] or {}).get("id") if data else None
+        except Exception:
+            name = None
+    cached[upstream] = name
+    return name
+
+
+_OLLAMA_FIT_CACHE: dict = {}          # (model, window) -> (checked_ts, refusal or None)
+_OLLAMA_FIT_TTL_S = 30.0
+# Sizes and shapes learned while Ollama was healthy, kept indefinitely. Without this the guard
+# is useless exactly when it is needed: once a model has crashed the service, /api/tags stops
+# answering, the guard cannot learn what the model weighs, and "never block on ignorance" lets
+# the next request through to kill the restarted process. Remembering is what breaks the loop.
+_OLLAMA_META_CACHE: dict = {}         # normalised model -> {"size_mb", "info", "params"}
+
+
+async def _free_ollama_models(reason: str = "") -> list:
+    """Unload whatever Ollama is holding. Returns the models it released.
+
+    Ollama keeps a model resident for OLLAMA_KEEP_ALIVE — two hours on this box — so a sweep
+    that moves from an Ollama model back to a vLLM one finds the memory still taken and the
+    container fails to start. Setting keep_alive to 0 on each resident model releases it now
+    rather than in two hours. Best-effort throughout: a swap must not fail because a tidy-up
+    call did.
+    """
+    released = []
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+            ps = await c.get(f"{OLLAMA_URL}/api/ps")
+            if ps.status_code != 200:
+                return released
+            for m in (ps.json().get("models") or []):
+                name = m.get("name") or m.get("model")
+                if not name:
+                    continue
+                try:
+                    await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "keep_alive": 0})
+                    released.append(name)
+                except httpx.RequestError:
+                    pass
+    except (httpx.RequestError, ValueError):
+        return released
+    if released:
+        print(f"[backend_fit] released ollama models {released} {reason}".strip())
+    return released
+
+
+async def _backend_uptime_s(name: str) -> float | None:
+    """Seconds since this backend's container started, or None when that cannot be told.
+
+    None means "do not know", and every caller must treat it as no evidence rather than as
+    zero: refusing to evict a backend whose age is unknown would disable eviction on any box
+    where docker is not reachable.
+    """
+    prov = PROVIDERS.get(name)
+    if prov is None or getattr(prov, "control", "") != "docker":
+        return None
+    docker = _docker_bin()
+    container = await _vllm_container(prov.base_url) if docker else None
+    if not container:
+        return None
+    code, out = await _run_cmd([docker, "inspect", container, "--format",
+                                "{{.State.StartedAt}}"], 15.0, max_chars=200)
+    if code != 0 or not out.strip():
+        return None
+    try:
+        # Docker prints RFC3339 with nanoseconds, which fromisoformat rejects past microseconds.
+        raw = re.sub(r"\.(\d{6})\d*", r".", out.strip().replace("Z", "+00:00"))
+        started = datetime.datetime.fromisoformat(raw)
+    except (ValueError, TypeError):
+        return None
+    return max(0.0, datetime.datetime.now(datetime.timezone.utc).timestamp()
+               - started.timestamp())
+
+
+async def _evict_for_fit(refusal: str, wanted_model: str,
+                         caller_owns: bool = False,
+                         _impossible: bool = False,
+                         pin: int | None = None) -> str | None:
+    """Free memory by stopping an idle backend so `wanted_model` can load. None = freed.
+
+    Returns a reason when it declines, which is then appended to the refusal — a request that
+    was refused despite eviction being enabled should say why it was not evicted for, rather
+    than looking like the setting did nothing.
+    """
+    cfg = ((load_rules_config().get("backend_fit") or {}).get("evict") or {})
+    if not cfg.get("enabled"):
+        return "eviction is off (backend_fit.evict.enabled)"
+    idle_s = float(cfg.get("idle_s", 600) or 600)
+    targets = [str(u).lower() for u in (cfg.get("evict_upstreams") or ["vllm"])]
+    # Never evict for a model that cannot fit on an EMPTY box. Eviction buys memory, and a
+    # model needing more than the machine has cannot be bought room — qwen3.6:35b-a3b prices at
+    # ~340 GB of KV on a 122 GB box, and asking for it stopped the container serving production
+    # to chase a load that could never succeed. Refusing costs one request; this cost every
+    # request for the eight minutes vLLM took to come back.
+    if _impossible:
+        return ("no amount of eviction would help: it needs more than this machine has in total")
+
+    # A running benchmark owns the box and the idle guard does not apply to it. A sweep exists
+    # to move between models, so the backend it needs to evict is by definition the one IT was
+    # using seconds ago — the guard would refuse every swap and make eviction useless for the
+    # only workload that wants it. An exclusive run has already quiesced live traffic through
+    # panic mode, so there is nobody left for idleness to protect.
+    #
+    # caller_owns is the x-proxy-evict header: a benchmark driven from OUTSIDE this proxy has
+    # no row in bench_runs, so the internal check cannot see it. Whoever is sweeping models is
+    # the only party who knows the box is theirs, so they say so per request.
+    bench_owns = caller_owns
+    if not bench_owns:
+        try:
+            conn = db()
+            bench_owns = bool(conn.execute(
+                "SELECT COUNT(*) FROM bench_runs WHERE status IN ('running','pending')"
+            ).fetchone()[0])
+            conn.close()
+        except Exception:
+            bench_owns = False
+    try:
+        conn = db()
+        row = conn.execute(
+            "SELECT MAX(ts) AS last FROM requests WHERE upstream IN (%s) AND ts > ?"
+            % ",".join("?" * len(targets)),
+            (*targets, time.time() - 86400)).fetchone()
+        conn.close()
+        last = (row["last"] if row else None) or 0
+    except Exception:
+        return "could not read recent traffic, so idleness is unknown"
+    idle_for = time.time() - last if last else idle_s + 1
+    if idle_for < idle_s and not bench_owns:
+        return (f"{targets[0]} served a request {idle_for:.0f}s ago and idle_s is {idle_s:.0f}s; "
+                f"evicting a backend in active use would trade one stall for everybody's")
+    # A backend that has only just started has served nothing, which reads as maximally idle —
+    # so the first request it cannot fit stops it, throwing away a load that takes five to seven
+    # minutes. Uptime is the difference between "nobody wants this" and "nobody has had the
+    # chance to want it yet".
+    if not bench_owns:
+        up = await _backend_uptime_s(targets[0])
+        if up is not None and up < idle_s:
+            return (f"{targets[0]} started {up:.0f}s ago and idle_s is {idle_s:.0f}s; it has not "
+                    f"been idle, it has not finished coming up")
+    # Ollama's OWN residents first, because they are usually the blocker and releasing them is
+    # free. It parks up to OLLAMA_MAX_LOADED_MODELS for OLLAMA_KEEP_ALIVE — three models for two
+    # hours here — so a sweep that has already visited two models is holding 47 GB before the
+    # third is even requested. Stopping vLLM for that would pay a 400-500s restart to reclaim
+    # memory Ollama was going to give back for nothing.
+    released = await _free_ollama_models(f"to make room for {wanted_model!r}")
+    if released:
+        for _ in range(20):
+            await asyncio.sleep(1.0)
+            _OLLAMA_FIT_CACHE.pop((wanted_model, pin or 0), None)
+            if await _ollama_fit_refusal(wanted_model, pin=pin) is None:
+                print("[backend_fit] released %s; no container stop needed" % released)
+                return None
+
+    stopped = []
+    for name in targets:
+        prov = PROVIDERS.get(name)
+        if prov is None:
+            continue
+        try:
+            await prov.stop()
+            stopped.append(name)
+        except Exception as e:
+            return f"stopping {name} failed: {type(e).__name__}"
+    if not stopped:
+        return ("nothing left to stop: %s" % (
+            "released %s but it was not enough" % released if released else "nothing to stop"))
+    # Hold the request until the memory is actually back, rather than guessing at a fixed
+    # sleep. A container does not release on exit, and the caller would rather wait through a
+    # swap than be told to try again — handling it here is the whole point of doing it in the
+    # proxy instead of in every client.
+    _wait_s = float(cfg.get("release_timeout_s", 120) or 120)
+    _t0 = time.time()
+    while time.time() - _t0 < _wait_s:
+        await asyncio.sleep(1.0)
+        _OLLAMA_FIT_CACHE.pop((wanted_model, pin or 0), None)
+        if await _ollama_fit_refusal(wanted_model, pin=pin) is None:
+            break
+    _why = ("caller owns the box" if caller_owns
+            else "bench owns the box" if bench_owns
+            else "idle %.0fs" % idle_for)
+    print("[backend_fit] evicted %s (%s) to make room for %r"
+          % (",".join(stopped), _why, wanted_model))
+    return None
+
+
+def _configured_num_ctx(model: str) -> int | None:
+    """The num_ctx the ollama_options rule would pin this model to, if any.
+
+    Read by both the fit gate and the swap itself so the two cannot disagree about how big the
+    request is — one refusing what the other was about to make fit.
+    """
+    cfg = (load_rules_config().get("ollama_options") or {})
+    if not cfg.get("enabled", False):
+        return None
+    for src in ((cfg.get("per_model") or {}).get(model), cfg.get("defaults") or {}):
+        if isinstance(src, dict) and src.get("num_ctx"):
+            try:
+                return int(src["num_ctx"])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _body_num_ctx(body: dict) -> int | None:
+    """The num_ctx a request asks for, wherever the client put it."""
+    if not isinstance(body, dict):
+        return None
+    opts = body.get("options") if isinstance(body.get("options"), dict) else {}
+    v = body.get("num_ctx") or opts.get("num_ctx")
+    try:
+        return int(v) if v else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _effective_num_ctx(model: str, body: dict) -> int | None:
+    """The window this request will actually load with, on the OpenAI-compatible path.
+
+    A client asking for a smaller context is asking for something Ollama's /v1 endpoint throws
+    away, so the proxy has to deliver it as a derived model — and the fit gate has to price the
+    request at it, or it refuses a load that was going to be a fraction of the size it feared.
+    The smaller of what the client asked for and what the config pins wins: a client asking for
+    MORE than the pin would undo the pin's whole purpose.
+    """
+    asked = _body_num_ctx(body)
+    # A request asking for the server default or more has nothing to deliver: that window is
+    # already what it would get. Acting on it anyway would derive a variant per model for the
+    # agents that auto-set num_ctx to the model's full training context, which is common.
+    if asked and asked >= _bench_ollama_server_ctx(None)[0]:
+        asked = None
+    pinned = _configured_num_ctx(model)
+    if asked and pinned:
+        return min(asked, pinned)
+    return asked or pinned
+
+
+async def _ollama_fit_refusal(model: str, assume_avail_mb: int = 0,
+                              pin: int | None = None) -> str | None:
+    """Why forwarding this would kill Ollama, or None if it is safe to send.
+
+    The same arithmetic the bench preflight uses, applied to live traffic and measured against
+    AVAILABLE memory rather than total — the bench owns the box, a live request does not. With
+    vLLM holding 85 of 121 GB, a request for a 51 GB Ollama model made the service allocate,
+    get OOM-killed, restart, and die again on the next request: 303 restarts, and the client
+    only ever saw "ended the response early". Refusing costs one request; forwarding costs the
+    backend and every other request queued behind it.
+
+    A model already resident is always allowed: it is loaded, so no allocation is coming.
+    """
+    if not model:
+        return None
+    now = time.time()
+    # A hypothetical ("would this fit on an empty box?") must not be cached as the real verdict,
+    # nor answered from one.
+    ckey = (model, pin or 0)
+    hit = None if assume_avail_mb else _OLLAMA_FIT_CACHE.get(ckey)
+    if hit and now - hit[0] < _OLLAMA_FIT_TTL_S:
+        return hit[1]
+
+    async def _decide() -> str | None:
+        key = _norm_model_id(model)
+        remembered = _OLLAMA_META_CACHE.get(key) or {}
+        body, sizes = {}, {}
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
+                ps = await c.get(f"{OLLAMA_URL}/api/ps")
+                if ps.status_code == 200:
+                    for m in (ps.json().get("models") or []):
+                        if _norm_model_id(m.get("name")) == key:
+                            return None          # resident: nothing to allocate
+                show = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
+                if show.status_code < 400:
+                    body = show.json() or {}
+                tags = await c.get(f"{OLLAMA_URL}/api/tags")
+                if tags.status_code == 200:
+                    for t in (tags.json().get("models") or []):
+                        if not t.get("size"):
+                            continue
+                        mb = t["size"] / (1024 * 1024)
+                        # Keyed by the EXACT name as well as the normalised one. Normalising
+                        # alone conflates the tags of a family: qwen3.6:35b-a3b (23 GB) and
+                        # qwen3.6:27b (16 GB) both reduce to "qwen3.6", so the 35b was priced
+                        # at the 27b's weight, judged to fit, and killed the service.
+                        sizes[t["name"]] = mb
+                        sizes.setdefault(_norm_model_id(t.get("name")), mb)
+        except (httpx.RequestError, ValueError, KeyError):
+            pass          # fall through to what was learned while the backend was healthy
+
+        info = body.get("model_info") or remembered.get("info") or {}
+        params = body.get("parameters") or remembered.get("params") or ""
+        if info:
+            _OLLAMA_META_CACHE.setdefault(key, {}).update({"info": info, "params": params})
+        if sizes.get(model) or sizes.get(key):
+            _OLLAMA_META_CACHE.setdefault(key, {})["size_mb"] = sizes.get(model) or sizes[key]
+        if not info:
+            return None                          # never seen it healthy: cannot judge
+        per_slot, parallel = _bench_ollama_server_ctx(None)
+        model_ctx = info.get(f"{info.get('general.architecture')}.context_length")
+        if isinstance(model_ctx, (int, float)) and model_ctx:
+            per_slot = min(per_slot, int(model_ctx))
+        for line in str(params).splitlines():
+            bits = line.split()
+            if len(bits) == 2 and bits[0] == "num_ctx":
+                try:
+                    per_slot = min(per_slot, int(float(bits[1])))
+                except ValueError:
+                    pass
+                break
+        # The window this request will really load at, decided by the caller. ollama_options
+        # rewrites the request to a context-pinned derivative later in the pipeline, and THAT
+        # is what gets loaded — qwen3.6:35b-a3b prices at 655 GB against the 262k server
+        # default and 47 GB pinned to 16k, and only the second number describes the load that
+        # would happen. Passed in rather than looked up here because the pin applies only on
+        # the OpenAI-compat path: a native /api/chat request carries its own num_ctx and is
+        # never swapped, so pricing it at the pin would wave through a 262k allocation.
+        if pin:
+            per_slot = min(per_slot, pin)
+        kv_mb = _bench_ollama_kv_mb(info, per_slot * parallel)
+        size_mb = sizes.get(model) or sizes.get(key) or remembered.get("size_mb")
+        avail_mb = assume_avail_mb or (_mem_snapshot() or {}).get("avail_mb")
+        if not size_mb or not avail_mb:
+            return None
+        # An unknown KV estimate must not defeat the check. _bench_ollama_kv_mb returns None for
+        # architectures whose fields it does not recognise — qwen3next among them — and the
+        # weights alone were already disqualifying: 48 GB of them into 36 GB free. Falling back
+        # to a weights-only comparison is strictly weaker and still catches that, which is the
+        # case that was crash-looping the service.
+        kv_known = kv_mb is not None
+        need = size_mb * _BENCH_FIT_OVERHEAD + (kv_mb or 0.0)
+        cap = avail_mb - _BENCH_FIT_RESERVE_MB
+        if need <= cap:
+            return None
+        _kv_part = (f"plus ~{kv_mb / 1024:.0f} GB of KV cache at {per_slot:,} tokens x "
+                    f"{parallel} parallel slots" if kv_known else
+                    f"plus a KV cache this build could not size ({per_slot:,} tokens x "
+                    f"{parallel} slots), so this counts the weights alone")
+        return (f"{model!r} cannot be loaded right now: it needs ~{size_mb / 1024:.0f} GB of "
+                f"weights {_kv_part}, and only ~{max(0, cap) / 1024:.0f} GB is free. "
+                f"Forwarding it would OOM the Ollama service rather than answer. Free memory "
+                f"(stop the vLLM container), lower OLLAMA_CONTEXT_LENGTH / OLLAMA_NUM_PARALLEL, "
+                f"or request a model that is already loaded.")
+
+    verdict = await _decide()
+    if not assume_avail_mb:
+        _OLLAMA_FIT_CACHE[ckey] = (now, verdict)
+    return verdict
+
+
+_MODEL_HOME_CACHE: dict = {"ts": 0.0, "map": {}}
+_MODEL_HOME_TTL_S = 30.0
+
+
+async def _backend_serving(model: str) -> str | None:
+    """The one backend that serves `model`, or None if it is ambiguous or unknown.
+
+    Passthrough routing sends a request to the path default — Ollama for /v1/chat — so naming a
+    model that only vLLM serves produced "model not found" in 100ms. Four models in a sweep
+    failed that way while their containers sat stopped and startable: the proxy knew where they
+    lived and never looked. Only an unambiguous answer is used; if two backends serve the name,
+    the caller has to say which with the qualified "model/backend" form.
+    """
+    if not model:
+        return None
+    now = time.time()
+    if now - _MODEL_HOME_CACHE["ts"] > _MODEL_HOME_TTL_S:
+        try:
+            index = await _bench_model_index()
+        except Exception:
+            return None
+        homes: dict = {}
+        for key, meta in (index or {}).items():
+            if not isinstance(meta, dict):
+                continue
+            name = _norm_model_id(meta.get("model") or "")
+            up = meta.get("upstream")
+            if name and up:
+                homes.setdefault(name, set()).add(up)
+        _MODEL_HOME_CACHE.update(ts=now, map={n: next(iter(u)) for n, u in homes.items()
+                                              if len(u) == 1})
+    return _MODEL_HOME_CACHE["map"].get(_norm_model_id(model))
+
+
+def _split_qualified_model(name: str) -> tuple[str, str | None]:
+    """Split "qwen3-coder-next/vllm" into ("qwen3-coder-next", "vllm").
+
+    /v1/models qualifies a name with its backend when two backends serve the same one, so a
+    client that picks the qualified entry must be able to send it back. Only a suffix naming a
+    real provider is treated as a qualifier — model ids contain slashes routinely
+    ("hf.co/unsloth/...", "nvidia/Nemotron..."), and splitting those would break them.
+    """
+    if not name or "/" not in name:
+        return name, None
+    head, _, tail = name.rpartition("/")
+    if head and tail in PROVIDERS:
+        return head, tail
+    return name, None
+
+
 def evaluate_router(body: dict, ctx: dict) -> dict | None:
     """Apply model_router config. Returns {from, to, via, condition} or None.
     Mutates `body['model']` in place when a rewrite fires."""
@@ -4003,6 +5401,23 @@ def evaluate_router(body: dict, ctx: dict) -> dict | None:
             matched_cond = cond
             upstream = r.get("upstream")  # e.g. "lmstudio" to send this model elsewhere
             break
+
+    # A rule with an upstream and no `then` keeps the model the client asked for and only
+    # changes where it goes. That is what "reach the model I named" needs: without it the only
+    # way to select a backend was to also rewrite the name, so every request came back served by
+    # whatever the catch-all pointed at, whatever had been asked for.
+    if target is None and upstream:
+        target = original
+
+    # "auto" means "whatever that upstream is serving", resolved per request. A swap of the
+    # container behind the port therefore moves traffic without a config change. Falls back to
+    # leaving the model untouched if the upstream cannot be reached, because rewriting the name
+    # to nothing would send a request naming no model at all.
+    if isinstance(target, str) and target.strip().lower() == "auto":
+        live = _live_served_model(upstream or ctx.get("upstream") or "")
+        if not live:
+            return None
+        target = live
 
     # A rule may switch upstream without renaming the model, so a bare upstream override
     # (target == original) still counts as a rewrite.
@@ -4042,6 +5457,98 @@ def _cap_num_ctx(body: dict, cap: int) -> int | None:
             opts["num_ctx"] = cap
             changed = cap
     return changed
+
+
+# num_ctx cannot be delivered over Ollama's OpenAI-compatible endpoint. Measured directly:
+# top-level `num_ctx` and nested `options.num_ctx` are both ignored there, and only the native
+# /api/chat honours them. A preload does not survive either — the OpenAI handler sends the
+# server default with every request, which reloads the model and silently discards the window
+# that was asked for. That is what quietly undid a 65,536 preload in the middle of a benchmark.
+#
+# Ollama's own answer is a derived model carrying the parameter, which every endpoint respects
+# because it lives in the model rather than the request. Deriving costs no disk (the blobs are
+# shared) and the rule then works as its config always implied it did.
+_CTX_MODELS_SEEN: set = set()
+
+
+def _ctx_derived_name(model: str, num_ctx: int) -> str:
+    """Stable, collision-free name for the pinned variant. Tag is dropped into the name so
+    'qwen3.8:27b' at 512k becomes 'qwen3.8-27b-ctx512k', which reads in `ollama list`."""
+    base = re.sub(r"[^A-Za-z0-9._-]", "-", (model or "").replace(":", "-")).strip("-")
+    k = num_ctx // 1024
+    suffix = f"{k // 1024}m" if k >= 1024 and k % 1024 == 0 else f"{k}k"
+    return f"{base}-ctx{suffix}"
+
+
+async def _ensure_ctx_model(base: str, num_ctx: int) -> str | None:
+    """Create (once) and return the pinned variant of `base`, or None to leave the request be.
+
+    Failure is never fatal: a request that cannot get its bigger window should still be served
+    at the default rather than refused, so every error path returns None and the caller
+    forwards the original model.
+    """
+    name = _ctx_derived_name(base, num_ctx)
+    if name in _CTX_MODELS_SEEN:
+        return name
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+            tags = (await c.get(f"{OLLAMA_URL}/api/tags")).json()
+            have = {(t.get("name") or "").split(":")[0] for t in (tags.get("models") or [])}
+            if name in have:
+                _CTX_MODELS_SEEN.add(name)
+                return name
+            info = await c.post(f"{OLLAMA_URL}/api/show", json={"model": base})
+            caps = (info.json() or {}).get("capabilities") or [] if info.status_code < 400 else []
+            caps = [str(x).lower() for x in caps]
+            r = await c.post(f"{OLLAMA_URL}/api/create",
+                             json={"model": name, "from": base,
+                                   "parameters": {"num_ctx": int(num_ctx)}, "stream": False})
+            if r.status_code >= 400:
+                print(f"[ollama_options] could not derive {name} from {base}: "
+                      f"HTTP {r.status_code} {r.text[:120]}")
+                return None
+            # Deriving minicpm-v4.5 once produced a variant that answered "Load failed" with its
+            # mmproj still being sized — the projector had not come across. That was a blanket
+            # ban on deriving vision models until qwen3.6:35b-a3b derived cleanly and kept
+            # vision, so the ban was costing a working config. Check the thing that actually
+            # goes wrong instead: if a capability was lost, throw the variant away.
+            if "vision" in caps:
+                after = await c.post(f"{OLLAMA_URL}/api/show", json={"model": name})
+                kept = [str(x).lower() for x in ((after.json() or {}).get("capabilities") or [])
+                        ] if after.status_code < 400 else []
+                if "vision" not in kept:
+                    await c.request("DELETE", f"{OLLAMA_URL}/api/delete",
+                                    json={"model": name})
+                    print(f"[ollama_options] {name} lost vision when derived from {base} — "
+                          f"deleted it, serving the base model unpinned instead")
+                    return None
+    except (httpx.RequestError, ValueError, KeyError) as e:
+        print(f"[ollama_options] could not derive {name}: {type(e).__name__}: {e}")
+        return None
+    _CTX_MODELS_SEEN.add(name)
+    print(f"[ollama_options] derived {name} from {base} with num_ctx={num_ctx}")
+    return name
+
+
+async def apply_ollama_ctx_model(body: dict, ctx: dict) -> dict | None:
+    """Swap the model for a context-pinned variant when the rule asks for a num_ctx the
+    OpenAI path cannot carry. Native-path requests are left alone — there, num_ctx works."""
+    if not isinstance(body, dict) or "/api/" in (ctx.get("path") or ""):
+        return None
+    cfg = (load_rules_config().get("ollama_options") or {})
+    if not cfg.get("enabled", False):
+        return None
+    base = body.get("model")
+    if not base or _ctx_derived_name(base, 1).rsplit("-ctx", 1)[0] in ("", None):
+        return None
+    want = _effective_num_ctx(base, body)
+    if not want:
+        return None
+    derived = await _ensure_ctx_model(base, want)
+    if not derived or derived == base:
+        return None
+    body["model"] = derived
+    return {"from": base, "to": derived, "num_ctx": want}
 
 
 def evaluate_ollama_options(body: dict, ctx: dict) -> dict | None:
@@ -4105,6 +5612,12 @@ def evaluate_ollama_options(body: dict, ctx: dict) -> dict | None:
         for k, v in candidate.items():
             if k in _NATIVE_TOP_LEVEL_KEYS:
                 continue  # not applicable to OpenAI-compat path
+            if k == "num_ctx":
+                # Measured: Ollama's OpenAI endpoint ignores num_ctx both at top level and
+                # nested under options. Setting it here changed nothing while reporting itself
+                # as applied — a rule claiming an effect it does not have. apply_ollama_ctx_model
+                # delivers it for real, via a derived model, and records itself in `sources`.
+                continue
             if k not in body:
                 body[k] = v
                 applied[k] = v
@@ -4339,6 +5852,16 @@ def evaluate_context_overflow(body, ctx) -> dict | None:
             "reason": f"prompt ~{est_tokens} tok exceeds num_ctx={num_ctx} (will be silently truncated by Ollama)"}
 
 
+def _pct_bucket(pct: int) -> str:
+    """Coarsen a percentage so the reminder text is stable across turns.
+
+    An exact figure ("~240916 tokens (~91%)") changes every request, so even a tail-appended
+    reminder would re-prefill on each turn. Ten-point buckets change a handful of times over a
+    whole conversation instead.
+    """
+    return "%d%%" % (max(0, min(100, int(pct))) // 10 * 10)
+
+
 def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
     """When the prompt is creeping toward num_ctx, return an action describing how to nudge
     the client/model to compact. Strategy depends on client_app — Claude Code respects the
@@ -4374,16 +5897,16 @@ def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
     }
     if strategy == "system_reminder":
         text = (
-            f"<system-reminder>This conversation has used ~{est} tokens "
-            f"(~{pct}% of the {num_ctx}-token context window). Strongly suggest the user "
-            f"run /compact to summarize older turns before continuing, or start a new chat.</system-reminder>"
+            f"<system-reminder>This conversation has passed {_pct_bucket(pct)} of the "
+            f"{num_ctx}-token context window. Strongly suggest the user run /compact to "
+            f"summarize older turns before continuing, or start a new chat.</system-reminder>"
         )
         return {**base, "action": "system_reminder", "text": text,
                 "reason": f"prompt ~{est} tok ({pct}%) — injecting <system-reminder> for {client_app}"}
     if strategy == "system_reminder_plain":
         text = (
-            f"NOTE: this conversation has used ~{est} tokens (~{pct}% of the available "
-            f"context). Before continuing, advise the user to summarize earlier turns or "
+            f"NOTE: this conversation has passed {_pct_bucket(pct)} of the available "
+            f"context. Before continuing, advise the user to summarize earlier turns or "
             f"start a fresh conversation. Long conversations cause silent truncation and "
             f"degrade response quality."
         )
@@ -4400,6 +5923,47 @@ def evaluate_compaction_nudge(body: dict, ctx: dict) -> dict | None:
         return {**base, "action": "synthetic_response", "text": msg,
                 "reason": f"prompt ~{est} tok ({pct}%) — synthetic nudge for {client_app}"}
     return None
+
+
+def _inject_trailing_reminder(body: dict, reminder: str) -> bool:
+    """Append `reminder` at the END of the conversation, leaving the prefix byte-identical.
+
+    _inject_system_reminder appends to the FIRST system message, which sits at the very front of
+    the prompt. That is fatal for a nudge that fires repeatedly: every request presents a
+    different prefix, the engine's prefix cache misses, and each turn pays a full prefill.
+    Measured when the compaction nudge was first switched on here — large-context turns went from
+    a median of 8s with 70% under 30s, to a median of 235s with NONE under 30s, which is past the
+    180s Claude Code waits before hanging up. The nudge meant to reduce the cost of a long
+    conversation instead made every long turn as expensive as possible.
+
+    Appending at the tail keeps everything before it cached, so the re-prefill is the reminder
+    itself rather than the transcript. Attached to the last user message rather than added as a
+    trailing system message, because that is the shape agent clients already use for injected
+    notes and it cannot be mistaken for a new turn.
+    """
+    if not isinstance(body, dict) or not reminder:
+        return False
+    msgs = body.get("messages")
+    if isinstance(msgs, list) and msgs:
+        for m in reversed(msgs):
+            if not isinstance(m, dict) or m.get("role") != "user":
+                continue
+            c = m.get("content")
+            if isinstance(c, str):
+                if reminder in c:
+                    return False            # already carried; do not stack duplicates
+                m["content"] = c.rstrip() + (chr(10) * 2) + reminder
+                return True
+            if isinstance(c, list):
+                if any(isinstance(p, dict) and p.get("text") == reminder for p in c):
+                    return False
+                c.append({"type": "text", "text": reminder})
+                return True
+        msgs.append({"role": "user", "content": reminder})
+        return True
+    # Anthropic shape with no messages to attach to: the system field is the only place left,
+    # and a request with no turns has no prefix worth protecting.
+    return _inject_system_reminder(body, reminder)
 
 
 def _inject_system_reminder(body: dict, reminder: str) -> bool:
@@ -5111,11 +6675,21 @@ def health(tables: bool = False):
             "archive_path": ARCHIVE_DB_PATH,
             "archive_bytes": (Path(ARCHIVE_DB_PATH).stat().st_size
                               if Path(ARCHIVE_DB_PATH).exists() else 0),
+            # Itemised, because the two fields above were computed and then never rendered:
+            # the UI showed the main file alone while the proxy held four times that on disk.
+            "disk": _db_files(),
             # So the UI can say "measuring" instead of silently showing nothing on the first
             # load after a restart.
             "table_sizes_pending": bool(tables and not table_sizes
                                         and _DBSTAT_CACHE.get("refreshing")),
         },
+        # Pool occupancy is the one number that would have named the 2026-08-08 outage on
+        # sight. Health is the right home for it: it is what a liveness poll already hits,
+        # and this failure mode is invisible to every other signal — the service is active,
+        # the upstreams are fast, and nothing is served.
+        "upstream_pool": _pool_stats(),
+        "inflight": len(_INFLIGHT_REQUESTS),
+        "tls": _tls_status(),
         "process": {
             "pid": os.getpid(),
             "rss_kb": rss_kb,
@@ -5144,6 +6718,11 @@ def _db_job_status() -> dict:
     step_started = job.pop("step_started", None)
     if step_started and job.get("state") == "running":
         job["step_elapsed_s"] = round(time.time() - step_started, 1)
+    if job.get("state") == "running":
+        # Disk grows while rows are being deleted — the removals land in the write-ahead log
+        # before a checkpoint folds them in. Watching the total climb during a "clear" looks
+        # like failure unless the log is shown as its own number.
+        job["disk"] = _db_files()
     return job
 
 
@@ -5159,11 +6738,80 @@ def _db_size() -> int:
     return total
 
 
+def _db_files() -> dict:
+    """Every file the proxy keeps on disk, itemised.
+
+    The System tab used to report only the main database. During a clear that read 7.7 GB
+    while the proxy actually occupied 35 GB — the archive, the two write-ahead logs and a
+    stale pre-backup made up the rest, and none of them appeared anywhere in the UI. The
+    number you check before deciding to clear the database has to be the real one.
+    """
+    seen: list = []
+    total = 0
+    # -wal and -shm are not incidental: during a large delete the WAL can exceed the database
+    # it belongs to, which is why disk climbs while rows are being removed.
+    for label, path in (
+        ("database", DB_PATH),
+        ("write-ahead log", DB_PATH + "-wal"),
+        ("shared index", DB_PATH + "-shm"),
+        ("archive", ARCHIVE_DB_PATH),
+        ("archive write-ahead log", ARCHIVE_DB_PATH + "-wal"),
+        ("archive shared index", ARCHIVE_DB_PATH + "-shm"),
+        ("pre-migration backup", DB_PATH + ".prebak"),
+    ):
+        try:
+            size = Path(path).stat().st_size
+        except OSError:
+            continue                      # absent is the normal case for several of these
+        seen.append({"label": label, "path": path, "bytes": size})
+        total += size
+    return {"files": seen, "total_bytes": total,
+            "total_mb": round(total / (1024 * 1024), 2)}
+
+
+# Batch size and pause for the reset's deletes. One `DELETE FROM requests` holds a write lock
+# for the whole multi-minute operation, which is how clearing the database made the metrics
+# collector fail ten times over and returned a 500 to a live /v1/chat/completions. Committing
+# in batches with a breath between them lets other writers interleave. Same shape as the
+# archive sweep, which already worked this way.
+DB_RESET_CHUNK = int(os.environ.get("PROXY_DB_RESET_CHUNK", "2000") or 2000)
+DB_RESET_PAUSE_S = float(os.environ.get("PROXY_DB_RESET_PAUSE_S", "0.05") or 0)
+
+
+def _chunked_delete(conn, table: str, chunk: int, pause_s: float, on_progress) -> int:
+    """Delete every row of `table`, committing as it goes. Returns the number removed.
+
+    Chunked by rowid rather than a WHERE clause on the data: every one of these tables is
+    being emptied completely, and rowid is the one column guaranteed present and indexed.
+    """
+    done = 0
+    while True:
+        cur = conn.execute(
+            f"DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} LIMIT ?)",
+            (int(chunk),))
+        removed = cur.rowcount or 0
+        conn.commit()                     # release the write lock between batches
+        if removed <= 0:
+            return done
+        done += removed
+        on_progress(done)
+        if pause_s:
+            time.sleep(pause_s)
+
+
 def _db_reset_job(targets: list, vacuum: bool) -> dict:
     """Runs in a worker thread. Publishes each step so the UI has something true to show."""
-    def step(name: str):
+    def step(name: str, total: int | None = None):
         _DB_JOB["step"] = name
         _DB_JOB["step_started"] = time.time()
+        # Reset per-step progress, so a step with no countable work doesn't inherit the last
+        # step's numbers and appear stuck at 100%.
+        _DB_JOB["progress"] = {"done": 0, "total": total}
+
+    def progress(done: int):
+        p = _DB_JOB.get("progress") or {}
+        p["done"] = done
+        _DB_JOB["progress"] = p
 
     _DB_JOB.update({"state": "running", "started": time.time(), "finished": None,
                     "targets": list(targets), "vacuum": bool(vacuum), "deleted": {},
@@ -5186,19 +6834,31 @@ def _db_reset_job(targets: list, vacuum: bool) -> dict:
                                   ("settings", "settings")):
                 if target not in targets:
                     continue
-                counts[target] = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
-                step(f"deleting {target}")
-                conn.execute(f"DELETE FROM {table}")
+                total = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                counts[target] = total
+                step(f"deleting {target}", total)
+                _chunked_delete(conn, table, DB_RESET_CHUNK, DB_RESET_PAUSE_S, progress)
                 _DB_JOB["deleted"] = dict(counts)
             # Blobs live in their own table now; wiping requests without them would strand
             # gigabytes of bodies with nothing pointing at them.
             if "requests" in targets:
-                step("deleting request bodies")
-                conn.execute("DELETE FROM request_blobs")
+                blob_total = conn.execute("SELECT COUNT(*) FROM request_blobs").fetchone()[0]
+                arch_total = 0
+                try:
+                    arch_total = conn.execute(
+                        "SELECT COUNT(*) FROM arch.request_blobs").fetchone()[0]
+                except sqlite3.Error:
+                    pass
+                step("deleting request bodies", blob_total + arch_total)
+                done_so_far = 0
+                done_so_far += _chunked_delete(
+                    conn, "request_blobs", DB_RESET_CHUNK, DB_RESET_PAUSE_S, progress)
                 # Including the ones that were moved out — otherwise "wipe requests" leaves
                 # gigabytes of bodies behind in the archive file.
                 try:
-                    conn.execute("DELETE FROM arch.request_blobs")
+                    base = done_so_far
+                    _chunked_delete(conn, "arch.request_blobs", DB_RESET_CHUNK,
+                                    DB_RESET_PAUSE_S, lambda n: progress(base + n))
                 except sqlite3.Error:
                     pass
             conn.commit()
@@ -5276,6 +6936,35 @@ async def db_reset(request: Request):
         _DB_JOB_LOCK.release()
 
 
+def _backends_from_row(d: dict) -> dict:
+    """Per-backend snapshots from a metrics row, newest storage first.
+
+    Rows written before the registry have one column per backend; rows written since have a
+    single blob. Reading both keeps history intact — and keeps every consumer's keys the same,
+    which is why none of them had to change.
+    """
+    out = {name: {} for name in list(PROVIDERS) + list(SIDE_SERVICES)}
+    for name in list(out):
+        col = f"{name}_json"
+        try:
+            raw = d[col] if col in d.keys() else None
+        except (TypeError, IndexError):
+            raw = None
+        if raw:
+            try:
+                out[name] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    raw = d["backends_json"] if "backends_json" in d.keys() else None
+    if raw:
+        try:
+            out.update({k: v for k, v in (json.loads(raw) or {}).items()
+                        if isinstance(v, dict)})
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return out
+
+
 @app.get("/__proxy/api/system/now")
 # Sync for the same reason as health and system_history: it reads the database, and the Live
 # view polls it every few seconds.
@@ -5284,7 +6973,7 @@ def system_now():
     row = conn.execute(
         """SELECT ts, cpu_pct, load_1m, mem_total_mb, mem_used_mb, mem_avail_mb,
                   gpu_json, ollama_json, lmstudio_json, comfyui_json, vllm_json,
-                  llamacpp_json
+                  llamacpp_json, backends_json
            FROM system_metrics ORDER BY ts DESC LIMIT 1"""
     ).fetchone()
     conn.close()
@@ -5298,11 +6987,13 @@ def system_now():
         "load_1m": d["load_1m"],
         "mem": {"total_mb": d["mem_total_mb"], "used_mb": d["mem_used_mb"], "avail_mb": d["mem_avail_mb"]},
         "gpus": json.loads(d["gpu_json"]) if d["gpu_json"] else [],
-        "ollama": json.loads(d["ollama_json"]) if d["ollama_json"] else {},
-        "lmstudio": json.loads(d["lmstudio_json"]) if d["lmstudio_json"] else {},
-        "comfyui": json.loads(d["comfyui_json"]) if d["comfyui_json"] else {},
-        "vllm": json.loads(d["vllm_json"]) if d["vllm_json"] else {},
-        "llamacpp": json.loads(d["llamacpp_json"]) if d["llamacpp_json"] else {},
+        **_backends_from_row(d),
+        # So the UI can build its tab bar from the registry instead of a list it has to
+        # be told to update — the omission that hid llama.cpp twice.
+        "backends_meta": [{"name": n, "label": b.label, "kind": kind}
+                          for kind, group in (("provider", PROVIDERS),
+                                              ("side", SIDE_SERVICES))
+                          for n, b in group.items()],
     }
 
 
@@ -5396,7 +7087,7 @@ def live_view(request: Request):  # sync → threadpool
     conn = db()
     placeholders = ",".join("?" for _ in inflight) or "''"
     rows = conn.execute(
-        f"""SELECT id, ts, conversation_id, turn_index, client_app, client_ip, model, upstream, path,
+        f"""SELECT id, ts, conversation_id, turn_index, client_app, surface, client_ip, model, upstream, path,
                    status, est_prompt_tokens, prompt_tokens, completion_tokens, duration_ms,
                    has_images, request_body, response_body, stream_chunks, ttft_ms
             FROM requests_v
@@ -5452,6 +7143,7 @@ def live_view(request: Request):  # sync → threadpool
         tiles.append({
             "cache": cache, "key": cid or rid, "fresh": fresh,
             "req_id": rid, "conv": (cid or "")[:6], "client": r["client_app"] or "?",
+            "surface": r["surface"],
             "model": r["model"] or "?", "upstream": r["upstream"], "path": r["path"],
             "state": state, "done": not active, "elapsed_ms": elapsed_ms,
             "ptok": ptok, "otok": otok, "tps": tps, "turn": r["turn_index"],
@@ -5473,26 +7165,118 @@ def _norm_model_id(mid: str) -> str:
     return s.split(":")[0].lower()
 
 
+# The catalogue asks five backends (one of them via `docker inspect`) what they have. Model
+# pickers poll this endpoint, and answering a poll with a fan-out of subprocess calls is how
+# a listing turns into load. Two seconds is short enough that starting a container still
+# shows up promptly and long enough that a polling client costs one sweep.
+_MODELS_CACHE: dict = {"ts": 0.0, "data": None}
+_MODELS_CACHE_TTL_S = 2.0
+
+
 @app.get("/v1/models")
 async def list_models_enriched():
-    """OpenAI /v1/models, enriched with each model's real context window.
+    """OpenAI /v1/models, but the union of EVERY backend the proxy fronts.
 
-    Ollama's /v1/models omits any context field, so a client that auto-discovers the window
-    (instead of hardcoding it) can't tell how large it is and falls back to a conservative
-    default — often 128k — then compacts/stops early even though the model is loaded much larger.
-    We fill `context_length` (plus `max_context_length` and `max_model_len` aliases, since
-    different clients read different keys) from the cached LM Studio snapshot — the runtime qwen
-    actually routes to — matched by normalized model name. Best-effort: if the snapshot is missing
-    or a model isn't matched, the entry is returned unchanged.
+    A client pointed at the proxy previously saw only Ollama's catalogue — the vLLM models
+    (the ones the router actually prefers for qwen traffic) were invisible, so a model
+    picker in any OpenAI-style client couldn't select them. Now: Ollama's tags, vLLM's
+    served models — including a stopped container's configured model, which the auto-loader
+    boots on first request — plus whatever llama-server and LM Studio are serving. Deduped
+    by id, first writer wins in that order; `owned_by` names the backend so the entries
+    stay tellable apart.
+
+    Context windows are filled in where a backend reports them (vLLM's max_model_len, LM
+    Studio's loaded context, the cached snapshot for Ollama-served names), because clients
+    auto-discover the window and fall back to a conservative default when the field is
+    absent — often 128k, then they compact early against a model loaded much larger.
+    All of it best-effort: an unreachable backend contributes nothing, never an error.
     """
-    client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
-    try:
-        r = await client.get(OLLAMA_URL + "/v1/models")
-        data = r.json() if r.status_code == 200 else {"object": "list", "data": []}
-    except Exception:
-        data = {"object": "list", "data": []}
-    finally:
-        await client.aclose()
+    now = time.time()
+    if _MODELS_CACHE["data"] is not None and now - _MODELS_CACHE["ts"] < _MODELS_CACHE_TTL_S:
+        return JSONResponse(_MODELS_CACHE["data"])
+    entries: dict[str, dict] = {}
+
+    def add(mid, backend, ctx=None, state=None, created=None, loaded=None):
+        # Keyed by (id, backend), not id alone. The same name can be served by two backends —
+        # qwen3-coder-next exists as a 51 GB GGUF in Ollama and as NVFP4 in vLLM, and they are
+        # different builds with different speeds. Deduping by name alone dropped the second one
+        # and attributed the survivor to whichever backend happened to be polled first, so the
+        # catalogue could not express "which one".
+        if not mid or (mid, backend) in entries:
+            return
+        e = {"id": mid, "object": "model", "created": created or 0, "owned_by": backend}
+        if isinstance(ctx, int) and ctx > 0:
+            e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
+        if state:
+            e["proxy_state"] = state
+        if loaded is not None:
+            # Resident-in-memory vs on-disk, as a machine-readable boolean beside the
+            # human-readable proxy_state — LM Studio's API makes the same distinction,
+            # and "answers now" vs "costs a load first" is real routing information.
+            e["loaded"] = bool(loaded)
+        entries[(mid, backend)] = e
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        async def _ollama():
+            r = await client.get(OLLAMA_URL + "/v1/models")
+            return r.json() if r.status_code == 200 else {}
+
+        async def _ollama_ps():
+            r = await client.get(OLLAMA_URL + "/api/ps")
+            return r.json() if r.status_code == 200 else {}
+
+        async def _ollama_tags():
+            # /v1/models does not carry sizes; /api/tags does, and a size is what decides
+            # whether a model can ever load here.
+            r = await client.get(OLLAMA_URL + "/api/tags")
+            return r.json() if r.status_code == 200 else {}
+
+        results = await asyncio.gather(
+            _ollama(), _ollama_ps(), _vllm_snapshot(client), _vllm_configs(),
+            _llamacpp_snapshot(client), _lmstudio_snapshot(client), _ollama_tags(),
+            # The second vLLM slot is appended rather than inserted: the unpack below is
+            # positional, and everything after an inserted probe would shift silently.
+            _vllm_snapshot(client, VLLM2_URL), _vllm_configs(VLLM2_URL),
+            return_exceptions=True)
+    def _at(i, default):
+        r = results[i] if len(results) > i else None
+        return r if not isinstance(r, BaseException) and r is not None else default
+    otags = _at(6, {}) if isinstance(_at(6, {}), dict) else {}
+    vllm2, vcfgs2 = _at(7, {}), _at(8, [])
+    # Slice to the first six: the probes after them are read by index above, and unpacking
+    # the whole list would fail the moment another probe is added.
+    odata, ops, vllm, vcfgs, lcpp, lms = (
+        r if not isinstance(r, BaseException) else {} for r in results[:6])
+
+    resident = {str(m.get("name") or m.get("model") or "")
+                for m in ((ops or {}).get("models") or []) if isinstance(m, dict)}
+    for m in ((odata or {}).get("data") or []):
+        if isinstance(m, dict):
+            is_res = m.get("id") in resident
+            add(m.get("id"), "ollama", created=m.get("created"), loaded=is_res,
+                state="loaded" if is_res else "available — loads on request")
+    for slot, snap, cfgs in (("vllm", vllm, vcfgs), ("vllm2", vllm2, vcfgs2)):
+        for m in ((snap or {}).get("available") or []):
+            add(m.get("id"), slot, ctx=m.get("max_context_length"),
+                state="loaded", loaded=True)
+        # A twin that is configured but not up is still one request away: the auto-loader (or
+        # a bench) boots it. Listing it is what makes it selectable at all. Only containers
+        # publishing this slot's port — the other slot's twins are not startable here.
+        for c in (cfgs if isinstance(cfgs, list) else []):
+            if not c.get("serves_port"):
+                continue
+            add(c.get("model"), slot, loaded=False,
+                state=("stopped — loads on first request"
+                       if str(c.get("state", "")).lower() != "running" else None))
+    for m in ((lcpp or {}).get("available") or []):
+        add(m.get("id"), "llamacpp", ctx=(lcpp or {}).get("n_ctx"),
+            state="loaded", loaded=True)
+    for m in ((lms or {}).get("available") or []):
+        add(m.get("id"), "lmstudio", loaded=(m.get("state") == "loaded") or None,
+            ctx=(m.get("loaded_context_length") or m.get("max_context_length")))
+
+    # Ollama's own entries omit any context field; the cached LM Studio snapshot historically
+    # filled it for names served through there. Best-effort, unchanged.
     ctxmap: dict[str, int] = {}
     try:
         conn = db()
@@ -5507,16 +7291,81 @@ async def list_models_enriched():
                 ctxmap[_norm_model_id(m.get("id"))] = ctx
     except Exception:
         pass
-    if isinstance(data, dict) and ctxmap:
-        for m in (data.get("data") or []):
-            if not isinstance(m, dict) or "context_length" in m:
-                continue
-            ctx = ctxmap.get(_norm_model_id(m.get("id")))
+    for e in entries.values():
+        if "context_length" not in e:
+            ctx = ctxmap.get(_norm_model_id(e["id"]))
             if ctx:
-                m["context_length"] = ctx
-                m["max_context_length"] = ctx
-                m["max_model_len"] = ctx
-    return JSONResponse(data)
+                e["context_length"] = e["max_context_length"] = e["max_model_len"] = ctx
+
+    # Advertised aliases: names this proxy answers to but no backend actually serves. A client
+    # whose model picker only offers what /v1/models lists cannot select a name the router
+    # would happily rewrite, so the alias has to appear in the catalogue to be selectable at
+    # all. Configured under model_router.advertise as {alias: target}; the routing itself is
+    # the existing rules, this only makes the name visible.
+    try:
+        advertise = (load_rules_config().get("model_router") or {}).get("advertise") or {}
+    except Exception:
+        advertise = {}
+    for alias, target in (advertise.items() if isinstance(advertise, dict) else []):
+        alias = str(alias).strip()
+        by_name = {k[0]: v for k, v in entries.items()}
+        if not alias or alias in by_name:
+            continue                       # never shadow a model that genuinely exists
+        base = by_name.get(str(target)) or {}
+        entries[(alias, "ai-proxy")] = {
+            **{k: v for k, v in base.items()
+               if k in ("context_length", "max_context_length", "max_model_len")},
+            "id": alias, "object": "model", "owned_by": "ai-proxy",
+            # Said plainly, because a name in this list that is not the model you get is the
+            # kind of thing that wastes an afternoon when it is discovered by accident.
+            "alias_of": str(target),
+            "description": f"alias — every request is served by {target}",
+        }
+
+    # Qualify a name only when it is genuinely ambiguous: "qwen3-coder-next" stays as it is when
+    # one backend serves it, and becomes "qwen3-coder-next/vllm" and "qwen3-coder-next/ollama"
+    # when two do. Suffixing everything would break every client config that names a model today.
+    # Ambiguity is judged on the NORMALISED name across DIFFERENT backends. Ollama tags its
+    # names and vLLM does not, so the same model reads as "qwen3-coder-next:latest" and
+    # "qwen3-coder-next" and never collides on the raw string — which is why this fired on
+    # nothing at first. Comparing normalised names catches it; requiring different backends
+    # keeps gemma4:26b and gemma4:12b, which normalise alike and are both on Ollama, unqualified
+    # — they are already tellable apart by their tags.
+    _backends_for: dict = {}
+    for (mid, backend) in entries:
+        _backends_for.setdefault(_norm_model_id(mid), set()).add(backend)
+    data = []
+    for (mid, backend), e in entries.items():
+        if len(_backends_for.get(_norm_model_id(mid), ())) > 1:
+            e = dict(e, id="%s/%s" % (mid, backend), served_model=mid, upstream=backend)
+        data.append(e)
+    # A model larger than this box can hold is not a choice, it is a trap: offering it in a
+    # picker invites a sweep to select it, and with eviction enabled that stops the serving
+    # container to attempt a load that cannot succeed. qwen3:235b-a22b is 132 GB on a 122 GB
+    # machine. Weights alone are the test — anything needing a KV cache on top is only more
+    # impossible, and being generous here keeps a merely-tight model selectable.
+    _total_mb = (_mem_snapshot() or {}).get("total_mb") or 0
+    _sizes_mb = {}
+    for _t in (otags.get("models") or []):
+        if _t.get("size"):
+            _sizes_mb[_norm_model_id(_t.get("name"))] = _t["size"] / (1024 * 1024)
+    if _total_mb:
+        _ceiling = _total_mb - _BENCH_FIT_RESERVE_MB
+        _kept = []
+        for _e in data:
+            _sz = _sizes_mb.get(_norm_model_id(_e.get("served_model") or _e["id"]))
+            if _sz and _sz > _ceiling:
+                _e["unloadable"] = True
+                _e["size_mb"] = round(_sz)
+                continue                       # dropped from the catalogue entirely
+            if _sz:
+                _e["size_mb"] = round(_sz)
+            _kept.append(_e)
+        data = _kept
+
+    payload = {"object": "list", "data": data}
+    _MODELS_CACHE.update(ts=now, data=payload)
+    return JSONResponse(payload)
 
 
 @app.get("/__proxy/api/ollama/update-check")
@@ -5641,7 +7490,7 @@ def _cache_verdict(evaluated, est, ttft_ms=None, prompt_tokens=None, upstream=No
 
 
 @app.get("/__proxy/api/requests")
-def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False, client: str = ""):  # sync → threadpool
+def list_requests(request: Request, limit: int = 200, offset: int = 0, include_shadows: bool = False, client: str = "", ip: str = ""):  # sync → threadpool
     viewer = _client_ip(request)
     conn = db()
     conds, params = [], []
@@ -5651,12 +7500,19 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         # Match either the detected app (e.g. "claude-code") or the raw client IP.
         conds.append("(client_app = ? OR client_ip = ?)")
         params += [client, client]
+    if ip:
+        # Separate from `client` and ANDed with it: one box can run several agents and one
+        # agent name can come from several boxes, so "hermes" and "from 192.168.15.10" are
+        # different questions and you often want both at once.
+        conds.append("client_ip = ?")
+        params.append(ip)
     where = ("WHERE " + " AND ".join(conds)) if conds else ""
     rows = conn.execute(
         f"""SELECT id, ts, method, path, model, is_stream, status, duration_ms, error,
                   prompt_tokens, completion_tokens, total_tokens, est_prompt_tokens, ttft_ms,
-                  upstream, client_ip, client_app, gate_verdict, gate_rule, gate_reason, shadow_of,
-                  has_images
+                  upstream, client_ip, client_app, surface, api_key_fp, gate_verdict, gate_rule, gate_reason,
+                  shadow_of, has_images, reasoning_effort, thinking, thinking_src,
+                  empty_output, inflight_at_finish, tool_outcome, tool_outcome_detail
            FROM requests {where} ORDER BY ts DESC LIMIT ? OFFSET ?""",
         (*params, limit, offset),
     ).fetchall()
@@ -5668,6 +7524,16 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         "SELECT client_app AS app, COUNT(*) AS count FROM requests WHERE client_app IS NOT NULL"
         + ("" if include_shadows else " AND shadow_of IS NULL")
         + " GROUP BY client_app ORDER BY count DESC"
+    ).fetchall()
+    # Distinct source addresses for the filter dropdown. Deliberately just the address and a
+    # count: a GROUP_CONCAT of the apps behind each one reads nicely but scans client_app across
+    # every row of a multi-gigabyte table to decorate a select box. Not gated by the PII rules —
+    # client_ip is not in the redaction set and the list already renders an address on every row.
+    ip_rows = conn.execute(
+        "SELECT client_ip AS ip, COUNT(*) AS count "
+        "FROM requests WHERE client_ip IS NOT NULL"
+        + ("" if include_shadows else " AND shadow_of IS NULL")
+        + " GROUP BY client_ip ORDER BY count DESC"
     ).fetchall()
     conn.close()
     items = []
@@ -5688,7 +7554,8 @@ def list_requests(request: Request, limit: int = 200, offset: int = 0, include_s
         d["cache_verdict"] = _cverdict
         items.append(_redact_row(d, viewer))
     return {"total": total, "items": items,
-            "clients": [dict(r) for r in client_rows], "redacted": REDACT_PII_ENABLED}
+            "clients": [dict(r) for r in client_rows],
+            "ips": [dict(r) for r in ip_rows], "redacted": REDACT_PII_ENABLED}
 
 
 @app.get("/__proxy/api/cache")
@@ -5783,6 +7650,7 @@ def list_conversations(request: Request, limit: int = 100):  # sync → threadpo
                   GROUP_CONCAT(DISTINCT model) AS models,
                   GROUP_CONCAT(DISTINCT client_ip) AS clients,
                   GROUP_CONCAT(DISTINCT client_app) AS apps,
+                  GROUP_CONCAT(DISTINCT surface) AS surfaces,
                   SUM(CASE WHEN gate_verdict = 'block' THEN 1 ELSE 0 END) AS blocks,
                   SUM(CASE WHEN gate_verdict = 'rewrite' THEN 1 ELSE 0 END) AS rewrites
            FROM requests
@@ -5828,7 +7696,7 @@ def get_conversation(conv_id: str, request: Request):  # sync → threadpool
     rows = conn.execute(
         """SELECT id, ts, model, turn_index, prompt_tokens, completion_tokens, total_tokens,
                   est_prompt_tokens, duration_ms, ttft_ms, status, error, gate_verdict, gate_rule,
-                  gate_reason, client_ip, client_app, is_stream, has_images, path, upstream
+                  gate_reason, client_ip, client_app, surface, api_key_fp, is_stream, has_images, path, upstream
            FROM requests
            WHERE conversation_id = ?
            ORDER BY ts ASC""",
@@ -6173,17 +8041,188 @@ async def get_rules():
     }
 
 
+_RULES_HISTORY_KEEP = 10
+
+
 @app.post("/__proxy/api/rules")
 async def update_rules(request: Request):
+    """Replace the stored rules document.
+
+    Replace, not merge, because the dashboard posts the whole config and deleting a key has to
+    be possible. The cost is that a hand-written POST of one section silently deletes every
+    other: posting {"ollama_options": ...} from a shell dropped the model_router rule that sent
+    qwen3-coder-next to vLLM, and the next request from the main client 503'd against Ollama.
+    So each write keeps the previous document and reports what the new one dropped.
+    """
     try:
         payload = await request.json()
     except Exception as e:
         return JSONResponse({"error": f"invalid JSON body: {e}"}, status_code=400)
     if not isinstance(payload, dict):
         return JSONResponse({"error": "rules config must be a JSON object"}, status_code=400)
+    prev_raw = (get_setting("rules") or {}).get("value")
+    dropped = []
+    if prev_raw:
+        try:
+            dropped = sorted(set(json.loads(prev_raw) or {}) - set(payload))
+        except json.JSONDecodeError:
+            pass
+        try:
+            hist = json.loads((get_setting("rules_history") or {}).get("value") or "[]")
+        except json.JSONDecodeError:
+            hist = []
+        hist.append({"ts": time.time(), "value": prev_raw})
+        set_setting("rules_history", json.dumps(hist[-_RULES_HISTORY_KEEP:]))
     set_setting("rules", json.dumps(payload, indent=2))
     cfg = load_rules_config()
-    return {"ok": True, "config": cfg, "source": "db"}
+    out = {"ok": True, "config": cfg, "source": "db"}
+    if dropped:
+        out["dropped_keys"] = dropped
+        out["warning"] = (f"this write removed {len(dropped)} section(s) that were stored "
+                          f"before it: {', '.join(dropped)}. They now fall back to the built-in "
+                          f"defaults. POST the whole config, or restore from "
+                          f"GET /__proxy/api/rules/history.")
+        print(f"[rules] write dropped stored sections: {', '.join(dropped)}")
+    return out
+
+
+@app.get("/__proxy/api/rules/history")
+async def rules_history():
+    """The last few stored rules documents, newest first, so a bad write can be undone."""
+    try:
+        hist = json.loads((get_setting("rules_history") or {}).get("value") or "[]")
+    except json.JSONDecodeError:
+        hist = []
+    return {"versions": [{"ts": h.get("ts"),
+                          "when": time.strftime("%Y-%m-%d %H:%M:%S",
+                                                time.localtime(h.get("ts") or 0)),
+                          "keys": sorted(json.loads(h.get("value") or "{}").keys()),
+                          "config": json.loads(h.get("value") or "{}")}
+                         for h in reversed(hist)]}
+
+
+@app.get("/__proxy/api/capacity")
+async def capacity(models: str = "", context: int = 0, parallel: int = 0):
+    """What can be co-resident here, and at what context. Written to be read by another agent.
+
+    Two questions, one endpoint. Called bare it returns the primitives — weights, KV cost per
+    thousand tokens, and the largest context each model can hold alone — so a planner can do its
+    own arithmetic. Called with ?models=a,b&context=N it answers the specific question directly,
+    because the interesting failure is a combination that each member could survive alone.
+
+    The arithmetic is the one the fit guard enforces, so a plan built from this endpoint agrees
+    with what the proxy will actually allow rather than being a second opinion that drifts.
+    """
+    mem = _mem_snapshot() or {}
+    total_mb = mem.get("total_mb") or 0
+    avail_mb = mem.get("avail_mb") or 0
+    reserve_mb = _BENCH_FIT_RESERVE_MB
+    per_slot_default, parallel_default = _bench_ollama_server_ctx(None)
+    parallel = parallel or parallel_default
+
+    sizes: dict = {}
+    resident: set = set()
+    infos: dict = {}
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(10.0)) as c:
+            tags = await c.get(f"{OLLAMA_URL}/api/tags")
+            if tags.status_code == 200:
+                for t in (tags.json().get("models") or []):
+                    if t.get("size"):
+                        sizes[t["name"]] = t["size"] / (1024 * 1024)
+            ps = await c.get(f"{OLLAMA_URL}/api/ps")
+            if ps.status_code == 200:
+                resident = {m.get("name") for m in (ps.json().get("models") or []) if m.get("name")}
+            wanted = [m.strip() for m in models.split(",") if m.strip()] or list(sizes)
+            for name in wanted[:40]:
+                show = await c.post(f"{OLLAMA_URL}/api/show", json={"model": name})
+                if show.status_code < 400:
+                    infos[name] = show.json() or {}
+    except (httpx.RequestError, ValueError):
+        pass
+
+    def _entry(name):
+        info = (infos.get(name) or {}).get("model_info") or {}
+        size_mb = sizes.get(name)
+        kv_1k = _bench_ollama_kv_mb(info, 1000) if info else None
+
+        def _ctx_for(budget_mb):
+            if not kv_1k or size_mb is None:
+                return None
+            room = budget_mb - reserve_mb - size_mb * _BENCH_FIT_OVERHEAD
+            # KV is per SLOT set: Ollama allocates num_ctx x parallel.
+            return int(max(0, room) / (kv_1k / 1000.0) / max(1, parallel))
+
+        return {
+            "id": name,
+            "weights_gb": round(size_mb / 1024, 2) if size_mb else None,
+            "kv_gb_per_1k_tokens": round(kv_1k / 1024, 4) if kv_1k else None,
+            "kv_measurable": kv_1k is not None,
+            # "alone" means alone on the box, so it is measured against TOTAL memory. Measuring
+            # it against what is free right now reported max_context_alone=0 for every model
+            # whenever vLLM was up — which is precisely when a planner asks the question, and
+            # the answer it needs is what fits once the box is cleared.
+            "max_context_alone": _ctx_for(total_mb),
+            "max_context_now": _ctx_for(avail_mb),
+            "resident": name in resident,
+        }
+
+    names = [m.strip() for m in models.split(",") if m.strip()]
+    body = {
+        "memory": {"total_gb": round(total_mb / 1024, 1),
+                   "available_gb": round(avail_mb / 1024, 1),
+                   "reserved_gb": round(reserve_mb / 1024, 1),
+                   "usable_gb": round(max(0, avail_mb - reserve_mb) / 1024, 1)},
+        "assumptions": {
+            "parallel_slots": parallel,
+            "server_context_default": per_slot_default,
+            "weights_overhead": _BENCH_FIT_OVERHEAD,
+            "formula": "weights_gb * overhead + kv_gb_per_1k_tokens * (context/1000) * "
+                       "parallel_slots <= usable_gb",
+            "note": "KV is deliberately over-estimated; sliding-window models cost less than "
+                    "this. Models whose architecture this build cannot size report "
+                    "kv_measurable=false and only their weights are known. "
+                    "max_context_alone assumes the box is otherwise empty; max_context_now "
+                    "measures against free memory this second.",
+        },
+    }
+
+    if names:
+        entries = [_entry(n) for n in names]
+        ctx = context or per_slot_default
+        need = 0.0
+        unknown = []
+        for e in entries:
+            if e["weights_gb"] is None:
+                unknown.append(e["id"])
+                continue
+            need += e["weights_gb"] * _BENCH_FIT_OVERHEAD
+            if e["kv_gb_per_1k_tokens"]:
+                need += e["kv_gb_per_1k_tokens"] * (ctx / 1000.0) * parallel
+            else:
+                unknown.append(e["id"])
+        usable = max(0, avail_mb - reserve_mb) / 1024
+        on_empty = max(0, total_mb - reserve_mb) / 1024
+        body["combination"] = {
+            "models": names, "context": ctx,
+            "required_gb": round(need, 1), "usable_gb": round(usable, 1),
+            "fits": bool(need and need <= usable),
+            # Two different questions. "Can these be co-resident?" is about the box; "can I have
+            # them right now?" is about what else is holding memory this second. A planner given
+            # only the second answer cannot tell an impossible combination from a busy box.
+            "usable_gb_on_empty_box": round(on_empty, 1),
+            "fits_on_empty_box": bool(need and need <= on_empty),
+            "unknown_kv": unknown,
+            "verdict": ("fits" if need and need <= usable else
+                        "does not fit now, but would on an idle box"
+                        if need and need <= on_empty else
+                        "does not fit" if need else "cannot judge"),
+        }
+        body["models"] = entries
+    else:
+        body["models"] = sorted((_entry(n) for n in sizes),
+                                key=lambda e: -(e["weights_gb"] or 0))
+    return body
 
 
 @app.get("/__proxy/api/archive")
@@ -6450,7 +8489,7 @@ def stats():  # sync → threadpool
     # vLLM streams token-by-token like the other local engines and belongs here — it was
     # missing until 2026-07, which silently emptied the decode metric on any box that had
     # moved its daily driver to vLLM.
-    GENERATION_RATE_UPSTREAMS = {"ollama", "lmstudio", "vllm", "llamacpp"}
+    GENERATION_RATE_UPSTREAMS = {n for n, p in PROVIDERS.items() if p.measures_decode}
     for r in tps_rows:
         ct = r["completion_tokens"] or 0
         pt = r["prompt_tokens"] or 0
@@ -6641,16 +8680,32 @@ def _request_image_refs(row):
 
 @app.get("/__proxy/api/requests/{req_id}/image/{idx}")
 def get_request_image(req_id: str, idx: int, request: Request):  # sync → threadpool
-    """Reconstruct and serve the idx-th image, from the full-fidelity images_data column."""
+    """Reconstruct and serve the idx-th image, from the full-fidelity images_data column.
+
+    Two-step fetch: images_data and the PII gate first; the request_body — multi-megabyte
+    for screenshot-heavy agent turns, and sitting behind the blob/archive join — is read
+    ONLY for pre-capture rows that have no images_data. Selecting it unconditionally made
+    every image click pay the full body's disk read and page cache just to throw it away.
+    """
     conn = db()
-    row = conn.execute("SELECT request_body, images_data, client_ip FROM requests_v WHERE id = ?", (req_id,)).fetchone()
-    conn.close()
+    row = conn.execute("SELECT images_data, client_ip FROM requests_v WHERE id = ?",
+                       (req_id,)).fetchone()
     if not row:
+        conn.close()
         return JSONResponse({"error": "not found"}, status_code=404)
     # Same visibility gate as the request detail: only a viewer who may see this client's content.
     if not _can_view_pii(_client_ip(request), row["client_ip"]):
+        conn.close()
         return JSONResponse({"error": "forbidden"}, status_code=403)
-    refs = _request_image_refs(row)
+    if _load_images_data(row["images_data"]):
+        conn.close()
+        refs = _request_image_refs(row)
+    else:
+        row = conn.execute(
+            "SELECT request_body, images_data, client_ip FROM requests_v WHERE id = ?",
+            (req_id,)).fetchone()
+        conn.close()
+        refs = _request_image_refs(row)
     if refs is None:
         return JSONResponse({"error": "image not stored (request predates image capture and the body was truncated)"},
                             status_code=422)
@@ -6689,8 +8744,14 @@ async def request_live(req_id: str, request: Request):
         return {"active": False, "text": None}
     return {
         "active": active,
+        # False means no incremental output is coming — not that none has arrived yet. The
+        # UI needs the difference to say so instead of showing an empty pane that looks broken.
+        "streaming": bool(s.get("stream")),
         "text": s.get("text") or "",
         "prompt_tokens": s.get("prompt"),
+        # Falls back to the chars/3.5 estimate so a non-streaming request still has something
+        # truthful to show while it runs.
+        "est_prompt_tokens": s.get("est_prompt"),
         "completion_tokens": s.get("completion"),
     }
 
@@ -7287,13 +9348,14 @@ async def _run_cmd(args: list, timeout: float = 120.0, max_chars: int = 800,
     return proc.returncode or 0, (text[-max_chars:] if keep_tail else text[:max_chars])
 
 
-async def _vllm_container() -> str | None:
-    """The container publishing VLLM_URL's port, running or not."""
+async def _vllm_container(url: str | None = None) -> str | None:
+    """The container publishing this vLLM slot's port, running or not."""
+    url = url or VLLM_URL
     docker = _docker_bin()
-    if not docker or not _upstream_is_local(VLLM_URL):
+    if not docker or not _upstream_is_local(url):
         return None
     try:
-        port = str(httpx.URL(VLLM_URL).port or 8000)
+        port = str(httpx.URL(url).port or 8000)
     except Exception:
         return None
     # {{.Ports}} is the LIVE port map and is empty once a container stops, so matching on it
@@ -7306,15 +9368,27 @@ async def _vllm_container() -> str | None:
     if code != 0 or not names.split():
         return None
     code, out = await _run_cmd(
-        [docker, "inspect", "--format", "{{.Name}}	{{json .HostConfig.PortBindings}}"]
+        [docker, "inspect", "--format",
+         "{{.Name}}	{{.State.Running}}	{{json .HostConfig.PortBindings}}"]
         + names.split(), 25.0, max_chars=8000)
     if code != 0:
         return None
+    # Several containers can be *configured* for the same port — spark keeps qwen-vllm and
+    # ornith-vllm side by side, only one running at a time. Returning the first match made
+    # "stop vLLM" target whichever happened to sort first: the bench once stopped the
+    # already-exited qwen-vllm, reported success, and left ornith-vllm's ~45 GB resident
+    # while a 123B model tried to load beside it. The running one is the one that holds
+    # memory, so it always wins; the first configured match is the fallback for "start it".
+    first = None
     for line in out.splitlines():
-        name, _, bindings = line.partition("	")
+        name, _, rest = line.partition("	")
+        running, _, bindings = rest.partition("	")
         if f'"HostPort":"{port}"' in bindings.replace(" ", ""):
-            return name.strip().lstrip("/")
-    return None
+            clean = name.strip().lstrip("/")
+            if running.strip() == "true":
+                return clean
+            first = first or clean
+    return first
 
 
 def _llamacpp_cfg() -> dict:
@@ -7352,39 +9426,15 @@ def _write_llamacpp_override(ctx: int, parallel: int) -> tuple[bool, str]:
 
 
 async def _llamacpp_ready(timeout_s: float) -> bool:
-    """Loading ~91 GB takes minutes; reporting success on the unit starting would be a lie."""
-    deadline = time.time() + timeout_s
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
-        while time.time() < deadline:
-            try:
-                if (await c.get(f"{LLAMACPP_URL}/v1/models")).status_code == 200:
-                    return True
-            except httpx.RequestError:
-                pass
-            await asyncio.sleep(5.0)
-    return False
+    """Kept as a name for existing callers; the poll itself lives on the provider now."""
+    return await PROVIDERS["llamacpp"].ready(timeout_s)
 
 
-async def _vllm_ready(timeout_s: float) -> bool:
-    """vLLM takes minutes to become ready — docker start returns long before the server does, so
-    reporting success on the container starting would be reporting a lie."""
-    deadline = time.time() + timeout_s
-    async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as c:
-        while time.time() < deadline:
-            try:
-                r = await c.get(f"{VLLM_URL}/v1/models")
-                if r.status_code == 200:
-                    return True
-            except httpx.RequestError:
-                pass
-            await asyncio.sleep(3.0)
-    return False
+async def _vllm_ready(timeout_s: float, upstream: str = "vllm") -> bool:
+    """Kept as a name for existing callers; the poll itself lives on the provider now."""
+    return await PROVIDERS[upstream].ready(timeout_s)
 
 
-# LM Studio has no load/unload over HTTP — the `lms` CLI is the only way in. That means this
-# works only when the proxy runs on the same machine as LM Studio, which is the common single-box
-# setup but not Docker or a remote LMSTUDIO_URL. Rather than fail confusingly there, the
-# capability reports itself as unavailable with the reason.
 def _lms_bin() -> str | None:
     for cand in (os.environ.get("PROXY_LMS_BIN"),
                  str(Path.home() / ".lmstudio" / "bin" / "lms"),
@@ -7436,23 +9486,27 @@ VLLM_ARG_SUMMARY = ("--served-model-name", "--model", "--max-model-len",
                     "--gpu-memory-utilization", "--kv-cache-dtype", "--quantization")
 
 
-async def _vllm_configs() -> list:
+async def _vllm_configs(url: str | None = None) -> list:
     """Every vLLM container on this host, running or not, with what it would serve.
+
+    `serves_port` is relative to the slot in `url`: with two slots the same container is a
+    twin of one and irrelevant to the other, and only the twins contend.
 
     Configuration is expressed as containers rather than as launch arguments the proxy templates
     into `docker run`. Defining how a server starts is Docker's job and people already do it that
     way — spark had a stopped `ornith-vllm` beside the running `qwen-vllm` before any of this
     existed. The proxy only decides which one is up, which is the part a benchmark needs.
     """
+    url = url or VLLM_URL
     docker = _docker_bin()
-    if not docker or not _upstream_is_local(VLLM_URL):
+    if not docker or not _upstream_is_local(url):
         return []
     code, out = await _run_cmd(
         [docker, "ps", "-a", "--format", "{{.Names}}	{{.Image}}	{{.State}}	{{.Ports}}"], 20.0)
     if code != 0:
         return []
     try:
-        want_port = str(httpx.URL(VLLM_URL).port or 8000)
+        want_port = str(httpx.URL(url).port or 8000)
     except Exception:
         want_port = "8000"
     named = [str(n) for n in ((load_rules_config().get("model_control") or {})
@@ -7514,6 +9568,11 @@ async def _vllm_configs() -> list:
             "max_model_len": flags.get("max-model-len"),
             "kv_cache_dtype": flags.get("kv-cache-dtype"),
             "prefix_caching": "--enable-prefix-caching" in args,
+            # What a boot will actually claim: vLLM pre-allocates this fraction of total
+            # memory at startup, which on unified memory is system RAM. The memory guards
+            # price a start by this, NOT by checkpoint size — 43 GB of weights booting with
+            # util 0.80 grabs ~97 GB, and the difference wedged the box once.
+            "gpu_memory_utilization": flags.get("gpu-memory-utilization"),
             "args": " ".join(args),
         })
     return out_list
@@ -7610,11 +9669,157 @@ async def control_service(name: str, request: Request):
     return {"ok": True, "action": action, "state": await _service_state(svc)}
 
 
+@app.post("/__proxy/api/control/ollama/update")
+async def control_ollama_update():
+    """Update Ollama in place, from the proxy.
+
+    Refuses while a bench is running — the installer restarts the service, which would turn
+    every in-flight cell into a page of 502s attributed to whatever model was being measured.
+    Requires a root-owned updater script this deployment's sudoers allows without a password
+    (see _ollama_update_cmd); the proxy's own user has no business running installers as root.
+    """
+    cmd = _ollama_update_cmd()
+    if not cmd:
+        return JSONResponse(
+            {"error": "no updater configured — set model_control.ollama_update_cmd to a "
+                      "command the proxy may run without a password, e.g. "
+                      '["sudo", "-n", "/usr/local/sbin/ollama-update"]'},
+            status_code=501)
+    conn = db()
+    busy = conn.execute(
+        "SELECT COUNT(*) FROM bench_runs WHERE status IN ('running', 'pending')").fetchone()[0]
+    conn.close()
+    if busy:
+        return JSONResponse(
+            {"error": "a benchmark is running — updating restarts Ollama and would corrupt "
+                      "it. Try again when it finishes."}, status_code=409)
+
+    async def _version() -> str | None:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(8.0)) as c:
+                r = await c.get(f"{OLLAMA_URL}/api/version")
+                return (r.json() or {}).get("version") if r.status_code == 200 else None
+        except (httpx.RequestError, ValueError):
+            return None
+
+    before = await _version()
+    code, out = await _run_cmd(cmd, 900.0, max_chars=2000, keep_tail=True)
+    if code != 0:
+        return JSONResponse({"error": f"updater exited {code}: {out[:500]}",
+                             "version_before": before}, status_code=502)
+    # The installer restarts the service; give it a moment to come back before reporting.
+    # If Ollama wasn't answering before the update there is nothing to wait out.
+    after = None
+    for i in range(30 if before else 1):
+        after = await _version()
+        if after:
+            break
+        await asyncio.sleep(2)
+    _OLLAMA_LATEST["ts"] = 0.0          # the next snapshot re-checks what "latest" means now
+    return {"ok": True, "version_before": before, "version_after": after,
+            "changed": bool(before and after and before != after),
+            "note": None if after else "updater succeeded but Ollama has not answered yet",
+            "output": out[-800:]}
+
+
+# Parameters a model's own defaults may sensibly carry. num_ctx is the headline: it is the
+# ONLY per-model context lever that reaches /v1 traffic — Ollama's OpenAI endpoint ignores
+# request-level num_ctx (verified live), and the env var is global and needs sudo.
+_OLLAMA_PARAM_ALLOWED = {"num_ctx", "temperature", "top_p", "top_k", "min_p",
+                         "repeat_penalty", "num_predict", "seed"}
+
+
+async def _ollama_apply_params(model: str, params: dict) -> tuple:
+    """Re-create the tag from itself with new default parameters. Blobs are shared, the
+    change is instant, and a later edit simply overrides again."""
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/create",
+                         json={"model": model, "from": model,
+                               "parameters": params, "stream": False})
+        if r.status_code >= 400:
+            return False, r.text[:300]
+    return True, "ok"
+
+
+@app.post("/__proxy/api/control/models/ollama-params")
+async def ollama_model_params(request: Request):
+    """Set a model's DEFAULT parameters (num_ctx etc.) by re-creating its tag in place.
+
+    Guarded by the same KV arithmetic that protects benchmarks: a num_ctx whose cache
+    cannot fit beside the weights is refused with the math, because that exact mistake
+    OOM-killed the Ollama service in a loop once already. `force: true` overrides — with
+    the numbers in hand, it is the operator's call."""
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "JSON body required"}, status_code=400)
+    model = str(payload.get("model") or "").strip()
+    if not model:
+        return JSONResponse({"error": "model is required"}, status_code=400)
+    params = dict(payload.get("params") or {})
+    if payload.get("num_ctx") is not None:
+        params["num_ctx"] = payload["num_ctx"]
+    bad = sorted(set(params) - _OLLAMA_PARAM_ALLOWED)
+    if bad:
+        return JSONResponse({"error": f"unsupported parameter(s): {', '.join(bad)} — "
+                                      f"allowed: {', '.join(sorted(_OLLAMA_PARAM_ALLOWED))}"},
+                            status_code=400)
+    if not params:
+        return JSONResponse({"error": "nothing to set"}, status_code=400)
+    try:
+        if "num_ctx" in params:
+            params["num_ctx"] = int(params["num_ctx"])
+            if not (256 <= params["num_ctx"] <= 4194304):
+                raise ValueError
+    except (TypeError, ValueError):
+        return JSONResponse({"error": "num_ctx must be an integer >= 256"}, status_code=400)
+
+    kv_note = None
+    if "num_ctx" in params:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+                show = (await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})).json()
+            info = show.get("model_info") or {}
+            _slot, parallel = _bench_ollama_server_ctx()
+            tokens = params["num_ctx"] * parallel
+            kv_mb = _bench_ollama_kv_mb(info, tokens)
+            size_mb = None
+            async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+                tags = (await c.get(f"{OLLAMA_URL}/api/tags")).json()
+            for m in (tags.get("models") or []):
+                if m.get("name") == model or m.get("model") == model:
+                    size_mb = round((m.get("size") or 0) / 1048576) or None
+            total_mb = (_mem_snapshot() or {}).get("total_mb")
+            if kv_mb is not None and size_mb and total_mb:
+                need = size_mb * _BENCH_FIT_OVERHEAD + kv_mb
+                cap = total_mb - _BENCH_FIT_RESERVE_MB
+                kv_note = (f"~{size_mb / 1024:.0f} GB weights + ~{kv_mb / 1024:.0f} GB KV at "
+                           f"{params['num_ctx']:,} × {parallel} slots, "
+                           f"of {cap / 1024:.0f} GB usable")
+                if need > cap and not payload.get("force"):
+                    return JSONResponse(
+                        {"error": f"that context would OOM this box: {kv_note}. "
+                                  f"Pass force:true to set it anyway.",
+                         "kv_estimate_mb": round(kv_mb)}, status_code=400)
+        except (httpx.RequestError, ValueError, KeyError):
+            kv_note = "KV estimate unavailable — set with care"
+
+    ok, detail = await _ollama_apply_params(model, params)
+    if not ok:
+        return JSONResponse({"error": f"ollama create failed: {detail}"}, status_code=502)
+    return {"ok": True, "model": model, "applied": params, "kv_note": kv_note,
+            "note": "defaults apply on the model's next load; a resident copy keeps its "
+                    "old settings until it unloads"}
+
+
 @app.get("/__proxy/api/control/models/vllm")
 async def control_vllm_configs():
     """The vLLM configurations available to switch between. They contend for one port, so at
     most one can be up — which is exactly what makes them a menu."""
-    return {"configs": await _vllm_configs(), "url": VLLM_URL}
+    return {"configs": await _vllm_configs(), "url": VLLM_URL,
+            "slots": [{"upstream": n, "url": _vllm_url(n),
+                       "configs": await _vllm_configs(_vllm_url(n))}
+                      for n in ("vllm", "vllm2")]}
 
 
 # Pulling a model is tens of gigabytes over minutes to hours, so it cannot be a request that
@@ -7747,20 +9952,24 @@ async def control_model_capabilities():
     """What can actually be loaded or unloaded, per backend, and why not when not. The UI needs
     this to avoid offering buttons that cannot work."""
     lms_ok, lms_why = _lms_available()
-    container = await _vllm_container()
-    return {
+    out = {
         "ollama": {"load": True, "unload": True, "how": "HTTP keep_alive"},
         "lmstudio": {"load": lms_ok, "unload": lms_ok,
                      "how": "lms CLI" if lms_ok else None, "reason": lms_why or None},
-        "vllm": {"load": bool(container), "unload": bool(container),
-                 "how": f"docker ({container})" if container else None,
-                 "reason": None if container else (
-                     "no container publishing this port was found"
-                     if _upstream_is_local(VLLM_URL)
-                     else f"vLLM is at {VLLM_URL}; only a local container can be controlled"),
-                 "note": "vLLM holds one model for the life of the server, so this stops and "
-                         "starts the container rather than swapping models"},
     }
+    for slot in ("vllm", "vllm2"):
+        url = _vllm_url(slot)
+        container = await _vllm_container(url)
+        out[slot] = {
+            "load": bool(container), "unload": bool(container), "url": url,
+            "how": f"docker ({container})" if container else None,
+            "reason": None if container else (
+                "no container publishing this port was found"
+                if _upstream_is_local(url)
+                else f"vLLM is at {url}; only a local container can be controlled"),
+            "note": "vLLM holds one model for the life of the server, so this stops and "
+                    "starts the container rather than swapping models"}
+    return out
 
 
 @app.post("/__proxy/api/control/models/unload")
@@ -7788,8 +9997,8 @@ async def control_model_unload(request: Request):
         if code != 0:
             return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
         return {"ok": True, "unloaded": ["all"] if payload.get("all") else [args[1]], "output": out}
-    if upstream == "vllm":
-        container = await _vllm_container()
+    if _is_vllm(upstream):
+        container = await _vllm_container(_vllm_url(upstream))
         if not container:
             return JSONResponse(
                 {"error": "no local vLLM container publishing this port was found"},
@@ -7820,12 +10029,12 @@ async def control_model_unload(request: Request):
 
 @app.post("/__proxy/api/control/models/load")
 async def control_model_load(request: Request):
-    """Load a model into Ollama without generating anything.
-    Body: {"model": name, "keep_alive": "30m"}.
+    """Make a backend serve a model, and wait until it does.
+    Body: {"upstream": "ollama", "model": name, ...} — the rest is per-backend.
 
-    A zero-token generate is how you ask Ollama to make a model resident. Loading a large model
-    takes tens of seconds, so this waits for it rather than returning early — the caller wants to
-    know it is actually resident, not that the request was accepted.
+    Every mechanism lives on its Provider, so this handler only resolves the name and checks the
+    one thing common to all of them. It used to branch four ways here, which is how llama.cpp
+    ended up needing an exemption written into a condition rather than stated on the backend.
     """
     try:
         payload = await request.json()
@@ -7833,123 +10042,13 @@ async def control_model_load(request: Request):
         payload = {}
     upstream = (payload.get("upstream") or "ollama").strip().lower()
     name = (payload.get("model") or "").strip()
-    # vLLM and llama.cpp need no model name: each server was launched with one, so starting it
-    # (or relaunching it at a different context size) is the whole operation. Requiring a name
-    # here made starting them impossible.
-    if not name and upstream not in ("vllm", "llamacpp"):
+    prov = PROVIDERS.get(upstream)
+    if prov is None:
+        return JSONResponse({"error": f"unknown upstream {upstream!r}",
+                             "known": sorted(PROVIDERS)}, status_code=404)
+    if not name and prov.requires_model_name:
         return JSONResponse({"error": "'model' is required"}, status_code=400)
-    if upstream == "lmstudio":
-        ok, why = _lms_available()
-        if not ok:
-            return JSONResponse({"error": why}, status_code=501)
-        args = ["load", name, "--yes"]
-        # These matter for real workloads: a model loaded at the wrong context length or without
-        # parallelism benchmarks as a different thing entirely. The request wins over the
-        # per-box defaults in model_control.
-        mc = load_rules_config().get("model_control") or {}
-        ctx = payload.get("context_length") or mc.get("lmstudio_context_length")
-        par = payload.get("parallel") or mc.get("lmstudio_parallel")
-        gpu = payload.get("gpu") or mc.get("lmstudio_gpu")
-        if ctx:
-            args += ["--context-length", str(int(ctx))]
-        if par:
-            args += ["--parallel", str(int(par))]
-        if gpu:
-            args += ["--gpu", str(gpu)]
-        if payload.get("ttl_s"):
-            args += ["--ttl", str(int(payload["ttl_s"]))]
-        t0 = time.perf_counter()
-        code, out = await _lms_run(args)
-        if code != 0:
-            return JSONResponse({"error": out or f"lms exited {code}"}, status_code=502)
-        return {"ok": True, "model": name, "upstream": "lmstudio", "output": out,
-                "load_ms": round((time.perf_counter() - t0) * 1000)}
-    if upstream == "llamacpp":
-        cfg = _llamacpp_cfg()
-        svc = _service_def("llamacpp") or {"unit": str(cfg.get("unit") or "llamacpp.service"),
-                                           "scope": cfg.get("scope") or "user",
-                                           "name": "llamacpp"}
-        ctx = int(payload.get("context_length") or payload.get("ctx") or 0)
-        par = int(payload.get("parallel") or 0)
-        if ctx or par:
-            # Carry over whatever was not specified so changing one does not silently reset
-            # the other to a default the caller never asked for.
-            cur = await _llamacpp_snapshot(app.state.metrics_client)
-            par = par or int(cur.get("parallel") or 1)
-            ctx = ctx or int((cur.get("n_ctx") or 0) * max(1, par)) or 65536
-            ok, detail = _write_llamacpp_override(ctx, par)
-            if not ok:
-                return JSONResponse({"error": detail}, status_code=400)
-            # daemon-reload takes no unit — _systemctl_args always appends one, which
-            # systemctl rejects with "Too many arguments."
-            reload_args = [a for a in _systemctl_args(svc, "daemon-reload")
-                           if a != svc["unit"]]
-            code, out = await _run_cmd(reload_args, 30.0, env=_systemctl_env(svc))
-            if code != 0:
-                return JSONResponse({"error": f"daemon-reload failed: {out[:200]}"},
-                                    status_code=502)
-        t0 = time.perf_counter()
-        code, out = await _run_cmd(_systemctl_args(svc, "restart"), 120.0,
-                                   env=_systemctl_env(svc))
-        if code != 0:
-            return JSONResponse({"error": f"restart failed: {out[:300]}"}, status_code=502)
-        ready = await _llamacpp_ready(float(payload.get("ready_timeout_s") or 1800))
-        return {"ok": ready, "upstream": "llamacpp", "ready": ready,
-                "context_length": ctx or None, "parallel": par or None,
-                "load_ms": round((time.perf_counter() - t0) * 1000),
-                "note": None if ready else "restarted, but the server did not answer in time"}
-    if upstream == "vllm":
-        wanted = (payload.get("container") or "").strip()
-        configs = await _vllm_configs()
-        if wanted:
-            match = next((c for c in configs if c["container"] == wanted), None)
-            if not match:
-                return JSONResponse(
-                    {"error": f"no vLLM container named {wanted!r}",
-                     "available": [c["container"] for c in configs]}, status_code=404)
-            if not match["serves_port"]:
-                return JSONResponse(
-                    {"error": f"{wanted!r} does not publish {VLLM_URL} — starting it would not "
-                              f"make it reachable through this proxy"}, status_code=409)
-            container = wanted
-        else:
-            container = await _vllm_container()
-        if not container:
-            return JSONResponse(
-                {"error": "no local vLLM container publishing this port was found",
-                 "available": [c["container"] for c in configs]}, status_code=501)
-        t0 = time.perf_counter()
-        # They contend for one port, so anything else running must come down first — otherwise
-        # docker start fails on the binding and the error looks unrelated.
-        stopped = []
-        for c in configs:
-            if c["running"] and c["container"] != container:
-                await _run_cmd([_docker_bin(), "stop", c["container"]], 180.0)
-                stopped.append(c["container"])
-        code, out = await _run_cmd([_docker_bin(), "start", container], 60.0)
-        if code != 0:
-            return JSONResponse({"error": out or f"docker start exited {code}"}, status_code=502)
-        # Started is not ready: vLLM takes minutes to load weights and build its KV cache.
-        cfg_mc = load_rules_config().get("model_control") or {}
-        ready = await _vllm_ready(float(payload.get("wait_s")
-                                        or cfg_mc.get("vllm_ready_timeout_s") or 420))
-        return {"ok": ready, "started_container": container, "stopped_containers": stopped,
-                "ready": ready, "load_ms": round((time.perf_counter() - t0) * 1000),
-                "error": None if ready else "container started but the server did not become "
-                                            "ready in time — it may still be loading"}
-    keep = payload.get("keep_alive") or "30m"
-    t0 = time.perf_counter()
-    try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
-            r = await c.post(f"{OLLAMA_URL}/api/generate",
-                             json={"model": name, "prompt": "", "keep_alive": keep})
-            if r.status_code >= 400:
-                return JSONResponse({"error": f"ollama said {r.status_code}: {r.text[:200]}"},
-                                    status_code=502)
-    except httpx.RequestError as e:
-        return JSONResponse({"error": f"ollama unreachable: {e}"}, status_code=502)
-    return {"ok": True, "model": name, "keep_alive": keep,
-            "load_ms": round((time.perf_counter() - t0) * 1000)}
+    return await prov.load(payload, name)
 
 
 @app.get("/__proxy/api/control/artifacts")
@@ -8229,7 +10328,10 @@ async def bench_suites():
         "suites": [
             {
                 "name": name,
-                "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"])}
+                "tasks": [{"id": t["id"], "entry": t["entry"], "cases": len(t["cases"]),
+                           "lang": t.get("lang") or "python",
+                           "desc": _BENCH_TASK_DESC.get(t["id"]) or "",
+                           "available": _bench_lang_available(t.get("lang") or "python")}
                           for t in tasks],
                 "task_count": len(tasks),
                 "case_count": sum(len(t["cases"]) for t in tasks),
@@ -8251,8 +10353,10 @@ async def bench_suites():
 # "fixed" means the server serves exactly what it was launched with: the bench cannot swap
 # models there, only measure the one that is up. llama.cpp is fixed for the same reason vLLM
 # is — one model per process, chosen on the command line.
-_BENCH_LOAD_MODES = {"ollama": "on-demand", "lmstudio": "jit", "vllm": "fixed",
-                     "llamacpp": "fixed"}
+# Derived, not repeated: a backend added to the registry appears in the bench without
+# anyone remembering to update a second list.
+def _bench_load_modes() -> dict:
+    return {name: p.load_mode for name, p in PROVIDERS.items()}
 
 
 async def _bench_model_index() -> dict:
@@ -8274,7 +10378,7 @@ async def _bench_model_index() -> dict:
             return
         key = f"{upstream}:{name}"
         rec = {"model": name, "upstream": upstream, "loaded": bool(loaded),
-               "load_mode": _BENCH_LOAD_MODES.get(upstream, "unknown")}
+               "load_mode": _bench_load_modes().get(upstream, "unknown")}
         rec.update({k: v for k, v in extra.items() if v is not None})
         # A loaded entry always wins over a catalogue entry for the same pair.
         if key in index and index[key].get("loaded") and not loaded:
@@ -8289,7 +10393,8 @@ async def _bench_model_index() -> dict:
         ollama = sysinfo.get("ollama") or {}
         for t in (ollama.get("tags") or []):
             if isinstance(t, dict):
-                put(t.get("name"), "ollama", False)
+                put(t.get("name"), "ollama", False,
+                    size_mb=t.get("size_mb"), params=t.get("parameter_size"))
         for m in (ollama.get("ps") or []):
             if isinstance(m, dict):
                 put(m.get("name") or m.get("model"), "ollama", True,
@@ -8306,31 +10411,119 @@ async def _bench_model_index() -> dict:
                     loaded_context=m.get("loaded_context_length"),
                     size_mb=round((m.get("size_bytes") or 0) / 1048576) or None,
                     parallel=m.get("parallel"))
-        vll = sysinfo.get("vllm") or {}
-        vcfg = vll.get("config") or {}
-        # A launch flag is authoritative where the checkpoint name is only a convention.
-        v_quant_from_args = _infer_quant(vll.get("launch_args"))
-        for m in (vll.get("available") or []):
-            if isinstance(m, dict):
-                put(m.get("id"), "vllm", (m.get("state") or "loaded").lower() == "loaded",
-                    max_context=m.get("max_context_length"), arch=m.get("arch"),
-                    quant=m.get("quant") or v_quant_from_args,
-                    checkpoint=m.get("root"),
-                    prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
-                                    if vcfg.get("enable_prefix_caching") is not None else None),
-                    kv_cache_dtype=vcfg.get("cache_dtype"))
+        # Both vLLM slots, identically: each has its own port, its own live probe and its own
+        # set of twins. Indexing only the first is how a model on the second slot became
+        # unbenchmarkable — the picker had no entry to select.
+        for _slot in ("vllm", "vllm2"):
+            vll = sysinfo.get(_slot) or {}
+            vcfg = vll.get("config") or {}
+            # A launch flag is authoritative where the checkpoint name is only a convention.
+            v_quant_from_args = _infer_quant(vll.get("launch_args"))
+            for m in (vll.get("available") or []):
+                if isinstance(m, dict):
+                    put(m.get("id"), _slot, (m.get("state") or "loaded").lower() == "loaded",
+                        max_context=m.get("max_context_length"), arch=m.get("arch"),
+                        quant=m.get("quant") or v_quant_from_args,
+                        checkpoint=m.get("root"),
+                        prefix_caching=(str(vcfg.get("enable_prefix_caching", "")).lower() == "true"
+                                        if vcfg.get("enable_prefix_caching") is not None else None),
+                        kv_cache_dtype=vcfg.get("cache_dtype"))
+            # Containers that are configured but not running. vLLM serves exactly what its
+            # process was launched with, so a stopped container looked identical to a model that
+            # does not exist — the only way to benchmark it was to go to the System tab, start it
+            # by hand, come back, and hope you picked the right one. The proxy already knows how
+            # to start it and what it would serve, so offer it here and let the bench do it.
+            try:
+                # A container may be RUNNING but not yet serving — vLLM spends minutes loading
+                # shards. Skipping every running container made a booting model vanish from the
+                # index entirely: not loaded, not startable, so its cells failed preflight in one
+                # second ("does not serve — it has <the other twin>") instead of using the same
+                # start-and-wait path a stopped container gets. Only a container whose model the
+                # live probe actually answered for is excluded here.
+                _live_ready = {m.get("id") for m in (vll.get("available") or [])}
+                for c in await _vllm_configs(_vllm_url(_slot)):
+                    if not c.get("serves_port") or not c.get("model"):
+                        continue
+                    if c.get("running") and c["model"] in _live_ready:
+                        continue
+                    put(c["model"], _slot, False, startable=True, container=c["container"],
+                        quant=c.get("quant"), checkpoint=c.get("checkpoint"),
+                        max_context=int(c["max_model_len"]) if c.get("max_model_len") else None,
+                        kv_cache_dtype=c.get("kv_cache_dtype"),
+                        prefix_caching=c.get("prefix_caching"))
+            except Exception as e:
+                # Not silent: a failure here makes stopped containers vanish from the picker,
+                # which looks exactly like "that model does not exist".
+                try:
+                    print(f"[bench] vLLM container scan failed ({_slot}): "
+                          f"{type(e).__name__}: {e}")
+                except Exception:
+                    pass
         lcp = sysinfo.get("llamacpp") or {}
         for m in (lcp.get("available") or []):
             if isinstance(m, dict):
-                put(m.get("id"), "llamacpp", True,
+                # Identity is the checkpoint PATH, not the snapshot's display id. The stopped
+                # fallback below keys on the configured path, and sweeps submit that path — so
+                # when the display id was cleaned for the System tab, a running llama.cpp
+                # stopped matching its own cells: preflight said "does not serve <path> — it
+                # has <clean name>" and eleven server-context cells died in zero seconds each.
+                put(lcp.get("model_path") or m.get("id"), "llamacpp", True,
                     arch=m.get("arch"), quant=m.get("quant"),
                     max_context=m.get("max_context_length") or lcp.get("n_ctx"),
                     loaded_context=lcp.get("n_ctx"),
                     checkpoint=lcp.get("model_path"),
                     parallel=lcp.get("parallel"))
-    except Exception:
-        pass
+        # vLLM reports no weight size — its OpenAI /v1/models says nothing about bytes on disk,
+        # so every vLLM row rendered a blank in the report's size column and the memory chart
+        # could not describe the one backend where memory is tightest. Size the checkpoint in
+        # the Hugging Face cache instead, which is where vLLM put it.
+        for rec in index.values():
+            if rec.get("upstream") != "vllm" or rec.get("size_mb"):
+                continue
+            ckpt = rec.get("checkpoint")
+            if not ckpt:
+                continue
+            try:
+                total = _hf_cache_bytes(ckpt)
+                if total:
+                    rec["size_mb"] = round(total / 1048576)
+            except OSError:
+                pass          # a missing cache is a missing metric, not a broken index
+        # A stopped llama.cpp offers no models at all, so once the bench stopped it to make room
+        # for vLLM, its own cells could not resolve a model and failed preflight. The unit is
+        # configured with exactly one model; offer that, the same way a stopped container is.
+        lc_path = (_llamacpp_cfg() or {}).get("model")
+        if lc_path:
+            try:
+                # Split GGUFs: the first shard names the set, so size the whole set.
+                pat = re.sub(r"-\d{4,5}-of-\d{4,5}\.gguf$", "-*.gguf", lc_path)
+                shards = sorted(Path(lc_path).parent.glob(Path(pat).name)) or [Path(lc_path)]
+                total = sum(f.stat().st_size for f in shards if f.exists())
+                for rec in index.values():
+                    if rec.get("upstream") == "llamacpp" and total:
+                        rec.setdefault("size_mb", round(total / 1048576))
+            except OSError:
+                pass
+        if not (lcp.get("reachable")):
+            lc = _llamacpp_cfg()
+            if lc.get("model"):
+                put(lc["model"], "llamacpp", False, startable=True,
+                    quant=_infer_quant(lc.get("model")), checkpoint=lc.get("model"))
+    except Exception as e:
+        # This once swallowed an UnboundLocalError and returned an empty picker: every backend
+        # showed zero models and the bench looked like it had lost the box. Falling back is
+        # right; doing it silently is not.
+        try:
+            print(f"[bench] model index build failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
     if index:
+        _bench_annotate_fit(index)
+        _bench_annotate_engines(index)
+        try:
+            await _bench_annotate_caps(index, app.state.metrics_client)
+        except Exception as e:
+            print(f"[bench] capability probe failed: {type(e).__name__}: {e}")
         return index
     # The snapshot comes from the background metrics collector, which hasn't necessarily run
     # yet on a freshly-started proxy — and a bench submitted in that window would silently get
@@ -8381,6 +10574,7 @@ async def _bench_model_index() -> dict:
                 _probe(c, f"{OLLAMA_URL}/api/tags", _ollama_tags),
                 _probe(c, f"{LMSTUDIO_URL}/api/v0/models", _lms_native),
                 _probe(c, f"{VLLM_URL}/v1/models", _openai_models("vllm")),
+                _probe(c, f"{VLLM2_URL}/v1/models", _openai_models("vllm2")),
             )
             # After tags, so a loaded model's entry wins over its catalogue entry.
             await _probe(c, f"{OLLAMA_URL}/api/ps", _ollama_ps)
@@ -8389,7 +10583,153 @@ async def _bench_model_index() -> dict:
                 await _probe(c, f"{LMSTUDIO_URL}/v1/models", _openai_models("lmstudio"))
     except Exception:
         pass
+    # Same annotation on the cold-start path, or a model would be selectable on a freshly
+    # restarted proxy and refused a minute later.
+    _bench_annotate_fit(index)
+    _bench_annotate_engines(index)
     return index
+
+
+# Weights are the floor, not the total: a runtime also needs a KV cache, activations and its
+# own footprint, and the OS needs room left to not fall over. Deliberately generous — refusing
+# a model that would have fit is a worse failure than letting a borderline one try and fail
+# with a real error.
+_BENCH_FIT_OVERHEAD = 1.15
+_BENCH_FIT_RESERVE_MB = 4096
+
+
+# Capabilities are a property of the model tag, so they never change once read. Cached for the
+# process: /api/show is a call per model, and the picker would otherwise make fifteen of them
+# every time someone opened the bench tab.
+_OLLAMA_CAPS: dict = {}
+
+
+async def _ollama_capabilities(client, name: str):
+    """What Ollama says a model can do, or None if it would not say."""
+    if name in _OLLAMA_CAPS:
+        return _OLLAMA_CAPS[name]
+    caps = None
+    try:
+        r = await client.post(f"{OLLAMA_URL}/api/show", json={"model": name})
+        if r.status_code == 200:
+            got = (r.json() or {}).get("capabilities")
+            caps = [str(c) for c in got] if isinstance(got, list) else None
+    except (httpx.RequestError, ValueError):
+        caps = None
+    _OLLAMA_CAPS[name] = caps
+    return caps
+
+
+def _hf_cache_bytes(checkpoint: str) -> int:
+    """Bytes on disk for a Hugging Face repo id, or a local checkpoint path.
+
+    vLLM serves whatever `--model` named: either a path, or a repo id it downloaded into the
+    cache as `models--org--name`. Only weight files are counted — a repo also carries configs,
+    tokenizers and often the original unquantised safetensors under a different revision, and
+    summing the directory would report a number nobody is holding in memory.
+    """
+    p = Path(checkpoint)
+    if p.is_dir():
+        roots = [p]
+    else:
+        cache = Path(os.environ.get("HF_HOME") or (Path.home() / ".cache" / "huggingface"))
+        hub = cache / "hub" if (cache / "hub").is_dir() else cache
+        slug = "models--" + checkpoint.strip("/").replace("/", "--")
+        root = hub / slug / "snapshots"
+        if not root.is_dir():
+            return 0
+        # Newest revision only: an updated repo leaves the previous snapshot in place, and
+        # adding them together would double the model's apparent size.
+        revs = sorted((d for d in root.iterdir() if d.is_dir()),
+                      key=lambda d: d.stat().st_mtime, reverse=True)
+        roots = revs[:1]
+    total = 0
+    for r in roots:
+        for f in r.rglob("*"):
+            if f.suffix.lower() in (".safetensors", ".bin", ".gguf", ".pt") and f.is_file():
+                try:
+                    total += f.stat().st_size      # follows the symlink into blobs/
+                except OSError:
+                    pass
+    return total
+
+
+def _bench_fits(size_mb: float | None, total_mb: float | None) -> bool | None:
+    """Can this model be resident on this box at all? None when the size is unknown.
+
+    Unknown must not mean "no". vLLM checkpoints live inside a container and cannot be sized
+    from here, and silently hiding a model because it could not be measured would be
+    indistinguishable from the model not existing.
+    """
+    if not size_mb or not total_mb:
+        return None
+    return (size_mb * _BENCH_FIT_OVERHEAD) <= (total_mb - _BENCH_FIT_RESERVE_MB)
+
+
+async def _bench_annotate_caps(index: dict, client) -> None:
+    """Mark what cannot answer a chat request at all, and what merely will not answer it well.
+
+    A model with no `completion` capability — an embedding model — cannot produce a measurement
+    under any configuration, so it is refused the same way a model that does not fit is.
+
+    `vision` is recorded and never acted on. It means the model also accepts images, not that
+    it is weak at text: gemma3, gemma4, llama4 and qwen3.6 all report it on this box and all
+    code perfectly well. There is no reliable signal separating "vision-first" from "multimodal
+    and strong at text", so that judgement stays with the person choosing the models.
+    """
+    names = [r.get("model") for r in index.values()
+             if r.get("upstream") == "ollama" and r.get("model")]
+    if not names:
+        return
+    caps = await asyncio.gather(*(_ollama_capabilities(client, n) for n in names),
+                                return_exceptions=True)
+    by_name = {n: (c if isinstance(c, list) else None) for n, c in zip(names, caps)}
+    for rec in index.values():
+        got = by_name.get(rec.get("model"))
+        if got is None:
+            continue          # Ollama would not say; an unknown is not a refusal
+        rec["capabilities"] = got
+        if "vision" in got:
+            rec["vision"] = True
+        if "completion" not in got:
+            rec["benchable"] = False
+            rec["bench_detail"] = ("cannot answer a chat request — Ollama reports "
+                                   f"{', '.join(got) or 'no capabilities'}")
+
+
+def _bench_annotate_engines(index: dict) -> None:
+    """Mark models the box can serve through more than one engine.
+
+    That pairing is the only controlled way to ask "is vLLM faster than Ollama here" — same
+    weights, everything else held — and until it is pointed out it is findable only by noticing
+    that two rows of the picker happen to be the same checkpoint.
+    """
+    by_id: dict = {}
+    for rec in index.values():
+        ident = _bench_model_identity(rec.get("model") or "")
+        if ident:
+            by_id.setdefault(ident, set()).add(rec.get("upstream"))
+    for rec in index.values():
+        ups = by_id.get(_bench_model_identity(rec.get("model") or "")) or set()
+        if len(ups) > 1:
+            rec["also_on"] = sorted(u for u in ups if u and u != rec.get("upstream"))
+
+
+def _bench_annotate_fit(index: dict) -> None:
+    """Mark entries the box cannot hold. Checked against total memory, not free memory: the
+    bench evicts everything before it measures, so what matters is capacity, not what happens
+    to be resident while someone is reading the picker."""
+    total_mb = (_mem_snapshot() or {}).get("total_mb")
+    for rec in index.values():
+        fits = _bench_fits(rec.get("size_mb"), total_mb)
+        if fits is None:
+            continue
+        rec["fits"] = fits
+        if not fits:
+            rec["fit_detail"] = (
+                f"{rec['size_mb'] / 1024:.1f} GB of weights needs about "
+                f"{rec['size_mb'] * _BENCH_FIT_OVERHEAD / 1024:.0f} GB resident; "
+                f"this machine has {total_mb / 1024:.0f} GB")
 
 
 def _bench_resolve_model(index: dict, model: str, upstream: str = "") -> dict:
@@ -8411,12 +10751,25 @@ async def bench_models():
     VRAM by the first request, so without a warm-up that load time lands inside the first
     measurement."""
     index = await _bench_model_index()
+    # What each model has historically cost per cell, so a sweep can be priced before it runs
+    # rather than discovered to be a three-hour job an hour in.
+    conn = db()
+    try:
+        cost = _bench_history_cost(conn)
+        measured = _bench_completed_cells(conn)
+    finally:
+        conn.close()
+    typical = (sorted(cost.values())[len(cost) // 2] if cost else None)
+    for meta in index.values():
+        meta["est_cell_s"] = cost.get(meta.get("model")) or typical
+        meta["measured_before"] = meta.get("model") in {
+            json.loads(k).get("model") for k in measured}
     items = [dict(meta, key=key) for key, meta in index.items()]
     items.sort(key=lambda i: (i["upstream"], not i["loaded"], i["model"]))
     # Per-backend rollup: what's reachable, how much of it is resident, and whether unloaded
     # models there can be used at all. This is what the upstream picker is built from.
     upstreams = []
-    for name, mode in _BENCH_LOAD_MODES.items():
+    for name, mode in _bench_load_modes().items():
         mine = [i for i in items if i["upstream"] == name]
         upstreams.append({
             "upstream": name,
@@ -8424,11 +10777,15 @@ async def bench_models():
             "total": len(mine),
             "loaded": sum(1 for i in mine if i["loaded"]),
             "reachable": bool(mine),
+            # Lets the UI say "will be resized" instead of "expect empty completions" for the
+            # backends where that is now true.
+            "resizable_context": bool(
+                getattr(PROVIDERS.get(name), "resizable_context", False)),
         })
     out: dict = {
         "items": items,
         "upstreams": upstreams,
-        "load_modes": dict(_BENCH_LOAD_MODES),
+        "load_modes": _bench_load_modes(),
         # Kept for older clients / convenience.
         "ollama": {
             "loaded": [i["model"] for i in items if i["upstream"] == "ollama" and i["loaded"]],
@@ -8436,6 +10793,7 @@ async def bench_models():
         },
         "lmstudio": [i["model"] for i in items if i["upstream"] == "lmstudio"],
         "vllm": [i["model"] for i in items if i["upstream"] == "vllm"],
+        "vllm2": [i["model"] for i in items if i["upstream"] == "vllm2"],
     }
     return out
 
@@ -8456,6 +10814,30 @@ async def bench_run(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"invalid JSON: {e}"}, status_code=400)
 
+    # One bench at a time, refused rather than queued. _BENCH_SEM already serialises execution,
+    # so a second submission would run eventually — but "eventually" is the problem: a bench
+    # takes the box exclusively, resizes context windows, evicts residents and gates other
+    # traffic. A run that starts an hour later measures a machine configured by whatever ran
+    # before it, and nothing in its results would say so. Stale rows cannot wedge this: a
+    # restart marks everything pending/running as interrupted on the way up.
+    conn = db()
+    busy = conn.execute(
+        "SELECT COALESCE(parent_id, id) root FROM bench_runs "
+        "WHERE status IN ('pending','running') ORDER BY ts LIMIT 1").fetchone()
+    active = conn.execute(
+        "SELECT id, model, label, status, ts, progress, progress_total FROM bench_runs "
+        "WHERE id=?", (busy["root"],)).fetchone() if busy else None
+    conn.close()
+    if busy:
+        d = dict(active) if active else {"id": busy["root"]}
+        return JSONResponse(
+            {"error": f"a bench is already running ({d.get('label') or d.get('model') or d['id']})"
+                      f" — wait for it to finish",
+             "running": {k: d.get(k) for k in
+                         ("id", "model", "label", "status", "progress", "progress_total")},
+             "started_ago_s": round(time.time() - (d.get("ts") or time.time()))},
+            status_code=409)
+
     # A model is identified by (name, upstream). Accepted forms, in order of preference:
     #   [{"model": "x", "upstream": "vllm"}]   explicit — what the UI sends
     #   ["vllm:x"]                              the index key
@@ -8468,11 +10850,11 @@ async def bench_run(request: Request):
             raw = str(entry or "").strip()
             name, up = raw, ""
             head = raw.split(":", 1)[0].lower()
-            if head in _BENCH_LOAD_MODES and ":" in raw:
+            if head in PROVIDERS and ":" in raw:
                 up, name = head, raw.split(":", 1)[1]
         if not name:
             return None
-        if up and up not in _BENCH_LOAD_MODES:
+        if up and up not in PROVIDERS:
             return None
         return {"model": name, "upstream": up}
 
@@ -8512,18 +10894,35 @@ async def bench_run(request: Request):
             return v
         return cast(v) if cast else v
 
+    # Graded runs default to a budget the long tasks can actually finish in. 512 cut verbose
+    # models off mid-function on semver_cmp-class tasks — the failure examples then read as
+    # broken code when the truth was an empty tank. An explicit max_tokens still wins.
+    _mt_default = 1024 if str(payload.get("suite") or "").strip() else 256
     config = {
         "runs": int(payload.get("runs", 5) or 5),
-        "max_tokens": int(payload.get("max_tokens", 256) or 256),
+        "max_tokens": int(payload.get("max_tokens", _mt_default) or _mt_default),
         "prompt_tokens": keep("prompt_tokens") if isinstance(payload.get("prompt_tokens"), list)
                          else int(payload.get("prompt_tokens", 0) or 0),
         "concurrency": (payload["concurrency"] if isinstance(payload.get("concurrency"), list)
                         else int(payload.get("concurrency", 1) or 1)),
         "randomize": bool(payload.get("randomize", False)),
-        "exclusive": bool(payload.get("exclusive", False)),
+        # Exclusive by default: a benchmark sharing the box with live traffic measures
+        # contention, disturbs the humans, and is defenseless against their restarts —
+        # all three happened. Callers must opt OUT, knowingly.
+        "exclusive": bool(payload.get("exclusive", True)),
         "drain_seconds": float(payload.get("drain_seconds", 5.0) or 0.0),
         "thinking": thinking if thinking is not None else "auto",
-        "bypass_router": bool(payload.get("bypass_router", False)),
+        # Pinned by default, for the same reason as `exclusive` above: a benchmark exists to
+        # measure the model it names. Left to the router, a catch-all rule rewrites the bench's
+        # own requests, and the damage depends on luck. Pointing every request at gemma4-vllm
+        # made a nemotron run die after 5 of 357 units — auto-load saw a request for the *other*
+        # vLLM twin, tried to swap mid-bench, and refused because a bench was running, reported
+        # as "a benchmark owns the box right now", which reads like contention rather than a
+        # rewrite. The quieter outcome is worse: where the rewrite target happens to be loaded,
+        # the run completes and records another model's scores under the name that was asked for.
+        # The UI has always sent this flag; the API defaulting the other way meant scripted runs
+        # were the only ones exposed. Callers wanting to measure the routed path opt out knowingly.
+        "bypass_router": bool(payload.get("bypass_router", True)),
         "no_nudge": bool(payload.get("no_nudge", False)),
         "quiesce": bool(payload.get("quiesce", False)),
         # Unload other Ollama models before each cell, without gating traffic. Only Ollama can
@@ -8554,8 +10953,19 @@ async def bench_run(request: Request):
             config[key] = v
     if isinstance(payload.get("extra_body"), dict):
         config["extra_body"] = payload["extra_body"]
+    # The window the backend is launched with. Absent means "leave it as found", so it is only
+    # carried when actually asked for — an explicit None here would read as an axis of one.
+    sctx = keep("server_context", int)
+    if sctx:
+        config["server_context"] = sctx
+    # Reuse cells an earlier run already measured with identical settings. On unless told
+    # otherwise: the signature covers every setting that changes what a cell measures, so a
+    # reused cell is one that would have produced the same numbers, and the copy records where
+    # they came from. The narrow risk of a stale number is worth less than the repeated cost of
+    # forgetting — three multi-hour runs went out unprotected because this had to be asked for.
+    config["resume"] = bool(payload.get("resume", True))
 
-    # A matrix is any submission with more than one cell across the four sweepable axes.
+    # A matrix is any submission with more than one cell across the sweepable axes.
     cells = _bench_expand_matrix(models, config)
     is_matrix = len(cells) > 1
     bench_id = "b_" + uuid.uuid4().hex[:12]
@@ -8600,16 +11010,175 @@ async def bench_run(request: Request):
             "matrix": is_matrix, "cells": len(cells)}
 
 
+# Everything that changes what a cell measures. Two cells with the same signature would
+# produce the same numbers, which is what makes reuse safe — and what makes changing any
+# setting correctly force a re-measurement.
+_BENCH_SIG_KEYS = ("upstream", "suite", "runs", "max_tokens", "prompt_tokens", "server_context",
+                   "thinking", "temperature", "cache", "concurrency", "randomize", "warmup")
+
+
+def _bench_phase(bench_id: str, text: str | None) -> None:
+    """Record what a run is doing right now, visible immediately.
+
+    Its own connection and commit on purpose: a phase that only lands when the step finishes
+    describes the past, and the whole point is the minutes in between.
+    """
+    try:
+        conn = db()
+        conn.execute("UPDATE bench_runs SET phase=? WHERE id=?", (text, bench_id))
+        conn.commit()
+        conn.close()
+    except sqlite3.Error:
+        pass
+
+
+def _bench_cell_sig(model: str, cfg: dict) -> str:
+    parts = {k: cfg.get(k) for k in _BENCH_SIG_KEYS}
+    parts["model"] = model
+    return json.dumps(parts, sort_keys=True, default=str)
+
+
+def _bench_completed_cells(conn, days: int = 30) -> dict:
+    """Signature -> the most recent completed run that measured it."""
+    out: dict = {}
+    rows = conn.execute(
+        "SELECT id, model, config_json, results_json, env_json, axes_json, label, "
+        "       started_ts, finished_ts, progress, progress_total "
+        "FROM bench_runs WHERE status='done' AND ts > ? ORDER BY ts ASC",
+        (time.time() - days * 86400,)).fetchall()
+    for r in rows:
+        try:
+            cfg = json.loads(r["config_json"] or "{}")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if cfg.get("models"):
+            continue          # a sweep parent measures nothing itself
+        try:
+            summary = (json.loads(r["results_json"] or "{}") or {}).get("summary") or {}
+        except (json.JSONDecodeError, TypeError):
+            summary = {}
+        if not summary.get("n_success"):
+            # "Done" is not "measured". A cell whose backend was OOM-cycling once finished
+            # with 87 identical 502 rows and status 'done' — and a resume then copied that
+            # garbage forward as if it were data. Zero successes means there is nothing here
+            # worth reusing; let the new sweep measure it for real.
+            continue
+        out[_bench_cell_sig(r["model"], cfg)] = r      # later rows win: most recent
+    return out
+
+
+def _bench_history_cost(conn, days: int = 30) -> dict:
+    """Mean completed-cell seconds per model, so a sweep can be costed before it runs."""
+    rows = conn.execute(
+        "SELECT model, started_ts, finished_ts FROM bench_runs "
+        "WHERE status='done' AND started_ts IS NOT NULL AND finished_ts IS NOT NULL "
+        "AND ts > ? ORDER BY ts DESC LIMIT 500", (time.time() - days * 86400,)).fetchall()
+    agg: dict = {}
+    for r in rows:
+        d = r["finished_ts"] - r["started_ts"]
+        if d > 0:
+            agg.setdefault(r["model"], []).append(d)
+    return {m: round(sum(v) / len(v)) for m, v in agg.items()}
+
+
+def _bench_eta_s(cells: list, now: float) -> float | None:
+    """Seconds left in a sweep, from what it has already done.
+
+    Two costs, and the second is the one a naive estimate misses: a cell's own runtime, and the
+    gap before it starts. On a server_context sweep that gap is a backend restart and a full
+    model reload — minutes, sometimes longer than the cell itself — so an ETA built from cell
+    durations alone reads far too optimistic. Both are measured from this run rather than
+    assumed, so a slow box gets a slow estimate.
+    """
+    # `is not None`, not truthiness: a timestamp of 0 is a real time, and dropping those cells
+    # silently degrades the estimate to "no basis" rather than to a wrong number.
+    done = [c for c in cells if c["status"] == "done"
+            and c["started_ts"] is not None and c["finished_ts"] is not None]
+    if not done:
+        return None
+    durs = [c["finished_ts"] - c["started_ts"] for c in done]
+    mean_dur = sum(durs) / len(durs)
+    # Gap = time between one cell finishing and the next starting.
+    gaps = []
+    for prev, nxt in zip(cells, cells[1:]):
+        if (prev["finished_ts"] is not None and nxt["started_ts"] is not None
+                and nxt["started_ts"] > prev["finished_ts"]):
+            gaps.append(nxt["started_ts"] - prev["finished_ts"])
+    mean_gap = (sum(gaps) / len(gaps)) if gaps else 0.0
+    total = 0.0
+    for c in cells:
+        if c["status"] in ("done", "skipped", "failed"):
+            continue
+        if c["status"] == "running":
+            elapsed = now - (now if c["started_ts"] is None else c["started_ts"])
+            prog, want = (c["progress"] or 0), (c["progress_total"] or 0)
+            # Project from this cell's own pace once it has produced anything; before that its
+            # own history is all we have.
+            total += max(0.0, (elapsed * want / prog) - elapsed) if (prog and want) \
+                else max(0.0, mean_dur - elapsed)
+        else:
+            total += mean_dur + mean_gap
+    return round(total, 1) if total > 0 else None
+
+
 @app.get("/__proxy/api/bench/runs")
-async def bench_runs_list(request: Request, limit: int = 50):
+async def bench_runs_list(request: Request, limit: int = 50, include_children: bool = False):
+    """History, one entry per submission.
+
+    A sweep's cells are rows in this table too, so listing everything showed one click as 25
+    entries — and, because the limit counts them, two sweeps pushed every earlier run off the
+    end of the history. The cells are already rendered inside their parent's detail view, so
+    listing them again at the top level was duplication as well as noise.
+    """
     limit = max(1, min(int(limit or 50), 200))
     conn = db()
     rows = conn.execute(
         "SELECT id, ts, model, config_json, status, progress, progress_total, "
-        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label "
-        "FROM bench_runs ORDER BY ts DESC LIMIT ?",
+        "started_ts, finished_ts, error, creator_ip, parent_id, axes_json, label, phase, "
+        "env_json "
+        "FROM bench_runs "
+        + ("" if include_children else "WHERE parent_id IS NULL ")
+        + "ORDER BY ts DESC LIMIT ?",
         (limit,),
     ).fetchall()
+    # How each sweep's cells actually landed. The parent's own progress counter only tracks
+    # cells that were queued, so without this a sweep that skipped or failed half its matrix
+    # still reads as a clean "done".
+    cells: dict = {}
+    ids = [r["id"] for r in rows if not r["parent_id"]]
+    if ids:
+        qs = ",".join("?" * len(ids))
+        for c in conn.execute(
+            f"SELECT parent_id, status, COUNT(*) n FROM bench_runs "
+            f"WHERE parent_id IN ({qs}) GROUP BY parent_id, status", ids,
+        ).fetchall():
+            entry = cells.setdefault(c["parent_id"], {"total": 0})
+            entry[c["status"]] = c["n"]
+            entry["total"] += c["n"]
+        # Which cell is in flight, and how far into it. The parent's own counter only ticks
+        # when a whole cell finishes, so on a graded sweep with large prompts it can sit at
+        # 0/6 for many minutes. That detail used to be visible because every cell had its own
+        # history row; now that they are grouped, it has to come along with the group.
+        for c in conn.execute(
+            f"SELECT parent_id, label, progress, progress_total, phase FROM bench_runs "
+            f"WHERE parent_id IN ({qs}) AND status='running' ORDER BY ts, rowid", ids,
+        ).fetchall():
+            entry = cells.setdefault(c["parent_id"], {"total": 0})
+            entry.setdefault("now", {"label": c["label"], "progress": c["progress"],
+                                     "progress_total": c["progress_total"],
+                                     "phase": c["phase"]})
+        # How much longer, measured from this run's own pace.
+        now_ts = time.time()
+        by_parent: dict = {}
+        for c in conn.execute(
+            f"SELECT parent_id, status, started_ts, finished_ts, progress, progress_total "
+            f"FROM bench_runs WHERE parent_id IN ({qs}) ORDER BY ts, rowid", ids,
+        ).fetchall():
+            by_parent.setdefault(c["parent_id"], []).append(dict(c))
+        for pid, kids in by_parent.items():
+            eta = _bench_eta_s(kids, now_ts)
+            if eta is not None and cells.get(pid):
+                cells[pid]["eta_s"] = eta
     conn.close()
     viewer = _client_ip(request)
     items = []
@@ -8625,8 +11194,49 @@ async def bench_runs_list(request: Request, limit: int = 50):
             d["axes"] = json.loads(d.pop("axes_json") or "null")
         except (json.JSONDecodeError, TypeError):
             d["axes"] = None
+        if cells.get(d["id"]):
+            d["cells"] = cells[d["id"]]
+        try:
+            d["memory_warning"] = (json.loads(r["env_json"] or "{}") or {}).get("memory_warning")
+        except (json.JSONDecodeError, TypeError):
+            d["memory_warning"] = None
         items.append(d)
     return {"items": items}
+
+
+@app.get("/__proxy/api/bench/runs/{bench_id}/grades")
+async def bench_grades(bench_id: str):
+    """The grading browser: a cell renders every request and case statically; a sweep parent
+    renders an index of its cells. This is where "89% — what failed in the other 11% and
+    WHY?" gets answered, one request at a time."""
+    conn = db()
+    row = conn.execute("SELECT * FROM bench_runs WHERE id=?", (bench_id,)).fetchone()
+    if not row:
+        conn.close()
+        return JSONResponse({"error": "not found"}, status_code=404)
+    run = dict(row)
+    for k, col in (("config", "config_json"), ("results", "results_json")):
+        try:
+            run[k] = json.loads(run.get(col) or "{}")
+        except (json.JSONDecodeError, TypeError):
+            run[k] = {}
+    kids = conn.execute(
+        "SELECT id, label, status, results_json FROM bench_runs WHERE parent_id=? ORDER BY ts",
+        (bench_id,)).fetchall()
+    conn.close()
+    if kids:
+        children = []
+        for k in kids:
+            c = dict(k)
+            try:
+                c["results"] = json.loads(c.get("results_json") or "{}")
+            except (json.JSONDecodeError, TypeError):
+                c["results"] = {}
+            children.append(c)
+        html = _bench_report_mod._bench_grades_index_html(run, children)
+    else:
+        html = _bench_report_mod._bench_grades_html(run)
+    return Response(content=html, media_type="text/html")
 
 
 @app.get("/__proxy/api/bench/runs/{bench_id}")
@@ -8688,562 +11298,60 @@ async def bench_run_delete(bench_id: str, request: Request):
     return {"ok": True}
 
 
-def _bench_fmt(v, digits=1, suffix=""):
-    if v is None:
-        return "—"
-    if isinstance(v, float):
-        return f"{v:.{digits}f}{suffix}"
-    return f"{v}{suffix}"
-
-
-def _bench_report_row(run: dict) -> dict:
-    """Flatten one run into the fields a comparison table needs."""
-    res = run.get("results") or {}
-    s = res.get("summary") or {}
-    q = s.get("quality") or {}
-    cfg = run.get("config") or {}
-    return {
-        "id": run.get("id"),
-        "label": run.get("label") or run.get("model"),
-        "model": run.get("model"),
-        "served": ", ".join(s.get("served_models") or []) or None,
-        "thinking": cfg.get("thinking"),
-        "temperature": cfg.get("temperature"),
-        "prompt_tokens": cfg.get("prompt_tokens"),
-        "n_success": s.get("n_success"),
-        "n_total": s.get("n_total"),
-        "ttft_p50": (s.get("ttft_ms") or {}).get("p50"),
-        "ttfc_p50": (s.get("ttfc_ms") or {}).get("p50"),
-        "decode_p50": (s.get("decode_tps") or {}).get("p50"),
-        "total_p50": (s.get("total_ms") or {}).get("p50"),
-        "reasoning_tok_p50": (s.get("reasoning_tokens") or {}).get("p50"),
-        "perfect_rate": q.get("perfect_rate"),
-        "case_pass_rate": q.get("case_pass_rate"),
-        "suite": cfg.get("suite"),
-        # Mean output length: the report's thinking-vs-not chapter turned on this number as much
-        # as on latency — ~18x more tokens generated for no quality gain.
-        "mean_tokens": (s.get("completion_tokens") or {}).get("mean"),
-        "cache": cfg.get("cache"),
-        "concurrency": cfg.get("concurrency") or 1,
-        "quant": (run.get("env") or {}).get("quant"),
-        "size_mb": (run.get("env") or {}).get("size_mb"),
-        "checkpoint": (run.get("env") or {}).get("checkpoint"),
-        "prefix_caching": (run.get("env") or {}).get("prefix_caching"),
-        "kv_cache_dtype": (run.get("env") or {}).get("kv_cache_dtype"),
-        "warmup_ms": s.get("warmup_ms"),
-        "warmup_ttft_ms": s.get("warmup_ttft_ms"),
-        "tiers": q.get("tiers") or {},
-        # Full distributions, used when there is a single configuration and a comparison table
-        # would have nothing to compare against.
-        "ttft": s.get("ttft_ms") or {},
-        "decode": s.get("decode_tps") or {},
-        "total": s.get("total_ms") or {},
-    }
-
-
-
-# Reports use the dashboard's palette rather than a document look of their own — they're read
-# next to the UI they came from, so a different skin reads as a different tool. Colour lives in
-# CSS variables with a light counterpart, because a dark page printed to PDF wastes a cartridge
-# and reads badly on paper; print forces the light set.
-_REPORT_CSS = """
-  :root {
-    --bg:#0c0f15; --panel:#141922; --panel-2:#10141c; --border:#262d38;
-    --ink:#e9edf4; --ink-dim:#c9d3e1; --ink-faint:#8b97a8;
-    --accent:#57d1e0; --accent-deep:#2f8f9c; --good:#68d391; --warn:#f0c674; --bad:#f07178;
-    --mono:ui-monospace,"SF Mono","Cascadia Code",Menlo,monospace;
-    --sans:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
-    color-scheme: dark;
-  }
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg:#eef1f5; --panel:#fff; --panel-2:#f4f6f9; --border:#d8dee7;
-      --ink:#1a1f28; --ink-dim:#3f4a5a; --ink-faint:#6b7688;
-      --accent:#14707e; --accent-deep:#0f5b66; --good:#0a7d4f; --warn:#8a6d1f; --bad:#b3261e;
-      color-scheme: light;
-    }
-  }
-  * { box-sizing:border-box; }
-  body { margin:0; background:var(--bg); color:var(--ink); font-family:var(--sans);
-         line-height:1.6; padding:clamp(18px,4vw,44px) clamp(14px,4vw,34px);
-         -webkit-font-smoothing:antialiased; }
-  .wrap { max-width:1040px; margin:0 auto; }
-  .eyebrow { font-family:var(--mono); font-size:11px; letter-spacing:.18em; text-transform:uppercase;
-             color:var(--accent); margin:0 0 10px; }
-  h1 { font-size:clamp(22px,3.4vw,32px); line-height:1.1; margin:0 0 6px; letter-spacing:-.02em;
-       font-weight:680; }
-  .sub { color:var(--ink-faint); font-size:13px; margin:0 0 20px; }
-  h2 { font-size:12px; font-family:var(--mono); letter-spacing:.14em; text-transform:uppercase;
-       color:var(--ink-faint); margin:34px 0 12px; padding-bottom:9px;
-       border-bottom:1px solid var(--border); font-weight:600; }
-  .meta { display:flex; flex-wrap:wrap; gap:6px 24px; font-family:var(--mono); font-size:12px;
-          color:var(--ink-faint); border-top:1px solid var(--border);
-          border-bottom:1px solid var(--border); padding:10px 0; margin-bottom:6px; }
-  .meta b { color:var(--ink-dim); font-weight:500; }
-  .note { color:var(--ink-faint); font-size:12.5px; margin:0 0 12px; max-width:76ch; }
-  .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:12px;
-           margin:16px 0 4px; }
-  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; }
-  .card .k { font-family:var(--mono); font-size:10.5px; letter-spacing:.1em; text-transform:uppercase;
-             color:var(--ink-faint); margin:0 0 8px; }
-  .card .v { font-family:var(--mono); font-size:24px; font-weight:600; letter-spacing:-.02em;
-             line-height:1.05; color:var(--ink); }
-  .card .v small { font-size:13px; color:var(--ink-faint); font-weight:400; }
-  .card .d { font-size:12px; color:var(--ink-faint); margin:7px 0 0; }
-  .card.hi { border-color:var(--accent-deep); } .card.hi .v { color:var(--accent); }
-  .tbl { overflow-x:auto; border:1px solid var(--border); border-radius:10px; background:var(--panel); }
-  table { border-collapse:collapse; width:100%; font-size:12.5px; }
-  th, td { padding:7px 11px; text-align:left; border-bottom:1px solid var(--border); }
-  thead th { font-family:var(--mono); font-size:10.5px; letter-spacing:.06em; text-transform:uppercase;
-             color:var(--ink-faint); font-weight:500; background:var(--panel-2); }
-  tbody tr:last-child td, tbody tr:last-child th { border-bottom:none; }
-  tbody th { font-weight:600; color:var(--ink-dim); }
-  td.n, th.n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums;
-              white-space:nowrap; }
-  /* A ledger's total is a different kind of row from the days above it, and has to read as one. */
-  tbody tr.sum th, tbody tr.sum td { border-top:2px solid var(--border); background:var(--panel-2);
-                                     font-weight:600; color:var(--ink); }
-  /* Nine columns of numbers read as noise until they're grouped. The spanning row names what
-     each block of them is, and a rule down the seam keeps the blocks from bleeding together. */
-  thead tr.grp th { text-align:center; font-size:9.5px; letter-spacing:.12em; padding-bottom:4px;
-                    color:var(--ink-faint); border-bottom:none; }
-  thead tr.grp th.blank { background:var(--panel-2); }
-  th.seam, td.seam { border-left:1px solid var(--border); }
-  thead th.wrap { white-space:normal; max-width:96px; line-height:1.25; }
-  /* Footnotes belong under the thing they qualify — above it they're just a wall to climb.
-     A list, not paragraphs: four separate caveats set as prose read as one grey slab. */
-  /* Sent before any query runs; a rule at the end of the stream hides it once the real
-     content has arrived. No script, so it still works in a saved copy. */
-  #building { display:flex; align-items:center; gap:9px; margin:20px 0 0; padding:13px 16px;
-              border:1px solid var(--border); border-radius:10px; background:var(--panel);
-              color:var(--ink-faint); font-size:13px; }
-  #building .spin { color:var(--accent); font-size:15px; animation:reportspin 1.1s linear infinite; }
-  @keyframes reportspin { to { transform:rotate(360deg); } }
-  @media (prefers-reduced-motion: reduce) { #building .spin { animation:none; } }
-  @media print { #building { display:none; } }
-  ul.fn { color:var(--ink-faint); font-size:11.5px; line-height:1.6; max-width:86ch;
-          margin:11px 0 0; padding-left:17px; }
-  ul.fn li { margin:0 0 4px; }
-  td.win { color:var(--accent); font-weight:700; }
-  td.slow { color:var(--bad); font-weight:600; }
-  td.ok { color:var(--good); } td.bad { color:var(--bad); font-weight:600; }
-  .unit { color:var(--ink-faint); font-weight:400; font-size:11.5px; }
-  code { font-family:var(--mono); font-size:.88em; background:var(--panel-2);
-         border:1px solid var(--border); border-radius:4px; padding:1px 5px; color:var(--accent); }
-  .bar { display:block; height:8px; background:var(--panel-2); border-radius:4px;
-         overflow:hidden; border:1px solid var(--border); min-width:60px; }
-  .bar i { display:block; height:100%; background:linear-gradient(90deg,var(--accent-deep),var(--accent)); }
-  svg { margin:4px 0 16px; display:block; }
-  .ct { font-size:10.5px; fill:var(--ink-faint); font-weight:600; text-transform:uppercase;
-        letter-spacing:.6px; }
-  .cl { font-size:11.5px; fill:var(--ink-dim); }
-  .cv { font-size:11.5px; fill:var(--ink); font-weight:600; }
-  /* The one loud element on the page. Everything else stays quiet so this reads first. */
-  .hero { background:linear-gradient(180deg,var(--panel),var(--panel-2));
-          border:1px solid var(--border); border-left:3px solid var(--accent);
-          border-radius:12px; padding:20px 22px; margin:18px 0 4px; }
-  .hero .lede { font-size:clamp(17px,2.2vw,21px); line-height:1.45; color:var(--ink);
-                margin:0; letter-spacing:-.01em; }
-  .hero .lede b { color:var(--accent); font-family:var(--mono); font-weight:600;
-                  font-size:1.06em; letter-spacing:-.02em; }
-  .hero .why { color:var(--ink-faint); font-size:13px; margin:10px 0 0; max-width:74ch; }
-  /* Minor tables sit side by side: full width would give them an authority they haven't earned. */
-  /* A single run is a record: read down a list of properties, not across a 14-column row. */
-  .spec { display:grid; grid-template-columns:repeat(auto-fit,minmax(148px,1fr)); gap:1px;
-          background:var(--border); border:1px solid var(--border); border-radius:10px;
-          overflow:hidden; margin:16px 0 4px; }
-  .spec div { background:var(--panel); padding:11px 14px; }
-  .spec .k { font-family:var(--mono); font-size:10px; letter-spacing:.1em; text-transform:uppercase;
-             color:var(--ink-faint); margin:0 0 5px; }
-  .spec .v { font-family:var(--mono); font-size:14px; color:var(--ink); margin:0;
-             overflow-wrap:anywhere; }
-  .spec .v.big { font-size:19px; font-weight:600; color:var(--accent); letter-spacing:-.02em; }
-  .band { display:grid; grid-template-columns:repeat(auto-fit,minmax(320px,1fr)); gap:0 26px; }
-  .band > section > h2 { margin-top:26px; }
-  section { min-width:0; }
-  footer { margin-top:38px; padding-top:14px; border-top:1px solid var(--border);
-           color:var(--ink-faint); font-size:11.5px; }
-  @media print {
-    :root { --bg:#fff; --panel:#fff; --panel-2:#f4f6f9; --border:#d8dee7;
-            --ink:#1a1f28; --ink-dim:#3f4a5a; --ink-faint:#6b7688;
-            --accent:#14707e; --accent-deep:#0f5b66; --good:#0a7d4f; --bad:#b3261e;
-            color-scheme: light; }
-    body { padding:0; }
-    h2 { page-break-after:avoid; }
-    table, svg, .cards { page-break-inside:avoid; }
-  }
-"""
-
-
-def _report_head(title: str, eyebrow: str) -> str:
-    """Everything that can be sent before a single row has been counted."""
-    return (
-        "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        f"<title>{_h(title)}</title><style>{_REPORT_CSS}</style></head><body><div class=\"wrap\">"
-        f"<p class=\"eyebrow\">{_h(eyebrow)}</p>"
-        f"<h1>{_h(title)}</h1>"
-    )
-
-
-# Shown the instant the page opens and hidden by a rule sent at the very end, so it disappears
-# on its own when the real content has arrived. No script: this has to survive being saved.
-_REPORT_BUILDING = (
-    '<div id="building"><span class="spin">\u25d0</span> Building the report \u2014 reading every request '
-    'the proxy has recorded. A few seconds.</div>'
-)
-_REPORT_BUILT = "<style>#building{display:none}</style>"
-
-
-def _report_foot() -> str:
-    return (_REPORT_BUILT
-            + "<footer>Generated by AI Proxy \u00b7 every request behind these numbers passed "
-              "through the proxy and is individually inspectable in the dashboard.</footer>"
-              "</div></body></html>")
-
-
-def _report_page(title: str, eyebrow: str, sub: str, meta: list, body: str) -> str:
-    """Shared chrome for every generated report."""
-    meta_html = "".join(f"<div>{_h(k)} <b>{_h(v)}</b></div>" for k, v in meta if v is not None)
-    return (_report_head(title, eyebrow)
-            + f"<p class=\"sub\">{_h(sub)}</p>"
-            + f"<div class=\"meta\">{meta_html}</div>"
-            + body
-            + _report_foot())
-
-
-def _bench_bar_svg(rows, key, label, unit, better="high", width=680):
-    """Horizontal bar chart as inline SVG — no script, no fonts, survives being saved to a file
-    or printed. Charts here exist to make the ordering obvious at a glance; the table beside
-    them carries the actual numbers."""
-    vals = [(r["label"], r.get(key)) for r in rows if r.get(key) is not None]
-    if not vals:
-        return ""
-    top = max(v for _n, v in vals) or 1
-    best = max(v for _n, v in vals) if better == "high" else min(v for _n, v in vals)
-    bar_h, gap, pad_l = 20, 8, 250
-    height = len(vals) * (bar_h + gap) + 26
-
-    def elide(name, limit=42):
-        """Elide the MIDDLE, not the tail. Cell labels share a long prefix (the model) and
-        differ in their last few segments (the axis values), so tail-truncation renders every
-        row of a sweep identically — which is the one thing a chart must not do."""
-        if len(name) <= limit:
-            return name
-        head = limit // 3
-        return name[:head] + "…" + name[-(limit - head - 1):]
-
-    parts = [f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
-             f'role="img" aria-label="{_h(label)}">',
-             f'<text x="0" y="12" class="ct">{_h(label)} ({_h(unit)})</text>']
-    for i, (name, v) in enumerate(vals):
-        y = 26 + i * (bar_h + gap)
-        w = max(2, int((v / top) * (width - pad_l - 60)))
-        fill = "#57d1e0" if v == best else "#33566b"
-        parts.append(f'<text x="0" y="{y + 14}" class="cl">{_h(elide(name))}</text>')
-        parts.append(f'<rect x="{pad_l}" y="{y}" width="{w}" height="{bar_h}" rx="3" fill="{fill}"/>')
-        parts.append(f'<text x="{pad_l + w + 6}" y="{y + 14}" class="cv">{v:,.1f}</text>')
-    parts.append("</svg>")
-    return "".join(parts)
-
-
-def _h(v) -> str:
-    """Escape for HTML text/attribute context."""
-    return (str("" if v is None else v).replace("&", "&amp;").replace("<", "&lt;")
-            .replace(">", "&gt;").replace('"', "&quot;"))
-
-
-def _bench_report_html(runs: list[dict], rows: list[dict]) -> str:
-    """Self-contained comparison report: environment, per-cell table, charts, quality breakdown.
-
-    Deliberately one file with inline CSS/SVG and no external requests, so it can be saved,
-    mailed, or printed to PDF and still render exactly the same a month later.
-    """
-    graded = any(r.get("perfect_rate") is not None for r in rows)
-    env = next((r.get("env") for r in runs if r.get("env")), {}) or {}
-    gpus = env.get("gpus") or []
-    gpu_txt = ", ".join(
-        f"{g.get('name') or 'GPU'}"
-        + (f" · {round((g.get('mem_total_mb') or 0) / 1024)} GB" if g.get("mem_total_mb") else "")
-        for g in gpus) or "not reported"
-    when = runs[0].get("ts")
-    when_txt = datetime.datetime.fromtimestamp(when).strftime("%Y-%m-%d %H:%M") if when else "—"
-    title = ((rows[0].get("served") or rows[0]["model"]) if len(rows) == 1
-             else f"{len(rows)} configurations")
-
-    def fmt(v, digits=0, suffix=""):
-        return "—" if v is None else f"{v:,.{digits}f}{suffix}"
-
-    def pct(v):
-        return "—" if v is None else f"{v * 100:.0f}%"
-
-    # Table -------------------------------------------------------------------------------
-    head = ["Configuration", "Model", "Quant", "Size", "Backend", "Think", "Cache", "Context",
-            "TTFT p50", "Decode p50", "Tokens", "Total p50", "vs best", "OK"]
-    if graded:
-        head[12:12] = ["Fully correct", "Cases"]
-    if len(rows) == 1:
-        head.remove("vs best")
-    # Slowdown against the fastest configuration in the set. A raw latency column doesn't make
-    # "16x slower for no quality gain" jump out; a ratio does.
-    fastest = min((r["total_p50"] for r in rows if r["total_p50"]), default=None)
-    best_dec = max((r["decode_p50"] for r in rows if r["decode_p50"] is not None), default=None)
-    best_ttft = min((r["ttft_p50"] for r in rows if r["ttft_p50"] is not None), default=None)
-    best_q = max((r["perfect_rate"] for r in rows if r["perfect_rate"] is not None), default=None)
-
-    body_rows = []
-    for r, run in zip(rows, runs):
-        cfg = run.get("config") or {}
-        slow = (r["total_p50"] / fastest) if (fastest and r["total_p50"]) else None
-        cells = [
-            f'<th scope="row">{_h(r["label"])}</th>',
-            f'<td><code>{_h(r["served"] or r["model"])}</code></td>',
-            f'<td>{_h(r.get("quant") or "—")}</td>',
-            f'<td class="n">{(str(round(r["size_mb"] / 1024, 1)) + " GB") if r.get("size_mb") else "—"}</td>',
-            f'<td>{_h(cfg.get("upstream") or "—")}</td>',
-            f'<td>{_h(r["thinking"] or "auto")}</td>',
-            f'<td>{_h(r.get("cache") or "—")}</td>',
-            f'<td class="n">{fmt(r["prompt_tokens"])}</td>',
-            f'<td class="n{" win" if r["ttft_p50"] == best_ttft else ""}">{fmt(r["ttft_p50"], 0, " ms")}</td>',
-            f'<td class="n{" win" if r["decode_p50"] == best_dec else ""}">{fmt(r["decode_p50"], 1)}</td>',
-            f'<td class="n">{fmt(r.get("mean_tokens"), 0)}</td>',
-            f'<td class="n">{fmt(r["total_p50"], 0, " ms")}</td>',
-        ]
-        if len(rows) > 1:
-            cells.append(
-                f'<td class="n{" slow" if (slow or 0) >= 2 else ""}">'
-                f'{("1.0x" if slow and slow < 1.05 else fmt(slow, 1, "x")) if slow else "—"}</td>')
-        if graded:
-            cells.append(f'<td class="n{" win" if r["perfect_rate"] == best_q else ""}">{pct(r["perfect_rate"])}</td>')
-            cells.append(f'<td class="n">{pct(r["case_pass_rate"])}</td>')
-        ok = r["n_success"] == r["n_total"]
-        cells.append(f'<td class="n {"ok" if ok else "bad"}">{r["n_success"]}/{r["n_total"]}</td>')
-        body_rows.append("<tr>" + "".join(cells) + "</tr>")
-
-    # One configuration has nothing to compare against: a chart with a single full-width bar
-    # conveys no scale, "best in column" marks everything, and "vs best" is always 1.0x. The
-    # only real variation in a single cell is run-to-run spread, so show that instead.
-    single = len(rows) == 1
-    if single:
-        r0 = rows[0]
-
-        def spread(label, dist, unit, digits=0):
-            if not dist or dist.get("p50") is None:
-                return ""
-            cells = "".join(f'<td class="n">{fmt(dist.get(k), digits)}</td>'
-                            for k in ("min", "p50", "p90", "max"))
-            return f'<tr><th scope="row">{_h(label)} <span class="unit">{_h(unit)}</span></th>{cells}</tr>'
-
-        charts = (
-            f'<p class="note">A single configuration, so there is nothing to rank \u2014 what matters '
-            f'here is consistency across the {r0["n_total"]} requests. A wide gap between p50 and max '
-            f'means the number is not repeatable.</p>'
-            '<table><thead><tr><th>Metric</th><th>min</th><th>p50</th><th>p90</th><th>max</th></tr></thead><tbody>'
-            + spread("Time to first token", r0.get("ttft"), "ms")
-            + spread("Decode rate", r0.get("decode"), "tokens/sec", 1)
-            + spread("Total", r0.get("total"), "ms")
-            + '</tbody></table>')
-    else:
-        charts = _bench_bar_svg(rows, "decode_p50", "Decode rate", "tokens/sec", "high")
-        charts += _bench_bar_svg(rows, "ttft_p50", "Time to first token", "ms, lower is better", "low")
-        if graded:
-            qrows = [dict(r, q=(r["perfect_rate"] or 0) * 100) for r in rows]
-            charts += _bench_bar_svg(qrows, "q", "Fully-correct responses", "%", "high")
-
-    # Per-task quality --------------------------------------------------------------------
-    task_html = ""
-    if graded:
-        tasks = {}
-        for r, run in zip(rows, runs):
-            q = (((run.get("results") or {}).get("summary") or {}).get("quality") or {})
-            for t in (q.get("tasks") or []):
-                tasks.setdefault(t["task"], {})[r["label"]] = t.get("perfect_rate")
-        if tasks:
-            labels = [r["label"] for r in rows]
-            th = "".join(f"<th>{_h(l)}</th>" for l in labels)
-            # With one configuration, a row per task is a column of identical 100%s. Only the
-            # tasks that lost a case carry information, so list those and count the rest.
-            items = sorted(tasks.items())
-            if len(rows) == 1:
-                lab = labels[0]
-                imperfect = [(t, per) for t, per in items if (per.get(lab) or 0) < 1]
-                clean = len(items) - len(imperfect)
-                if not imperfect:
-                    task_summary = (f'<p class="note">All <b>{clean}</b> tasks fully correct on '
-                                    "every run — nothing to single out.</p>")
-                    trs = []
-                else:
-                    task_summary = (f'<p class="note"><b>{clean}</b> of {len(items)} tasks were '
-                                    "fully correct on every run; the ones that were not are "
-                                    "listed below.</p>")
-                    trs = [f'<tr><th scope="row"><code>{_h(t)}</code></th>'
-                           f'<td class="n">{pct(per.get(lab))}</td></tr>' for t, per in imperfect]
-            else:
-                task_summary = ""
-                trs = []
-                for tname, per in items:
-                    tds = "".join(f'<td class="n">{pct(per.get(l))}</td>' for l in labels)
-                    trs.append(f'<tr><th scope="row"><code>{_h(tname)}</code></th>{tds}</tr>')
-            tier_rows = ""
-            if any(r.get("tiers") for r in rows):
-                names = {"core": "Core \u2014 any usable coding model clears these",
-                         "hard": "Hard \u2014 separates models that both pass the core tier"}
-                ttrs = []
-                for tier in ("core", "hard"):
-                    if not any((r.get("tiers") or {}).get(tier) for r in rows):
-                        continue
-                    tds = "".join(
-                        f'<td class="n">{pct(((r.get("tiers") or {}).get(tier) or {}).get("perfect_rate"))}</td>'
-                        for r in rows)
-                    ttrs.append(f'<tr><th scope="row">{_h(names.get(tier, tier))}</th>{tds}</tr>')
-                tier_rows = ('<table><thead><tr><th>Tier</th>' + th + '</tr></thead><tbody>'
-                             + "".join(ttrs) + '</tbody></table>')
-            # Runs recorded before the hard tier existed carry no tier data; an empty heading
-            # with a paragraph explaining a table that isn't there is worse than no section.
-            tier_html = ("<h2>Correctness by tier</h2>"
-                         '<p class="note">The core tier confirms a model is not broken; it '
-                         "saturates for anything capable, which is exactly why the hard tier "
-                         "exists. Compare two models on the hard row when both score 100% on "
-                         "core.</p>" + tier_rows) if tier_rows else ""
-            task_html = tier_html + f"""<h2>Per-task correctness</h2>
-<p class="note">Share of responses that passed every case for that task. A model strong
-everywhere except one task and a model mediocre throughout can share an overall average.</p>
-{task_summary}
-{f'<div class="tbl"><table><thead><tr><th>Task</th>{th}</tr></thead><tbody>{"".join(trs)}</tbody></table></div>' if trs else ""}"""
-
-    # Cold vs cached, paired by everything except the cache axis. This is the comparison that
-    # exposes a backend serving every repeated prompt as a fresh prefill.
-    cache_html = ""
-    pairs: dict = {}
-    for r in rows:
-        if not r.get("cache"):
-            continue
-        key = (r["model"], r["prompt_tokens"], r["thinking"], r.get("concurrency"))
-        pairs.setdefault(key, {})[r["cache"]] = r
-    both = {k: v for k, v in pairs.items() if "cold" in v and "cached" in v}
-    if both:
-        trs = []
-        for (model, ctx, think, _cc), v in both.items():
-            cold, cached = v["cold"]["ttft_p50"], v["cached"]["ttft_p50"]
-            speedup = (cold / cached) if (cold and cached) else None
-            verdict = ("cache is working" if speedup and speedup >= 1.5 else
-                       "no measurable reuse" if speedup else "—")
-            trs.append(
-                f'<tr><th scope="row"><code>{_h(model)}</code></th>'
-                f'<td class="n">{fmt(ctx)}</td><td>{_h(think)}</td>'
-                f'<td class="n">{fmt(cold, 0, " ms")}</td>'
-                f'<td class="n">{fmt(cached, 0, " ms")}</td>'
-                f'<td class="n{" win" if speedup and speedup >= 1.5 else ""}">{fmt(speedup, 1, "x") if speedup else "—"}</td>'
-                f'<td>{_h(verdict)}</td></tr>')
-        cache_html = f"""<h2>Prompt cache</h2>
-<p class="note">Cold sends a uniquely salted prompt every time so nothing can be reused; cached
-repeats one identical prompt after a priming request. A backend whose prefix caching is off or
-unsupported shows roughly the same first-token latency in both columns — which looks like
-ordinary slowness rather than a misconfiguration.</p>
-<table><thead><tr><th>Model</th><th>Context</th><th>Think</th><th>Cold TTFT</th>
-<th>Cached TTFT</th><th>Speed-up</th><th></th></tr></thead><tbody>{"".join(trs)}</tbody></table>"""
-
-    # The warm-up in cached mode sends the prompt the measured runs will send, so its TTFT is
-    # the cold prefill of that exact prompt. Against the measured (cached) TTFT that is a direct
-    # read on whether the prefix cache is working, and it costs nothing extra to report.
-    cold_html = ""
-    cold_rows = []
-    for r in rows:
-        cold_t, warm_t = r.get("warmup_ttft_ms"), r.get("ttft_p50")
-        if r.get("cache") == "cached" and cold_t and warm_t and cold_t > warm_t * 1.5:
-            cold_rows.append((r, cold_t, warm_t, cold_t / warm_t))
-    if cold_rows:
-        trs = "".join(
-            f'<tr><th scope="row">{_h(r["label"])}</th>'
-            f'<td class="n">{fmt(r["prompt_tokens"])}</td>'
-            f'<td class="n">{fmt(c, 0, " ms")}</td><td class="n">{fmt(w, 0, " ms")}</td>'
-            f'<td class="n win">{fmt(ratio, 0, "x")}</td></tr>'
-            for r, c, w, ratio in cold_rows)
-        cold_html = (
-            "<h2>Prompt cache</h2>"
-            '<p class="note">The warm-up sends the same prompt the measured runs use, so its '
-            "first-token time is that prompt\u2019s <em>cold</em> prefill; everything after it is "
-            "served warm. A backend whose prefix caching is off or unsupported shows no gap "
-            "between these two columns.</p>"
-            "<table><thead><tr><th>Configuration</th><th>Prompt</th><th>Cold TTFT</th>"
-            "<th>Cached TTFT</th><th>Faster by</th></tr></thead><tbody>" + trs + "</tbody></table>")
-
-    warm = [(fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')
-             if len(rows) == 1 else
-             f"{r['label']}: {fmt(((run.get('results') or {}).get('summary') or {}).get('warmup_ms'), 0, ' ms')}")
-            for r, run in zip(rows, runs)
-            if ((run.get("results") or {}).get("summary") or {}).get("warmup_ms")]
-
-    if single:
-        r0 = rows[0]
-        cfg0 = (runs[0].get("config") or {})
-        q0 = r0.get("perfect_rate")
-        # The verdict first. A wide table asks you to reconstruct it from fifteen cells.
-        verdict = (f"scored <b>{q0 * 100:.0f}%</b> fully correct" if q0 is not None
-                   else f"completed <b>{r0['n_success']}</b> of {r0['n_total']} requests")
-        results = f"""
-  <div class="hero">
-    <p class="lede"><b>{_h(r0["served"] or r0["model"])}</b> {verdict} at
-      <b>{_fmt_n(r0["decode_p50"], 1)}</b> tok/s, first token in <b>{_fmt_n(r0["ttft_p50"], 0)}</b> ms.</p>
-    <p class="why">{r0["n_success"]} of {r0["n_total"]} requests succeeded.</p>
-  </div>
-  <h2>Configuration</h2>
-  <div class="spec">
-    <div><p class="k">Backend</p><p class="v">{_h(cfg0.get("upstream") or "—")}</p></div>
-    <div><p class="k">Context</p><p class="v">{_fmt_n(r0["prompt_tokens"]) if r0["prompt_tokens"] else "short"}</p></div>
-    <div><p class="k">Thinking</p><p class="v">{_h(r0["thinking"] or "auto")}</p></div>
-    <div><p class="k">Prompt cache</p><p class="v">{_h(r0.get("cache") or "—")}</p></div>
-    <div><p class="k">Temperature</p><p class="v">{"—" if r0.get("temperature") is None else _h(str(r0["temperature"]))}</p></div>
-    <div><p class="k">Quantisation</p><p class="v">{_h(r0.get("quant") or "not reported")}</p></div>
-    <div><p class="k">Prefix caching</p><p class="v">{"on" if r0.get("prefix_caching") else ("off" if r0.get("prefix_caching") is False else "—")}</p></div>
-    <div><p class="k">KV cache dtype</p><p class="v">{_h(r0.get("kv_cache_dtype") or "—")}</p></div>
-    <div><p class="k">Decode rate</p><p class="v big">{_fmt_n(r0["decode_p50"], 1)}</p></div>
-    <div><p class="k">Time to first token</p><p class="v big">{_fmt_n(r0["ttft_p50"], 0)} ms</p></div>
-    <div><p class="k">Reply length</p><p class="v">{_fmt_n(r0.get("mean_tokens"), 0)} tok</p></div>
-    <div><p class="k">Total per request</p><p class="v">{_fmt_n(r0["total_p50"], 0)} ms</p></div>
-  </div>
-"""
-    else:
-        results = f"""
-  <h2>Results</h2>
-  <p class="note">TTFT is the first token of any kind; TTFC the first <em>content</em> token —
-  the gap between them is time the model spent reasoning. Decode rate is measured from the first
-  token onward, so reasoning tokens count as generated work. Best value in each column is
-  highlighted.</p>
-  <div class="tbl"><table>
-    <thead><tr>{"".join(f'<th>{_h(h)}</th>' for h in head)}</tr></thead>
-    <tbody>{"".join(body_rows)}</tbody>
-  </table></div>
-"""
-
-    body = f"""
-  {results}
-
-  <h2>{"Consistency" if single else "At a glance"}</h2>
-  {charts}
-
-  {cache_html}
-
-  {cold_html}
-
-  {task_html}
-
-  {"<h2>Warm-up</h2><p class='note'>Excluded from every measurement above. A large value is the model-load cost for a model that was not resident when the run started.</p><p class='note'>" + _h(" · ".join(warm)) + "</p>" if warm else ""}
-"""
-    return _report_page(
-        title=f"Benchmark — {title}",
-        eyebrow="AI Proxy · benchmark",
-        sub=f"{when_txt} · proxy {env.get('proxy_version') or ''}",
-        meta=[("GPU", gpu_txt), ("Configurations", len(rows)),
-              ("Requests", f"{sum(r['n_total'] or 0 for r in rows):,}"),
-              ("Graded suite", rows[0].get("suite") if graded else None)],
-        body=body,
-    )
+# The whitepaper renderer lives in bench_report — pure functions, importable
+# without the app. Re-bound under the old names for callers and tests.
+_host_hw_facts = _bench_report_mod._host_hw_facts
+_fmt_n = _bench_report_mod._fmt_n
+_d3_source = _bench_report_mod._d3_source
+_bench_model_display = _bench_report_mod._bench_model_display
+_bench_model_identity = _bench_report_mod._bench_model_identity
+_bench_label_display = _bench_report_mod._bench_label_display
+_bench_fmt = _bench_report_mod._bench_fmt
+_bench_report_row = _bench_report_mod._bench_report_row
+_REPORT_TOKENS_LIGHT = _bench_report_mod._REPORT_TOKENS_LIGHT
+_REPORT_TOKENS_DARK = _bench_report_mod._REPORT_TOKENS_DARK
+_REPORT_CSS = _bench_report_mod._REPORT_CSS
+_report_head = _bench_report_mod._report_head
+_REPORT_BUILDING = _bench_report_mod._REPORT_BUILDING
+_REPORT_BUILT = _bench_report_mod._REPORT_BUILT
+_report_foot = _bench_report_mod._report_foot
+_report_page = _bench_report_mod._report_page
+_SVG_HALO = _bench_report_mod._SVG_HALO
+_BENCH_WEIGHT_DEFAULT = _bench_report_mod._BENCH_WEIGHT_DEFAULT
+_bench_weighted_data = _bench_report_mod._bench_weighted_data
+_bench_weighted_rows = _bench_report_mod._bench_weighted_rows
+_bench_weighted_html = _bench_report_mod._bench_weighted_html
+_bench_parallel_groups = _bench_report_mod._bench_parallel_groups
+_bench_category_winners_html = _bench_report_mod._bench_category_winners_html
+_bench_coldstart_split_html = _bench_report_mod._bench_coldstart_split_html
+_bench_language_profile_html = _bench_report_mod._bench_language_profile_html
+_bench_category_html = _bench_report_mod._bench_category_html
+_bench_efficiency_html = _bench_report_mod._bench_efficiency_html
+_bench_variance_html = _bench_report_mod._bench_variance_html
+_bench_place_labels = _bench_report_mod._bench_place_labels
+_bench_size_by_model = _bench_report_mod._bench_size_by_model
+_bench_best_per_model = _bench_report_mod._bench_best_per_model
+_bench_bubbles_svg = _bench_report_mod._bench_bubbles_svg
+_bench_answer_time_svg = _bench_report_mod._bench_answer_time_svg
+_bench_engine_pair_data = _bench_report_mod._bench_engine_pair_data
+_bench_engine_pairs_svg = _bench_report_mod._bench_engine_pairs_svg
+_bench_coldstart_svg = _bench_report_mod._bench_coldstart_svg
+_bench_scorecards = _bench_report_mod._bench_scorecards
+_bench_pareto = _bench_report_mod._bench_pareto
+_bench_scatter_svg = _bench_report_mod._bench_scatter_svg
+_bench_bar_svg = _bench_report_mod._bench_bar_svg
+_h = _bench_report_mod._h
+_BENCH_AXIS_LABELS = _bench_report_mod._BENCH_AXIS_LABELS
+_bench_axis_values = _bench_report_mod._bench_axis_values
+_bench_axis_split = _bench_report_mod._bench_axis_split
+_bench_cell_name = _bench_report_mod._bench_cell_name
+_bench_case_text = _bench_report_mod._bench_case_text
+_bench_failure_examples = _bench_report_mod._bench_failure_examples
+_bench_report_html = _bench_report_mod._bench_report_html
 
 
 
-def _fmt_n(v, digits=0, suffix=""):
-    return "—" if v is None else f"{v:,.{digits}f}{suffix}"
+
 
 
 def _fmt_tokens(v):
@@ -9982,6 +12090,99 @@ async def stats_report(format: str = "html"):
                                       "x-accel-buffering": "no"})
 
 
+@app.get("/__proxy/api/bench/guide")
+def bench_guide(request: Request, suite: str = "", format: str = "html"):
+    """What every benchmark task asks, and what right and wrong answers look like.
+
+    The passing answer is derived from the task's own cases, using the same vocabulary the
+    report's failure examples use — so a reader who has seen one recognises the other. The
+    failing answer is a REAL reply pulled from stored runs, because an invented failure teaches
+    the shape of a mistake nobody made.
+    """
+    wanted = [s.strip() for s in (suite or "").split(",") if s.strip()] or list(_BENCH_SUITES)
+    # Real failures first: one pass over recent runs, keyed by task id. Three channels record
+    # a failure and only one of them is per-case `got`: a compile error lands in grade.error
+    # (18 of them across recent runs — "./task.go:7:2: errors imported and not used"), and a
+    # runtime error lands in the case's own `error` with got=null. Reading only `got` hid every
+    # task that never built, which is the loudest failure a coding suite can have.
+    examples: dict = {}
+    stats: dict = {}
+    conn = db()
+    try:
+        for row in conn.execute(
+                "SELECT results_json FROM bench_runs WHERE results_json IS NOT NULL "
+                "ORDER BY ts DESC LIMIT 40"):
+            try:
+                rows = (json.loads(row["results_json"]) or {}).get("rows") or []
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for u in rows:
+                g = u.get("grade") or {}
+                tid = u.get("task")
+                if not tid or not g:
+                    continue
+                st = stats.setdefault(tid, {"runs": 0, "perfect": 0})
+                st["runs"] += 1
+                if g.get("passed", 0) >= g.get("total", 0):
+                    st["perfect"] += 1
+                    continue
+                found = []
+                if g.get("error"):
+                    found.append(("build", str(g["error"])[:200]))
+                for c in (g.get("cases") or []):
+                    if c.get("ok"):
+                        continue
+                    if c.get("error"):
+                        found.append(("crash", str(c["error"])[:160]))
+                    elif c.get("got") is not None:
+                        found.append(("wrong", str(c.get("got"))[:160]))
+                seen = examples.setdefault(tid, [])
+                for kind, txt in found:
+                    if not any(txt == t for _k, t in seen) and len(seen) < 3:
+                        seen.append((kind, txt))
+    finally:
+        conn.close()
+
+    # Grouped by CATEGORY, each task once. Grouping by suite rendered 431 cards for 177 tasks:
+    # full-v2 contains coding-v3 plus agent-v2 plus security-v1 plus the rest, so parse_query
+    # appeared four times. The suites a task belongs to are a property of the task, not a reason
+    # to draw it again.
+    by_cat: dict = {}
+    seen: dict = {}
+    for name in wanted:
+        for t in (_BENCH_SUITES.get(name) or []):
+            tid = t["id"]
+            if tid in seen:
+                seen[tid]["suites"].append(name)
+                continue
+            good = []
+            for i in range(len(t.get("cases") or [])):
+                try:
+                    good.append(_bench_report_mod._bench_case_parts(t, i))
+                except Exception:
+                    continue
+            cat = _BENCH_TASK_CATEGORY.get(tid) or "other"
+            entry = {
+                "id": tid, "lang": t.get("lang") or "python", "category": cat,
+                "desc": _BENCH_TASK_DESC.get(tid) or "",
+                "note": _BENCH_TASK_NOTES.get(tid) or "",
+                "good": good, "suites": [name],
+                "stats": stats.get(tid) or {"runs": 0, "perfect": 0},
+            }
+            seen[tid] = entry
+            by_cat.setdefault(cat, []).append(entry)
+    # Biggest category first: it is the one a reader is most likely to have come for.
+    out = [{"name": c, "tasks": sorted(v, key=lambda x: x["id"])}
+           for c, v in sorted(by_cat.items(), key=lambda kv: -len(kv[1]))]
+    if not out:
+        return JSONResponse({"error": f"no such suite; available: {list(_BENCH_SUITES)}"},
+                            status_code=404)
+    if format == "json":
+        return {"categories": out, "failures": examples, "stats": stats}
+    return Response(content=_bench_report_mod._bench_guide_html(out, examples),
+                    media_type="text/html; charset=utf-8")
+
+
 @app.get("/__proxy/api/bench/report")
 async def bench_report(request: Request, ids: str = "", format: str = "json"):
     """Comparison report over any number of runs. `ids` is comma-separated; a suite parent
@@ -10020,17 +12221,18 @@ async def bench_report(request: Request, ids: str = "", format: str = "json"):
         return {"rows": rows, "env": [r.get("env") for r in runs]}
 
     graded = any(r.get("perfect_rate") is not None for r in rows)
-    head = ["Run", "Model", "Think", "Ctx", "TTFT p50", "Decode p50", "Total p50"]
+    head = ["Run", "Model", "Think", "Prompt", "Server ctx", "TTFT p50", "Decode p50", "Total p50"]
     if graded:
         head += ["Fully correct", "Cases"]
     lines = ["| " + " | ".join(head) + " |",
              "|" + "|".join(["---"] * len(head)) + "|"]
     for r in rows:
         cells = [
-            str(r["label"] or "—"),
-            str(r["served"] or r["model"] or "—"),
+            _bench_label_display(r["label"] or "—"),
+            _bench_model_display(r["served"] or r["model"] or "—"),
             str(r["thinking"] or "auto"),
             _bench_fmt(r["prompt_tokens"], 0),
+            _bench_fmt(r.get("server_context"), 0),
             _bench_fmt(r["ttft_p50"], 0, " ms"),
             _bench_fmt(r["decode_p50"], 1, " tok/s"),
             _bench_fmt(r["total_p50"], 0, " ms"),
@@ -10096,6 +12298,320 @@ async def memory_delete(scope: str):
     conn.commit()
     conn.close()
     return {"ok": True, "removed": cur.rowcount}
+
+
+# -------- Scratchboard: shared working notes, visible from every subnet --------
+#
+# Everything else the dashboard shows is somebody's captured traffic, so it goes through the
+# PII gate: a viewer on another subnet sees placeholders. These notes are written BY the
+# viewers rather than captured from them, and a shared board that each machine sees a
+# different version of is not a shared board. So this endpoint deliberately does not redact,
+# and that is the whole feature rather than an oversight.
+_SCRATCH_MAX_CHARS = 8000
+_SCRATCH_MAX_ROWS = 500
+_SCRATCH_MAX_FILE_BYTES = 8 * 1024 * 1024
+
+
+@app.get("/__proxy/api/scratchboard")
+def scratchboard_list():          # sync → threadpool, same as the other small reads
+    conn = db()
+    rows = [dict(r) for r in conn.execute(
+        "SELECT id, ts, author, text, client_ip, pinned, parent_id FROM scratchboard "
+        "ORDER BY ts DESC LIMIT ?", (_SCRATCH_MAX_ROWS * 4,)).fetchall()]
+    conn.close()
+    # Roots newest-first with pinned on top; replies oldest-first beneath their parent, because
+    # a thread reads forwards even though a board reads backwards.
+    by_parent: dict = {}
+    for r in rows:
+        if r.get("parent_id"):
+            by_parent.setdefault(r["parent_id"], []).append(r)
+    roots = [r for r in rows if not r.get("parent_id")]
+    roots.sort(key=lambda r: (-(r.get("pinned") or 0), -(r.get("ts") or 0)))
+    # Attachment metadata only — never the bytes. A board with a few images on it would
+    # otherwise ship megabytes of base64 on every poll of a page that refreshes constantly.
+    files: dict = {}
+    conn2 = db()
+    for f in conn2.execute("SELECT id, note_id, name, mime, size, ts FROM scratchboard_files "
+                           "ORDER BY ts").fetchall():
+        files.setdefault(f["note_id"], []).append(dict(f))
+    conn2.close()
+    for r in rows:
+        r["files"] = files.get(r["id"], [])
+    for r in roots:
+        r["replies"] = sorted(by_parent.get(r["id"], []), key=lambda x: x.get("ts") or 0)
+    # A reply whose parent was deleted would otherwise vanish silently; surface it as a root
+    # rather than losing someone's answer to a question that no longer exists.
+    known = {r["id"] for r in roots}
+    orphans = [r for pid, kids in by_parent.items() if pid not in known for r in kids]
+    for o in orphans:
+        o["replies"] = []
+        o["orphaned"] = True
+    return {"items": roots[:_SCRATCH_MAX_ROWS] + orphans}
+
+
+@app.post("/__proxy/api/scratchboard")
+async def scratchboard_add(request: Request):
+    """Add a note. Body: {text, author?, pinned?}."""
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    text = (payload.get("text") or "").strip()
+    if not text:
+        return JSONResponse({"error": "text is required"}, status_code=400)
+    if len(text) > _SCRATCH_MAX_CHARS:
+        return JSONResponse(
+            {"error": f"text too long ({len(text)} chars, limit {_SCRATCH_MAX_CHARS})"},
+            status_code=413)
+    author = (payload.get("author") or "").strip()[:64] or None
+    entry_id = uuid.uuid4().hex[:16]
+    conn = db()
+    # One level of nesting: replying to a reply attaches to the same root, so a thread stays a
+    # thread instead of becoming a tree nobody can render.
+    parent = (payload.get("parent_id") or "").strip() or None
+    if parent:
+        row = conn.execute("SELECT id, parent_id FROM scratchboard WHERE id = ?",
+                           (parent,)).fetchone()
+        if not row:
+            conn.close()
+            return JSONResponse({"error": f"no note {parent!r} to reply to"}, status_code=404)
+        parent = row["parent_id"] or row["id"]
+    conn.execute(
+        "INSERT INTO scratchboard (id, ts, author, text, client_ip, pinned, parent_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (entry_id, time.time(), author, text, _client_ip(request),
+         1 if (payload.get("pinned") and not parent) else 0, parent))
+    # Bound the table rather than letting a board become a log nobody reads. Pinned notes are
+    # exempt: pinning is the way to say "this one is not scratch". Replies are exempt too —
+    # pruning them by age would strip answers off notes that are still on the board.
+    conn.execute(
+        "DELETE FROM scratchboard WHERE pinned = 0 AND parent_id IS NULL AND id NOT IN "
+        "(SELECT id FROM scratchboard WHERE pinned = 0 AND parent_id IS NULL "
+        " ORDER BY ts DESC LIMIT ?)",
+        (_SCRATCH_MAX_ROWS,))
+    # The prune above took only the root. Its replies came back as orphan roots — which is the
+    # right answer when a human deletes a note by accident, and the wrong one for a bound whose
+    # whole job is to stop the board growing — and its attachments stayed in the table with
+    # nothing referencing them, at up to 8 MB each. Written as a sweep rather than a targeted
+    # delete so it also clears whatever the earlier version already stranded.
+    conn.execute("DELETE FROM scratchboard WHERE parent_id IS NOT NULL "
+                 "AND parent_id NOT IN (SELECT id FROM scratchboard WHERE parent_id IS NULL)")
+    conn.execute("DELETE FROM scratchboard_files "
+                 "WHERE note_id NOT IN (SELECT id FROM scratchboard)")
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": entry_id}
+
+
+@app.delete("/__proxy/api/scratchboard/{entry_id}")
+def scratchboard_delete(entry_id: str):
+    conn = db()
+    # Replies go with their parent. Leaving them behind would surface answers as roots, which
+    # is right for a parent that vanished by accident and wrong for one deleted on purpose.
+    # Attachments go too — orphaned blobs would sit in the database with nothing referencing
+    # them, which is how a bounded table stops being bounded.
+    conn.execute("DELETE FROM scratchboard_files WHERE note_id = ? OR note_id IN "
+                 "(SELECT id FROM scratchboard WHERE parent_id = ?)", (entry_id, entry_id))
+    cur = conn.execute("DELETE FROM scratchboard WHERE id = ? OR parent_id = ?",
+                       (entry_id, entry_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.post("/__proxy/api/scratchboard/{entry_id}/files")
+async def scratchboard_attach(entry_id: str, request: Request):
+    """Attach a file to a note. Body: {name, mime?, data_b64}.
+
+    base64 in JSON rather than multipart: multipart needs python-multipart, and this package
+    ships three dependencies on purpose. The 33% encoding overhead is irrelevant at an 8 MB cap.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    name = (payload.get("name") or "").strip()[:200]
+    b64 = payload.get("data_b64") or ""
+    if not name or not b64:
+        return JSONResponse({"error": "name and data_b64 are required"}, status_code=400)
+    try:
+        blob = base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        return JSONResponse({"error": "data_b64 is not valid base64"}, status_code=400)
+    if len(blob) > _SCRATCH_MAX_FILE_BYTES:
+        return JSONResponse(
+            {"error": f"file is {len(blob):,} bytes; limit {_SCRATCH_MAX_FILE_BYTES:,}"},
+            status_code=413)
+    conn = db()
+    if not conn.execute("SELECT 1 FROM scratchboard WHERE id = ?", (entry_id,)).fetchone():
+        conn.close()
+        return JSONResponse({"error": f"no note {entry_id!r}"}, status_code=404)
+    fid = uuid.uuid4().hex[:16]
+    conn.execute("INSERT INTO scratchboard_files (id, note_id, ts, name, mime, size, data) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (fid, entry_id, time.time(), name,
+                  (payload.get("mime") or "").strip()[:100] or None, len(blob), blob))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "id": fid, "size": len(blob)}
+
+
+_SCRATCH_ZIP_MAX_BYTES = 512 * 1024 * 1024
+
+
+def _zip_safe_name(name: str, fallback: str = "file") -> str:
+    """A filename a zip can carry and an extractor will not write outside the target
+    directory. Path separators and .. are stripped rather than escaped: the name is a label,
+    and no attachment here legitimately contains a directory."""
+    base = (name or "").replace("\\", "/").split("/")[-1]
+    base = re.sub(r'[^A-Za-z0-9._ ()\[\]-]', "_", base).strip(" .")
+    return base[:120] or fallback
+
+
+def _scratch_note_text(note: dict, replies: list) -> str:
+    """The note as it reads on the board. Whoever opens the zip a month later needs the author,
+    the time and the thread, not just the body — the attachments are only half of a note."""
+    def block(n, indent=""):
+        when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(n.get("ts") or 0))
+        head = f"{n.get('author') or 'anonymous'} · {when}"
+        if n.get("client_ip"):
+            head += f" · from {n['client_ip']}"
+        files = [f["name"] for f in (n.get("files") or [])]
+        out = [indent + head, indent + "-" * len(head)]
+        out += [indent + line for line in (n.get("text") or "").splitlines()]
+        if files:
+            out += ["", indent + "attached: " + ", ".join(files)]
+        return "\n".join(out)
+
+    parts = [block(note)]
+    for r in replies:
+        parts.append("\n" + block(r, indent="    "))
+    return "\n".join(parts) + "\n"
+
+
+def _scratch_zip(notes: list[dict], filename: str):
+    """One download: every attachment plus the text that goes with it.
+
+    Built in memory. The per-file cap is 8 MB and a board is 500 notes, so the ceiling is
+    theoretically large — hence the explicit total check, which refuses with the arithmetic
+    rather than having the process killed while assembling a 4 GB buffer.
+    """
+    import io
+    import zipfile
+
+    total = sum(f.get("size") or 0 for n in notes for f in (n.get("files") or []))
+    if total > _SCRATCH_ZIP_MAX_BYTES:
+        return JSONResponse(
+            {"error": f"attachments total {total / 1048576:.0f} MB; the zip is built in memory "
+                      f"and refuses above {_SCRATCH_ZIP_MAX_BYTES // 1048576} MB. Download the "
+                      f"files individually, or delete some first.",
+             "total_bytes": total}, status_code=413)
+
+    conn = db()
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        board = []
+        for note in notes:
+            replies = note.get("replies") or []
+            text = _scratch_note_text(note, replies)
+            board.append(text)
+            # One folder per note only when there is more than one, so the common case —
+            # downloading a single note — extracts flat instead of into a stray directory.
+            stem = _zip_safe_name(
+                f"{time.strftime('%Y%m%d-%H%M', time.localtime(note.get('ts') or 0))}-"
+                f"{note.get('author') or 'anon'}", "note")
+            prefix = f"{stem}/" if len(notes) > 1 else ""
+            if len(notes) > 1:
+                z.writestr(prefix + "note.txt", text)
+            seen: dict = {}
+            for n in [note] + list(replies):
+                for f in (n.get("files") or []):
+                    row = conn.execute("SELECT data FROM scratchboard_files WHERE id = ?",
+                                       (f["id"],)).fetchone()
+                    if not row:
+                        continue          # deleted between listing the board and reading it
+                    name = _zip_safe_name(f.get("name") or "", "file")
+                    # Two attachments called screenshot.png are normal; silently keeping one
+                    # would be a download that quietly lost a file.
+                    if name in seen:
+                        seen[name] += 1
+                        stem_, dot, ext = name.rpartition(".")
+                        name = (f"{stem_} ({seen[name] - 1}).{ext}" if dot
+                                else f"{name} ({seen[name] - 1})")
+                    else:
+                        seen[name] = 1
+                    z.writestr(prefix + name, row["data"])
+        z.writestr("notes.txt" if len(notes) > 1 else "note.txt",
+                   ("\n\n" + "=" * 78 + "\n\n").join(board))
+    conn.close()
+    data = buf.getvalue()
+    return Response(
+        content=data, media_type="application/zip",
+        headers={"content-disposition": f'attachment; filename="{filename}"',
+                 "content-length": str(len(data))})
+
+
+@app.get("/__proxy/api/scratchboard/zip")
+def scratchboard_zip_all():
+    """The whole board as one file. Registered before the {entry_id} route below so that
+    'zip' is read as the literal path it is."""
+    board = scratchboard_list()
+    notes = board.get("items") or []
+    if not notes:
+        return JSONResponse({"error": "the board is empty"}, status_code=404)
+    return _scratch_zip(notes, f"scratchboard-{time.strftime('%Y%m%d-%H%M')}.zip")
+
+
+@app.get("/__proxy/api/scratchboard/{entry_id}/zip")
+def scratchboard_zip_note(entry_id: str):
+    notes = [n for n in (scratchboard_list().get("items") or []) if n["id"] == entry_id]
+    if not notes:
+        return JSONResponse({"error": f"no note {entry_id!r}"}, status_code=404)
+    stem = _zip_safe_name(f"{notes[0].get('author') or 'note'}-"
+                          f"{time.strftime('%Y%m%d-%H%M', time.localtime(notes[0].get('ts') or 0))}",
+                          "note")
+    return _scratch_zip(notes, f"{stem}.zip")
+
+
+@app.get("/__proxy/api/scratchboard/files/{file_id}")
+def scratchboard_file(file_id: str):
+    conn = db()
+    row = conn.execute("SELECT name, mime, data FROM scratchboard_files WHERE id = ?",
+                       (file_id,)).fetchone()
+    conn.close()
+    if not row:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    # Always as an attachment, always octet-stream, never sniffed. These bytes are uploaded by
+    # whoever can reach the proxy and are served from the same origin as the dashboard — an
+    # HTML or SVG file rendered inline would be script execution against this page.
+    safe = re.sub(r'[^A-Za-z0-9._ -]', "_", row["name"] or "file")[:120]
+    return Response(
+        content=row["data"], media_type="application/octet-stream",
+        headers={"content-disposition": f'attachment; filename="{safe}"',
+                 "x-content-type-options": "nosniff"})
+
+
+@app.delete("/__proxy/api/scratchboard/files/{file_id}")
+def scratchboard_file_delete(file_id: str):
+    conn = db()
+    cur = conn.execute("DELETE FROM scratchboard_files WHERE id = ?", (file_id,))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "removed": cur.rowcount}
+
+
+@app.post("/__proxy/api/scratchboard/{entry_id}/pin")
+async def scratchboard_pin(entry_id: str, request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    conn = db()
+    cur = conn.execute("UPDATE scratchboard SET pinned = ? WHERE id = ?",
+                       (0 if payload.get("pinned") is False else 1, entry_id))
+    conn.commit()
+    conn.close()
+    return {"ok": True, "updated": cur.rowcount}
 
 
 @app.get("/__proxy/api/personalities")
@@ -10493,384 +13009,233 @@ _BENCH_BASE_TASK = (
 # SECURITY: this executes model-generated code. It runs in a separate process with a hard timeout,
 # in a scratch cwd, with the parent's env stripped down. That contains accidents and runaway loops
 # — it is NOT a sandbox against deliberately hostile code. Grading is opt-in per bench run.
-_BENCH_SUITES: dict[str, list[dict]] = {
-    "coding-v1": [
-        {
-            "id": "binary_search",
-            "prompt": ("Write a Python function `binary_search(items: list[int], target: int) -> int` "
-                       "that returns the index of target in the sorted list items, or -1 if absent. "
-                       "Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "binary_search",
-            "cases": [
-                {"args": [[1, 3, 5, 7, 9], 7], "expect": 3},
-                {"args": [[1, 3, 5, 7, 9], 1], "expect": 0},
-                {"args": [[1, 3, 5, 7, 9], 9], "expect": 4},
-                {"args": [[1, 3, 5, 7, 9], 4], "expect": -1},
-                {"args": [[], 1], "expect": -1},
-                {"args": [[42], 42], "expect": 0},
-            ],
-        },
-        {
-            "id": "merge_intervals",
-            "prompt": ("Write a Python function `merge_intervals(intervals: list[list[int]]) -> list[list[int]]` "
-                       "that merges all overlapping intervals and returns them sorted by start. "
-                       "Touching intervals like [1,2] and [2,3] count as overlapping. "
-                       "Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "merge_intervals",
-            "cases": [
-                {"args": [[[1, 3], [2, 6], [8, 10], [15, 18]]], "expect": [[1, 6], [8, 10], [15, 18]]},
-                {"args": [[[1, 4], [4, 5]]], "expect": [[1, 5]]},
-                {"args": [[]], "expect": []},
-                {"args": [[[5, 6], [1, 2]]], "expect": [[1, 2], [5, 6]]},
-            ],
-        },
-        {
-            "id": "word_freq",
-            "prompt": ("Write a Python function `word_freq(text: str, n: int) -> list[tuple[str, int]]` "
-                       "returning the n most common lowercase words in text, as (word, count) tuples "
-                       "sorted by count descending then word ascending. Words are runs of letters; "
-                       "ignore case and punctuation. Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "word_freq",
-            "cases": [
-                {"args": ["the cat the dog THE bird", 2], "expect": [["the", 3], ["bird", 1]]},
-                {"args": ["a b c", 2], "expect": [["a", 1], ["b", 1]]},
-                {"args": ["", 3], "expect": []},
-            ],
-        },
-        {
-            "id": "roman",
-            "prompt": ("Write a Python function `to_roman(n: int) -> str` converting an integer "
-                       "between 1 and 3999 into a Roman numeral. Return only the function in a "
-                       "single ```python code block."),
-            "tier": "core",
-            "entry": "to_roman",
-            "cases": [
-                {"args": [1], "expect": "I"},
-                {"args": [4], "expect": "IV"},
-                {"args": [9], "expect": "IX"},
-                {"args": [58], "expect": "LVIII"},
-                {"args": [1994], "expect": "MCMXCIV"},
-                {"args": [3999], "expect": "MMMCMXCIX"},
-            ],
-        },
-        {
-            "id": "balanced",
-            "prompt": ("Write a Python function `is_balanced(s: str) -> bool` returning True when "
-                       "every (), [] and {} in s is correctly matched and nested. Ignore all other "
-                       "characters. Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "is_balanced",
-            "cases": [
-                {"args": ["({[]})"], "expect": True},
-                {"args": ["(]"], "expect": False},
-                {"args": [""], "expect": True},
-                {"args": ["a(b)c[d]{e}"], "expect": True},
-                {"args": ["((("], "expect": False},
-            ],
-        },
-        {
-            "id": "flatten",
-            "prompt": ("Write a Python function `flatten(nested: list) -> list` that fully flattens "
-                       "an arbitrarily nested list of lists into a single flat list, preserving order. "
-                       "Non-list values pass through. Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "flatten",
-            "cases": [
-                {"args": [[1, [2, [3, [4]]], 5]], "expect": [1, 2, 3, 4, 5]},
-                {"args": [[]], "expect": []},
-                {"args": [[[], [[]], [[[1]]]]], "expect": [1]},
-            ],
-        },
-        {
-            "id": "two_sum",
-            "prompt": ("Write a Python function `two_sum(nums: list[int], target: int) -> list[int]` "
-                       "returning the indices of the two numbers that add to target, as a list of two "
-                       "ascending indices. Exactly one solution exists and an element can't be reused. "
-                       "Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "two_sum",
-            "cases": [
-                {"args": [[2, 7, 11, 15], 9], "expect": [0, 1]},
-                {"args": [[3, 2, 4], 6], "expect": [1, 2]},
-                {"args": [[3, 3], 6], "expect": [0, 1]},
-                {"args": [[-1, -2, -3, -4], -7], "expect": [2, 3]},
-            ],
-        },
-        {
-            "id": "lru_cache_sim",
-            "prompt": ("Write a Python function `lru(capacity: int, ops: list) -> list` simulating an "
-                       "LRU cache. ops is a list of ['put', key, value] or ['get', key]. Return the list "
-                       "of results of every 'get', using -1 for a miss. A get or put counts as a use. "
-                       "Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "lru",
-            "cases": [
-                {"args": [2, [["put", 1, 1], ["put", 2, 2], ["get", 1], ["put", 3, 3], ["get", 2], ["get", 3]]],
-                 "expect": [1, -1, 3]},
-                {"args": [1, [["put", 1, 1], ["put", 2, 2], ["get", 1], ["get", 2]]], "expect": [-1, 2]},
-            ],
-        },
-        {
-            "id": "group_anagrams",
-            "prompt": ("Write a Python function `group_anagrams(words: list[str]) -> list[list[str]]` "
-                       "grouping words that are anagrams. Each group is sorted alphabetically, and the "
-                       "groups are sorted by their first word. Return only the function in a single "
-                       "```python code block."),
-            "tier": "core",
-            "entry": "group_anagrams",
-            "cases": [
-                {"args": [["eat", "tea", "tan", "ate", "nat", "bat"]],
-                 "expect": [["ate", "eat", "tea"], ["bat"], ["nat", "tan"]]},
-                {"args": [[]], "expect": []},
-                {"args": [["a"]], "expect": [["a"]]},
-            ],
-        },
-        {
-            "id": "run_length",
-            "prompt": ("Write a Python function `rle(s: str) -> str` performing run-length encoding: "
-                       "each run becomes the character followed by its count, including runs of length 1 "
-                       "(so 'aab' becomes 'a2b1'). Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "rle",
-            "cases": [
-                {"args": ["aab"], "expect": "a2b1"},
-                {"args": [""], "expect": ""},
-                {"args": ["abc"], "expect": "a1b1c1"},
-                {"args": ["aaaaaaaaaaaa"], "expect": "a12"},
-            ],
-        },
-        {
-            "id": "compare_versions",
-            "prompt": ("Write a Python function `compare_versions(a: str, b: str) -> int` comparing "
-                       "dotted version strings. Return -1 if a < b, 1 if a > b, 0 if equal. Segments "
-                       "are integers, missing segments count as 0, and leading zeros are ignored "
-                       "('1.02' equals '1.2'). Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "compare_versions",
-            "cases": [
-                {"args": ["1.2", "1.10"], "expect": -1},
-                {"args": ["1.02", "1.2"], "expect": 0},
-                {"args": ["1.0.0", "1"], "expect": 0},
-                {"args": ["2.1", "2.0.9"], "expect": 1},
-                {"args": ["1.0.1", "1"], "expect": 1},
-            ],
-        },
-        {
-            "id": "spiral",
-            "prompt": ("Write a Python function `spiral(matrix: list[list[int]]) -> list[int]` returning "
-                       "the elements of the matrix in clockwise spiral order starting at the top-left. "
-                       "Return only the function in a single ```python code block."),
-            "tier": "core",
-            "entry": "spiral",
-            "cases": [
-                {"args": [[[1, 2, 3], [4, 5, 6], [7, 8, 9]]], "expect": [1, 2, 3, 6, 9, 8, 7, 4, 5]},
-                {"args": [[[1, 2], [3, 4]]], "expect": [1, 2, 4, 3]},
-                {"args": [[]], "expect": []},
-                {"args": [[[1]]], "expect": [1]},
-            ],
-        },
-        # ---- hard tier ---------------------------------------------------------------------
-        # The core tier is a smoke test: any usable coding model clears it, which means it can
-        # confirm a model works but cannot rank two that both do. These are chosen to fail
-        # partially — each has an edge case that a plausible-looking implementation gets wrong.
-        {
-            "id": "edit_distance",
-            "tier": "hard",
-            "prompt": ("Write a Python function `edit_distance(a: str, b: str) -> int` returning the "
-                       "Levenshtein distance between a and b: the minimum number of single-character "
-                       "insertions, deletions or substitutions to turn a into b. "
-                       "Return only the function in a single ```python code block."),
-            "entry": "edit_distance",
-            "cases": [
-                {"args": ["kitten", "sitting"], "expect": 3},
-                {"args": ["flaw", "lawn"], "expect": 2},
-                {"args": ["", "abc"], "expect": 3},
-                {"args": ["same", "same"], "expect": 0},
-                {"args": ["a", ""], "expect": 1},
-                {"args": ["intention", "execution"], "expect": 5},
-            ],
-        },
-        {
-            "id": "lis_length",
-            "tier": "hard",
-            "prompt": ("Write a Python function `lis_length(nums: list[int]) -> int` returning the "
-                       "length of the longest STRICTLY increasing subsequence (elements need not be "
-                       "contiguous). Return only the function in a single ```python code block."),
-            "entry": "lis_length",
-            "cases": [
-                {"args": [[10, 9, 2, 5, 3, 7, 101, 18]], "expect": 4},
-                {"args": [[0, 1, 0, 3, 2, 3]], "expect": 4},
-                {"args": [[7, 7, 7, 7]], "expect": 1},
-                {"args": [[]], "expect": 0},
-                {"args": [[3, 1, 2]], "expect": 2},
-            ],
-        },
-        {
-            "id": "simplify_path",
-            "tier": "hard",
-            "prompt": ("Write a Python function `simplify_path(path: str) -> str` that canonicalises "
-                       "an absolute Unix path: collapse repeated slashes, resolve '.' and '..', and "
-                       "return a path with no trailing slash (except the root, which is '/'). "
-                       "'..' at the root stays at the root. "
-                       "Return only the function in a single ```python code block."),
-            "entry": "simplify_path",
-            "cases": [
-                {"args": ["/home/"], "expect": "/home"},
-                {"args": ["/../"], "expect": "/"},
-                {"args": ["/home//foo/"], "expect": "/home/foo"},
-                {"args": ["/a/./b/../../c/"], "expect": "/c"},
-                {"args": ["/"], "expect": "/"},
-                {"args": ["/a/../../b/../c//.//"], "expect": "/c"},
-            ],
-        },
-        {
-            "id": "calculator",
-            "tier": "hard",
-            "prompt": ("Write a Python function `calculate(expr: str) -> int` evaluating an arithmetic "
-                       "expression containing non-negative integers and the operators + - * / with "
-                       "normal precedence and optional spaces. There are no parentheses. Division is "
-                       "INTEGER division that truncates toward zero (so 7/-2 would be -3, and 3/2 is 1). "
-                       "Return only the function in a single ```python code block."),
-            "entry": "calculate",
-            "cases": [
-                {"args": ["3+2*2"], "expect": 7},
-                {"args": [" 3/2 "], "expect": 1},
-                {"args": [" 3+5 / 2 "], "expect": 5},
-                {"args": ["2*3+4*5"], "expect": 26},
-                {"args": ["14-3/2"], "expect": 13},
-                {"args": ["100"], "expect": 100},
-            ],
-        },
-        {
-            "id": "word_break",
-            "tier": "hard",
-            "prompt": ("Write a Python function `word_break(s: str, words: list[str]) -> bool` "
-                       "returning True when s can be segmented into a sequence of one or more words "
-                       "from the list. Words may be reused. "
-                       "Return only the function in a single ```python code block."),
-            "entry": "word_break",
-            "cases": [
-                {"args": ["leetcode", ["leet", "code"]], "expect": True},
-                {"args": ["applepenapple", ["apple", "pen"]], "expect": True},
-                {"args": ["catsandog", ["cats", "dog", "sand", "and", "cat"]], "expect": False},
-                {"args": ["aaaaaaa", ["aaaa", "aaa"]], "expect": True},
-                {"args": ["", ["a"]], "expect": True},
-            ],
-        },
-        {
-            "id": "topo_sort",
-            "tier": "hard",
-            "prompt": ("Write a Python function `topo_sort(n: int, edges: list[list[int]]) -> list[int]` "
-                       "returning a topological ordering of nodes 0..n-1, where each edge [a, b] means a "
-                       "must come before b. When several orderings are valid, return the "
-                       "lexicographically smallest. Return an empty list if a cycle makes it impossible. "
-                       "Return only the function in a single ```python code block."),
-            "entry": "topo_sort",
-            "cases": [
-                {"args": [4, [[0, 1], [0, 2], [1, 3], [2, 3]]], "expect": [0, 1, 2, 3]},
-                {"args": [3, [[2, 0], [2, 1]]], "expect": [2, 0, 1]},
-                {"args": [2, [[0, 1], [1, 0]]], "expect": []},
-                {"args": [3, []], "expect": [0, 1, 2]},
-            ],
-        },
-    ],
-}
+# Suite task data lives in its own module — pure data, no logic. Re-bound here under the
+# old names so every existing reference (and every test that monkeypatches through this
+# module) keeps working unchanged.
+_BENCH_SUITES = _bench_suites_mod.SUITES
+_BENCH_TASK_DESC = _bench_suites_mod.TASK_DESC
+_BENCH_TASK_NOTES = _bench_suites_mod.TASK_NOTES
 
-_BENCH_CODE_BLOCK_RE = re.compile(r"```(?:python|py)?\s*\n(.*?)```", re.DOTALL | re.IGNORECASE)
-
-
-def _bench_extract_code(text: str) -> str:
-    """Pull the Python out of a model response. Prefers fenced blocks (taking the longest, since
-    models often emit a short usage example alongside the real implementation); falls back to the
-    raw text when the model skipped the fence."""
-    blocks = _BENCH_CODE_BLOCK_RE.findall(text or "")
-    if blocks:
-        return max(blocks, key=len)
-    # Unfenced fallback, but only when the text plausibly *is* code — otherwise prose gets
-    # handed to the compiler and the failure is reported as a SyntaxError, which reads like a
-    # broken implementation rather than "the model never wrote any code".
-    if "def " in (text or ""):
-        return text
-    return ""
-
-
-# Runner executed in the child process: import the model's code, call the entry point on each
-# case, and report what came back. Kept as a string so it can be fed to `python -c` without
-# needing a file on disk that the parent has to clean up.
-_BENCH_GRADER_SRC = r'''
-import json, sys
-payload = json.loads(sys.stdin.read())
-ns = {}
-out = []
+# agent-v1: multi-tool episodes. Registered into the same suite registry so the picker, the
+# reports, the grades browser and reuse signatures all treat it as just another suite.
 try:
-    exec(compile(payload["code"], "<model>", "exec"), ns)
-except Exception as e:
-    print(json.dumps({"fatal": "%s: %s" % (type(e).__name__, e)}))
-    sys.exit(0)
-fn = ns.get(payload["entry"])
-if not callable(fn):
-    print(json.dumps({"fatal": "no callable named %r" % payload["entry"]}))
-    sys.exit(0)
-for case in payload["cases"]:
-    try:
-        got = fn(*case["args"])
-        # Tuples and lists are interchangeable for grading: JSON can't tell them apart, and a
-        # model returning [("a",1)] vs [["a",1]] is not a correctness difference.
-        def norm(v):
-            if isinstance(v, tuple):
-                return [norm(x) for x in v]
-            if isinstance(v, list):
-                return [norm(x) for x in v]
-            return v
-        out.append({"got": norm(got), "ok": norm(got) == norm(case["expect"])})
-    except Exception as e:
-        out.append({"got": None, "ok": False, "error": "%s: %s" % (type(e).__name__, e)})
-print(json.dumps({"results": out}))
-'''
+    from . import bench_agent as _bench_agent_mod
+except ImportError:          # flat-script launch
+    import bench_agent as _bench_agent_mod
+_BENCH_SUITES.setdefault("agent-v1", _bench_agent_mod.AGENT_TASKS)
+# agent-v2: the hard set — each episode targets one specific agentic failure mode
+# (error-message protocols, joins, budgeted search, dedup, authority, migration, recall).
+_BENCH_SUITES.setdefault("agent-v2", _bench_agent_mod.AGENT2_TASKS
+                         + _bench_agent_mod.CONSTRAINT_AGENT_TASKS)
+_BENCH_TASK_DESC.update(_bench_agent_mod.AGENT_TASK_DESC)
+_BENCH_TASK_DESC.update(_bench_agent_mod.CONSTRAINT_AGENT_DESC)
+_BENCH_TASK_NOTES.update(_bench_agent_mod.AGENT_TASK_NOTES)
+_BENCH_TASK_NOTES.update(_bench_agent_mod.CONSTRAINT_AGENT_NOTES)
+
+try:
+    from . import bench_security as _bench_security_mod
+except ImportError:          # flat-script launch
+    import bench_security as _bench_security_mod
+_BENCH_SUITES.setdefault("security-v1", _bench_security_mod.SECURITY_TASKS
+                         + _bench_agent_mod.SECURITY_AGENT_TASKS)
+
+try:
+    from . import bench_instruct as _bench_instruct_mod
+except ImportError:          # flat-script launch
+    import bench_instruct as _bench_instruct_mod
+try:
+    from . import bench_transport as _bench_transport_mod
+except ImportError:          # flat-script launch
+    import bench_transport as _bench_transport_mod
+# instruct-v1: obedience and output shape — the properties a parser depends on.
+# refusal-v1: two-sided calibration — engages with security work, declines the harmful end.
+try:
+    from . import bench_memory as _bench_memory_mod
+except ImportError:          # flat-script launch
+    import bench_memory as _bench_memory_mod
+# memory-v1: what the model chooses to write down, look up, and revise. Graded on the
+# STORE the episode leaves behind, not only on the answer it produced.
+_BENCH_SUITES.setdefault("memory-v1", _bench_memory_mod.MEMORY_TASKS)
+_BENCH_TASK_DESC.update(_bench_memory_mod.MEMORY_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_memory_mod.MEMORY_TASK_NOTES)
+
+try:
+    from . import bench_langpref as _bench_langpref_mod
+except ImportError:          # flat-script launch
+    import bench_langpref as _bench_langpref_mod
+# langpref-v1: not "is it right" but "what did it reach for". The score only catches an
+# outright strange pick; the profile in the report is the point.
+_BENCH_SUITES.setdefault("langpref-v1", _bench_langpref_mod.LANGPREF_TASKS)
+_BENCH_TASK_DESC.update(_bench_langpref_mod.LANGPREF_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_langpref_mod.LANGPREF_TASK_NOTES)
+
+try:
+    from . import bench_longctx as _bench_longctx_mod
+except ImportError:          # flat-script launch
+    import bench_longctx as _bench_longctx_mod
+# longctx-v1: whether a big window holds anything. Deliberately NOT folded into full-v1 or
+# full-v2 — a 300k prefill is minutes of exclusive GPU, and quietly adding that to the suite
+# everyone runs would turn a 20-minute sweep into an afternoon. Run it on purpose.
+_BENCH_SUITES.setdefault("longctx-v1", _bench_longctx_mod.LONGCTX_TASKS)
+# The same ladder from 600k up. Separate suite rather than a task filter because a run is
+# identified by its suite name, and "which rungs did this number come from" has to survive
+# into the report.
+_BENCH_SUITES.setdefault("longctx-deep", _bench_longctx_mod.LONGCTX_DEEP_TASKS)
+_BENCH_SUITES.setdefault("longctx-lite", _bench_longctx_mod.LONGCTX_LITE_TASKS)
+
+try:
+    from . import bench_project as _bench_project_mod
+except ImportError:          # flat-script launch
+    import bench_project as _bench_project_mod
+# project-v1: build the thing the spec describes, not the thing the examples show. Kept out of
+# the aggregate suites — an episode here is minutes, and the coding suite it exists to replace
+# runs in seconds per task.
+_BENCH_SUITES.setdefault("project-v1", _bench_project_mod.PROJECT_TASKS
+                         + _bench_project_mod.PROJECT_EPISODE_TASKS)
+_BENCH_TASK_DESC.update(_bench_project_mod.PROJECT_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_project_mod.PROJECT_TASK_NOTES)
+_BENCH_TASK_DESC.update(_bench_longctx_mod.LONGCTX_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_longctx_mod.LONGCTX_TASK_NOTES)
+
+_BENCH_SUITES.setdefault("instruct-v1", _bench_instruct_mod.INSTRUCT_TASKS)
+_BENCH_SUITES.setdefault("refusal-v1", _bench_instruct_mod.REFUSAL_TASKS)
+_BENCH_TASK_DESC.update(_bench_instruct_mod.INSTRUCT_TASK_DESC)
+_BENCH_TASK_DESC.update(_bench_instruct_mod.REFUSAL_TASK_DESC)
+_BENCH_TASK_NOTES.update(_bench_instruct_mod.INSTRUCT_TASK_NOTES)
+_BENCH_TASK_NOTES.update(_bench_instruct_mod.REFUSAL_TASK_NOTES)
+_BENCH_TASK_DESC.update(_bench_security_mod.SECURITY_TASK_DESC)
+_BENCH_TASK_DESC.update(_bench_agent_mod.SECURITY_AGENT_DESC)
+_BENCH_TASK_NOTES.update(_bench_security_mod.SECURITY_TASK_NOTES)
+_BENCH_TASK_NOTES.update(_bench_agent_mod.SECURITY_AGENT_NOTES)
+
+# full-v1: one suite, three categories. Splitting them was an artefact of when each was
+# written, not of how models are used — the same request stream wants code that works, an
+# agent that finishes, and neither of them handing an attacker the keys. Running them
+# together is also the only way a single number means anything: a model that writes clean
+# code and follows injected instructions is not "87% good".
+_BENCH_SUITES.setdefault("full-v1", _BENCH_SUITES["coding-v3"]
+                         + _BENCH_SUITES["agent-v2"]
+                         + _BENCH_SUITES["security-v1"])
+# full-v2 adds the behavioural halves: doing as it is told, and engaging with the work.
+_BENCH_SUITES.setdefault("full-v2", _BENCH_SUITES["full-v1"]
+                         + _BENCH_SUITES["instruct-v1"]
+                         + _BENCH_SUITES["refusal-v1"]
+                         + _BENCH_SUITES["memory-v1"])
+# transport-v1 asks a different question from every other suite — whether the backend delivers
+# the tool call the model made, rather than what the model knows. Registered standalone, and
+# NOT folded into full-v2: the aggregate is the axis every cross-model comparison on this box
+# is expressed in, and changing its composition would silently make new totals incomparable
+# with every run already recorded. Run it alongside, or fold it into a future full-v3.
+_BENCH_SUITES.setdefault("transport-v1", _bench_transport_mod.TRANSPORT_TASKS)
+_BENCH_TASK_NOTES.update({t["id"]: t["note"] for t in _bench_transport_mod.TRANSPORT_TASKS})
+_BENCH_TASK_DESC.update({t["id"]: t["desc"] for t in _bench_transport_mod.TRANSPORT_TASKS})
+
+# Category per task id, defaulted by which suite a task came from so the older suites did
+# not need editing task-by-task. Read by the report to break results out by category.
+_BENCH_TASK_CATEGORY: dict = {}
+for _suite_name, _default_cat in (("coding-v1", "coding"), ("coding-v2", "coding"),
+                                  ("coding-v3", "coding"), ("agent-v1", "agentic"),
+                                  ("agent-v2", "agentic"), ("security-v1", "security"),
+                                  ("instruct-v1", "instruct"), ("refusal-v1", "refusal"),
+                                  ("memory-v1", "memory"),
+                                  ("langpref-v1", "preference"),
+                                  ("longctx-v1", "longcontext"),
+                                  ("longctx-deep", "longcontext"),
+                                  ("longctx-lite", "longcontext"),
+                                  ("project-v1", "project")):
+    for _t in _BENCH_SUITES.get(_suite_name) or []:
+        _BENCH_TASK_CATEGORY.setdefault(_t["id"], _t.get("category") or _default_cat)
+# The security suite's own tasks additionally carry a side; agentic security episodes are
+# blue-team by construction (the model is the thing under attack).
+_BENCH_TASK_SIDE: dict = {t["id"]: t.get("side")
+                          for t in (_BENCH_SUITES.get("security-v1") or [])
+                          + (_BENCH_SUITES.get("refusal-v1") or []) if t.get("side")}
+# The report renders the category breakdown but must not re-derive the mapping — one
+# definition, pushed to it here, so the two cannot drift.
+_bench_report_mod.TASK_CATEGORY.update(_BENCH_TASK_CATEGORY)
+_bench_report_mod.TASK_SIDE.update(_BENCH_TASK_SIDE)
+_bench_report_mod.TASK_REQUESTED_LANG.update(_bench_langpref_mod.LANGPREF_REQUESTED)
+
+# Grading machinery lives in bench_graders — synchronous, importable without the
+# app. Re-bound under the old names so references and monkeypatching tests keep
+# working; note that graders-internal calls resolve inside that module, so tests
+# that patch grader INTERNALS patch ai_proxy.bench_graders, not this facade.
+_BENCH_CODE_BLOCK_RE = _bench_graders_mod._BENCH_CODE_BLOCK_RE
+_BENCH_LANGS = _bench_graders_mod._BENCH_LANGS
+_BENCH_TOOL_DIRS = _bench_graders_mod._BENCH_TOOL_DIRS
+_bench_tool = _bench_graders_mod._bench_tool
+_bench_lit = _bench_graders_mod._bench_lit
+_BENCH_TOOLCHAIN_PROBES = _bench_graders_mod._BENCH_TOOLCHAIN_PROBES
+_BENCH_TOOLCHAIN_OK = _bench_graders_mod._BENCH_TOOLCHAIN_OK
+_bench_lang_available = _bench_graders_mod._bench_lang_available
+_bench_suite_tasks = _bench_graders_mod._bench_suite_tasks
+_BenchHTML = _bench_graders_mod._BenchHTML
+_bench_html_select = _bench_graders_mod._bench_html_select
+_bench_html_text = _bench_graders_mod._bench_html_text
+_bench_check_html = _bench_graders_mod._bench_check_html
+_bench_check_css = _bench_graders_mod._bench_check_css
+_html_attr_eq = _bench_graders_mod._html_attr_eq
+toolchain_versions = _bench_graders_mod.toolchain_versions
+_bench_extract_code = _bench_graders_mod._bench_extract_code
+_BENCH_GRADER_SRC = _bench_graders_mod._BENCH_GRADER_SRC
+_BENCH_JS_GRADER_SRC = _bench_graders_mod._BENCH_JS_GRADER_SRC
+_bench_grade_c = _bench_graders_mod._bench_grade_c
+_bench_grade_compiled = _bench_graders_mod._bench_grade_compiled
+_bench_grade_php = _bench_graders_mod._bench_grade_php
+_bench_grade_sql = _bench_graders_mod._bench_grade_sql
+_bench_grade_bash = _bench_graders_mod._bench_grade_bash
+_bench_grade_sync = _bench_graders_mod._bench_grade_sync
+_bench_grade_needles = _bench_graders_mod._bench_grade_needles
 
 
-def _bench_grade_sync(code: str, entry: str, cases: list, timeout_s: float) -> dict:
-    """Run one task's code against its cases in a subprocess. Blocking — call via to_thread."""
-    payload = json.dumps({"code": code, "entry": entry, "cases": cases})
-    env = {"PATH": os.environ.get("PATH", ""), "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
-    try:
-        proc = subprocess.run(
-            [sys.executable, "-I", "-c", _BENCH_GRADER_SRC],
-            input=payload, capture_output=True, text=True,
-            timeout=timeout_s, cwd=tempfile.gettempdir(), env=env,
-        )
-    except subprocess.TimeoutExpired:
-        return {"passed": 0, "total": len(cases), "error": f"timeout after {timeout_s}s"}
-    except Exception as e:
-        return {"passed": 0, "total": len(cases), "error": f"{type(e).__name__}: {e}"}
-    raw = (proc.stdout or "").strip().splitlines()
-    if not raw:
-        return {"passed": 0, "total": len(cases),
-                "error": (proc.stderr or "no output from grader")[:300]}
-    try:
-        parsed = json.loads(raw[-1])
-    except (json.JSONDecodeError, TypeError):
-        return {"passed": 0, "total": len(cases), "error": "grader output was not JSON"}
-    if parsed.get("fatal"):
-        return {"passed": 0, "total": len(cases), "error": parsed["fatal"]}
-    results = parsed.get("results") or []
-    passed = sum(1 for r in results if r.get("ok"))
-    return {"passed": passed, "total": len(cases), "cases": results}
 
-
-async def _bench_grade(text: str, task: dict, timeout_s: float) -> dict:
+async def _bench_grade(text: str, task: dict, timeout_s: float,
+                       reasoning: str = "", finish_reason: str | None = None) -> dict:
     """Grade one response against one task definition."""
-    code = _bench_extract_code(text)
+    lang = task.get("lang") or "python"
+    # Analysis, format and refusal tasks are graded on the reply itself: extracting a code
+    # block from an answer whose deliverable IS the answer would throw away the thing being
+    # graded — and for format tasks the wrapper is precisely what is under test.
+    if lang == "auto":
+        # The task named no language, so the model's own choice decides how it is run. A reply
+        # with nothing recognisable in it is skipped rather than zeroed — an ungradeable answer
+        # says nothing about correctness, which is the same contract as a missing toolchain.
+        picked = _bench_graders_mod._bench_detect_lang(text)
+        if not picked:
+            return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
+                    "score": 0.0, "skipped": True,
+                    "error": "no recognisable code in the reply, and the task named no language"}
+        if not _bench_lang_available(picked):
+            return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
+                    "score": 0.0, "skipped": True,
+                    "error": f"the model chose {picked}, which this machine cannot grade"}
+        lang = picked
+    code = (text if lang in ("text", "answer", "format", "refusal", "langpick", "needles")
+            else _bench_extract_code(text, lang))
+    # A model that answered in its reasoning field has still answered. Measured: at 700k this
+    # model returned empty content with all five codes in `reasoning`, which would score 0
+    # against a suite whose whole point is whether the context was readable. Scoped to needles
+    # rather than applied generally — for a format task the content IS the deliverable, and
+    # grading its scratchpad instead would be measuring the wrong thing.
+    if lang == "needles" and not code.strip():
+        code = reasoning or ""
     if not code.strip():
         return {"task": task["id"], "passed": 0, "total": len(task["cases"]),
                 "score": 0.0, "error": "no code in response"}
-    res = await asyncio.to_thread(_bench_grade_sync, code, task["entry"], task["cases"], timeout_s)
+    res = await asyncio.to_thread(_bench_grade_sync, code, task["entry"], task["cases"],
+                                  timeout_s, lang, task.get("suffix") or "")
     total = res.get("total") or len(task["cases"])
     res["task"] = task["id"]
     res["score"] = (res.get("passed", 0) / total) if total else 0.0
+    # A reply cut off at max_tokens did not fail the task, it never finished answering it.
+    # Measured during the first longctx run: one 262k unit spent its whole 2,048-token budget
+    # on 6,134 characters of reasoning and emitted no content at all, which would have been
+    # read as recall collapsing at 256k. Flagged rather than silently scored.
+    if finish_reason == "length" and res.get("passed", 0) < total:
+        res["truncated"] = True
+    if any(c.get("visible") for c in (task.get("cases") or [])):
+        _bench_graders_mod._bench_split_visible(res, task["cases"])
+        res["chose_lang"] = lang
     return res
 
 
@@ -10885,6 +13250,37 @@ def _bench_build_prompt(prompt_tokens: int, randomize: bool, seq: int) -> str:
     salt = f"// nonce: {uuid.uuid4().hex}\n" if randomize else ""
     head = f"Below is a code module. After the module, you'll be given a task.\n\n{salt}<CODE>\n"
     tail = f"\n</CODE>\n\nTask: {_BENCH_BASE_TASK}"
+    body = ""
+    while len(head) + len(body) + len(tail) < target_chars:
+        body += _BENCH_FILLER
+    return head + body + tail
+
+
+def _bench_task_at_depth(task_prompt: str, prompt_tokens: int, randomize: bool,
+                         seq: int) -> str:
+    """The same graded task, asked after `prompt_tokens` of irrelevant context.
+
+    Every suite task is a short prompt, so the suites measure a model at its best and say
+    nothing about the state it is actually used in — hermes sits at 50k tokens by turn 30.
+    Sweeping prompt_tokens as an axis turns any graded suite into a long-context test: the
+    task is identical at every depth, so a score that falls is the context doing it, not
+    the task getting harder.
+
+    The task goes LAST, after the filler, because that is where the real ask sits in a long
+    agent transcript, and it is delimited so a model that reads only the tail can still see
+    the whole instruction. Nothing in the filler is needed to answer — a model that ignores
+    the padding entirely SHOULD score exactly as it does at zero depth, which is what makes
+    a drop meaningful.
+    """
+    if prompt_tokens <= 0:
+        return task_prompt
+    target_chars = int(prompt_tokens * 3.5)
+    salt = f"// nonce: {uuid.uuid4().hex}\n" if randomize else ""
+    head = ("Reference material from the current session follows. It is background only "
+            "and is NOT needed to answer; the task is stated after it.\n\n"
+            f"{salt}<CONTEXT>\n")
+    tail = ("\n</CONTEXT>\n\nIgnore the reference material above unless it is relevant. "
+            f"Your task:\n\n{task_prompt}")
     body = ""
     while len(head) + len(body) + len(tail) < target_chars:
         body += _BENCH_FILLER
@@ -10936,8 +13332,15 @@ def _bench_apply_sampling(body: dict, cfg: dict) -> None:
             body[k] = v
 
 
-def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict) -> dict:
-    """Assemble the full request body for one bench request."""
+def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict,
+                      tools: list | None = None) -> dict:
+    """Assemble the full request body for one bench request.
+
+    `tools` exists so a suite can measure a streaming request that offers tools. Nothing else
+    in the bench does: single-turn tasks stream but carry no tools, and agent episodes carry
+    tools but run stream:False. Ollama's /v1 loses tool calls only from *streamed* replies, so
+    the combination no suite exercised was exactly the one that was broken in production.
+    """
     body = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
@@ -10945,6 +13348,8 @@ def _bench_build_body(model: str, prompt: str, max_tokens: int, cfg: dict) -> di
         "stream_options": {"include_usage": True},
         "max_tokens": max_tokens,
     }
+    if tools:
+        body["tools"] = tools
     _bench_apply_thinking(body, str(cfg.get("thinking") or "auto"))
     _bench_apply_sampling(body, cfg)
     return body
@@ -10968,9 +13373,105 @@ def _bench_headers(cfg: dict) -> dict:
     return h
 
 
+async def _bench_run_agent(client: httpx.AsyncClient, base: str, model: str,
+                           task: dict, cfg: dict) -> dict:
+    """One agent EPISODE: the model drives, the bench plays the tools deterministically.
+
+    Non-streaming on purpose — an episode's metric is turns and wall time, not token
+    cadence — and the whole conversation transcript is stored so the grading browser can
+    show exactly where an episode went off the rails."""
+    cfg = cfg or {}
+    world = _bench_agent_mod.AgentWorld(task)
+    messages = [{"role": "user", "content": task["prompt"]}]
+    headers = _bench_headers(cfg)
+    transcript = [f"USER: {task['prompt']}"]
+    t0 = time.perf_counter()
+    steps = 0
+    final = None
+    err = None
+    ttft = None
+    ctok = 0
+    for _ in range(int(task.get("max_steps") or 10)):
+        body = {"model": model, "messages": messages, "tools": task.get("tools") or [],
+                "stream": False, "max_tokens": int(cfg.get("max_tokens") or 1024)}
+        _bench_apply_thinking(body, str(cfg.get("thinking") or "auto"))
+        _bench_apply_sampling(body, cfg)
+        try:
+            resp = await client.post(base + "/v1/chat/completions", headers=headers,
+                                     json=body, timeout=httpx.Timeout(600.0))
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            break
+        if resp.status_code != 200:
+            err = f"HTTP {resp.status_code}: {resp.text[:200]}"
+            break
+        try:
+            j = resp.json()
+        except ValueError:
+            err = "non-JSON response"
+            break
+        steps += 1
+        if ttft is None:
+            ttft = (time.perf_counter() - t0) * 1000
+        ctok += ((j.get("usage") or {}).get("completion_tokens") or 0)
+        msg = ((j.get("choices") or [{}])[0].get("message")) or {}
+        tcs = msg.get("tool_calls") or []
+        if tcs:
+            messages.append({"role": "assistant", "content": msg.get("content") or None,
+                             "tool_calls": tcs})
+            for k, tc in enumerate(tcs):
+                fn = (tc.get("function") or {})
+                nm = fn.get("name") or "?"
+                out = world.execute(nm, fn.get("arguments"))
+                transcript.append(f"TOOL CALL: {nm}({str(fn.get('arguments'))[:200]})")
+                transcript.append(f"TOOL RESULT: {out[:200]}")
+                messages.append({"role": "tool",
+                                 "tool_call_id": tc.get("id") or f"call_{steps}_{k}",
+                                 "content": out})
+            continue
+        final = msg.get("content") or ""
+        transcript.append(f"ASSISTANT: {final[:400]}")
+        break
+    exhausted = final is None and err is None
+    if exhausted:
+        transcript.append(f"[step budget of {task.get('max_steps')} exhausted]")
+    grade = _bench_agent_mod.grade_episode(task, world, final, steps, exhausted)
+    # A project episode is graded on what it BUILT. Run the file the model wrote against the
+    # cases it never saw, and fold the result in beside the answer and conduct cases — writing
+    # a file that does not work is a different failure from not writing one, and both are
+    # different from a clean episode that produced nothing.
+    built = task.get("build")
+    if built:
+        code = (world.state.get("files") or {}).get(built.get("path")) or ""
+        if code.strip():
+            sub = await asyncio.to_thread(
+                _bench_grade_sync, code, built.get("entry") or task.get("entry") or "",
+                task["cases"], float(built.get("timeout_s") or 30.0),
+                built.get("lang") or "python", "")
+            _bench_graders_mod._bench_split_visible(sub, task["cases"])
+            grade["cases"] = (grade.get("cases") or []) + (sub.get("cases") or [])
+            for k in ("visible_passed", "visible_total", "hidden_passed", "hidden_total",
+                      "copied_examples"):
+                grade[k] = sub.get(k)
+            if sub.get("error"):
+                grade["build_error"] = sub["error"]
+        else:
+            grade["build_error"] = f"no {built.get('path')} was written"
+        grade["passed"] = sum(1 for c in grade["cases"] if c.get("ok"))
+        grade["total"] = len(grade["cases"])
+        grade["score"] = grade["passed"] / (grade["total"] or 1)
+    total_ms = (time.perf_counter() - t0) * 1000
+    return {"seq": 0, "task": task["id"], "error": err, "grade": grade,
+            "ttft_ms": ttft, "ttfc_ms": ttft, "total_ms": total_ms,
+            "completion_tokens": ctok or None, "reasoning_tokens": None,
+            "decode_tps": (ctok / (total_ms / 1000)) if ctok and total_ms else None,
+            "steps": steps, "text": "\n".join(transcript)[:6000]}
+
+
 async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                          max_tokens: int, prompt: str, run_seq: int,
-                         cfg: dict | None = None, capture_text: bool = False) -> dict:
+                         cfg: dict | None = None, capture_text: bool = False,
+                         tools: list | None = None) -> dict:
     """Issue one streaming chat-completion request via the proxy and collect timings.
 
     Reasoning-aware: a thinking model emits its reasoning as `reasoning_content` deltas before
@@ -10980,7 +13481,8 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     boundaries: `ttft_ms` (first token of either kind) and `ttfc_ms` (first content token).
     """
     cfg = cfg or {}
-    body = json.dumps(_bench_build_body(model, prompt, max_tokens, cfg)).encode("utf-8")
+    body = json.dumps(_bench_build_body(model, prompt, max_tokens, cfg, tools)).encode("utf-8")
+    tool_calls = 0
     headers = _bench_headers(cfg)
     t0 = time.perf_counter()
     ttft_ms: float | None = None       # first token of ANY kind (reasoning or content)
@@ -10992,11 +13494,22 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     reasoning_words = 0
     served_model: str | None = None
     text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    finish_reason: str | None = None
     err: str | None = None
     status_code: int | None = None
     try:
+        # Scaled to the prompt, not fixed. A flat 600s aborted every 700k-token unit of the
+        # long-context ladder while the model was still prefilling — the proxy logged
+        # "499 client disconnected" and six of them tripped the run's circuit breaker, so a
+        # harness limit was recorded as the backend failing. Measured prefill on this box runs
+        # 650-1900s at 700k; 250 tok/s is well under the slowest observed rate, and the floor
+        # keeps short prompts on the old behaviour.
+        _prefill_s = len(body) / 4 / 250 if body else 0        # ~4 chars per token
+        _timeout_s = max(600.0, _prefill_s + 600.0)
         async with client.stream("POST", base + "/v1/chat/completions",
-                                 headers=headers, content=body, timeout=httpx.Timeout(600.0)) as resp:
+                                 headers=headers, content=body,
+                                 timeout=httpx.Timeout(_timeout_s)) as resp:
             status_code = resp.status_code
             if resp.status_code != 200:
                 err = f"HTTP {resp.status_code}: {(await resp.aread()).decode('utf-8', errors='replace')[:300]}"
@@ -11015,13 +13528,23 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
                     if served_model is None and j.get("model"):
                         served_model = str(j["model"])
                     for ch in (j.get("choices") or []):
+                        if ch.get("finish_reason"):
+                            finish_reason = str(ch["finish_reason"])
                         delta = ch.get("delta") or {}
+                        # Counted only where a name arrives: a streamed call is split across
+                        # deltas, and every fragment after the first carries argument text with
+                        # no name, so counting deltas would report one call as several.
+                        for _tc in (delta.get("tool_calls") or []):
+                            if isinstance(_tc, dict) and (_tc.get("function") or {}).get("name"):
+                                tool_calls += 1
                         # Engines disagree on the field name for reasoning deltas.
                         reasoning = delta.get("reasoning_content") or delta.get("reasoning")
                         if reasoning:
                             if ttft_ms is None:
                                 ttft_ms = (time.perf_counter() - t0) * 1000
                             reasoning_words += len(re.findall(r"\S+", reasoning))
+                            if capture_text:
+                                reasoning_parts.append(reasoning)
                         if delta.get("content"):
                             now_ms = (time.perf_counter() - t0) * 1000
                             if ttft_ms is None:
@@ -11052,10 +13575,14 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     # An empty completion is a failure, not a very fast success. This is how a prompt that
     # overflows the model's context window presents (see the tokenizer-density note in
     # docs/benchmarking.md) — the request 200s and returns nothing.
-    if not err and completion_tokens == 0:
+    # A turn whose whole output is a tool call has no prose and is a success, so the emptiness
+    # check must see the call. Without this the transport suite would score every *working*
+    # backend as a failure — the exact inversion it exists to detect.
+    if not err and completion_tokens == 0 and not tool_calls:
         err = "empty completion (0 tokens) — possible context overflow or refused generation"
     row = {
         "seq": run_seq,
+        "tool_calls": tool_calls,
         "ttft_ms": ttft_ms,
         "ttfc_ms": ttfc_ms,
         "total_ms": total_ms,
@@ -11069,6 +13596,11 @@ async def _bench_run_one(client: httpx.AsyncClient, base: str, model: str,
     }
     if capture_text:
         row["text"] = "".join(text_parts)
+        # Kept apart from `text` rather than concatenated: for every other suite the content
+        # field is the deliverable and folding a scratchpad into it would change what they
+        # grade. Only the long-context grader reads this, and only when content came back empty.
+        row["reasoning_text"] = "".join(reasoning_parts)
+    row["finish_reason"] = finish_reason
     return row
 
 
@@ -11157,6 +13689,8 @@ def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
         if not g:
             slot["errors"] += 1
             continue
+        if g.get("truncated"):
+            slot["truncated"] = slot.get("truncated", 0) + 1
         slot["passed_cases"] += g.get("passed", 0)
         slot["total_cases"] += g.get("total", 0)
         if g.get("total") and g.get("passed") == g.get("total"):
@@ -11199,13 +13733,434 @@ def _bench_quality_summary(rows: list[dict], suite: list[dict]) -> dict:
     }
 
 
+# The reply needs room alongside the prompt, and the char-per-token estimate drifts by ~15%
+# between tokenisers, so a run sized right up to the limit returns empty completions.
+_BENCH_CTX_HEADROOM = 0.9
+
+
+def _bench_ctx_budget(window: int, max_tokens: int) -> float:
+    """The largest prompt that fits in `window`. Inverse of _bench_ctx_needed."""
+    return (window - int(max_tokens)) * _BENCH_CTX_HEADROOM
+
+
+def _bench_ctx_needed(prompt_tokens: int, max_tokens: int) -> int:
+    """The window a request of this shape needs end to end."""
+    return int(math.ceil(int(prompt_tokens) / _BENCH_CTX_HEADROOM)) + int(max_tokens)
+
+
+def _bench_preflight(model: str, meta: dict, upstream: str, index: dict) -> str | None:
+    """Why this run cannot produce a measurement, checked before a single request is sent.
+
+    A doomed run is not free: it still costs the full request count — 54 empty completions
+    against a backend serving a different model — and with `exclusive` set every other proxy
+    client queues behind it for the duration. The matrix path already skipped cells that could
+    not fit; a single run had no equivalent and just sent them.
+    """
+    if not upstream:
+        known = sorted({v.get("model") for v in index.values() if v.get("model")})
+        return (f"no reachable backend serves {model!r}"
+                + (f" — reachable models: {', '.join(known[:8])}" if known else
+                   " — no backend is reachable"))
+    if meta.get("benchable") is False:
+        return f"{model!r} cannot be benchmarked — {meta.get('bench_detail') or 'it does not answer chat requests'}"
+    if meta.get("fits") is False:
+        return f"{model!r} does not fit on this machine — {meta.get('fit_detail') or 'too large'}"
+    if meta.get("startable") and not meta.get("loaded"):
+        return None          # not running yet, but the bench knows how to start it
+    if not meta:
+        served = sorted(v.get("model") for v in index.values()
+                        if v.get("upstream") == upstream and v.get("model"))
+        if not served:
+            return (f"{upstream} is not serving anything — it is unreachable, or it has no "
+                    f"model loaded")
+        return (f"{upstream} does not serve {model!r} — it has "
+                f"{', '.join(served[:6])}{' …' if len(served) > 6 else ''}")
+    return None
+
+
+# Ollama sizes its default context from TOTAL vram — 262,144 tokens on this box — and
+# multiplies it by OLLAMA_NUM_PARALLEL when it starts llama-server. Neither value is
+# queryable from outside, so they are mirrored here (override via model_control:
+# `ollama_server_ctx` / `ollama_num_parallel`, matching OLLAMA_CONTEXT_LENGTH /
+# OLLAMA_NUM_PARALLEL on the service). The KV bytes-per-element matches q8_0 (34/32).
+_BENCH_OLLAMA_DEFAULT_CTX = 262144
+_BENCH_OLLAMA_PARALLEL = 4
+_BENCH_KV_BYTES_PER_ELT = 1.0625
+
+
+def _bench_ollama_server_ctx(cfg: dict | None = None) -> tuple[int, int]:
+    """The per-slot context Ollama will actually load with, and the parallel slot count."""
+    mc = load_rules_config().get("model_control") or {}
+    per_slot = int((cfg or {}).get("server_context") or 0) \
+        or int(mc.get("ollama_server_ctx") or 0) or _BENCH_OLLAMA_DEFAULT_CTX
+    parallel = int(mc.get("ollama_num_parallel") or 0) or _BENCH_OLLAMA_PARALLEL
+    return per_slot, parallel
+
+
+def _bench_ollama_kv_mb(model_info: dict, tokens: int) -> float | None:
+    """Estimate the KV cache for `tokens` total context, in MB, from /api/show model_info.
+
+    Deliberately conservative: sliding-window layers cost less than this assumes (devstral-2
+    measures ~1.7× below the estimate), so an over-estimate can only block a model that was
+    going to be tight anyway — the failure mode this exists to prevent is the opposite one,
+    where a 108 GB allocation OOM-kills the whole Ollama service.
+    """
+    arch = model_info.get("general.architecture")
+    if not arch:
+        return None
+    def g(key):
+        v = model_info.get(f"{arch}.{key}")
+        # Per-layer lists appear on some archs; the max is the conservative read.
+        if isinstance(v, list):
+            v = max((x for x in v if isinstance(x, (int, float))), default=None)
+        return v
+    blocks = g("block_count")
+    if not blocks:
+        return None
+    lora = g("attention.kv_lora_rank")
+    if lora:
+        # MLA (deepseek-style) stores one compressed vector per layer per token, plus the
+        # decoupled rope key.
+        per_layer_elts = float(lora) + float(g("attention.key_length") or 64)
+    else:
+        head = g("attention.head_count")
+        # A model that does not declare head_count_kv is not using grouped-query attention, so
+        # every attention head carries its own KV: head_count IS the KV head count. Returning
+        # None instead made the whole check unusable for such models — qwen3.6:35b-a3b declares
+        # block_count, head_count and key_length and still could not be priced, so it was waved
+        # through and OOM-killed Ollama once a minute. Assuming MHA also errs high, which is the
+        # direction this estimator is meant to err in.
+        heads_kv = g("attention.head_count_kv") or head
+        if not heads_kv:
+            return None
+        k_len = g("attention.key_length") or (
+            (g("embedding_length") or 0) / head if head else None)
+        v_len = g("attention.value_length") or k_len
+        if not k_len:
+            return None
+        per_layer_elts = float(heads_kv) * (float(k_len) + float(v_len))
+    return blocks * per_layer_elts * _BENCH_KV_BYTES_PER_ELT * tokens / (1024 * 1024)
+
+
+async def _bench_ollama_kv_preflight(model: str, meta: dict, cfg: dict) -> str | None:
+    """Why loading this model under Ollama's real context settings would OOM the box.
+
+    The weights-only fit check missed this entirely: devstral-2:123b fits its 65 GB of
+    weights easily, but Ollama's vram-based default context (262k × 4 slots) put a 108 GB
+    KV cache on top, and the OOM killer took down ollama.service in a load/kill/restart
+    loop while the cell burned all 87 of its requests on 502s. Checked before a single
+    request is sent, with the arithmetic in the message so the remedy is obvious.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
+            if r.status_code >= 400:
+                return None                      # unknown must not mean "no"
+            body = r.json() or {}
+            info = body.get("model_info") or {}
+            params = body.get("parameters") or ""
+    except (httpx.RequestError, ValueError):
+        return None
+    per_slot, parallel = _bench_ollama_server_ctx(cfg)
+    model_ctx = info.get(f"{info.get('general.architecture')}.context_length")
+    if isinstance(model_ctx, (int, float)) and model_ctx:
+        per_slot = min(per_slot, int(model_ctx))  # ollama clamps to the training context
+    # A model carrying its own num_ctx loads at THAT, not at the server default — which is the
+    # whole point of the derived models the proxy creates for per-model context. Without this
+    # the check priced qwen3.8-27b-ctx16k at 262,144 and refused it for a 138 GB KV cache, while
+    # the same model sat loaded at 16,384 using 17 GB. `parameters` is a text blob, not a dict.
+    for line in str(params).splitlines():
+        bits = line.split()
+        if len(bits) == 2 and bits[0] == "num_ctx":
+            try:
+                per_slot = min(per_slot, int(float(bits[1])))
+            except ValueError:
+                pass
+            break
+    tokens = per_slot * parallel
+    kv_mb = _bench_ollama_kv_mb(info, tokens)
+    total_mb = (_mem_snapshot() or {}).get("total_mb")
+    size_mb = meta.get("size_mb")
+    if kv_mb is None or not total_mb or not size_mb:
+        return None
+    need = size_mb * _BENCH_FIT_OVERHEAD + kv_mb
+    cap = total_mb - _BENCH_FIT_RESERVE_MB
+    if need <= cap:
+        return None
+    return (f"{model!r} would OOM this box under Ollama's context settings: "
+            f"~{size_mb / 1024:.0f} GB weights + ~{kv_mb / 1024:.0f} GB KV cache at "
+            f"{per_slot:,} tokens × {parallel} parallel slots > {cap / 1024:.0f} GB usable. "
+            f"Set OLLAMA_CONTEXT_LENGTH on the ollama service (and mirror it in "
+            f"model_control.ollama_server_ctx) to bench this model.")
+
+
+# ---- Auto-load: Ollama-style on-demand loading for the fixed backends -----------------------
+#
+# Opt-in via model_control.auto_load.enabled. A request for a model that lives on a stopped
+# backend (or the other vLLM twin) starts what it needs and waits, instead of 404ing until a
+# human swaps containers. Other models are unloaded ONLY when the target does not fit in free
+# memory — a request must not strip the box out of habit the way a benchmark deliberately does.
+_AUTO_LOAD_LOCK = asyncio.Lock()
+_AUTO_LOAD_LAST = {"ts": 0.0, "target": ""}
+
+
+def _auto_load_cfg() -> dict:
+    return (load_rules_config().get("model_control") or {}).get("auto_load") or {}
+
+
+async def _ensure_model_served(model: str, upstream: str) -> dict | None:
+    """Make `model` servable on `upstream`, Ollama-style. None = proceed with the request;
+    a dict = refuse it with this error/status instead.
+
+    Single-flight: concurrent requests during a load coalesce on one lock, re-check, and
+    proceed together. min_hold_s stops two clients ping-ponging the port between the twins."""
+    cfg = _auto_load_cfg()
+    if not cfg.get("enabled"):
+        return None
+    if not (_is_vllm(upstream) or upstream == "llamacpp"):
+        return None                    # ollama and lmstudio already load on demand
+    index = await _bench_model_index()
+    meta = _bench_resolve_model(index, model, upstream)
+    if meta.get("loaded"):
+        return None
+    if not meta or not (meta.get("startable") or upstream == "llamacpp"):
+        return None                    # unknown model: let the upstream 404 honestly
+    conn = db()
+    busy = conn.execute("SELECT COUNT(*) FROM bench_runs "
+                        "WHERE status IN ('running', 'pending')").fetchone()[0]
+    conn.close()
+    if busy:
+        return {"status": 503,
+                "error": f"a benchmark owns the box right now; auto-load will not fight it. "
+                         f"{model!r} loads once the bench finishes."}
+    async with _AUTO_LOAD_LOCK:
+        index = await _bench_model_index()
+        meta = _bench_resolve_model(index, model, upstream)
+        if meta.get("loaded"):
+            return None                # someone else loaded it while we queued
+        # Ollama holds a model for OLLAMA_KEEP_ALIVE — two hours here — so a sweep coming back
+        # from an Ollama model to a vLLM one finds the memory still taken and the container
+        # fails to start. Releasing costs nothing when Ollama is already empty.
+        if _auto_load_cfg().get("release_ollama", True):
+            await _free_ollama_models(f"before loading {model!r} on {upstream}")
+        min_hold = float(cfg.get("min_hold_s", 120))
+        tgt = f"{upstream}:{model}"
+        # HELD, not refused: a request that arrives inside another target's hold window
+        # sleeps the window out and then takes its turn. The hold still prevents thrash —
+        # two clients on different twins get slow alternation instead of a coin-flip 503.
+        while (_AUTO_LOAD_LAST["target"] and _AUTO_LOAD_LAST["target"] != tgt
+                and time.time() - _AUTO_LOAD_LAST["ts"] < min_hold):
+            await asyncio.sleep(min(2.0, min_hold - (time.time() - _AUTO_LOAD_LAST["ts"])))
+            index = await _bench_model_index()
+            meta = _bench_resolve_model(index, model, upstream)
+            if meta.get("loaded"):
+                return None            # the hold ended in our favour after all
+        prov = PROVIDERS.get(upstream)
+        if prov is None:
+            return {"status": 503, "error": f"no provider for {upstream!r}"}
+        # The vLLM twins contend for one port: the running one must stop before the target
+        # starts, and stopping it is also the cheapest way to free memory. But someone may
+        # be mid-stream on it — drain in-flight requests (bounded) before pulling the plug.
+        if _is_vllm(upstream):
+            running = await _vllm_container(_vllm_url(upstream))
+            if running and running != meta.get("container"):
+                drain_deadline = time.time() + float(cfg.get("drain_s", 120))
+                def _busy():
+                    now2 = time.time()
+                    return any((not v.get("cancelled")) and v.get("upstream") == upstream
+                               and now2 - v.get("ts", now2) < 900
+                               for v in dict(_INFLIGHT_REQUESTS).values())
+                while _busy() and time.time() < drain_deadline:
+                    await asyncio.sleep(2)
+                await prov.stop()
+        # Evict others ONLY if the target does not fit in what is free now. A vLLM boot is
+        # priced by its utilization claim, never by checkpoint size — size_mb is usually
+        # unknown for containers, and want=0 skipped this check entirely, which is exactly
+        # how a 97 GB boot landed beside a 22 GB resident and wedged the box.
+        want = (meta.get("size_mb") or 0) * _BENCH_FIT_OVERHEAD
+        if _is_vllm(upstream):
+            claim = await _vllm_boot_claim_mb(meta.get("container"))
+            if claim:
+                want = max(want, claim)
+        if want and _free_mem_mb() < want:
+            snap = await _bench_residency_snapshot()
+            await _bench_free_gpu(snap, keep=model, spare=upstream, want_free_mb=want)
+            free_now = _free_mem_mb()
+            if free_now < want:
+                # Refusing IS the guard: starting anyway starves sshd and the proxy first,
+                # so nobody can even reach the box to fix it.
+                return {"status": 503,
+                        "error": f"not enough memory to bring up {model!r} on {upstream}: "
+                                 f"it will claim ~{want / 1024:.0f} GB and only "
+                                 f"{free_now / 1024:.0f} GB is free even after eviction. "
+                                 f"Refusing to start it rather than wedge the box."}
+        timeout = float(cfg.get("ready_timeout_s", 900))
+        payload: dict = {"ready_timeout_s": timeout, "wait_s": timeout}
+        if meta.get("container"):
+            payload["container"] = meta["container"]
+        res = await prov.load(payload, model)
+        ok, detail = _load_result(res)
+        if not ok:
+            return {"status": 503,
+                    "error": f"auto-load could not bring up {model!r} on {upstream}: "
+                             f"{detail or 'it did not become ready in time'}"}
+        _AUTO_LOAD_LAST.update(ts=time.time(), target=tgt)
+        return None
+
+
+async def _bench_start_backend(meta: dict, persist: bool = True,
+                               bench_id: str = "") -> dict:
+    """Make room, bring up the stopped backend the run needs, and say how to undo both.
+
+    Freeing first is a precondition, not a courtesy. A fixed backend that cannot allocate never
+    becomes ready, and the symptom is indistinguishable from a slow load — vLLM wants ~99 GB on
+    a 121 GB box, so llama.cpp holding 90 GB of it means the start can only ever time out. It
+    did, for seven minutes, and read as "vLLM is broken".
+    """
+    upstream, container = meta.get("upstream") or "", meta.get("container")
+    prov = PROVIDERS.get(upstream)
+    if prov is None:
+        return {"ok": False, "started": False, "restore": None,
+                "detail": f"unknown upstream {upstream!r}"}
+    if bench_id:
+        _bench_phase(bench_id, f"freeing memory for {upstream}")
+    snap = await _bench_residency_snapshot()
+    want = meta.get("size_mb")
+    want_free = (want * _BENCH_FIT_OVERHEAD) if want else 0
+    if _is_vllm(upstream):
+        # The utilization claim, not the checkpoint: without this, an unsized vLLM meta
+        # meant want_free=0 and the bench started a ~97 GB boot without waiting for the
+        # evicted memory to actually come back.
+        claim = await _vllm_boot_claim_mb(meta.get("container"))
+        if claim:
+            want_free = max(want_free, claim)
+    freed = await _bench_free_gpu(snap, keep=meta.get("model") or "", bench_id=bench_id,
+                                  want_free_mb=want_free)
+    # Persisted before anything is started: a proxy restart between here and the restore would
+    # otherwise leave the box stripped, with nothing recording what had been running. A cell
+    # inside a sweep does not persist: the sweep already recorded the state before its first
+    # cell, and this snapshot is of the box mid-run, which would restore the wrong thing.
+    if persist:
+        _save_pending_residency(snap)
+    if bench_id:
+        _bench_phase(bench_id, f"starting {upstream} and waiting for it to serve "
+                               f"(a large model takes minutes)")
+    # A bench is already committed to waiting, and 420s is not enough for a large vLLM
+    # checkpoint on this box — qwen3-coder-next was stopped mid-load at the deadline and
+    # recorded as a failure. Waiting longer is only safe because died() now covers docker as
+    # well as systemd: a container that actually exits is caught in seconds, so the ceiling
+    # only ever applies to something genuinely still loading.
+    payload = {"container": container} if container else {}
+    payload["wait_s"] = _BENCH_START_READY_S
+    payload["ready_timeout_s"] = _BENCH_START_READY_S
+    # Timed here because this is where the expensive part happens. For an on-demand backend
+    # the warm-up request IS the load, and env["load_ms"] measures it correctly — but a
+    # container backend loads its weights BEFORE the first request, so the warm-up saw an
+    # already-hot server and reported 16s against a boot that really took ~6 minutes
+    # (qwen3-coder-next: 4.7 min of weight loading alone, per the container's own log).
+    # Twenty-fold under-reporting, in the column a reader uses to compare engines.
+    _t_start = time.perf_counter()
+    res = await prov.load(payload, meta.get("model") or "")
+    start_ms = round((time.perf_counter() - _t_start) * 1000)
+    ok, detail = _load_result(res)
+    # `ok` is "it is serving"; this is "the box was changed". vLLM's load starts the container
+    # and *then* waits for readiness, so a timeout leaves it running. Reporting nothing to undo
+    # left one crash-looping under restart=unless-stopped for thirteen minutes, competing for
+    # the memory it had just failed to get.
+    started = ok or bool(isinstance(res, dict) and res.get("started_container"))
+    return {"ok": ok, "started": started, "detail": detail, "freed": freed,
+            "backend_start_ms": start_ms,
+            "restore": {"upstream": upstream, "stop": started,
+                        "residency": snap if persist else None}}
+
+
+async def _bench_restore_backend(token: dict | None) -> dict | None:
+    """Undo both halves, in order: stop what the bench started, then put back what it stopped.
+
+    Stopping first is deliberate — vLLM holds ~99 GB whether or not anything is asking it, and
+    llama.cpp cannot reload its weights until that memory comes back.
+    """
+    if not token:
+        return None
+    out: dict = {}
+    if token.get("stop"):
+        prov = PROVIDERS.get(token.get("upstream"))
+        if prov is not None:
+            try:
+                out["stopped"] = await prov.stop()
+            except Exception as e:
+                out["stopped"] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+    snap = token.get("residency")
+    if snap:
+        try:
+            out["residency"] = await _bench_restore_residency(snap)
+            _save_pending_residency(None)
+        except Exception as e:
+            out["residency"] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
+    return out
+
+
+async def _bench_fit_context(upstream: str, needed: int, concurrency: int,
+                             exact: bool = False, bench_id: str = "") -> dict:
+    """Make `upstream` serve at least `needed` tokens per slot, or say why it cannot.
+
+    Returns {ok, detail, changed, restore}. `restore` is the token for _bench_restore_context,
+    and is None when nothing was changed and so nothing needs putting back.
+    """
+    prov = PROVIDERS.get(upstream)
+    if prov is None or not prov.resizable_context:
+        return {"ok": False, "changed": False, "restore": None,
+                "detail": f"{upstream} cannot change its context window"}
+    if bench_id:
+        _bench_phase(bench_id, f"restarting {upstream} at a {needed:,}-token window "
+                               f"and reloading its weights")
+    res = await prov.resize_context(needed, concurrency, exact=exact)
+    prev = res.get("previous")
+    return {"ok": bool(res.get("ok")), "changed": bool(res.get("changed")),
+            "detail": res.get("detail") or "",
+            "restore": dict(prev, upstream=upstream) if prev else None}
+
+
+async def _bench_restore_context(token: dict | None) -> dict | None:
+    """Put the window back where the bench found it.
+
+    Same reasoning as the residency handshake: a bench that permanently reconfigures the box
+    silently changes what the *next* bench measures, and the difference would be read as a
+    property of the model.
+    """
+    if not token:
+        return None
+    prov = PROVIDERS.get(token.get("upstream"))
+    if prov is None:
+        return None
+    ok, detail = _load_result(await prov.load(
+        {"context_length": token["context_length"], "parallel": token["parallel"],
+         "ready_timeout_s": _BENCH_RESIZE_READY_S}, ""))
+    return {"ok": ok, "detail": detail, "context_length": token["context_length"],
+            "parallel": token["parallel"]}
+
+
+
+
 async def _bench_env_snapshot() -> dict:
     """Machine + engine state at run time. Without this a number from three weeks ago is
     uninterpretable: you can't tell which quant was loaded, how much context it was serving,
     or whether the GPU was already half-full when the run started."""
     env: dict = {"ts": time.time(), "proxy_version": __version__}
     try:
-        sysinfo = await system_now()
+        env["hw"] = _host_hw_facts()
+    except Exception:
+        pass
+    try:
+        env["toolchains"] = _bench_graders_mod.toolchain_versions()
+    except Exception:
+        pass
+    try:
+        # system_now is sync so Starlette runs it in the threadpool; awaiting it raises
+        # TypeError into the blanket except below, and every run since has recorded an error
+        # string instead of the GPU, memory and engine state it exists to capture. Same
+        # mistake, same shape, second location — _bench_model_index had it too.
+        sysinfo = await asyncio.to_thread(system_now)
         gpus = sysinfo.get("gpus") or []
         env["gpus"] = [
             {"name": g.get("name"), "mem_used_mb": g.get("mem_used_mb"),
@@ -11219,6 +14174,7 @@ async def _bench_env_snapshot() -> dict:
             for m in (ollama.get("ps") or []) if isinstance(m, dict)
         ]
         env["ollama_config"] = ollama.get("config")
+        env["ollama_version"] = ollama.get("version")
         lms = sysinfo.get("lmstudio") or {}
         env["lmstudio_loaded"] = [m.get("id") for m in (lms.get("models") or [])
                                   if isinstance(m, dict)]
@@ -11227,6 +14183,12 @@ async def _bench_env_snapshot() -> dict:
                               if isinstance(m, dict)]
     except Exception as e:
         env["error"] = f"{type(e).__name__}: {e}"
+        # Not silent: this is the only record of what the machine looked like, and a run whose
+        # environment is missing is a number nobody can interpret later.
+        try:
+            print(f"[bench] environment snapshot failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
     return env
 
 
@@ -11251,9 +14213,140 @@ async def _bench_evict_ollama(keep: str = "") -> list:
                 await c.post(f"{OLLAMA_URL}/api/generate",
                              json={"model": name, "keep_alive": 0, "prompt": ""})
                 unloaded.append(name)
-    except Exception:
-        pass
+    except Exception as e:
+        # Not silent: the caller takes an empty list to mean the GPU is clear, and proceeds to
+        # measure a contended box as if it were quiet. Three outages this codebase has had were
+        # a live failure swallowed exactly here.
+        try:
+            print(f"[bench] Ollama eviction failed: {type(e).__name__}: {e}")
+        except Exception:
+            pass
     return unloaded
+
+
+async def _bench_declared_context(model: str, upstream: str) -> int | None:
+    """The window a model declares, readable BEFORE it is loaded.
+
+    _bench_loaded_context asks what is resident, which is the right answer once the model is
+    up and useless in the context preflight — that runs before the warm-up, when the model
+    under test is usually not the one in memory. Measured: a 131,072-token model was checked
+    while a 1M model was resident, so the guard saw nothing to compare against and let three
+    oversized rungs through to be front-truncated.
+
+    Capped by the server's own per-slot setting, because Ollama will not load a larger window
+    than it is configured for however big the model says it can go.
+    """
+    try:
+        if upstream != "ollama":
+            return None
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
+            r = await c.post(f"{OLLAMA_URL}/api/show", json={"model": model})
+        if r.status_code >= 400:
+            return None
+        info = (r.json() or {}).get("model_info") or {}
+        arch = info.get("general.architecture")
+        declared = int(info.get(f"{arch}.context_length") or 0) if arch else 0
+        if not declared:
+            return None
+        server_ctx, _parallel = _bench_ollama_server_ctx()
+        return min(declared, server_ctx) if server_ctx else declared
+    except Exception:
+        return None
+
+
+async def _bench_loaded_context(model: str, upstream: str) -> int | None:
+    """The context window the backend ACTUALLY loaded, read after the model is up.
+
+    Not the same as what was asked for. A preload at num_ctx=65536 is discarded the moment a
+    request arrives carrying no context hint — Ollama reloads at OLLAMA_CONTEXT_LENGTH, which
+    here is 262144. That happened silently in the middle of a benchmark and nothing in the
+    report could show it, because the only context the report knew was the catalogue's.
+    """
+    try:
+        if upstream == "ollama":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+            for m in (ps.get("models") or []):
+                if (m.get("name") or m.get("model")) == model:
+                    return m.get("context_length") or None
+            return None
+        if _is_vllm(upstream):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                data = (await c.get(f"{_vllm_url(upstream)}/v1/models")).json()
+            for m in (data.get("data") or []):
+                if m.get("id") == model or len(data.get("data") or []) == 1:
+                    return m.get("max_model_len") or m.get("context_length") or None
+    except (httpx.RequestError, ValueError, KeyError, TypeError):
+        return None
+    return None
+
+
+async def _bench_resident_mb(model: str, upstream: str) -> float | None:
+    """How much the model is actually holding, as opposed to how big it is on disk.
+
+    A 75 GB checkpoint with its KV cache allocated is a different number, and it is the one
+    that decides what else fits beside it. Ollama reports it per model; the others are inferred
+    from what the machine lost, which is why this is read after the model is up and before
+    anything else moves.
+    """
+    try:
+        if upstream == "ollama":
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as c:
+                ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
+            for m in (ps.get("models") or []):
+                if (m.get("name") or m.get("model")) == model:
+                    v = m.get("size_vram") or m.get("size")
+                    return round(v / 1048576) if v else None
+            return None
+    except (httpx.RequestError, ValueError, KeyError):
+        return None
+    # vLLM holds its weights inside a container that was already running, so the caller's
+    # "what did the machine lose while this loaded" fallback measures nothing — it reported
+    # 712 MB for a 20 GB model. Ask the container what it is holding instead.
+    if _is_vllm(upstream):
+        try:
+            name = await _vllm_container(_vllm_url(upstream))
+            docker = _docker_bin()
+            if name and docker:
+                rc, out = await _run_cmd(
+                    [docker, "stats", "--no-stream", "--format", "{{.MemUsage}}", name],
+                    timeout=25.0)
+                if rc == 0:
+                    return _docker_mem_mb(out)
+        except Exception:
+            return None          # an unreadable container costs the metric, not the run
+    return None
+
+
+def _docker_mem_mb(usage: str) -> float | None:
+    """Megabytes from a `docker stats` MemUsage cell, e.g. '12.34GiB / 121GiB' -> 12636."""
+    m = re.match(r"\s*([\d.]+)\s*([KMGT]?i?B)", usage or "", re.I)
+    if not m:
+        return None
+    scale = {"b": 1 / 1048576, "kib": 1 / 1024, "kb": 1 / 1024, "mib": 1.0, "mb": 1.0,
+             "gib": 1024.0, "gb": 1024.0, "tib": 1048576.0, "tb": 1048576.0}
+    factor = scale.get(m.group(2).lower())
+    return round(float(m.group(1)) * factor) if factor else None
+
+
+async def _bench_reload_ollama(names: list) -> list:
+    """Make previously-resident Ollama models resident again.
+
+    Eviction used to be opt-in, so losing them was the point. Now that every run evicts, the
+    models have to come back — otherwise a three-minute benchmark quietly leaves the daily
+    driver cold and the next request pays a full load with nothing explaining it.
+    """
+    back = []
+    for name in names or []:
+        try:
+            async with httpx.AsyncClient(timeout=httpx.Timeout(600.0)) as c:
+                r = await c.post(f"{OLLAMA_URL}/api/generate",
+                                 json={"model": name, "prompt": "", "keep_alive": "30m"})
+                if r.status_code < 400:
+                    back.append(name)
+        except httpx.RequestError:
+            pass
+    return back
 
 
 async def _bench_residency_snapshot() -> dict:
@@ -11263,26 +14356,34 @@ async def _bench_residency_snapshot() -> dict:
     and ComfyUI is a unit and Ollama is an HTTP keep_alive. Whatever is up when the bench starts
     is what comes back when it ends.
     """
-    snap: dict = {"taken_at": time.time(), "vllm": None, "services": [], "ollama": []}
-    try:
-        container = await _vllm_container()
-        if container:
-            code, out = await _run_cmd(
-                [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
-                15.0, max_chars=100)
-            snap["vllm"] = {"container": container,
-                            "was_running": code == 0 and out.strip().lower() == "true"}
-    except Exception as e:
-        snap["vllm_error"] = f"{type(e).__name__}: {e}"
-    try:
-        svcs = ((load_rules_config().get("model_control") or {}).get("services") or {})
-        for name in svcs:
-            svc = _service_def(name)
-            if svc:
-                st = await _service_state(svc)
-                snap["services"].append({"name": name, "was_running": st["running"]})
-    except Exception as e:
-        snap["services_error"] = f"{type(e).__name__}: {e}"
+    snap: dict = {"taken_at": time.time(), "backends": [], "ollama": []}
+    for name, b in list(PROVIDERS.items()) + list(SIDE_SERVICES.items()):
+        if b.control == "none":
+            continue          # nothing to stop or restore
+        try:
+            st = await b.state()
+            running = st.get("running")
+            container = st.get("container") if b.control == "docker" else None
+            if b.control == "docker" and not container:
+                container = await _vllm_container(b.base_url)
+            if running is None and b.control == "docker":
+                # docker's state() reports the container, not whether it is up.
+                if container:
+                    code, out = await _run_cmd(
+                        [_docker_bin(), "inspect", container, "--format", "{{.State.Running}}"],
+                        15.0, max_chars=100)
+                    running = code == 0 and out.strip().lower() == "true"
+            entry = {"name": name, "was_running": bool(running), "control": b.control}
+            if container:
+                # WHICH container matters, not just that "vllm was up": several can be
+                # configured for the same port (qwen-vllm / ornith-vllm), and a restore
+                # that rediscovers by port starts whichever sorts first — the sweep that
+                # measured Ornith all afternoon handed the box back running qwen instead.
+                entry["container"] = container
+            snap["backends"].append(entry)
+        except Exception as e:
+            snap.setdefault("errors", []).append(f"{name}: {type(e).__name__}: {e}")
+    # Ollama holds models rather than a process the proxy starts, so it is recorded separately.
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as c:
             ps = (await c.get(f"{OLLAMA_URL}/api/ps")).json()
@@ -11298,8 +14399,52 @@ def _free_mem_mb() -> float:
     return float(m.get("avail_mb") or 0)
 
 
+async def _vllm_boot_claim_mb(container: str | None) -> float | None:
+    """What starting this vLLM container will actually take from the box.
+
+    NOT the checkpoint size: vLLM pre-allocates gpu_memory_utilization × total memory at
+    boot (weights + KV pool + CUDA graphs), and on a unified-memory box that claim IS
+    system RAM. Sizing a boot by its 43 GB checkpoint while it grabbed 97 GB is how
+    qwen-vllm landed on top of a resident gemma4 and wedged the machine — sshd and the
+    proxy starved while the resident backends kept answering. Utilization is read from
+    the container's own launch args; vLLM's default is 0.9 when the flag is absent.
+    None when there is nothing to compute with (no total, no such container).
+
+    Plus a reserve, because utilization is not an upper bound. Two vLLMs sized to
+    0.45 + 0.35 = 0.80 of a 122 GB box both died mid-request with "NVRM: Out of memory ...
+    kgrctxAllocCtxBuffers": qwen3-coder-next's weights alone are 42.7 GiB against a 54.8 GB
+    claim, so it took 61.8 GiB, and the two together left the driver nothing for CUDA
+    contexts. Both engines exited 0 with OOMKilled=false, which reads like a clean shutdown
+    from every side except the kernel log. The claim prices what vLLM asks for; the reserve
+    is what the driver and the page cache need to still be there afterwards."""
+    total = (_mem_snapshot() or {}).get("total_mb")
+    if not total:
+        return None
+    util = 0.90
+    try:
+        for c in await _vllm_configs():
+            if not container or c.get("container") == container:
+                if c.get("gpu_memory_utilization") is not None:
+                    util = float(c["gpu_memory_utilization"])
+                break
+    except (ValueError, TypeError):
+        pass
+    try:
+        reserve = float((load_rules_config().get("model_control") or {}).get(
+            "vllm_boot_reserve_mb") or 0)
+    except Exception:
+        # Broad on purpose: this runs on the refusal path, and a boot must still be priced
+        # when the config cannot be read. Falling through to 0 here would drop the reserve
+        # silently — the one case where it matters most.
+        reserve = 0.0
+    if reserve <= 0:
+        reserve = _vllm_boot_reserve_mb(total)
+    return float(total) * util + reserve
+
+
 async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
-                          timeout_s: float = 240.0) -> dict:
+                          timeout_s: float = 240.0, spare: str = "",
+                          bench_id: str = "") -> dict:
     """Stop everything in the snapshot, then wait for the memory to actually come back.
 
     The waiting is the part that matters. `docker stop` returns as soon as the process is
@@ -11307,27 +14452,34 @@ async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
     measures a machine that is still tidying up, which is exactly the kind of contaminated
     number a benchmark exists to avoid.
     """
-    out: dict = {"stopped_services": [], "stopped_vllm": None, "evicted_ollama": []}
-    for svc in (snap.get("services") or []):
-        if not svc.get("was_running"):
+    out: dict = {"stopped": [], "evicted_ollama": []}
+    for entry in (snap.get("backends") or []):
+        if not entry.get("was_running"):
+            continue          # restoring must not start what was already down
+        if spare and entry["name"] == spare:
+            continue          # the backend about to be measured
+        b = backend(entry["name"])
+        if not b:
             continue
-        d = _service_def(svc["name"])
-        if not d:
-            continue
-        code, msg = await _run_cmd(_systemctl_args(d, "stop"), 60.0, env=_systemctl_env(d))
-        out["stopped_services"].append({"name": svc["name"], "ok": code == 0, "output": msg[:200]})
-    v = snap.get("vllm") or {}
-    if v.get("was_running") and v.get("container"):
-        code, msg = await _run_cmd([_docker_bin(), "stop", v["container"]], 180.0)
-        out["stopped_vllm"] = {"container": v["container"], "ok": code == 0, "output": msg[:200]}
+        res = await b.stop()
+        out["stopped"].append({"name": entry["name"], **res})
     out["evicted_ollama"] = await _bench_evict_ollama(keep)
 
     before = _free_mem_mb()
     if want_free_mb:
+        # `docker stop` and `systemctl stop` return when the process is signalled, not when its
+        # memory is back. Unmapping ~90 GB takes appreciably longer, and starting the next model
+        # into a machine that is still handing memory back is how a 36 GB model ended up with 28
+        # GB resident and took 24 minutes a request. Wait for the memory, not for the signal.
         deadline = time.time() + timeout_s
         while time.time() < deadline:
-            if _free_mem_mb() >= want_free_mb:
+            now_free = _free_mem_mb()
+            if now_free >= want_free_mb:
                 break
+            if bench_id:
+                _bench_phase(bench_id,
+                             f"waiting for memory to come back — {now_free / 1024:.0f} GB free, "
+                             f"need {want_free_mb / 1024:.0f} GB")
             await asyncio.sleep(2.0)
     else:
         # Even without a target, give the kernel a moment to finish reclaiming.
@@ -11335,6 +14487,7 @@ async def _bench_free_gpu(snap: dict, keep: str = "", want_free_mb: float = 0,
     out["free_mb_before"] = before
     out["free_mb_after"] = _free_mem_mb()
     out["reached_target"] = (not want_free_mb) or out["free_mb_after"] >= want_free_mb
+    out["wanted_mb"] = want_free_mb or None
     return out
 
 
@@ -11345,22 +14498,20 @@ async def _bench_restore_residency(snap: dict) -> dict:
     reporting "restored" while the daily driver is still refusing connections would be worse
     than saying nothing.
     """
-    res: dict = {"started_services": [], "started_vllm": None, "reloaded_ollama": []}
-    v = snap.get("vllm") or {}
-    if v.get("was_running") and v.get("container"):
-        code, msg = await _run_cmd([_docker_bin(), "start", v["container"]], 180.0)
-        ready = await _vllm_ready(_vllm_ready_timeout()) if code == 0 else False
-        res["started_vllm"] = {"container": v["container"], "ok": code == 0,
-                               "ready": ready, "output": msg[:200]}
-    for svc in (snap.get("services") or []):
-        if not svc.get("was_running"):
+    res: dict = {"started": [], "reloaded_ollama": []}
+    for entry in (snap.get("backends") or []):
+        if not entry.get("was_running"):
             continue
-        d = _service_def(svc["name"])
-        if not d:
+        b = backend(entry["name"])
+        if not b:
             continue
-        code, msg = await _run_cmd(_systemctl_args(d, "start"), 90.0, env=_systemctl_env(d))
-        res["started_services"].append({"name": svc["name"], "ok": code == 0,
-                                        "output": msg[:200]})
+        started = await b.start(container=entry.get("container")) \
+            if entry.get("container") else await b.start()
+        # Started is not serving. vLLM measured ~9 minutes to reload its weights, and reporting
+        # "restored" while the daily driver still refuses connections is worse than silence.
+        # Started is not serving; ask the backend itself rather than mapping names to waiters.
+        ready = await b.ready(_vllm_ready_timeout()) if isinstance(b, Provider) else None
+        res["started"].append({"name": entry["name"], **started, "ready": ready})
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as c:
             for name in (snap.get("ollama") or []):
@@ -11494,37 +14645,68 @@ def _bench_expand_matrix(model_axis: list, cfg: dict) -> list[dict]:
     # silently disabled looks merely slow, not misconfigured.
     caches = as_list(cfg.get("cache"), None)
     concs = as_list(cfg.get("concurrency"), 1)
+    # The window the *server* is launched with, as opposed to prompt_tokens, which is how much
+    # is sent. They are different questions — "is a model slower when it has a 262k KV pool
+    # allocated, even for a short prompt?" is this axis, and there was no way to ask it before.
+    # It is also the only axis whose value the bench must change on the box between cells.
+    servers = as_list(cfg.get("server_context"), None)
     cells = []
     for m in model_axis:
         # Entries may be bare names (older callers) or {model, upstream} pairs, so a sweep can
         # span backends — the same weights on LM Studio and on vLLM are two different cells.
         name = m.get("model") if isinstance(m, dict) else m
         up = (m.get("upstream") or "") if isinstance(m, dict) else ""
+        # server_context only means anything where the window is a launch argument. Expanding
+        # it across every model turned one preset into three identical cells per Ollama model,
+        # all of which failed at the gate with "ollama cannot change its context window" — 84
+        # failures out of 102 from a single tick box. An axis a backend cannot honour is not a
+        # failure for that backend, it is simply not an axis.
+        _prov = PROVIDERS.get(up) if up else None
+        my_servers = servers if (_prov is not None and _prov.resizable_context) else [None]
         for pt in prompts:
             for th in thinks:
                 for tp in temps:
                     for ca in caches:
                         for cc in concs:
-                            axes = {"model": name, "prompt_tokens": int(pt or 0),
-                                    "thinking": str(th or "auto")}
-                            if up:
-                                axes["upstream"] = up
-                            if tp is not None:
-                                axes["temperature"] = float(tp)
-                            if ca:
-                                axes["cache"] = str(ca)
-                            if int(cc or 1) != 1:
-                                axes["concurrency"] = int(cc)
-                            cells.append(axes)
+                            for sv in my_servers:
+                                axes = {"model": name, "prompt_tokens": int(pt or 0),
+                                        "thinking": str(th or "auto")}
+                                if up:
+                                    axes["upstream"] = up
+                                if tp is not None:
+                                    axes["temperature"] = float(tp)
+                                if ca:
+                                    axes["cache"] = str(ca)
+                                if int(cc or 1) != 1:
+                                    axes["concurrency"] = int(cc)
+                                if sv:
+                                    axes["server_context"] = int(sv)
+                                cells.append(axes)
+    # Each distinct server_context costs a restart and a full model reload, so run the cells
+    # that share one together. A stable sort keeps the order within each group, so the cache
+    # axis still sees cold before cached.
+    if any(c.get("server_context") for c in cells):
+        cells.sort(key=lambda c: c.get("server_context") or 0)
+    # Backend last, so it is the outermost grouping. Two backends rarely fit on one box at
+    # once, so every switch means stopping one and loading the other — interleaving them would
+    # pay that repeatedly, and a mixed sweep once ran llama.cpp's cell while it was stopped for
+    # vLLM's.
+    if len({c.get("upstream") for c in cells}) > 1:
+        cells.sort(key=lambda c: str(c.get("upstream") or ""))
     return cells
 
 
 def _bench_cell_label(axes: dict) -> str:
-    bits = [str(axes.get("model") or "?")]
+    bits = [_bench_model_display(axes.get("model") or "?")]
     if axes.get("upstream"):
         bits.append(f"@{axes['upstream']}")
     pt = axes.get("prompt_tokens") or 0
-    bits.append(f"{int(pt) // 1000}k ctx" if pt >= 1000 else (f"{pt} ctx" if pt else "short"))
+    # "32k ctx" for a prompt size read as a context setting, which is exactly the confusion
+    # this axis pair caused. Prompts say "prompt", windows say "ctx".
+    bits.append(f"{int(pt) // 1000}k prompt" if pt >= 1000
+                else (f"{pt} prompt" if pt else "short"))
+    if axes.get("server_context"):
+        bits.append(f"{int(axes['server_context']) // 1024}k ctx")
     if axes.get("thinking") and axes["thinking"] != "auto":
         bits.append(f"think={axes['thinking']}")
     if axes.get("cache"):
@@ -11560,6 +14742,13 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     child_ids = []
     skipped = 0
     now = time.time()
+    # Largest window any cell needs, and the widest concurrency it needs it at. Collected while
+    # planning so the backend is sized once, before the first cell runs.
+    prior = _bench_completed_cells(conn) if cfg.get("resume") else {}
+    reused = 0
+    need_ctx, need_par, need_up = 0, 1, ""
+    ctx_axis_up = ""      # set when the sweep varies the window itself, per cell
+    start_meta = None     # a configured-but-stopped backend this sweep needs
     for axes in cells:
         cid = "b_" + uuid.uuid4().hex[:12]
         child_cfg = dict(cfg)
@@ -11577,6 +14766,8 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
             # the mechanism, so a result column reads "cold / cached" not "randomize true/false".
             child_cfg["cache"] = axes["cache"]
             child_cfg["randomize"] = (axes["cache"] == "cold")
+        # The one axis a cell has to apply to the box itself, so the child owns it.
+        child_cfg["server_context"] = axes.get("server_context") or None
         # Always write the scalar, including the default. Copying it only when it differed left
         # every concurrency-1 cell holding the parent's [1, 4] list, and int() on a list raises.
         child_cfg["concurrency"] = axes.get("concurrency") or 1
@@ -11584,10 +14775,28 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         child_cfg["quiesce"] = False
         meta = _bench_resolve_model(index, axes["model"], axes.get("upstream", ""))
         window = meta.get("loaded_context") or meta.get("max_context")
-        # The reply needs room too, and the char-per-token estimate drifts by ~15% between
-        # tokenisers, so leave headroom rather than sail right up to the limit.
-        budget = (window - int(child_cfg.get("max_tokens", 256))) * 0.9 if window else None
-        if budget and axes["prompt_tokens"] > budget:
+        budget = (_bench_ctx_budget(window, child_cfg.get("max_tokens", 256))
+                  if window else None)
+        cell_up = axes.get("upstream") or meta.get("upstream") or ""
+        cell_prov = PROVIDERS.get(cell_up)
+        if meta.get("startable") and not meta.get("loaded") and start_meta is None:
+            start_meta = meta
+        if axes.get("server_context"):
+            # The sweep is varying the window on purpose. Sizing it once here would flatten the
+            # axis into a constant — which is what it did to a prompt sweep that meant this.
+            ctx_axis_up = ctx_axis_up or cell_up
+        elif budget and axes["prompt_tokens"] > budget and cell_prov is not None \
+                and cell_prov.resizable_context:
+            # Resizable: record what the sweep needs and let the cell run. Sizing once to the
+            # largest cell rather than per-cell is both far cheaper (one restart, not 24) and
+            # more comparable — every cell then measures against the same KV pool, so a
+            # difference between them is the axis rather than the window.
+            need_ctx = max(need_ctx,
+                           _bench_ctx_needed(axes["prompt_tokens"],
+                                             child_cfg.get("max_tokens", 256)))
+            need_par = max(need_par, int(child_cfg["concurrency"]))
+            need_up = need_up or cell_up
+        elif budget and axes["prompt_tokens"] > budget:
             conn.execute(
                 """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
                                            parent_id, axes_json, label, error, finished_ts)
@@ -11598,6 +14807,29 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
                  f"{axes['model']}'s {window:,}-token window", now),
             )
             skipped += 1
+            continue
+        old = prior.get(_bench_cell_sig(axes["model"], child_cfg))
+        if old is not None:
+            # Copied rather than re-parented, so the run it came from keeps its own report
+            # intact. The copy records where the numbers came from — a measurement whose
+            # provenance is invisible is worse than no measurement.
+            try:
+                oenv = json.loads(old["env_json"] or "{}")
+            except (json.JSONDecodeError, TypeError):
+                oenv = {}
+            oenv["reused_from"] = old["id"]
+            oenv["reused_measured_at"] = old["finished_ts"]
+            conn.execute(
+                """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
+                                           parent_id, axes_json, label, results_json, env_json,
+                                           started_ts, finished_ts, progress, progress_total)
+                   VALUES (?, ?, ?, ?, 'done', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (cid, now, axes["model"], json.dumps(child_cfg), creator_ip, parent_id,
+                 json.dumps(axes), _bench_cell_label(axes), old["results_json"],
+                 json.dumps(oenv), old["started_ts"], old["finished_ts"],
+                 old["progress"], old["progress_total"]),
+            )
+            reused += 1
             continue
         conn.execute(
             """INSERT INTO bench_runs (id, ts, model, config_json, status, creator_ip,
@@ -11611,7 +14843,7 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
         "UPDATE bench_runs SET status='running', started_ts=?, progress=0, progress_total=?, "
         "results_json=? WHERE id=?",
         (time.time(), len(child_ids),
-         json.dumps({"children": child_ids, "skipped": skipped}), parent_id),
+         json.dumps({"children": child_ids, "skipped": skipped, "reused": reused}), parent_id),
     )
     conn.commit()
     conn.close()
@@ -11622,6 +14854,37 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     quiesce_state = None
     if cfg.get("quiesce"):
         quiesce_state = await _bench_quiesce(True, keep="")
+    # Record the box as it was before the first cell. Cells start and stop backends between
+    # themselves — a mixed sweep switches backends because two rarely fit at once — so the only
+    # snapshot worth restoring is the one taken before any of that happened.
+    # Unconditional: every cell evicts, and only this snapshot knows what was resident before
+    # the first one did. Taken here whether or not a backend switch is coming.
+    orig_residency = await _bench_residency_snapshot()
+    _save_pending_residency(orig_residency)
+    ctx_restore = None
+    if need_ctx:
+        fit = await _bench_fit_context(need_up, need_ctx, need_par, bench_id=parent_id)
+        if not fit["ok"]:
+            conn = db()
+            conn.execute(
+                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                (f"could not size {need_up} to the {need_ctx:,}-token window this sweep "
+                 f"needs: {fit['detail']}", time.time(), parent_id))
+            conn.commit()
+            conn.close()
+            if quiesce_state is not None:
+                await _bench_quiesce(False, quiesce_state)
+            return
+        ctx_restore = fit["restore"]
+    elif ctx_axis_up:
+        # Cells will each set their own window, so capture where to put it back *before* the
+        # first one changes it — there is no single "previous" to recover afterwards.
+        prov = PROVIDERS.get(ctx_axis_up)
+        if prov is not None and prov.resizable_context:
+            slot, par = await prov.context_window()
+            if slot:
+                ctx_restore = {"upstream": ctx_axis_up,
+                               "context_length": slot * par, "parallel": par}
     try:
       try:
         for i, cid in enumerate(child_ids, start=1):
@@ -11654,6 +14917,14 @@ async def _bench_execute_suite(parent_id: str, app: FastAPI):
     finally:
         if quiesce_state is not None:
             await _bench_quiesce(False, quiesce_state)
+        await _bench_restore_context(ctx_restore)
+        if orig_residency is not None:
+            _bench_phase(parent_id, "putting the backends and models back as they were")
+            # Stop whatever the sweep left running, then put back exactly what it found.
+            await _bench_free_gpu(await _bench_residency_snapshot())
+            await _bench_restore_residency(orig_residency)
+            _save_pending_residency(None)
+            _bench_phase(parent_id, None)
     conn = db()
     conn.execute(
         "UPDATE bench_runs SET status='done', finished_ts=?, results_json=? WHERE id=?",
@@ -11688,7 +14959,14 @@ async def _bench_execute(bench_id: str, app: FastAPI):
             return (v[0] if v else default) if isinstance(v, list) else v
 
         runs = max(1, min(int(_scalar("runs", 5)), 50))
-        max_tokens = max(16, min(int(_scalar("max_tokens", 256)), 8192))
+        # The ceiling was 8192, chosen when every prompt was short and every answer shorter.
+        # It silently clamped a deliberate 32768 and the run looked identical to the one it was
+        # meant to replace. Long-context work needs the room: reasoning length here scales with
+        # INPUT size, not task difficulty — the same five-line answer drew ~1k characters of
+        # reasoning at 16k of context and 24,652 at 300k, which overruns 8192 tokens.
+        # It stays a runaway guard rather than a correctness mechanism; a reply that hits it is
+        # now flagged truncated rather than scored as a failure.
+        max_tokens = max(16, min(int(_scalar("max_tokens", 256)), 32768))
         prompt_tokens = max(0, min(int(_scalar("prompt_tokens", 0)), 262144))
         concurrency = max(1, min(int(_scalar("concurrency", 1)), 8))
         randomize = bool(cfg.get("randomize", False))
@@ -11698,7 +14976,8 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Graded mode replaces the synthetic prompt with a suite of real tasks, one request
         # each, and scores the returned code. runs is then per-task rather than total.
         suite_name = str(cfg.get("suite") or "").strip()
-        suite = _BENCH_SUITES.get(suite_name) if suite_name else None
+        suite, _sk = _bench_suite_tasks(suite_name) if suite_name else (None, {})
+        suite = suite or None
         grade_timeout = max(1.0, min(float(cfg.get("grade_timeout", 10.0)), 60.0))
         warmup = bool(cfg.get("warmup", True))
         total_units = (len(suite) * runs) if suite else runs
@@ -11709,16 +14988,73 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         conn.commit()
         conn.close()
         env = await _bench_env_snapshot()
+        if _sk:
+            # Portability: a task whose tooling is absent on this machine is dropped from the
+            # run and recorded — never scored as zero, which would punish the model for the
+            # box. The report's method section reads this back. This must sit AFTER the env
+            # snapshot exists: it originally ran ten lines earlier and crashed every graded
+            # cell on any machine actually missing a toolchain — the exact machines the
+            # feature exists for — while passing everywhere the suite ran complete.
+            env["skipped_languages"] = {k: v for k, v in sorted(_sk.items())}
         # Resolve the backend from the model unless the user pinned one explicitly. Asking the
         # user to state both invites contradictions (an Ollama model aimed at vLLM just errors),
         # and the proxy already knows the answer.
-        model_meta = _bench_resolve_model(await _bench_model_index(), model,
-                                          str(cfg.get("upstream") or ""))
+        index = await _bench_model_index()
+        model_meta = _bench_resolve_model(index, model, str(cfg.get("upstream") or ""))
         if not cfg.get("upstream") and model_meta.get("upstream"):
             cfg["upstream"] = model_meta["upstream"]
             cfg["upstream_inferred"] = True
         env["model_loaded_at_start"] = model_meta.get("loaded")
         env["resolved_upstream"] = cfg.get("upstream")
+        # Same contract as skipped_languages, applied to context rather than toolchains: a task
+        # whose prompt cannot fit this model's window is DROPPED and recorded, never scored as a
+        # zero. Until longctx-v1 no graded task had a prompt worth checking, so a task simply
+        # too big for the model would have been sent, front-truncated by the backend, and
+        # reported as the model failing to recall something it was never shown.
+        if suite:
+            _window = model_meta.get("loaded_context") or model_meta.get("max_context")
+            if not _window:
+                # The catalogue does not always carry a window. Measured: the index entry for a
+                # resident Ollama model held only {"loaded": True}, so this guard silently did
+                # nothing and a 1M-token rung was sent to a 1M window it cannot fit — the
+                # backend front-truncated it and the rung scored a number that measured
+                # nothing. Ask the backend what it actually loaded, which is the same source
+                # the env snapshot uses further down.
+                _up = str(cfg.get("upstream") or "")
+                try:
+                    # What is resident first — it is the truth when the model is already up —
+                    # then what the model declares, which is readable before it loads.
+                    _window = (await _bench_loaded_context(model, _up)
+                               or await _bench_declared_context(model, _up))
+                except Exception:
+                    _window = None
+            if _window:
+                _budget = _bench_ctx_budget(int(_window), int(cfg.get("max_tokens") or 256))
+                _too_big = {t["id"]: int(t["target_tokens"]) for t in suite
+                            if t.get("target_tokens")
+                            and int(t["target_tokens"]) > _budget}
+                if _too_big:
+                    suite = [t for t in suite if t["id"] not in _too_big]
+                    env["skipped_context"] = {
+                        "window": int(_window),
+                        "budget": int(_budget),
+                        "tasks": {k: v for k, v in sorted(_too_big.items(), key=lambda kv: kv[1])},
+                    }
+                    total_units = (len(suite) * runs) if suite else runs
+                    _c = db()
+                    _c.execute("UPDATE bench_runs SET progress_total=? WHERE id=?",
+                               (total_units, bench_id))
+                    _c.commit()
+                    _c.close()
+                if not suite:
+                    _c = db()
+                    _c.execute("UPDATE bench_runs SET status='failed', error=?, "
+                               "finished_ts=? WHERE id=?",
+                               (f"every task in this suite needs more context than {model!r} "
+                                f"has ({int(_window):,} tokens)", time.time(), bench_id))
+                    _c.commit()
+                    _c.close()
+                    return
         for k in ("quant", "size_mb", "max_context", "loaded_context", "checkpoint",
                   "prefix_caching", "kv_cache_dtype"):
             if model_meta.get(k) is not None:
@@ -11728,6 +15064,127 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                      (json.dumps(env), json.dumps(cfg), bench_id))
         conn.commit()
         conn.close()
+
+        def _abort(reason: str):
+            conn = db()
+            conn.execute(
+                "UPDATE bench_runs SET status='failed', error=?, finished_ts=? WHERE id=?",
+                (reason, time.time(), bench_id))
+            conn.commit()
+            conn.close()
+
+        # Everything below this point costs real time and, under `exclusive`, blocks every other
+        # proxy client. Refuse here rather than discovering it 54 empty completions later.
+        why = _bench_preflight(model, model_meta, str(cfg.get("upstream") or ""), index)
+        if not why and str(cfg.get("upstream") or "") == "ollama":
+            why = await _bench_ollama_kv_preflight(model, model_meta, cfg)
+        if why:
+            _abort(why)
+            return
+        # Free the box for whatever this cell is about to measure — every cell, not only the
+        # ones that need a backend started. Wiring this to "am I starting something" was wrong:
+        # an Ollama cell starts nothing, so llama.cpp kept its ~90 GB and Ollama could fit only
+        # 28 of codellama:70b's 38, spilling the rest. One request took 24 minutes instead of
+        # ten seconds, and the number that came out measured memory pressure, not the model.
+        this_up = str(cfg.get("upstream") or "")
+        resid_snap = None
+        try:
+            snap_now = await _bench_residency_snapshot()
+            if any(e.get("was_running") and e.get("name") != this_up
+                   for e in (snap_now.get("backends") or [])):
+                _bench_phase(bench_id, f"stopping other backends to free memory for {this_up}")
+                # What this cell's model actually needs resident, so the wait has a target
+                # rather than a guess. Unknown size falls back to no target, which is the old
+                # behaviour and no worse.
+                # A model already resident needs no room made for it — its weights are inside
+                # the pool its backend allocated at boot. Asking for size_mb of FREE memory on
+                # top double-counts, and it stamped every vLLM cell "measured under memory
+                # pressure — only 22 GB free; 23 GB wanted" while the 20 GB in question was
+                # already loaded and serving requests.
+                _want = 0 if model_meta.get("loaded") else (model_meta.get("size_mb") or 0)
+                _want = _want * _BENCH_FIT_OVERHEAD if _want else 0
+                # A standalone run owns the restore; inside a sweep the suite already recorded
+                # the box before its first cell and puts everything back at the end.
+                if row["parent_id"] is None:
+                    resid_snap = snap_now
+                    _save_pending_residency(snap_now)
+                freed = await _bench_free_gpu(snap_now, keep=model, spare=this_up,
+                                              want_free_mb=_want, bench_id=bench_id)
+                env["freed_before_run"] = freed
+                if _want and not freed.get("reached_target"):
+                    # Not fatal — a model can run partly offloaded — but it is the difference
+                    # between a measurement and a measurement of memory pressure, so it has to
+                    # appear beside the numbers rather than be inferred from them later.
+                    env["memory_warning"] = (
+                        f"only {freed.get('free_mb_after', 0) / 1024:.0f} GB free after "
+                        f"stopping others; {_want / 1024:.0f} GB wanted")
+        except Exception as e:
+            print(f"[bench] freeing memory failed: {type(e).__name__}: {e}")
+
+        # Bring the backend up if the run needs a container that is configured but stopped.
+        # Before the ready() poll and the window fit, both of which assume something is serving.
+        backend_restore = None
+        if model_meta.get("startable") and not model_meta.get("loaded"):
+            got = await _bench_start_backend(model_meta, persist=row["parent_id"] is None,
+                                             bench_id=bench_id)
+            if not got["ok"]:
+                await _bench_restore_backend(got["restore"])
+                _abort(f"could not start {cfg.get('upstream')} for {model!r}: {got['detail']}")
+                return
+            env["started_backend"] = model_meta.get("container") or cfg.get("upstream")
+            # The boot cost, kept separate from the warm-up so the report can show the split
+            # and so neither number silently absorbs the other.
+            if got.get("backend_start_ms"):
+                env["backend_start_ms"] = got["backend_start_ms"]
+            # Only a standalone run puts it back. In a sweep the suite started it once for the
+            # whole matrix; stopping it here would make every cell pay a full vLLM boot.
+            if row["parent_id"] is None:
+                backend_restore = got["restore"]
+            # Re-resolve: the index entry was the container's configuration, and what the server
+            # actually reports once up is the authority for context size and quantisation.
+            model_meta = _bench_resolve_model(await _bench_model_index(), model,
+                                              str(cfg.get("upstream") or "")) or model_meta
+
+        # Fit the window. Children of a sweep skip this: the suite sized the backend once for
+        # the whole matrix, and the metrics snapshot this reads from may not have caught up yet.
+        ctx_restore = None
+        window = model_meta.get("loaded_context") or model_meta.get("max_context")
+        want_ctx = int(cfg.get("server_context") or 0)
+        if want_ctx:
+            # The window is this cell's variable, so set it exactly — including downwards, which
+            # the fit-to-prompt path never does. A parent sweep captured the original before its
+            # first cell ran and restores it at the end, so nothing is restored here.
+            fit = await _bench_fit_context(str(cfg.get("upstream") or ""), want_ctx,
+                                           concurrency, exact=True, bench_id=bench_id)
+            if not fit["ok"]:
+                _abort(f"could not set {cfg.get('upstream')} to a {want_ctx:,}-token "
+                       f"window: {fit['detail']}")
+                return
+            env["server_context"] = want_ctx
+            if row["parent_id"] is None:
+                ctx_restore = fit["restore"]
+            conn = db()
+            conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                         (json.dumps(env), bench_id))
+            conn.commit()
+            conn.close()
+        elif row["parent_id"] is None and window:
+            needed = _bench_ctx_needed(prompt_tokens, max_tokens)
+            if needed > int(window):
+                fit = await _bench_fit_context(str(cfg.get("upstream") or ""), needed,
+                                               concurrency, bench_id=bench_id)
+                if not fit["ok"]:
+                    _abort(f"{prompt_tokens:,} prompt tokens need a {needed:,}-token window; "
+                           f"{cfg.get('upstream')} serves {int(window):,} and {fit['detail']}")
+                    return
+                ctx_restore = fit["restore"]
+                env["context_resized_to"] = needed
+                env["context_was"] = int(window)
+                conn = db()
+                conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                             (json.dumps(env), bench_id))
+                conn.commit()
+                conn.close()
         # Exclusive mode: clear the gate, optionally drain in-flight requests, run, then re-set.
         gate_held = False
         if exclusive:
@@ -11742,11 +15199,17 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         # Spare the model about to run, or it would be evicted and immediately reloaded.
         quiesce_state = (await _bench_quiesce(True, keep=model)
                          if cfg.get("quiesce") else None)
-        if cfg.get("evict_others") and not cfg.get("quiesce"):
-            # Same eviction without the traffic gate, for the common case of wanting a clean
-            # measurement without also blocking everyone.
+        # Always, not on request. A benchmark that leaves other models resident is not measuring
+        # the model, it is measuring whatever the box happened to be holding — and on a unified
+        # memory box an idle model competes for the same bandwidth whichever backend is being
+        # measured. That is not a preference, so it stopped being a checkbox.
+        evicted = []
+        if not cfg.get("quiesce"):        # quiesce already does this, and restores it
+            _bench_phase(bench_id, "unloading other Ollama models")
+            _t_ev = time.perf_counter()
             evicted = await _bench_evict_ollama(keep=model)
             if evicted:
+                env["unload_ms"] = round((time.perf_counter() - _t_ev) * 1000)
                 env["evicted_before_run"] = evicted
                 conn = db()
                 conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
@@ -11763,6 +15226,15 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                 # large model) and the run's min/max are nonsense. The warm-up result is
                 # discarded, never scored, and never counted in the summary.
                 if warmup:
+                    # The load itself. For Ollama this is where a 36 GB model is pulled into
+                    # memory, and it was the one long step with no phase: the counter sits at
+                    # 0 for minutes because the warm-up is deliberately not counted, so the
+                    # run looks wedged exactly when it is doing the most work.
+                    _sz = model_meta.get("size_mb")
+                    env["free_mb_before_load"] = _free_mem_mb()
+                    _bench_phase(bench_id, f"loading {_bench_model_display(model)} into memory"
+                                 + (f" ({_sz / 1024:.0f} GB)" if _sz else "")
+                                 + " — warm-up, not measured")
                     # In cached mode the warm-up must send the prompt the measured runs will
                     # send, otherwise it primes nothing and the first "cached" request is
                     # actually a cold prefill — which is exactly the confound this axis exists
@@ -11770,27 +15242,73 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                     warm_prompt = (_bench_build_prompt(prompt_tokens, False, 1)
                                    if not randomize else _bench_build_prompt(0, True, 0))
                     warm_max = max_tokens if not randomize else 16
+                    _t_warm = time.perf_counter()
                     warm = await _bench_run_one(client, base, model, warm_max,
                                                 warm_prompt, 0, cfg=cfg)
+                    # The warm-up IS the cold load for an on-demand backend, and it is already
+                    # excluded from every measurement — so its duration is the load time, free.
+                    # For a container backend the weights were loaded before this request, by
+                    # the start above: add that in, or the column compares an Ollama cold load
+                    # against a vLLM warm request and calls vLLM twenty times faster to start.
+                    env["warmup_request_ms"] = round((time.perf_counter() - _t_warm) * 1000)
+                    env["load_ms"] = (env["warmup_request_ms"]
+                                      + int(env.get("backend_start_ms") or 0))
+                    env["free_mb_after_load"] = _free_mem_mb()
+                    _res = await _bench_resident_mb(model, str(cfg.get("upstream") or ""))
+                    if _res is None and env.get("free_mb_before_load") is not None:
+                        # Not reported per model: infer from what the machine lost while the
+                        # only thing happening was this model loading.
+                        _res = max(0, env["free_mb_before_load"] - env["free_mb_after_load"])
+                    env["resident_mb"] = _res
+                    # Read after the warm-up, so it reflects what is serving rather than what
+                    # was requested. Overrides the catalogue value: the catalogue records what
+                    # the backend offered, this records what it did.
+                    _ctx = await _bench_loaded_context(model, str(cfg.get("upstream") or ""))
+                    if _ctx:
+                        env["loaded_context"] = _ctx
                     conn = db()
-                    conn.execute("UPDATE bench_runs SET results_json=? WHERE id=?",
-                                 (json.dumps({"rows": [], "warmup": warm}), bench_id))
+                    # env_json rides the write that already happens here. Without it, load_ms
+                    # and resident_mb were captured into a dict that never touched the
+                    # database again — and because the report only renders the Load and
+                    # Resident columns when data exists, the loss was silent: a design meant
+                    # to avoid columns of dashes made missing data look like a layout choice.
+                    conn.execute("UPDATE bench_runs SET results_json=?, env_json=? WHERE id=?",
+                                 (json.dumps({"rows": [], "warmup": warm}),
+                                  json.dumps(env), bench_id))
                     conn.commit()
                     conn.close()
+                    _bench_phase(bench_id, None)      # measuring from here; the counter moves
                 else:
                     warm = None
+                    _bench_phase(bench_id, f"loading {_bench_model_display(model)} into memory "
+                                           f"— warm-up is off, so "
+                                           f"the first measurement carries it")
                 # Each unit is one request. Without a suite that's the synthetic prompt N times;
                 # with one it's every task × N repeats, so each task gets its own percentiles
                 # and a repeatable score.
                 units: list[tuple[str, dict | None]] = []
                 if suite:
                     for task in suite:
-                        for _ in range(runs):
-                            units.append((task["prompt"], task))
+                        for _rep in range(runs):
+                            # A task may vary itself per repeat. longctx does: repeating one
+                            # identical prompt measures the prompt cache, because the backend
+                            # serves repeats 2..N off a KV prefix it already holds and five
+                            # matching answers look like consistency when they are one answer
+                            # counted five times. The builder is stored UNCALLED — every unit
+                            # of the run is assembled before the first request is sent, and a
+                            # long-context ladder materialised up front is ~100 MB of filler
+                            # held for the whole run.
+                            _pf = getattr(task, "prompt_for", None)
+                            units.append((_pf(_rep) if callable(_pf) else task["prompt"], task))
                 else:
                     units = [(None, None)] * runs  # prompt built per-seq below (salting needs seq)
 
                 seq_counter = 0
+                consec_errors = 0
+                if warm and warm.get("error"):
+                    # A failed warm-up already counts toward the breaker: when the load
+                    # itself died, the measured requests are not going to fare better.
+                    consec_errors = 1
                 while seq_counter < len(units):
                     wave_size = min(concurrency, len(units) - seq_counter)
                     coros = []
@@ -11799,26 +15317,96 @@ async def _bench_execute(bench_id: str, app: FastAPI):
                         idx = seq_counter + offset
                         seq = idx + 1
                         task_prompt, task = units[idx]
-                        prompt = (task_prompt if task_prompt is not None
-                                  else _bench_build_prompt(prompt_tokens, randomize, seq))
+                        if callable(task_prompt):
+                            task_prompt = task_prompt()   # built here so only one is resident
+                        # A graded task at prompt_tokens > 0 is the same task asked from
+                        # inside a long context — the axis that turns any suite into a
+                        # long-context test. Episodes are excluded: their length comes from
+                        # the transcript they build, and padding the first turn would
+                        # measure something else.
+                        #
+                        # stream_tools tasks are NOT episodes and must stay eligible. The
+                        # transport suite is pointless at bench prompt sizes: the tool-call
+                        # loss it hunts was measured on prompts of 70k tokens and up, and a
+                        # clean result at 2k tokens says nothing about that. Excluding every
+                        # task carrying `tools` swept these up with the episodes and left the
+                        # suite unable to reach the conditions it exists to reproduce.
+                        _stream_tools = bool((task or {}).get("stream_tools"))
+                        _is_episode = bool((task or {}).get("tools")) and not _stream_tools
+                        prompt = (
+                            _bench_task_at_depth(task_prompt, prompt_tokens, randomize, seq)
+                            if (task_prompt is not None and prompt_tokens and not _is_episode)
+                            else task_prompt if task_prompt is not None
+                            else _bench_build_prompt(prompt_tokens, randomize, seq))
                         wave_tasks.append(task)
-                        coros.append(_bench_run_one(client, base, model, max_tokens, prompt, seq,
-                                                    cfg=cfg, capture_text=bool(task)))
+                        if task and task.get("tools") and not _stream_tools:
+                            # An agent task is an episode, not a completion: its runner owns
+                            # the tool loop and returns the row already graded.
+                            coros.append(_bench_run_agent(client, base, model, task, cfg))
+                        else:
+                            # stream_tools deliberately stays on the streaming single-turn path:
+                            # the whole point is to offer tools over a *stream*, which the
+                            # episode runner cannot do because it posts stream:False.
+                            coros.append(_bench_run_one(
+                                client, base, model, max_tokens, prompt, seq,
+                                cfg=cfg, capture_text=bool(task),
+                                tools=(task or {}).get("tools") if _stream_tools else None))
                     results = await asyncio.gather(*coros, return_exceptions=False)
                     # Grade after the wave so scoring never overlaps generation — a busy CPU
                     # during generation would show up as slower decode.
                     for res, task in zip(results, wave_tasks):
                         if task:
                             res["task"] = task["id"]
-                            if not res.get("error"):
-                                res["grade"] = await _bench_grade(res.get("text") or "", task,
-                                                                  grade_timeout)
+                            if "grade" in res:
+                                pass          # agent episodes arrive graded by their runner
+                            elif task.get("stream_tools"):
+                                # Graded here rather than through _bench_grade, which scores
+                                # text: the evidence is whether a call survived the stream, and
+                                # an error row still counts as a loss — a 400 or a dropped
+                                # connection failed to deliver the call just as surely as a
+                                # well-formed empty turn did.
+                                _n = res.get("tool_calls") or 0
+                                res["grade"] = {
+                                    "ok": _n > 0, "passed": 1 if _n else 0, "total": 1,
+                                    "mode": "stream_tools",
+                                    "detail": (f"{_n} tool call(s) arrived" if _n else
+                                               "no tool call arrived over the stream"
+                                               + (f" ({res['error'][:120]})"
+                                                  if res.get("error") else "")),
+                                }
+                            elif not res.get("error"):
+                                res["grade"] = await _bench_grade(
+                                    res.get("text") or "", task, grade_timeout,
+                                    reasoning=res.get("reasoning_text") or "",
+                                    finish_reason=res.get("finish_reason"))
+                                # A failing grade on a response that used its whole token
+                                # budget is a different diagnosis from wrong code, and the
+                                # report must say which one it is.
+                                g = res["grade"]
+                                if (isinstance(g, dict)
+                                        and (g.get("passed") or 0) < (g.get("total") or 1)
+                                        and (res.get("completion_tokens") or 0) >= max_tokens):
+                                    g["truncated"] = True
                             # The full response can be megabytes across a suite; the grade is
                             # the durable artifact, so keep only a readable excerpt.
                             if "text" in res:
                                 res["text"] = res["text"][:4000]
                     rows.extend(results)
                     seq_counter += wave_size
+                    # Circuit breaker: a cell whose backend is dead does not get to burn its
+                    # whole request budget discovering that. The devstral OOM loop sent 87
+                    # requests into a service the OOM killer was restarting, each one
+                    # re-triggering the fatal load; every row said the same thing. A handful
+                    # of consecutive failures with no success in between is that signature —
+                    # a merely slow or flaky backend produces successes in the mix and never
+                    # trips this.
+                    for res in results:
+                        consec_errors = consec_errors + 1 if res.get("error") else 0
+                    if consec_errors >= max(6, 2 * concurrency):
+                        raise RuntimeError(
+                            f"aborted after {consec_errors} consecutive failed requests "
+                            f"({seq_counter}/{len(units)} sent) — the backend is failing, "
+                            f"not slow — last: {str(rows[-1].get('error'))[:200]}")
                     # Persist progress incrementally so the UI can poll.
                     conn = db()
                     conn.execute(
@@ -11858,9 +15446,43 @@ async def _bench_execute(bench_id: str, app: FastAPI):
         finally:
             if quiesce_state is not None:
                 await _bench_quiesce(False, quiesce_state)
+            # Reload what was evicted. Opt-in, this was the user's explicit choice to clear the
+            # GPU; unconditional, a three-minute bench would silently leave their daily driver
+            # cold with nothing saying why.
+            # Standalone runs put them back themselves. Inside a sweep the next cell is about
+            # to evict them again, so reloading here would be minutes of thrash per cell —
+            # the suite restores the whole set once, at the end.
+            if evicted and row["parent_id"] is None:
+                _bench_phase(bench_id, "reloading the models it unloaded")
+                await _bench_reload_ollama(evicted)
+            if backend_restore or ctx_restore or resid_snap:
+                _bench_phase(bench_id, "putting the backends back as they were")
+            await _bench_restore_backend(backend_restore)
+            restored = await _bench_restore_context(ctx_restore)
+            if resid_snap is not None:
+                try:
+                    await _bench_restore_residency(resid_snap)
+                    _save_pending_residency(None)
+                except Exception as e:
+                    print(f"[bench] restoring residency failed: {type(e).__name__}: {e}")
+            if restored is not None:
+                conn = db()
+                row2 = conn.execute("SELECT env_json FROM bench_runs WHERE id=?",
+                                    (bench_id,)).fetchone()
+                try:
+                    e = json.loads(row2["env_json"]) if row2 and row2["env_json"] else {}
+                except (json.JSONDecodeError, TypeError):
+                    e = {}
+                e["context_restored"] = restored
+                conn.execute("UPDATE bench_runs SET env_json=? WHERE id=?",
+                             (json.dumps(e), bench_id))
+                conn.commit()
+                conn.close()
             if gate_held:
                 _BENCH_TRAFFIC_OK.set()
                 _BENCH_EXCLUSIVE_DEADLINE = 0.0
+            # A finished row must not keep describing a step it is no longer doing.
+            _bench_phase(bench_id, None)
 
 
 # -------- Task queue (one-shots + cron/interval recurring) --------
@@ -11989,6 +15611,153 @@ async def _task_execute(task_id: int):
         conn.close()
 
 
+_POOL_WARNED = {"at": 0.0}
+_TLS_WARNED = {"at": 0.0}
+_TLS_CACHE: dict = {"key": None, "value": None}
+# Certificates are renewed on a schedule nobody watches. Two weeks is enough warning to act
+# without being so early the message becomes background noise.
+TLS_EXPIRY_WARN_DAYS = 14
+
+
+async def _wait_for_http_start(http_server, http_task, timeout_s: float) -> None:
+    """Block until the HTTP listener has finished starting, or refuse to continue.
+
+    The HTTPS listener runs with lifespan="off" and borrows the HTTP server's state, so it
+    must not open until that state exists. The original loop polled for 5 seconds and then
+    opened the listener regardless — but init_db runs migrations and backfills, which on a
+    multi-gigabyte database takes far longer than that, and every HTTPS request arriving in
+    the gap fails on an app.state.client that has not been created yet.
+
+    A slow start is a reason to keep waiting, not a reason to serve half-built state, so
+    exhausting the deadline raises instead of proceeding.
+    """
+    deadline = time.monotonic() + timeout_s
+    while not getattr(http_server, "started", False):
+        if http_task.done():
+            await http_task                  # surface whatever killed it, if anything
+            raise RuntimeError("HTTP listener exited during startup; HTTPS was not started")
+        if time.monotonic() > deadline:
+            http_server.should_exit = True
+            raise RuntimeError(
+                f"HTTP listener did not finish starting within {timeout_s}s; refusing to open "
+                f"HTTPS against an uninitialised app (raise PROXY_STARTUP_TIMEOUT_S if startup "
+                f"is legitimately slow)")
+        await asyncio.sleep(0.05)
+
+
+def _cert_not_after(path: str) -> float | None:
+    """Expiry of a PEM certificate as an epoch, or None if it can't be read.
+
+    `_test_decode_cert` is private, but it is the only stdlib way to read a certificate from
+    disk without opening a connection, and this package deliberately carries no crypto
+    dependency. `cert_time_to_seconds` beside it is public. Both are wrapped: a certificate we
+    cannot parse must cost the metric, never the health endpoint.
+    """
+    try:
+        info = ssl._ssl._test_decode_cert(path)
+        return ssl.cert_time_to_seconds((info or {})["notAfter"])
+    except Exception:
+        return None
+
+
+def _tls_status() -> dict:
+    """Expiry of the configured HTTPS certificate.
+
+    Expiry is the same shape of failure as pool exhaustion: scheduled, silent, and total the
+    moment it lands, with nothing reporting it beforehand. Health is where it belongs — the
+    file is stat'd per call and only re-parsed when it changes, so a polling UI costs nothing.
+    """
+    cert = os.environ.get("PROXY_SSL_CERT", "").strip()
+    try:
+        port = int(os.environ.get("PROXY_HTTPS_PORT", "0") or "0")
+    except ValueError:
+        port = 0
+    if not cert or port <= 0:
+        return {"enabled": False}
+    out = {"enabled": True, "port": port, "cert": cert, "exists": False}
+    try:
+        mtime = Path(cert).stat().st_mtime
+    except OSError:
+        # Configured but unreadable: HTTPS did not start, and silence would read as healthy.
+        return out
+    out["exists"] = True
+    key = (cert, mtime)
+    if _TLS_CACHE.get("key") != key:
+        _TLS_CACHE["key"] = key
+        _TLS_CACHE["value"] = _cert_not_after(cert)
+    not_after = _TLS_CACHE.get("value")
+    if not_after is None:
+        return out
+    days = (not_after - time.time()) / 86400.0
+    out["not_after"] = not_after
+    out["days_remaining"] = round(days, 2)
+    out["expired"] = days <= 0
+    out["expiring_soon"] = days <= TLS_EXPIRY_WARN_DAYS
+    return out
+
+
+def _tls_watch() -> None:
+    """Warn while the certificate is still valid, rather than after it isn't."""
+    s = _tls_status()
+    if not s.get("enabled") or not s.get("expiring_soon"):
+        return
+    if time.time() - _TLS_WARNED["at"] < 3600:
+        return          # hourly: this is a slow-moving condition, not an incident
+    _TLS_WARNED["at"] = time.time()
+    days = s.get("days_remaining")
+    try:
+        if s.get("expired"):
+            print(f"[tls] certificate {s['cert']} EXPIRED {abs(days):.1f} days ago — "
+                  f"HTTPS clients are failing")
+        else:
+            print(f"[tls] certificate {s['cert']} expires in {days:.1f} days")
+    except Exception:
+        pass
+
+
+def _pool_stats() -> dict:
+    """Occupancy of the shared upstream connection pool.
+
+    httpx exposes no public accessor for this, so it reaches through the transport into
+    httpcore. Wrapped whole: an observability hook must never be the thing that breaks
+    proxying, so a version bump that moves these internals costs the metric, not the box.
+    """
+    try:
+        pool = app.state.client._transport._pool
+        conns = list(pool.connections)
+        limit = pool._max_connections
+    except Exception:
+        return {}
+    idle = 0
+    for c in conns:
+        try:
+            idle += 1 if c.is_idle() else 0
+        except Exception:
+            pass
+    return {"connections": len(conns), "idle": idle,
+            "active": len(conns) - idle, "limit": limit}
+
+
+def _pool_watch() -> None:
+    """Say something while the pool is filling, rather than after it is full.
+
+    Exhaustion has no natural symptom — requests just stop finishing — so the only warning
+    anyone gets is the one printed here."""
+    s = _pool_stats()
+    limit = s.get("limit") or 0
+    if not limit or s.get("active", 0) < limit * 0.8:
+        return
+    if time.time() - _POOL_WARNED["at"] < 300:
+        return          # once per 5 min: a full pool would otherwise flood the journal
+    _POOL_WARNED["at"] = time.time()
+    try:
+        print(f"[pool] {s['active']}/{limit} upstream connections checked out "
+              f"({s['idle']} idle, {len(_INFLIGHT_REQUESTS)} requests in flight) — "
+              f"at the cap, proxied requests will queue")
+    except Exception:
+        pass
+
+
 async def _inflight_zombie_killer(app: FastAPI):
     """Periodically cancel in-flight requests that have been running longer than the
     configured max. Safety net for streamer coroutines that wedge on a dead client socket
@@ -12000,6 +15769,16 @@ async def _inflight_zombie_killer(app: FastAPI):
         try:
             await asyncio.sleep(60)
             now = time.time()
+            # Drain sockets orphaned by _save_finish first — these are already-finished
+            # requests, so there is nothing to wait for and every one held is a pool slot gone.
+            while _ORPHANED_RESPONSES:
+                _resp = _ORPHANED_RESPONSES.pop()
+                try:
+                    await _resp.aclose()
+                except Exception:
+                    pass
+            _pool_watch()
+            _tls_watch()
             for req_id in list(_INFLIGHT_REQUESTS.keys()):
                 info = _INFLIGHT_REQUESTS.get(req_id)
                 if not info or info.get("cancelled"):
@@ -12282,6 +16061,16 @@ _SYS_PROMPT_FINGERPRINTS = (
     # sub-agent uses a distinct "security reviewer" prompt (same host, OpenAI SDK) → hermes-safety.
     ("you are hermes agent", "hermes"),
     ("security reviewer for an ai coding agent", "hermes-safety"),
+    # Hindsight, Hermes's memory plugin. It runs its own pipeline through the stock
+    # AsyncOpenAI SDK with no x-client-name, so it landed in the generic 'openai-sdk'
+    # bucket and was invisible as a caller — while being the second-busiest thing on the
+    # box. Two stages, labelled apart because they cost very differently: extraction runs
+    # per batch of facts, consolidation carries the existing observations in its prompt
+    # (~7k tokens against ~3.5k) and is the one that gets expensive as memory grows.
+    ("extract significant facts from text", "hindsight-extract"),
+    ("you are a memory consolidation system", "hindsight-consolidate"),
+    # Not memory work: whatever generates conversation titles, also on the bare SDK.
+    ("generate a short, descriptive title", "title-generator"),
     ("you are pair programming with a user", "cursor"),
     ("you are cline", "cline"),
     ("you are roo,", "roo-code"),
@@ -12299,6 +16088,53 @@ _SYS_PROMPT_FINGERPRINTS = (
 )
 
 
+# Headers whose value is a credential. Stored redacted, never verbatim.
+_CREDENTIAL_HEADERS = ("authorization", "x-api-key", "api-key", "proxy-authorization",
+                       "cookie", "x-auth-token")
+_CRED_REDACTED = "[redacted]"
+
+
+def _credential_fingerprint(headers: dict | None) -> str | None:
+    """A stable, non-reversible id for the credential a caller presented.
+
+    Callers here share an IP and often a client label — everything hermes runs arrives from
+    one host through the same SDK — so the key is the one thing that reliably tells two
+    callers apart. Storing the key itself to get that would be trading a real secret for a
+    convenience: the database is copied, archived and handed around, and a bearer token in
+    it is a bearer token in all of those. A hash plus the last four characters identifies
+    the caller just as well and is worthless to whoever finds it.
+
+    Placeholder credentials that local backends accept ('no-key-required' and friends) are
+    not fingerprinted: they identify nobody, and a column full of one shared value invites
+    the reader to think it means something.
+    """
+    if not isinstance(headers, dict):
+        return None
+    for k, v in headers.items():
+        if k.lower() not in _CREDENTIAL_HEADERS:
+            continue
+        raw = str(v or "").strip()
+        if raw.lower().startswith("bearer "):
+            raw = raw[7:].strip()
+        if len(raw) < 8:
+            return None
+        if re.fullmatch(r"(?i)[-_a-z0-9]*(not|no)[-_]?(key|auth|required|needed)[-_a-z0-9]*",
+                        raw) or raw.lower() in ("none", "null", "dummy", "placeholder"):
+            return None
+        digest = hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:12]
+        return f"{digest}…{raw[-4:]}"
+    return None
+
+
+def _redact_credential_headers(headers: dict) -> dict:
+    """Headers as stored: same shape, credentials replaced. The fingerprint column carries
+    whatever identification value the real value had."""
+    out = {}
+    for k, v in (headers or {}).items():
+        out[k] = _CRED_REDACTED if k.lower() in _CREDENTIAL_HEADERS else v
+    return out
+
+
 def _fingerprint_client_from_system(sys_text: str) -> str | None:
     """Best-effort agentic-client identification from the system prompt. High-precision markers
     only; returns None when nothing distinctive matches so the caller keeps its generic verdict."""
@@ -12309,6 +16145,42 @@ def _fingerprint_client_from_system(sys_text: str) -> str | None:
         if marker in t:
             return label
     return None
+
+
+# Apps identifiable by the toolbox they hand the model, when they send nothing else that
+# names them. hermes drives the OpenAI Python SDK with no x-client-name, so it arrived as a
+# generic "openai-sdk" alongside every other script — and its traffic stopped being tellable
+# apart the moment it stopped setting the header. The system prompt is no help: subagents run
+# under their own personas ("# UX Reviewer"), not a fixed banner.
+#
+# Tools chosen for being specific rather than common: read_file or terminal would match half
+# the agents in existence, while skill_manage and read_window_below match one. Three hits are
+# required so a client that happens to share a name or two is not mislabelled.
+_CLIENT_TOOL_FINGERPRINTS = (
+    ("hermes", 3, frozenset({
+        "skill_manage", "skills_list", "skill_view", "session_search", "delegate_task",
+        "apply_layout", "focus_pane", "read_window_below", "project_switch", "project_create",
+        "cronjob", "setup_mcp", "vision_analyze", "open_preview", "read_preview",
+        "read_terminal", "close_terminal", "tour",
+    })),
+)
+
+
+def _tool_names_in_body(body: dict | None) -> set:
+    """Every tool name the request offers, in either wire shape."""
+    out: set = set()
+    if not isinstance(body, dict):
+        return out
+    for t in (body.get("tools") or []):
+        if not isinstance(t, dict):
+            continue
+        name = (t.get("function") or {}).get("name") or t.get("name")
+        if isinstance(name, str):
+            out.add(name)
+    for f in (body.get("functions") or []):
+        if isinstance(f, dict) and isinstance(f.get("name"), str):
+            out.add(f["name"])
+    return out
 
 
 def _detect_client_app(headers: dict | None, body: dict | None) -> str:
@@ -12347,6 +16219,17 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
             slug = re.sub(r"[^a-z0-9._-]+", "-", v.lower())[:40].strip("-")
             if slug:
                 return slug
+
+    # Nothing named it, so identify it by what it can do. Runs after the explicit headers above,
+    # which stay authoritative — hermes-safety sets x-client-name and should keep that label
+    # rather than being flattened into "hermes" by its toolbox.
+    _offered = _tool_names_in_body(body)
+    if _offered:
+        for _label, _need, _markers in _CLIENT_TOOL_FINGERPRINTS:
+            if len(_offered & _markers) >= _need:
+                return _label
+    if "hermes agent" in sys_text.lower() or "nous research" in sys_text.lower():
+        return "hermes"
 
     # Editor / IDE integrations
     ev = (h.get("editor-version") or "").lower()
@@ -12436,6 +16319,82 @@ def _detect_client_app(headers: dict | None, body: dict | None) -> str:
     return "unknown"
 
 
+def _body_system_text(body: dict | None) -> str:
+    """The system prompt as one string, whatever shape the client sent it in."""
+    if not isinstance(body, dict):
+        return ""
+    sys_field = body.get("system")
+    if isinstance(sys_field, str):
+        return sys_field
+    if isinstance(sys_field, list):
+        return " ".join(p.get("text", "") for p in sys_field
+                        if isinstance(p, dict) and isinstance(p.get("text"), str))
+    for m in (body.get("messages") or []):
+        if isinstance(m, dict) and m.get("role") == "system":
+            c = m.get("content")
+            if isinstance(c, str):
+                return c
+            if isinstance(c, list):
+                return " ".join(p.get("text", "") for p in c
+                                if isinstance(p, dict) and isinstance(p.get("text"), str))
+            break
+    return ""
+
+
+# Tools that only mean anything inside a windowed UI. Naming them beats matching a prefix:
+# "read_preview" and "read_file" share no useful pattern, and a prefix rule would have to guess.
+_WEB_SURFACE_TOOLS = frozenset({
+    "annotate_preview", "apply_layout", "close_preview", "close_terminal", "drive_preview",
+    "focus_pane", "open_preview", "read_preview", "read_terminal", "read_window_below",
+})
+
+
+def _detect_surface(headers: dict | None, body: dict | None) -> str | None:
+    """Which surface an agentic client was driven from: 'discord', 'cron', 'web' or 'cli'.
+
+    One client_app can front several execution contexts (hermes runs as a Discord bot, a
+    scheduled cron job, AND an interactive local session — same IP, same UA, same
+    x-client-name), so the client label alone can't answer "where did this session come
+    from". The context leaks into the request anyway: cron prompts announce there is no
+    user present, Discord sessions carry a guild/channel context block and discord tools,
+    local sessions offer file/exec tools without any of that. NULL when nothing matches —
+    an honest unknown beats a guessed label."""
+    h = {k.lower(): str(v) for k, v in (headers or {}).items()} if isinstance(headers, dict) else {}
+    v = (h.get("x-client-surface") or "").strip()
+    if v:  # caller-supplied wins, same contract as x-client-name
+        slug = re.sub(r"[^a-z0-9._-]+", "-", v.lower())[:24].strip("-")
+        if slug:
+            return slug
+    sys_text = _body_system_text(body)
+    tools = set()
+    if isinstance(body, dict):
+        for t in (body.get("tools") or []):
+            if isinstance(t, dict):
+                name = (t.get("function") or {}).get("name") or t.get("name")
+                if isinstance(name, str):
+                    tools.add(name)
+    if not sys_text and not tools:
+        return None
+    if re.search(r"running as a scheduled (cron job|task)", sys_text, re.I):
+        return "cron"
+    # A guild/channel context block means a live Discord session; the discord tools alone
+    # also imply one (DMs get the tools without the guild block).
+    if re.search(r"^\s*-?\s*Guild:\s*`?\d", sys_text, re.M) or \
+            not tools.isdisjoint({"discord", "discord_admin"}):
+        return "discord"
+    # A windowed host: panes, previews, layouts, in-page terminals. Checked BEFORE cli because
+    # the web toolbox is a SUPERSET of the CLI one — it carries execute_code and read_file too,
+    # so the cli rule matched it first and 1,103 requests from both surfaces were logged
+    # identically as "cli". Two markers rather than one: a single tool name could plausibly show
+    # up in some other client's toolbox, a pair of them could not.
+    if len(tools & _WEB_SURFACE_TOOLS) >= 2:
+        return "web"
+    # Local exec toolset with no discord anywhere → an interactive local/CLI session.
+    if {"execute_code", "read_file"} <= tools or {"read_file", "patch"} <= tools:
+        return "cli"
+    return None
+
+
 def _client_ip(request: Request) -> str | None:
     xff = request.headers.get("x-forwarded-for")
     if xff:
@@ -12496,6 +16455,38 @@ def _upstream_error_message(status: int | None, body_text: str | None) -> str | 
     if not msg:
         return None
     return f"upstream returned {status}: {str(msg)[:400]}"
+
+
+# Transport failures that mean "nothing answered". ReadTimeout is deliberately absent: that one
+# means the backend DID accept and is still thinking, and retrying it would put a second copy of
+# an expensive prefill on a box that is already busy.
+_RESTART_RETRYABLE = ("ConnectError", "ConnectTimeout", "ReadError",
+                      "RemoteProtocolError", "WriteError", "WriteTimeout")
+
+
+async def _wait_out_backend_restart(upstream: str | None, exc) -> bool:
+    """True once a fixed backend that just dropped us is serving again.
+
+    Only the fixed backends: Ollama and LM Studio load on demand, so a failure there is not a
+    restart to wait out. Provider.ready() does the waiting and already refuses to poll a
+    corpse — it consults died() from the second pass on, so a container that exited for good
+    fails fast while one docker is restarting gets its full minutes.
+    """
+    if not (_is_vllm(upstream) or upstream == "llamacpp"):
+        return False
+    if type(exc).__name__ not in _RESTART_RETRYABLE:
+        return False
+    prov = PROVIDERS.get(upstream or "")
+    if prov is None:
+        return False
+    try:
+        cfg = (load_rules_config().get("model_control") or {}).get("hold_for_restart") or {}
+        if not cfg.get("enabled", True):
+            return False
+        timeout = float(cfg.get("timeout_s") or 0)
+    except Exception:
+        return False
+    return await prov.ready(timeout or _vllm_ready_timeout())
 
 
 def _explain_upstream_error(exc, upstream: str | None, url: str | None,
@@ -12592,11 +16583,149 @@ def _redact_row(row: dict, viewer_ip: str | None, *, originator_ip_field: str = 
     return row
 
 
+# Every dialect a client has used here to say "think" or "don't", in the order they override
+# each other: a body carrying both reasoning_effort and an explicit enable_thinking meant the
+# latter, because it is the one the template actually reads.
+_THINK_LEVELS = {"minimal": "low", "low": "low", "medium": "medium", "high": "high"}
+
+
+def _thinking_intent(body) -> tuple[str | None, str | None, str | None]:
+    """What the client asked for: (effort, mode, source).
+
+    effort is the level when one was named ('low'/'medium'/'high'), mode is 'on' or 'off', and
+    source names the field that settled it — so a row can say *why* it was recorded that way
+    rather than leaving you to guess which of six dialects the client speaks. All three are
+    None when the request said nothing, which is the common case: most clients never mention
+    thinking and take whatever the model defaults to.
+    """
+    if not isinstance(body, dict):
+        return None, None, None
+    effort = mode = src = None
+
+    eff = body.get("reasoning_effort")
+    if eff is None and isinstance(body.get("reasoning"), dict):
+        eff = body["reasoning"].get("effort")
+    if eff is not None:
+        e = str(eff).strip().lower()
+        src = "reasoning_effort"
+        if e in ("none", "off"):
+            mode = "off"
+        elif e in _THINK_LEVELS:
+            effort, mode = _THINK_LEVELS[e], "on"
+        else:
+            mode = "on"
+
+    ctk = body.get("chat_template_kwargs")
+    et = body.get("enable_thinking")
+    if et is None and isinstance(ctk, dict):
+        et = ctk.get("enable_thinking")
+    if isinstance(et, bool):
+        mode, src = ("on" if et else "off"), "enable_thinking"
+
+    # Ollama's native field. Newer versions take a level here as well as a bool.
+    think = body.get("think")
+    if isinstance(think, bool):
+        mode, src = ("on" if think else "off"), "think"
+    elif isinstance(think, str) and think.strip().lower() in _THINK_LEVELS:
+        effort, mode, src = _THINK_LEVELS[think.strip().lower()], "on", "think"
+
+    t = body.get("thinking")
+    if isinstance(t, dict):
+        if t.get("type") == "disabled":
+            mode, src = "off", "thinking"
+        elif t.get("type") == "enabled":
+            b = t.get("budget_tokens") or 0
+            effort = "high" if b >= 8000 else "medium" if b >= 2000 else "low" if b > 0 else None
+            mode, src = "on", "thinking_budget"
+
+    # Qwen's in-band switches, which live in the prompt rather than the body.
+    last_user = ""
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        for m in reversed(msgs):
+            if isinstance(m, dict) and m.get("role") == "user":
+                c = m.get("content")
+                if isinstance(c, str):
+                    last_user = c
+                elif isinstance(c, list):
+                    last_user = " ".join(str(p.get("text") or "") for p in c if isinstance(p, dict))
+                break
+    if not last_user and isinstance(body.get("prompt"), str):
+        last_user = body["prompt"]
+    if last_user:
+        if re.search(r"/no_think\b", last_user):
+            mode, src = "off", "/no_think"
+        elif re.search(r"/think\b", last_user):
+            mode, src = "on", "/think"
+
+    return effort, mode, src
+
+
+def _resolve_tool_outcomes(conversation_id: str, body_json) -> int:
+    """Write the results carried by this request back onto the requests that asked for them.
+
+    A tool call and its outcome live in different requests: the model asks in turn N, the client
+    reports what happened in turn N+1. Nothing joined them, so the request list could show that
+    Edit had been called twelve times and never that all twelve failed with "String to replace
+    not found" — the reason it kept retrying was only visible by opening the *next* request's
+    body and reading the transcript by hand.
+
+    Matching is by tool_call_id, which is why the ids are stored rather than just the names.
+    Bounded to the recent history of one conversation: results reference calls from the turn
+    immediately before, and an unbounded scan would walk a 900-message transcript every request.
+    """
+    if not conversation_id or not isinstance(body_json, dict):
+        return 0
+    results = _tool_results_with_ids(body_json)
+    if not results:
+        return 0
+    by_id = {r["id"]: r for r in results}
+    updated = 0
+    try:
+        conn = db()
+        rows = conn.execute(
+            "SELECT id, tool_call_ids, tool_outcome FROM requests "
+            "WHERE conversation_id=? AND tool_call_ids IS NOT NULL "
+            "ORDER BY ts DESC LIMIT 12", (conversation_id,)).fetchall()
+        for row in rows:
+            if row["tool_outcome"] and row["tool_outcome"] != "pending":
+                continue                       # already resolved; do not rewrite history
+            try:
+                calls = json.loads(row["tool_call_ids"] or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            matched = [by_id[c["id"]] for c in calls
+                       if isinstance(c, dict) and c.get("id") in by_id]
+            if not matched:
+                continue
+            failed = [m for m in matched if not m["ok"]]
+            # "partial" is its own verdict: one failure among several calls is a different
+            # situation from every call failing, and flattening them would hide which.
+            outcome = ("ok" if not failed else
+                       "error" if len(failed) == len(matched) else "partial")
+            detail = [{"name": m["name"], "ok": m["ok"], "excerpt": m["excerpt"][:240]}
+                      for m in matched]
+            conn.execute("UPDATE requests SET tool_outcome=?, tool_outcome_detail=? WHERE id=?",
+                         (outcome, json.dumps(detail), row["id"]))
+            updated += 1
+        if updated:
+            conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"[tool_outcome] resolve failed: {type(e).__name__}: {e}")
+    return updated
+
+
 def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: str, body_text: str, body_json, model, is_stream: bool, upstream: str | None = None):
     conv_id = _conversation_id(body_json)
     turn = _turn_index(body_json)
     headers_dict = dict(request.headers)
     client_app = _detect_client_app(headers_dict, body_json if isinstance(body_json, dict) else None)
+    surface = _detect_surface(headers_dict, body_json if isinstance(body_json, dict) else None)
+    # Fingerprint before redacting, store only the fingerprint. The forwarded request is
+    # untouched — headers_dict is our copy for the log, not the one going upstream.
+    api_key_fp = _credential_fingerprint(headers_dict)
+    headers_dict = _redact_credential_headers(headers_dict)
     # Chars-based prompt-token estimate, persisted so the requests list can derive a cache
     # verdict (evaluated vs estimated) without re-parsing the body on every load.
     est = _estimate_prompt_tokens(body_json, 3.5) if isinstance(body_json, dict) else 0
@@ -12630,10 +16759,11 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     _url_imgs = any(k == "url" for (_i, _mt, k, _p) in _iter_request_images(body_json)) \
         if isinstance(body_json, dict) else False
     has_imgs = 1 if (imgs or _embedded_imgs or _url_imgs) else None
+    _effort, _think_mode, _think_src = _thinking_intent(body_json)
     conn = db()
     conn.execute(
-        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, upstream, est_prompt_tokens, has_images)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        """INSERT INTO requests (id, ts, method, path, upstream_url, request_headers, model, is_stream, client_ip, conversation_id, turn_index, client_app, surface, api_key_fp, upstream, est_prompt_tokens, has_images, reasoning_effort, thinking, thinking_src)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             req_id,
             time.time(),
@@ -12647,9 +16777,14 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
             conv_id,
             turn,
             client_app,
+            surface,
+            api_key_fp,
             upstream,
             est or None,
             has_imgs,
+            _effort,
+            _think_mode,
+            _think_src,
         ),
     )
     _blobs_upsert(conn, req_id,
@@ -12659,7 +16794,22 @@ def _save_pending(req_id: str, request: Request, full_path: str, upstream_url: s
     conn.close()
     # Seed live state with the estimate so the UI shows something immediately, even before
     # the upstream confirms the real input_tokens.
-    _LIVE_STREAMS[req_id] = {"prompt": None, "completion": None, "est_prompt": est or None}
+    #
+    # `stream` is recorded because a non-streaming request produces NO live text, ever: the
+    # body arrives in one aread() and streamer() — the only caller of _live_update_from_chunk —
+    # never runs. Without this flag the live pane cannot tell "streaming, nothing yet" from
+    # "nothing is coming", so it claimed to be live and rendered blank for the full 30s of
+    # every hindsight call. Absence of data and absence of streaming should not look alike.
+    _LIVE_STREAMS[req_id] = {"prompt": None, "completion": None, "est_prompt": est or None,
+                             "stream": bool(is_stream), "buf": ""}
+    # This request carries the outcomes of the calls the PREVIOUS one made. Resolving here, on
+    # the way in, is what closes the loop between a call and its result — they arrive one turn
+    # apart and nothing joined them before. Never allowed to fail a request: it is bookkeeping
+    # about a turn that has already finished.
+    try:
+        _resolve_tool_outcomes(conv_id, body_json)
+    except Exception as e:
+        print(f"[tool_outcome] {type(e).__name__}: {e}")
 
 
 _TOOL_ERROR_PATTERNS = (
@@ -12688,15 +16838,26 @@ def _is_tool_error(text) -> tuple[bool, str | None]:
             if j.get("error") or j.get("success") is False or j.get("isError"):
                 msg = j.get("error") if isinstance(j.get("error"), str) else (j.get("message") or json.dumps(j.get("error") or j)[:200])
                 return True, str(msg)[:240]
+            # A structured result carrying a payload and NO error field is a success, whatever
+            # words happen to appear inside it. read_file returning a Python module was filed as
+            # an error because the module contained "is required"; the payload key is the
+            # authoritative signal and beats sniffing the text it wraps.
+            if any(k in j for k in ("content", "output", "result", "data", "stdout")):
+                return False, None
     except (json.JSONDecodeError, TypeError):
         pass
     first_line = s.split("\n", 1)[0]
     fl_lower = first_line.lower()
     if fl_lower.startswith("error") or fl_lower.startswith("exception"):
         return True, first_line[:240]
-    s_lower = s.lower()
+    # Scanned over the OPENING of the result, not all of it. These patterns are ordinary English
+    # ("is required", "failed to") and scanning the whole blob flagged successful calls whose
+    # output merely contained them: a read_file returning a Python module, and a terminal
+    # returning diff output, were both filed as errors. A tool that failed says so at the top;
+    # a match three thousand characters into a file is the file, not a failure.
+    head = s[:400].lower()
     for pat in _TOOL_ERROR_PATTERNS:
-        if pat in s_lower:
+        if pat in head:
             return True, first_line[:240]
     return False, None
 
@@ -12772,6 +16933,125 @@ def _tool_results_in_body(body) -> list[tuple[str, str]]:
                     text = "Error: " + text
                 pairs.append((name, text))
     return pairs
+
+
+def _extract_tool_call_ids(response_body, stream_text) -> list[dict]:
+    """The calls a response made, as [{"id", "name"}] — the id being the join key.
+
+    _extract_tool_calls returns names only, which is enough to count what was invoked but not to
+    match a result back to the call that caused it: the result in the next request references
+    tool_call_id. Same three shapes it handles, kept separate rather than widened so its many
+    existing callers keep getting a plain list of names.
+    """
+    out: list[dict] = []
+    seen: set = set()
+
+    def add(tid, name):
+        if not tid or tid in seen:
+            return
+        seen.add(tid)
+        out.append({"id": str(tid), "name": str(name or "?")})
+
+    def from_choices(choices):
+        for c in choices or []:
+            if not isinstance(c, dict):
+                continue
+            for src in (c.get("message"), c.get("delta")):
+                if not isinstance(src, dict):
+                    continue
+                for tc in (src.get("tool_calls") or []):
+                    if isinstance(tc, dict):
+                        add(tc.get("id"), (tc.get("function") or {}).get("name"))
+
+    def from_anthropic(content):
+        for blk in content or []:
+            if isinstance(blk, dict) and blk.get("type") == "tool_use":
+                add(blk.get("id"), blk.get("name"))
+
+    for blob in (response_body, stream_text):
+        if not blob:
+            continue
+        for raw in str(blob).splitlines() or [str(blob)]:
+            line = raw[6:] if raw.startswith("data: ") else raw
+            line = line.strip()
+            if not line or line == "[DONE]" or not line.startswith("{"):
+                continue
+            try:
+                j = json.loads(line)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            from_choices(j.get("choices"))
+            if isinstance(j.get("message"), dict):
+                from_choices([{"message": j["message"]}])
+            if isinstance(j.get("content"), list):
+                from_anthropic(j["content"])
+            # Streamed Anthropic: the id arrives on the block that opens the call.
+            if j.get("type") == "content_block_start":
+                cb = j.get("content_block") or {}
+                if cb.get("type") == "tool_use":
+                    add(cb.get("id"), cb.get("name"))
+    return out
+
+
+def _tool_results_with_ids(body) -> list[dict]:
+    """Results carried by a REQUEST body, as [{"id", "name", "ok", "excerpt"}].
+
+    The mirror of _extract_tool_call_ids: this reads what came back, that one reads what was
+    asked. Both wire shapes again — OpenAI role="tool" with tool_call_id, Anthropic tool_result
+    blocks with tool_use_id.
+    """
+    if not isinstance(body, dict):
+        return []
+    msgs = body.get("messages") or []
+    id_to_name: dict = {}
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        for tc in (m.get("tool_calls") or []):
+            if isinstance(tc, dict) and tc.get("id"):
+                id_to_name[tc["id"]] = (tc.get("function") or {}).get("name") or "?"
+        if m.get("role") == "assistant" and isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict) and blk.get("type") == "tool_use" and blk.get("id"):
+                    id_to_name[blk["id"]] = blk.get("name") or "?"
+
+    def _text(v):
+        if isinstance(v, list):
+            return chr(10).join(p.get("text", "") for p in v if isinstance(p, dict))
+        if v is None:
+            return ""
+        if isinstance(v, str):
+            return v
+        try:
+            return json.dumps(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    out: list[dict] = []
+    for m in msgs:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "tool" and m.get("tool_call_id"):
+            content = _text(m.get("content"))
+            err, excerpt = _is_tool_error(content)
+            out.append({"id": str(m["tool_call_id"]),
+                        "name": id_to_name.get(m["tool_call_id"]) or m.get("name") or "?",
+                        "ok": not err, "excerpt": excerpt or ""})
+        elif m.get("role") == "user" and isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if not isinstance(blk, dict) or blk.get("type") != "tool_result":
+                    continue
+                tid = blk.get("tool_use_id")
+                if not tid:
+                    continue
+                content = _text(blk.get("content"))
+                err, excerpt = _is_tool_error(content)
+                # Anthropic states it outright; trust that over sniffing the text.
+                if blk.get("is_error"):
+                    err, excerpt = True, (excerpt or content[:240])
+                out.append({"id": str(tid), "name": id_to_name.get(tid) or "?",
+                            "ok": not err, "excerpt": excerpt or ""})
+    return out
 
 
 def _extract_tool_calls(response_body, stream_text):
@@ -12931,6 +17211,23 @@ def _anthropic_to_openai_request(body: dict) -> dict:
             out[k] = body[k]
     if body.get("stop_sequences") is not None:
         out["stop"] = body["stop_sequences"]
+    # Anthropic states thinking as a block; the OpenAI side wants reasoning_effort. Without
+    # this the field was silently dropped, so a Claude-shaped client asking for no thinking got
+    # it anyway: measured on gemma4, time to the first character of the answer was 15.80s with
+    # thinking disabled against 0.97s once the request actually said reasoning_effort=none.
+    # Every client on /v1/messages — Claude Code, the Anthropic SDK, opencode — had no working
+    # way to turn it off.
+    think = body.get("thinking")
+    if isinstance(think, dict):
+        kind = str(think.get("type") or "").lower()
+        if kind == "disabled":
+            out["reasoning_effort"] = "none"
+        elif kind == "enabled":
+            # budget_tokens is the only dial Anthropic gives, so it maps onto the three levels
+            # the OpenAI side understands rather than being passed through as a token count.
+            budget = think.get("budget_tokens") or 0
+            out["reasoning_effort"] = ("high" if budget >= 8000
+                                       else "medium" if budget >= 2000 else "low")
     # Ask upstream to include usage in stream chunks so back-translation has accurate counts.
     if out.get("stream"):
         out["stream_options"] = {"include_usage": True}
@@ -13083,6 +17380,13 @@ def _openai_to_anthropic_response(o: dict, fallback_model: str | None = None) ->
     choice = (o.get("choices") or [{}])[0]
     msg = choice.get("message") or {}
     content_blocks: list[dict] = []
+    # Reasoning first, because Anthropic orders thinking ahead of the answer it produced.
+    # Dropping it was silent data loss: a gemma4 reply that was 4,888 characters of reasoning
+    # and zero characters of content reached claude-code as a well-formed EMPTY turn, after a
+    # hundred seconds of generation, and read as the model giving up for no reason.
+    reasoning = msg.get("reasoning") or msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip() and _bridge_translates_reasoning():
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
     text = msg.get("content")
     if isinstance(text, str) and text:
         content_blocks.append({"type": "text", "text": text})
@@ -13126,6 +17430,18 @@ def _openai_to_anthropic_response(o: dict, fallback_model: str | None = None) ->
     }
 
 
+def _bridge_translates_reasoning() -> bool:
+    """Whether the bridge turns upstream reasoning into Anthropic thinking blocks.
+
+    On by default because the alternative is silent data loss — the translator knew only `text`
+    and `tool_use`, so a reply made entirely of reasoning arrived as an empty turn. A flag rather
+    than a constant because it changes what block types a client sees, and any client that
+    cannot cope with `thinking` needs a way back that does not require a deploy.
+    """
+    cfg = load_rules_config().get("protocol_bridge") or {}
+    return bool(cfg.get("translate_reasoning", True))
+
+
 class IncrementalAnthropicBridge:
     """Stateful, chunk-at-a-time translator that converts an OpenAI-format SSE stream into
     Anthropic-format SSE events. Unlike the batch translator below, this one emits events
@@ -13150,13 +17466,14 @@ class IncrementalAnthropicBridge:
         self._finished = False
         # Block state — Anthropic protocol requires a strict open/close pattern.
         self._cur_block_idx = -1
-        self._cur_block_type: str | None = None  # 'text' | 'tool_use' | None
+        self._cur_block_type: str | None = None  # 'text' | 'thinking' | 'tool_use' | None
         # Tool-call accumulator: openai-tc-index → {block_idx, id, name, started}
         self._tool_calls: dict = {}
         self._next_block_idx = 0
         self._finish_reason: str | None = None
         self._input_tokens = 0
         self._output_tokens = 0
+        self._translate_reasoning = _bridge_translates_reasoning()
 
     @staticmethod
     def _event(name: str, payload: dict) -> str:
@@ -13196,6 +17513,18 @@ class IncrementalAnthropicBridge:
         }))
         self._cur_block_type = "text"
 
+    def _open_thinking_block(self, out: list):
+        if self._cur_block_type == "thinking":
+            return
+        self._close_current_block(out)
+        self._cur_block_idx = self._next_block_idx
+        self._next_block_idx += 1
+        out.append(self._event("content_block_start", {
+            "type": "content_block_start", "index": self._cur_block_idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        }))
+        self._cur_block_type = "thinking"
+
     def _process_chunk(self, j: dict, out: list):
         if isinstance(j.get("model"), str) and j["model"]:
             self.model = j["model"]
@@ -13206,6 +17535,13 @@ class IncrementalAnthropicBridge:
             if c.get("finish_reason"):
                 self._finish_reason = c["finish_reason"]
             d = c.get("delta") or {}
+            reasoning = d.get("reasoning") or d.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning and self._translate_reasoning:
+                self._open_thinking_block(out)
+                out.append(self._event("content_block_delta", {
+                    "type": "content_block_delta", "index": self._cur_block_idx,
+                    "delta": {"type": "thinking_delta", "thinking": reasoning},
+                }))
             content = d.get("content")
             if isinstance(content, str) and content:
                 self._open_text_block(out)
@@ -13314,6 +17650,7 @@ def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: 
     text = openai_chunks.decode("utf-8", errors="replace") if isinstance(openai_chunks, bytes) else str(openai_chunks)
 
     accum_text = ""
+    accum_reasoning = ""
     tcs: dict[int, dict] = {}  # index -> {id, name, args}
     tool_index_order: list[int] = []
     finish_reason: str | None = None
@@ -13338,6 +17675,9 @@ def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: 
             d = c.get("delta") or {}
             if isinstance(d.get("content"), str):
                 accum_text += d["content"]
+            _r = d.get("reasoning") or d.get("reasoning_content")
+            if isinstance(_r, str):
+                accum_reasoning += _r
             for tc in (d.get("tool_calls") or []):
                 idx = tc.get("index", 0)
                 if idx not in tcs:
@@ -13380,6 +17720,17 @@ def _openai_sse_to_anthropic_events(openai_chunks: bytes | str, fallback_model: 
     })
 
     block_idx = 0
+    if accum_reasoning.strip() and _bridge_translates_reasoning():
+        evt("content_block_start", {
+            "type": "content_block_start", "index": block_idx,
+            "content_block": {"type": "thinking", "thinking": ""},
+        })
+        evt("content_block_delta", {
+            "type": "content_block_delta", "index": block_idx,
+            "delta": {"type": "thinking_delta", "thinking": accum_reasoning},
+        })
+        evt("content_block_stop", {"type": "content_block_stop", "index": block_idx})
+        block_idx += 1
     if accum_text:
         evt("content_block_start", {
             "type": "content_block_start",
@@ -13494,6 +17845,15 @@ async def _run_shadow(primary_id: str, primary_body: dict, primary_path: str,
                 evaluate_ollama_options(shadow_body, shadow_router_ctx)
             except Exception:
                 pass
+            # ...and then carry num_ctx the only way the OpenAI-compat endpoint respects it.
+            # Injecting the option alone was a no-op here: Ollama's /v1 drops num_ctx, which is
+            # the entire reason the derived model exists, so a per_model pin configured for a
+            # shadow target silently did nothing and the shadow loaded at the server default.
+            if target["upstream_label"] == "ollama":
+                try:
+                    await apply_ollama_ctx_model(shadow_body, shadow_router_ctx)
+                except Exception as e:
+                    print(f"[shadow] ctx model swap failed: {type(e).__name__}: {e}")
             # Strip per-request volatile prefix so llama.cpp's KV cache survives between turns.
             # (For translated bodies _anthropic_to_openai_request already did this; this catches
             # passthrough OpenAI-shape shadows.)
@@ -13501,6 +17861,34 @@ async def _run_shadow(primary_id: str, primary_body: dict, primary_path: str,
                 _strip_volatile_prefix(shadow_body)
             except Exception:
                 pass
+
+        # The same fit gate the primary request passes. A shadow is best-effort for the CLIENT,
+        # never for the box: Ollama sizes its server at OLLAMA_CONTEXT_LENGTH × OLLAMA_NUM_PARALLEL
+        # — 262,144 × 4 on this machine — and a model that cannot hold that window does not fail
+        # the request, it takes the whole Ollama service down with it. Three shadow runs of a
+        # 2.5 GB model killed it three times. Refusing costs a comparison; sending cost every
+        # other model resident at the time.
+        if target["upstream_label"] == "ollama":
+            _sm = str(shadow_body.get("model") or "")
+            try:
+                _refusal = await _ollama_fit_refusal(
+                    _sm, pin=_effective_num_ctx(_sm, shadow_body))
+            except Exception:
+                _refusal = None
+            if _refusal:
+                conn = db()
+                conn.execute(
+                    """INSERT INTO requests (id, ts, method, path, upstream_url, model,
+                                             is_stream, client_ip, conversation_id, turn_index,
+                                             client_app, shadow_of, status, error)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (shadow_id, time.time(), "POST", "/" + shadow_path,
+                     f"{target['upstream_base']}/{shadow_path}", _sm, 0, viewer_ip,
+                     _conversation_id(primary_body), _turn_index(primary_body), "shadow",
+                     primary_id, 0, f"shadow not sent: {_refusal}"))
+                conn.commit()
+                conn.close()
+                return
 
         upstream_url = f"{target['upstream_base']}/{shadow_path}"
         body_text = json.dumps(shadow_body)
@@ -14210,6 +18598,76 @@ def _extract_ttft_ms(body_text: str | None, stream_text: str | None) -> float | 
     return None
 
 
+# Special tokens a chat template should have consumed. When one reaches the wire the template
+# has lost its place, and what follows is usually nothing at all.
+_CONTROL_TOKEN_RE = re.compile(r"<\|[a-z0-9_]+\|>", re.I)
+
+
+def _extract_finish_reason(stream_text: str | None) -> str | None:
+    """The finish reason an SSE stream reported, if it reported one at all.
+
+    A stream that ends without one did not finish — it stopped. That is the difference between
+    a model choosing to say nothing and a connection dying halfway through a sentence.
+    """
+    for line in (stream_text or "").splitlines():
+        raw = line[6:] if line.startswith("data: ") else line
+        raw = raw.strip()
+        if not raw or raw == "[DONE]" or not raw.startswith("{"):
+            continue
+        try:
+            j = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        for ch in (j.get("choices") or []):
+            if ch.get("finish_reason"):
+                return str(ch["finish_reason"])
+        if j.get("done_reason"):
+            return str(j["done_reason"])
+        if j.get("type") == "message_delta":
+            sr = (j.get("delta") or {}).get("stop_reason")
+            if sr:
+                return str(sr)
+    return None
+
+
+def _response_delivered_chars(body_text: str | None, stream_text: str | None) -> int:
+    """How much the client actually received: content plus reasoning, across every shape.
+
+    Counting only `content` would call a thinking model's reply empty when the client did get
+    something, and counting tokens would call it non-empty when the client got nothing — the
+    upstream bills for output it then discards.
+    """
+    # A control token is protocol debris, not an answer. The one production stream that died
+    # mid-flight had emitted exactly "<|channel|>" into its reasoning field and nothing else,
+    # which would otherwise read as eleven characters successfully delivered.
+    def _real(text: str) -> int:
+        return len(_CONTROL_TOKEN_RE.sub("", text or "").strip())
+
+    total = 0
+    for blob in (stream_text or "", body_text or ""):
+        for line in blob.splitlines():
+            raw = line[6:] if line.startswith("data: ") else line
+            raw = raw.strip()
+            if not raw or raw == "[DONE]" or not raw.startswith("{"):
+                continue
+            try:
+                j = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            for ch in (j.get("choices") or []):
+                d = ch.get("delta") or ch.get("message") or {}
+                total += _real(d.get("content"))
+                total += _real(d.get("reasoning") or d.get("reasoning_content"))
+            m = j.get("message")
+            if isinstance(m, dict):
+                total += _real(m.get("content"))
+                total += _real(m.get("thinking"))
+            if j.get("type") == "content_block_delta":
+                dd = j.get("delta") or {}
+                total += _real(dd.get("text")) + _real(dd.get("thinking"))
+    return total
+
+
 def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | None,
                  stream_text: str | None, elapsed_ms: float, error: str | None,
                  ttft_ms: float | None = None):
@@ -14225,11 +18683,45 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
         _tools = _extract_tool_calls(body_text, stream_text)
     except Exception:
         _tools = []
+    # Did anything actually reach the client? Billed tokens with nothing delivered is a real
+    # failure that every other signal reports as success, so it gets recorded rather than
+    # inferred later from blobs.
+    _empty = None
+    _inflight = None
+    try:
+        if status and 200 <= status < 300 and not _tools:
+            _delivered = _response_delivered_chars(body_text, stream_text)
+            # Two different failures wear the same face — a 2xx that gave the client nothing.
+            #
+            #   billed:  the upstream counted tokens and sent no content, reasoning or tool call
+            #   died:    the stream stopped mid-flight, with no [DONE], no usage and no
+            #            finish_reason, so nothing was billed either
+            #
+            # The second is the one seen in production and the first version of this check
+            # missed it, because it required completion_tokens > 0 and a dead stream never gets
+            # a usage block. Observed 3 times in 24 hours across gemma4 AND nemotron — the last
+            # thing one of them emitted was the control token <|channel|> in its reasoning
+            # field, after which the stream simply ended.
+            _died = (bool(stream_text) and "[DONE]" not in stream_text
+                     and not _extract_finish_reason(stream_text))
+            if _delivered == 0 and ((ct or 0) > 0 or _died):
+                _empty = 1
+                _inflight = len(_INFLIGHT_REQUESTS)
+                print(f"[empty_output] {req_id} delivered nothing "
+                      f"({'stream died mid-flight' if _died else f'billed {ct} tokens'}, "
+                      f"{_inflight} in flight)")
+    except Exception:
+        pass
+    try:
+        _call_ids = _extract_tool_call_ids(body_text, stream_text)
+    except Exception:
+        _call_ids = []
     conn = db()
     conn.execute(
         """UPDATE requests
            SET status=?, response_headers=?, duration_ms=?, error=?,
-               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?, tool_calls=?
+               prompt_tokens=?, completion_tokens=?, total_tokens=?, ttft_ms=?, tool_calls=?,
+               empty_output=?, inflight_at_finish=?, tool_call_ids=?, tool_outcome=?
            WHERE id=?""",
         (
             status,
@@ -14238,6 +18730,13 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
             error,
             pt, ct, tt, ttft_ms,
             json.dumps(_tools) if _tools else None,
+            _empty,
+            _inflight,
+            # The calls this turn made, with their ids. "pending" until the client reports back
+            # in its next request — a turn stuck on pending means the agent walked away from a
+            # call it asked for, which is worth seeing on its own.
+            json.dumps(_call_ids) if _call_ids else None,
+            "pending" if _call_ids else None,
             req_id,
         ),
     )
@@ -14247,7 +18746,13 @@ def _save_finish(req_id: str, status: int, resp_headers: dict, body_text: str | 
     conn.commit()
     conn.close()
     _LIVE_STREAMS.pop(req_id, None)
-    _INFLIGHT_REQUESTS.pop(req_id, None)
+    _gone = _INFLIGHT_REQUESTS.pop(req_id, None)
+    # Finalizing the row must not strand the socket: whichever path got here, if the response
+    # is still open this is the last moment anything holds a reference to it.
+    if _gone is not None:
+        _resp = _gone.get("upstream_resp")
+        if _resp is not None and not getattr(_resp, "is_closed", True):
+            _ORPHANED_RESPONSES.append(_resp)
 
 
 @app.api_route(
@@ -14304,12 +18809,23 @@ async def proxy(full_path: str, request: Request):
     body_json = None
     model = None
     is_stream = False
+    qualified_upstream = None      # set when the client named "model/backend"
     if body_text:
         try:
             body_json = json.loads(body_text)
             if isinstance(body_json, dict):
                 model = body_json.get("model")
                 is_stream = bool(body_json.get("stream"))
+                # A model picked from /v1/models may be qualified as "name/backend", which is how
+                # the catalogue distinguishes the same model served by two backends. Unqualify it
+                # here, before routing or auditing sees it, and remember the backend it named so
+                # the request goes where the client chose.
+                _bare, _qual_up = _split_qualified_model(str(model or ""))
+                if _qual_up:
+                    model = _bare
+                    body_json["model"] = _bare
+                    body_text = json.dumps(body_json)
+                    qualified_upstream = _qual_up
         except json.JSONDecodeError:
             pass
 
@@ -14395,8 +18911,7 @@ async def proxy(full_path: str, request: Request):
     # both Ollama and LM Studio speak the same /v1 shape, so no body translation is needed.
     # "anthropic" is deliberately NOT a target: forwarding an OpenAI-shape body there without
     # the protocol bridge (which only goes anthropic→ollama) would produce 400s.
-    _UPSTREAM_BASES = {"ollama": OLLAMA_URL, "lmstudio": LMSTUDIO_URL, "vllm": VLLM_URL,
-                       "llamacpp": LLAMACPP_URL}
+    _UPSTREAM_BASES = {n: p.base_url for n, p in PROVIDERS.items()}
     # x-proxy-upstream forces the backend directly, without needing a routing rule. Same
     # motivation as x-proxy-no-router: benchmark the engine you meant to benchmark.
     # Kept OUT of `rewrite`: that dict is the model_router verdict and downstream audit code
@@ -14405,6 +18920,20 @@ async def proxy(full_path: str, request: Request):
     _pin_upstream = (request.headers.get("x-proxy-upstream") or "").strip().lower()
     if _pin_upstream not in _UPSTREAM_BASES:
         _pin_upstream = ""
+    # "model/backend" from the catalogue is as explicit as the header, and loses to it only
+    # because a header is set deliberately per request.
+    if not _pin_upstream and qualified_upstream in _UPSTREAM_BASES:
+        _pin_upstream = qualified_upstream
+    # Nothing explicit said where this goes, and no rule matched. If exactly one backend serves
+    # the name, send it there rather than to the path default, which would 404 on a model it has
+    # never heard of. Explicit pins above always win; an ambiguous name is left alone so the
+    # qualified form stays the way to choose.
+    if (not _pin_upstream and not (rewrite or {}).get("upstream")
+            and isinstance(body_json, dict) and body_json.get("model")
+            and not _is_ollama_native_only(full_path)):
+        _home = await _backend_serving(str(body_json.get("model")))
+        if _home and _home != upstream_label and _home in _UPSTREAM_BASES:
+            _pin_upstream = _home
     _want_upstream = _pin_upstream or ((rewrite or {}).get("upstream") or "")
     # Even an explicit x-proxy-upstream cannot make another backend answer /api/show.
     if _is_ollama_native_only(full_path):
@@ -14432,26 +18961,134 @@ async def proxy(full_path: str, request: Request):
             except Exception:
                 pass
 
+    # backend_fit: refuse rather than forward a request that would OOM the backend. Checked
+    # here, after routing has settled which model and upstream this is actually going to, and
+    # before a single byte is sent.
+    _fit_cfg = load_rules_config().get("backend_fit") or {}
+    if (_fit_cfg.get("enabled", True) and isinstance(body_json, dict)
+            and upstream_label in [str(u).lower() for u in (_fit_cfg.get("upstreams") or ["ollama"])]
+            and full_path.startswith(("v1/chat", "v1/completions", "api/chat", "api/generate"))):
+        # A native /api/chat request keeps the model it named and carries its own num_ctx;
+        # only the OpenAI-compat path gets swapped for a context-pinned derivative. Price each
+        # for the window it will actually load at.
+        _fit_model = str(body_json.get("model") or "")
+        # Native /api/chat carries num_ctx to Ollama itself; the OpenAI path needs the swap, and
+        # either way the window is whatever this request will really load with.
+        _pin = (_body_num_ctx(body_json) if full_path.startswith("api/")
+                else _effective_num_ctx(_fit_model, body_json))
+        _fit_refusal = await _ollama_fit_refusal(_fit_model, pin=_pin)
+        if _fit_refusal:
+            # Try to make room before refusing. Re-checked afterwards rather than assumed:
+            # stopping a container is not a promise that what is left is enough.
+            _owns = (request.headers.get("x-proxy-evict") or "").strip().lower() in (
+                "1", "true", "yes")
+            # Would it fit on an empty machine? If not, stopping things is pure loss.
+            _mem_all = _mem_snapshot() or {}
+            _hopeless = await _ollama_fit_refusal(
+                _fit_model, assume_avail_mb=(_mem_all.get("total_mb") or 0),
+                pin=_pin) is not None
+            _why_not = await _evict_for_fit(_fit_refusal, _fit_model, caller_owns=_owns,
+                                            _impossible=_hopeless, pin=_pin)
+            if _why_not is None:
+                _OLLAMA_FIT_CACHE.pop((_fit_model, _pin or 0), None)
+                _fit_refusal = await _ollama_fit_refusal(_fit_model, pin=_pin)
+            elif _fit_refusal:
+                _fit_refusal += f" (not evicted: {_why_not})"
+        if _fit_refusal:
+            _save_gate(req_id, {"verdict": "block", "rule": "backend_fit",
+                                "reason": _fit_refusal, "details": {"model": body_json.get("model"),
+                                                                    "upstream": upstream_label}})
+            elapsed = (time.perf_counter() - start) * 1000
+            _body = json.dumps({"error": {"message": _fit_refusal, "type": "insufficient_memory",
+                                          "code": "backend_fit"}})
+            _save_finish(req_id, 503, {"content-type": "application/json"}, _body, None,
+                         elapsed, "backend_fit: refused before forwarding")
+            return Response(content=_body.encode(), status_code=503,
+                            media_type="application/json",
+                            headers={"x-proxy-rule": "backend_fit"})
+
+    # Auto-load (opt-in): a request for a model on a stopped backend or the other vLLM twin
+    # starts what it needs and waits, Ollama-style, evicting only when it doesn't fit.
+    if (isinstance(body_json, dict) and body_json.get("model")
+            and (_is_vllm(upstream_label) or upstream_label == "llamacpp")
+            and full_path.startswith(("v1/chat", "v1/completions"))):
+        _al_err = await _ensure_model_served(str(body_json["model"]), upstream_label)
+        if _al_err:
+            return JSONResponse({"error": _al_err["error"], "auto_load": True},
+                                status_code=int(_al_err.get("status", 503)))
+
     # Per-model quirk thinking control (see DEFAULT_MODEL_QUIRKS / model_quirks.json). Some models
     # need thinking managed via chat_template_kwargs.enable_thinking because they ignore the OpenAI
     # reasoning_effort knob (e.g. Ornith). The quirk says whether to force thinking off, or default
     # it off but let reasoning_effort high/medium opt in. A client that set enable_thinking itself
     # is left untouched.
     ornith_think = None
+    # Tracked separately from ornith_think because it feeds body_mutated below. Without it a
+    # request whose ONLY change was the thinking quirk kept the client's original bytes and the
+    # quirk silently did nothing — which is how gemma4 went on thinking in production: the
+    # catch-all router rewrite happened to set body_mutated, so it worked by luck rather than
+    # by wiring, and would have stopped the moment that rule changed.
+    think_quirk_applied = False
     _qmodel = str(body_json.get("model") or "") if isinstance(body_json, dict) else ""
     _quirk = _model_quirk(_qmodel) or {}
     _tmode = _quirk.get("thinking")
-    if _tmode in ("force_off", "default_off_optin"):
-        ctk = body_json.get("chat_template_kwargs")
-        if not isinstance(ctk, dict):
-            ctk = {}
-        if "enable_thinking" not in ctk:
-            want = False
-            if _tmode == "default_off_optin":
-                want = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
-            ctk["enable_thinking"] = want
-            body_json["chat_template_kwargs"] = ctk
-            ornith_think = want
+    # Which knob actually turns thinking off differs by engine, and using the wrong one fails
+    # silently — the request is accepted, the field ignored, and the model thinks anyway.
+    # Measured on Ollama 0.32.13 with gemma4:26b, same question, max_tokens=200:
+    #   no knob                        -> 0 chars of content, 918 of reasoning, budget exhausted
+    #   chat_template_kwargs           -> 0 chars of content, 861 of reasoning  (ignored outright)
+    #   reasoning_effort="none"        -> 175 chars of content, 0 reasoning, 32 tokens
+    # The first two are the same answer: nothing the client can use. vLLM and LM Studio read
+    # chat_template_kwargs, Ollama's /v1 reads reasoning_effort, so the quirk names its lever.
+    _rctl = str(_quirk.get("reasoning_control") or "chat_template_kwargs.enable_thinking")
+    def _apply_think_quirk():
+        """Set the thinking knob on whatever body is about to go upstream.
+
+        Called again after the protocol bridge, because that translation builds a NEW dict from
+        the Anthropic body and carries only the fields it knows about — so anything set here
+        beforehand is discarded. That is what happened to gemma4: the quirk fired, the bridge
+        threw the result away, and every claude-code turn kept thinking. Idempotent, so calling
+        it twice on a non-bridged request changes nothing.
+        """
+        nonlocal ornith_think, think_quirk_applied
+        if _tmode not in ("force_off", "default_off_optin") or not isinstance(body_json, dict):
+            return
+        want_think = False
+        if _tmode == "default_off_optin":
+            want_think = str(body_json.get("reasoning_effort") or "").lower() in ("high", "medium")
+        if _rctl == "reasoning_effort":
+            # Only when the client said nothing: an explicit reasoning_effort is the caller
+            # asking for a specific budget, and overriding it would be the proxy deciding.
+            if not str(body_json.get("reasoning_effort") or "").strip():
+                body_json["reasoning_effort"] = "none"
+                ornith_think = False
+                think_quirk_applied = True
+        else:
+            ctk = body_json.get("chat_template_kwargs")
+            if not isinstance(ctk, dict):
+                ctk = {}
+            if "enable_thinking" not in ctk:
+                ctk["enable_thinking"] = want_think
+                body_json["chat_template_kwargs"] = ctk
+                ornith_think = want_think
+                think_quirk_applied = True
+
+    _apply_think_quirk()
+    if ornith_think is not None:
+        # The row already holds what the client asked for; this is the only place that
+        # knows what it actually got. The stored body is the client's original, so
+        # without this the audit would show "nothing requested" for a model the proxy
+        # had just silently switched off.
+        try:
+            _conn = db()
+            _conn.execute(
+                "UPDATE requests SET thinking=?, thinking_src=? WHERE id=?",
+                ("on" if ornith_think else "off", f"quirk:{_tmode}", req_id),
+            )
+            _conn.commit()
+            _conn.close()
+        except Exception:
+            pass
     # system_nudge: some reasoning-trained models (Ornith) narrate their reasoning in the *content*
     # even with the <think> block disabled. A short system-prompt instruction is the only lever
     # that curbs that (the thinking toggle can't — it's not in a think block). Appended, not replaced.
@@ -14463,8 +19100,15 @@ async def proxy(full_path: str, request: Request):
         _inject_system_reminder(body_json, str(_nudge))
 
     # Protocol bridge: when an Anthropic-shape request is routed (via model_router) to a
-    # non-Claude model, translate body to OpenAI shape and route to OLLAMA_URL. Response
-    # gets translated back on the way out (see streaming/non-streaming branches below).
+    # non-Claude model, translate body to OpenAI shape and route to whichever OpenAI-compatible
+    # backend the router named. Response gets translated back on the way out (see
+    # streaming/non-streaming branches below).
+    #
+    # The destination used to be hardwired to OLLAMA_URL, which quietly outranked the router:
+    # pointing the catch-all at a vLLM-served model moved every client except this one, and
+    # claude-code — the only client that speaks Anthropic, and the one whose lost tool calls
+    # motivated the move — kept being sent to Ollama, where that model name does not exist.
+    # It answered 404 on every request while /v1/chat/completions worked perfectly.
     bridge_active = False
     bridge_original_model: str | None = None
     _bridge_cfg = load_rules_config().get("protocol_bridge") or {}
@@ -14476,8 +19120,17 @@ async def proxy(full_path: str, request: Request):
         bridge_original_model = body_json.get("model")
         body_json = _anthropic_to_openai_request(body_json)
         bridge_active = True
-        upstream_label = "ollama"
-        upstream_base = OLLAMA_URL
+        # The translation above discards anything the thinking quirk set on the Anthropic body,
+        # so it has to run again on the OpenAI-shape body that actually goes upstream.
+        _apply_think_quirk()
+        # Ollama remains the default so nothing changes for an unrouted request. "anthropic" is
+        # never a valid target: the translation only runs one way, so sending an OpenAI-shape
+        # body back to Anthropic would 400.
+        _bridge_up = ((request.headers.get("x-proxy-upstream") or "").strip().lower()
+                      or str((rewrite or {}).get("upstream") or "").lower())
+        _bridge_base = _UPSTREAM_BASES.get(_bridge_up) if _bridge_up != "anthropic" else None
+        upstream_label = _bridge_up if _bridge_base else "ollama"
+        upstream_base = _bridge_base or OLLAMA_URL
         full_path = "v1/chat/completions"
         upstream_url = f"{upstream_base}/{full_path}"
         if request.url.query:
@@ -14503,6 +19156,20 @@ async def proxy(full_path: str, request: Request):
 
     options_inject = (evaluate_ollama_options(body_json, router_ctx)
                       if isinstance(body_json, dict) and upstream_label != "anthropic" else None)
+    # num_ctx is the one option the OpenAI-compat endpoint drops on the floor, so it is carried
+    # by a derived model instead. Runs right after the injection whose promise it keeps, and
+    # before the overflow guard so that guard sees the window the request will really get.
+    ctx_swap = None
+    if isinstance(body_json, dict) and upstream_label == "ollama":
+        try:
+            ctx_swap = await apply_ollama_ctx_model(body_json, router_ctx)
+        except Exception as e:                       # never fail a request over a tuning knob
+            print(f"[ollama_options] ctx model swap failed: {type(e).__name__}: {e}")
+        if ctx_swap:
+            options_inject = dict(options_inject or {})
+            options_inject.setdefault("applied", {})["num_ctx"] = ctx_swap["num_ctx"]
+            options_inject.setdefault("sources", []).append(
+                f"ctx_model:{ctx_swap['from']}->{ctx_swap['to']}")
     # tool_pruner runs after model/options choice, before overflow guard, so pruning shrinks
     # the token estimate the overflow guard sees.
     pruned = evaluate_tool_pruner(body_json, router_ctx) if isinstance(body_json, dict) else None
@@ -14547,7 +19214,7 @@ async def proxy(full_path: str, request: Request):
                   if isinstance(body_json, dict) else None)
     compaction_reminder_injected = False
     if compaction and compaction.get("action") == "system_reminder":
-        compaction_reminder_injected = _inject_system_reminder(body_json, compaction.get("text") or "")
+        compaction_reminder_injected = _inject_trailing_reminder(body_json, compaction.get("text") or "")
         if compaction_reminder_injected:
             _save_gate(req_id, {
                 "verdict": "rewrite",
@@ -14582,12 +19249,33 @@ async def proxy(full_path: str, request: Request):
             _so["include_usage"] = True
             usage_injected = True
 
+    # output_budget: clamp an oversized max_tokens reservation (see the rule for the incident).
+    # Applied after the bridge, so the Anthropic max_tokens that has been translated onto the
+    # OpenAI body is the one clamped rather than a value the translation would discard.
+    output_clamped = None
+    _ob = load_rules_config().get("output_budget") or {}
+    if (_ob.get("enabled") and isinstance(body_json, dict)
+            and upstream_label not in ("anthropic",)):
+        _cap = int(_ob.get("max_tokens", 8192) or 8192)
+        try:
+            _want = int(body_json.get("max_tokens") or 0)
+        except (TypeError, ValueError):
+            _want = 0
+        if _want > _cap:
+            body_json["max_tokens"] = _cap
+            output_clamped = {"from": _want, "to": _cap}
+
     body_mutated = bool(
         rewrite or options_inject or bridge_active or tool_injection_active
         or compaction_reminder_injected
         or (pruned and pruned.get("action") == "prune")
         or (overflow and overflow.get("action") in ("bump", "trim"))
-        or ctx_capped or usage_injected
+        or ctx_capped or usage_injected or think_quirk_applied or output_clamped
+        # Stripping the "/backend" selector edits body_json, and without saying so here the
+        # ORIGINAL bytes go upstream — the engine then sees a model name it does not serve.
+        # Third time this ordering has bitten: the thinking quirk and the output clamp both
+        # mutated the body and were silently discarded for the same reason.
+        or qualified_upstream
         or (compressed and compressed.get("action") == "compress")
     )
     if body_mutated:
@@ -14730,6 +19418,39 @@ async def proxy(full_path: str, request: Request):
     headers_out.append(("accept-encoding", "identity"))
     client: httpx.AsyncClient = request.app.state.client
 
+    # tool_stream: ask upstream for a non-streaming reply when it would lose the tool call, and
+    # rebuild the stream ourselves once it lands (see the `tool_stream` rule and
+    # _tool_stream_mode). Decided here, after routing has settled the model and upstream and
+    # after every body mutation above, so the outgoing bytes are the last word.
+    #
+    # The obvious version of this — send stream:false upstream and rebuild the stream here — was
+    # measured and rejected, and the numbers are worth keeping because the idea is a trap.
+    #
+    # Ollama sends no response headers for a non-streaming reply until generation is completely
+    # finished: curl against gemma4:26b for a 300-token answer reported time_starttransfer=5.347s
+    # and time_total=5.347s, identical to three decimal places. httpx's send() therefore would not
+    # return until the model was done — before the streamer that emits keepalives ever runs — so
+    # the client would sit in silence for the whole generation. Over 72 hours, 15.9% of
+    # tool-bearing Ollama requests ran longer than the ~30s Claude Code tolerates, p99 was 126s
+    # and the worst was 686s. That trades a 0.13% failure for a 15.9% one.
+    #
+    # So the request still streams upstream, purely to keep the keepalives flowing, and the
+    # non-streaming re-issue happens in the streamer only for the responses that actually came
+    # back broken. The slow path costs latency exactly where the alternative was a dead turn.
+    tool_stream_buffered = False
+    if (is_stream and isinstance(body_json, dict) and _request_has_tools(body_json)
+            and _tool_stream_mode(str(body_json.get("model") or ""), upstream_label) == "buffer"):
+        # Buffered rather than relayed live: the failure ends in a finish_reason of its own, and
+        # a client that has already been handed one will not always accept a second message after
+        # it. Holding the bytes back until the response is known-good keeps the re-issue invisible.
+        tool_stream_buffered = True
+        _ts_body = dict(body_json)
+        _ts_body["stream"] = False
+        # A streaming-only field: left in place on a stream:false request, Ollama rejects it
+        # outright rather than ignoring it.
+        _ts_body.pop("stream_options", None)
+        _ts_retry_body = json.dumps(_ts_body).encode("utf-8")
+
     # Pre-flight overhead = everything up to handing off to upstream.
     _overhead_samples.append((time.perf_counter() - start) * 1000)
 
@@ -14769,26 +19490,63 @@ async def proxy(full_path: str, request: Request):
             _pri_sem.release()
             _pri_released = True
 
-    try:
-        upstream_req = client.build_request(
-            request.method, upstream_url, headers=headers_out, content=body or None
-        )
-        upstream_resp = await client.send(upstream_req, stream=True)
-    except Exception as e:
-        _release_pri_slot()
-        elapsed = (time.perf_counter() - start) * 1000
-        explained = _explain_upstream_error(e, upstream_label, upstream_url, elapsed,
-                                            got_bytes=False)
-        _save_finish(req_id, 0, {}, None, None, elapsed, explained)
-        return JSONResponse(
-            {"error": "upstream unreachable", "upstream": upstream_base,
-             "detail": str(e), "explanation": explained},
-            status_code=502,
-        )
+    # Registered BEFORE the send, not after it. client.send(stream=True) does not return until
+    # the upstream produces response headers, and for a long prefill — or a request queued
+    # behind a busy single-slot model — that is minutes away. Registering afterwards meant the
+    # Live view was blind to exactly the requests worth watching: a 300k-token prefill was
+    # invisible for its whole six minutes, and a queued request never appeared at all. (Short
+    # ones still showed, because the tile query also picks up rows from the last 32 seconds,
+    # which is why this looked like an intermittent glitch rather than a rule.)
+    _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": None,
+                                  "upstream": upstream_label, "cancelled": False}
+    # One retry, and only across a backend restart. Nothing has been sent to the client yet and
+    # the upstream produced no bytes, so re-sending is safe — the request was never processed.
+    _held_ms = 0.0
+    for _attempt in (0, 1):
+        try:
+            upstream_req = client.build_request(
+                request.method, upstream_url, headers=headers_out, content=body or None
+            )
+            upstream_resp = await client.send(upstream_req, stream=True)
+            break
+        except Exception as e:
+            if _attempt == 0:
+                _t_hold = time.perf_counter()
+                if await _wait_out_backend_restart(upstream_label, e):
+                    _held_ms = (time.perf_counter() - _t_hold) * 1000
+                    _ent = _INFLIGHT_REQUESTS.get(req_id)
+                    if _ent is not None:          # so the Live view shows the wait, not a stall
+                        _ent["held_for_restart_ms"] = round(_held_ms)
+                    continue
+            _release_pri_slot()
+            elapsed = (time.perf_counter() - start) * 1000
+            explained = _explain_upstream_error(e, upstream_label, upstream_url, elapsed,
+                                                got_bytes=False)
+            _save_finish(req_id, 0, {}, None, None, elapsed, explained)
+            return JSONResponse(
+                {"error": "upstream unreachable", "upstream": upstream_base,
+                 "detail": str(e), "explanation": explained},
+                status_code=502,
+            )
 
-    # Register this in-flight request so /api/control/cancel/{req_id} can find it.
-    _INFLIGHT_REQUESTS[req_id] = {"ts": time.time(), "upstream_resp": upstream_resp,
-                                  "cancelled": False}
+    # Attach the socket to the entry registered above, so /api/control/cancel/{req_id} has
+    # something to close.
+    _entry = _INFLIGHT_REQUESTS.get(req_id)
+    if _entry is None:            # zombie-killer reaped it while we waited on headers
+        _entry = {"ts": time.time(), "upstream": upstream_label, "cancelled": False}
+        _INFLIGHT_REQUESTS[req_id] = _entry
+    _entry["upstream_resp"] = upstream_resp
+    if _entry.get("cancelled"):
+        # Killed while the prefill was still running. There was no socket to close at the time,
+        # so honour it now rather than streaming out a response nobody is waiting for.
+        try:
+            await upstream_resp.aclose()
+        except Exception:
+            pass
+        _release_pri_slot()
+        _save_finish(req_id, 499, {}, None, None, (time.perf_counter() - start) * 1000,
+                     "cancelled while waiting for the upstream to respond")
+        return JSONResponse({"error": "cancelled"}, status_code=499)
 
     # tool_call_xml_retry: when Ollama returns 500 with an XML-parse error in the body
     # (qwen-style models occasionally emit `<parameter>...</function>` without closing the
@@ -14876,6 +19634,14 @@ async def proxy(full_path: str, request: Request):
         out_headers["x-proxy-model-rewrite"] = f"{_rewrite_from}->{_rewrite_to}"
     _preserve_model = bool((load_rules_config().get("model_router") or {}).get("preserve_response_model_name", False))
     _restore_model_name = _rewrite_from if (_preserve_model and _rewrite_from and _rewrite_to) else None
+    # A qualified "model/backend" name is echoed back as asked, whatever preserve_response_model_name
+    # says. The suffix is this proxy's selector syntax, not a different model: the client picked that
+    # exact id out of /v1/models, and answering with the bare name makes every requested-vs-served
+    # comparison read as a mismatch. A sweep naming qwen3-coder-next/vllm was reported as "the
+    # backend ignored the requested model and served a different one" when it had served precisely
+    # what was asked for.
+    if qualified_upstream and isinstance(model, str):
+        _restore_model_name = "%s/%s" % (model, qualified_upstream)
 
     # Helper used by both streaming and non-streaming paths: iteratively call upstream,
     # execute proxy-owned tools, append tool_results, and re-call until the model stops
@@ -14955,7 +19721,10 @@ async def proxy(full_path: str, request: Request):
     if treat_as_stream:
         do_intercept = _post_flight_active(body_json) and 200 <= upstream_resp.status_code < 300
         # Bridge translation AND tool-injection both require the full upstream stream first.
-        do_buffer = do_intercept or bridge_active or tool_injection_active
+        # tool_stream_buffered joins them because there is no stream to relay: upstream was asked
+        # for a single JSON reply, and forwarding that verbatim would hand an SSE client a bare
+        # object. It is converted below, once, and then travels the same path as everything else.
+        do_buffer = do_intercept or bridge_active or tool_injection_active or tool_stream_buffered
 
         # Emit keepalive bytes every N seconds while we're waiting on upstream. Prevents
         # client-side read timeouts during long prefills (claude-code times out after ~30s
@@ -14982,7 +19751,8 @@ async def proxy(full_path: str, request: Request):
         # translating at the end. Without this, clients with completion-event timeouts
         # (Anthropic SDK, claude-code, opencode) give up during long generations because
         # they see only keepalives — no actual content events.
-        _do_incr_bridge = bridge_active and not do_intercept and not tool_injection_active
+        _do_incr_bridge = (bridge_active and not do_intercept and not tool_injection_active
+                           and not tool_stream_buffered)
         _incr_bridge = IncrementalAnthropicBridge(bridge_original_model) if _do_incr_bridge else None
 
         # Shared finalize-state so a client disconnect (which cancels streamer() mid-yield,
@@ -15072,6 +19842,50 @@ async def proxy(full_path: str, request: Request):
                 pass
 
             full = b"".join(chunks).decode("utf-8", errors="replace")
+
+            # The Ollama /v1 streaming defect, caught and undone. The model decides to call a
+            # tool, the stream delivers {"delta":{"content":""},"finish_reason":"stop"}, and the
+            # call itself never arrives — a well-formed turn carrying nothing, which the agent
+            # driving it reads as the model giving up. Re-issuing the identical request with
+            # stream:false returns the tool call, because only the streaming path loses it.
+            #
+            # Safe to re-issue precisely here: this branch buffers, so not a byte of the failed
+            # response has reached the client and the second attempt replaces it rather than
+            # appending to it. Once, because a failure that turned out to be deterministic would
+            # otherwise loop.
+            if tool_stream_buffered and not err:
+                if not _stream_has_tool_call(full) and not _response_delivered_chars(None, full):
+                    print(f"[tool_stream] {req_id} streamed reply carried no content and no tool "
+                          f"call — re-issuing non-streaming ({len(full)} bytes discarded)")
+                    try:
+                        _tsr = await client.post(upstream_url, headers=dict(headers_out),
+                                                 content=_ts_retry_body)
+                        _ts_json = json.loads(_tsr.text) if _tsr.status_code == 200 else None
+                    except (httpx.HTTPError, ValueError) as _e:
+                        _ts_json = None
+                        print(f"[tool_stream] {req_id} re-issue failed: {_e!r}")
+                    if isinstance(_ts_json, dict):
+                        _sse = _synth_response_stream(_ts_json)
+                        chunks[:] = [_sse]     # replayed verbatim below when nothing transforms it
+                        full = _sse.decode("utf-8", errors="replace")
+                        # recovered=false is the signal that the re-issue came back empty too,
+                        # which means this was never the streaming defect — gemma4:26b is the MoE
+                        # build, and it has a separate reported habit of returning nothing at all
+                        # on long system prompts. Worth watching the split: a rising share of
+                        # false says the answer is a different model, not a different transport.
+                        _ts_ok = bool(_stream_has_tool_call(full)
+                                      or _response_delivered_chars(None, full))
+                        _save_gate(req_id, {
+                            "verdict": "rewrite", "rule": "tool_stream",
+                            "reason": ("streamed reply lost its tool call (Ollama /v1); re-issued "
+                                       "non-streaming and rebuilt the stream")
+                                      if _ts_ok else
+                                      ("streamed reply was empty and the non-streaming re-issue "
+                                       "was empty too — not the streaming defect"),
+                            "details": {"upstream": upstream_label, "model": model,
+                                        "recovered": _ts_ok},
+                        })
+
             findings: list[dict] = []
             fixes: list[dict] = []
             replaced = False
@@ -15267,10 +20081,15 @@ async def proxy(full_path: str, request: Request):
                     except Exception:
                         pass
                     _fin["saved"] = True
-                    try:
-                        await upstream_resp.aclose()   # free the upstream socket / GPU slot
-                    except Exception:
-                        pass
+                # Unconditional, and outside the `not saved` branch it used to live in: on the
+                # happy path streamer() has already closed this and a second aclose() is a
+                # no-op, but "streamer finished normally" and "the socket was released" are not
+                # the same claim, and betting a pool slot on them being equal is what filled
+                # the pool. Closing twice is free; closing never is a 25-minute outage.
+                try:
+                    await upstream_resp.aclose()   # free the upstream socket / GPU slot
+                except Exception:
+                    pass
 
         return StreamingResponse(
             _gen_with_release(),
@@ -15914,6 +20733,99 @@ async def _mcp_export(args: dict, request: Request | None = None):
 
 
 @mcp_tool(
+    "read_scratchboard",
+    "Read the shared scratchboard: working notes anyone on the network can post, newest "
+    "first with pinned notes at the top. Use it to pick up context a human or another agent "
+    "left behind — what is being worked on, what was already tried, what not to touch.",
+    {
+        "type": "object",
+        "properties": {
+            "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": 200},
+            "pinned_only": {"type": "boolean", "default": False,
+                            "description": "Only the pinned notes — the standing context."},
+        },
+    },
+)
+async def _mcp_read_scratchboard(args: dict, request: Request | None = None):
+    limit = max(1, min(int(args.get("limit", 50) or 50), 200))
+    conn = db()
+    where = "WHERE pinned = 1 " if args.get("pinned_only") else ""
+    roots = conn.execute(
+        "SELECT id, ts, author, text, pinned FROM scratchboard "
+        + where + ("AND " if where else "WHERE ") + "parent_id IS NULL "
+        "ORDER BY pinned DESC, ts DESC LIMIT ?", (limit,)).fetchall()
+    replies: dict = {}
+    for r in conn.execute("SELECT id, ts, author, text, parent_id FROM scratchboard "
+                          "WHERE parent_id IS NOT NULL ORDER BY ts ASC").fetchall():
+        replies.setdefault(r["parent_id"], []).append(r)
+    conn.close()
+
+    # Rendered rather than dumped: an agent reading this wants the notes, not a JSON envelope
+    # around them, and timestamps are more useful as dates than as floats. Replies are indented
+    # under their note so a question and its answer arrive together — a reply read apart from
+    # what it answers is worse than not reading it.
+    def fmt(r, indent=""):
+        when = datetime.datetime.fromtimestamp(r["ts"]).strftime("%Y-%m-%d %H:%M")
+        who = f" — {r['author']}" if r["author"] else ""
+        head = f"{indent}{'📌 ' if r.keys().__contains__('pinned') and r['pinned'] else ''}[{when}{who}]"
+        body = "\n".join(indent + line for line in (r["text"] or "").splitlines())
+        return f"{head}\n{body}"
+
+    out = []
+    for r in roots:
+        block = [fmt(r)]
+        for rep in replies.get(r["id"], []):
+            block.append(fmt(rep, indent="    ↳ "))
+        out.append("\n".join(block))
+    return _mcp_text_result("\n\n".join(out) or "(the scratchboard is empty)")
+
+
+@mcp_tool(
+    "write_scratchboard",
+    "Post a note to the shared scratchboard so humans and other agents can see it. "
+    "WRITE TOOL — gated by MCP_ALLOW_WRITE.",
+    {
+        "type": "object",
+        "properties": {
+            "text": {"type": "string", "description": "The note."},
+            "author": {"type": "string", "description": "Who is posting — an agent name is fine."},
+            "pinned": {"type": "boolean", "default": False,
+                       "description": "Pin as standing context rather than a scratch note."},
+            "reply_to": {"type": "string",
+                         "description": "Note id to reply to — answer a question on the board "
+                                        "rather than starting a new thread."},
+        },
+        "required": ["text"],
+    },
+    write=True,
+)
+async def _mcp_write_scratchboard(args: dict, request: Request | None = None):
+    text = (args.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required")
+    if len(text) > _SCRATCH_MAX_CHARS:
+        raise ValueError(f"text too long ({len(text)} chars, limit {_SCRATCH_MAX_CHARS})")
+    entry_id = uuid.uuid4().hex[:16]
+    conn = db()
+    parent = (args.get("reply_to") or "").strip() or None
+    if parent:
+        row = conn.execute("SELECT id, parent_id FROM scratchboard WHERE id = ?",
+                           (parent,)).fetchone()
+        if not row:
+            conn.close()
+            raise ValueError(f"no note {parent!r} to reply to")
+        parent = row["parent_id"] or row["id"]      # flatten to one level
+    conn.execute("INSERT INTO scratchboard (id, ts, author, text, client_ip, pinned, parent_id) "
+                 "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                 (entry_id, time.time(), (args.get("author") or "mcp").strip()[:64],
+                  text, _client_ip(request) if request else None,
+                  1 if (args.get("pinned") and not parent) else 0, parent))
+    conn.commit()
+    conn.close()
+    return _mcp_text_result({"ok": True, "id": entry_id})
+
+
+@mcp_tool(
     "update_rules",
     "Replace the stored rules config. Top-level must be a JSON object. Takes effect on the next request. WRITE TOOL — gated by MCP_ALLOW_WRITE.",
     {"type": "object", "properties": {"rules": {"type": "object", "description": "Full rules config object."}}, "required": ["rules"]},
@@ -16080,15 +20992,27 @@ def main():
                 http_server = uvicorn.Server(http_cfg)
                 https_server = uvicorn.Server(https_cfg)
                 http_task = asyncio.create_task(http_server.serve())
-                # Wait for HTTP server lifespan startup to complete before opening HTTPS,
-                # so the shared httpx client / DB are ready when HTTPS requests arrive.
-                for _ in range(50):
-                    await asyncio.sleep(0.1)
-                    if getattr(http_server, "started", False):
-                        break
+
+                await _wait_for_http_start(http_server, http_task, STARTUP_TIMEOUT_S)
                 https_task = asyncio.create_task(https_server.serve())
                 try:
-                    await asyncio.gather(http_task, https_task)
+                    # Not gather(): the HTTPS server runs with lifespan="off" and borrows the
+                    # HTTP server's client and database, so it must never outlive it answering
+                    # requests against torn-down state. Whichever stops first takes the other
+                    # down with it.
+                    done, pending = await asyncio.wait(
+                        {http_task, https_task}, return_when=asyncio.FIRST_COMPLETED)
+                    http_server.should_exit = True
+                    https_server.should_exit = True
+                    for t in pending:
+                        try:
+                            await asyncio.wait_for(t, timeout=(GRACEFUL_SHUTDOWN_S or 10) + 5)
+                        except (asyncio.TimeoutError, asyncio.CancelledError):
+                            t.cancel()
+                    for t in done:
+                        exc = t.exception()
+                        if exc and not isinstance(exc, (KeyboardInterrupt, SystemExit)):
+                            raise exc
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     pass
 

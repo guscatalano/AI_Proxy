@@ -1,0 +1,127 @@
+"""The same model served by two backends must be selectable, and tellable apart.
+
+qwen3-coder-next exists as a 51 GB GGUF in Ollama and as NVFP4 in vLLM — different builds with
+different speeds. /v1/models deduped by name alone, so only one appeared, attributed to whichever
+backend was polled first, and there was no way to ask for the other.
+
+Names are qualified ONLY when ambiguous. Suffixing everything would break every client config
+that names a model today.
+"""
+from ai_proxy import proxy as P
+
+
+# --- splitting a qualified name ----------------------------------------------------------------
+
+
+def test_a_backend_suffix_is_split_off():
+    assert P._split_qualified_model("qwen3-coder-next/vllm") == ("qwen3-coder-next", "vllm")
+    assert P._split_qualified_model("qwen3-coder-next/ollama") == ("qwen3-coder-next", "ollama")
+
+
+def test_huggingface_ids_are_left_alone():
+    """Model ids contain slashes routinely; splitting those would break them."""
+    for name in ("hf.co/unsloth/Qwen-AgentWorld-35B", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4",
+                 "saricles/Qwen3-Coder-Next-NVFP4-GB10"):
+        assert P._split_qualified_model(name) == (name, None), name
+
+
+def test_an_unknown_suffix_is_not_a_backend():
+    assert P._split_qualified_model("some-model/v2") == ("some-model/v2", None)
+
+
+def test_a_plain_name_is_unchanged():
+    assert P._split_qualified_model("gemma4") == ("gemma4", None)
+
+
+def test_every_provider_name_works_as_a_suffix():
+    for up in P.PROVIDERS:
+        assert P._split_qualified_model("m/" + up) == ("m", up), up
+
+
+# --- the catalogue -------------------------------------------------------------------------------
+
+
+def test_the_listing_qualifies_only_ambiguous_names(client):
+    """A name served by one backend stays bare; served by two, both appear qualified."""
+    data = client.get("/v1/models").json().get("data") or []
+    ids = [e["id"] for e in data]
+    assert len(ids) == len(set(ids)), "ids must be unique or a picker cannot address them"
+    for e in data:
+        if "/" in e["id"] and e.get("upstream"):
+            # A qualified entry carries the parts it was built from, so a client does not
+            # have to re-parse the string to know what it selected.
+            assert e["id"] == "%s/%s" % (e["served_model"], e["upstream"])
+            assert e["upstream"] in P.PROVIDERS
+
+
+def test_ambiguity_is_judged_across_backends_not_on_the_raw_string(client, monkeypatch):
+    """Ollama tags its names and vLLM does not, so the same model reads as
+    "qwen3-coder-next:latest" and "qwen3-coder-next" and never collides literally. That is why
+    the first version of this qualified nothing at all."""
+    assert P._norm_model_id("qwen3-coder-next:latest") == P._norm_model_id("qwen3-coder-next")
+
+
+def test_two_tags_on_one_backend_stay_unqualified(client):
+    """gemma4:26b and gemma4:12b normalise alike but are both on Ollama — already tellable
+    apart by their tags, and qualifying them would add noise, not information."""
+    data = client.get("/v1/models").json().get("data") or []
+    by_backend = {}
+    for e in data:
+        if e.get("owned_by") == "ai-proxy":
+            continue
+        key = P._norm_model_id(e.get("served_model") or e["id"])
+        by_backend.setdefault(key, set()).add(e.get("owned_by"))
+    for e in data:
+        if e.get("owned_by") == "ai-proxy":
+            continue
+        key = P._norm_model_id(e.get("served_model") or e["id"])
+        if len(by_backend.get(key, ())) == 1:
+            assert not e.get("upstream"), "%s was qualified but is unambiguous" % e["id"]
+
+
+# --- the name that comes back --------------------------------------------------------------------
+#
+# A qualified id is what the client picked out of /v1/models, so answering with the bare name makes
+# any requested-vs-served comparison read as a mismatch. A sweep naming qwen3-coder-next/vllm was
+# reported as "the backend ignored the requested model and served a different one" — when it had
+# served exactly what was asked for, and only the selector suffix had been stripped on the way out.
+
+
+def test_a_qualified_request_is_answered_with_the_qualified_name(client):
+    import httpx
+
+    seen = {}
+
+    def handler(request: httpx.Request):
+        import json as _json
+        seen["sent"] = _json.loads(request.content or b"{}").get("model")
+        return httpx.Response(200, json={
+            "id": "c1", "object": "chat.completion", "model": seen["sent"],
+            "choices": [{"index": 0, "finish_reason": "stop",
+                         "message": {"role": "assistant", "content": "hi"}}],
+            "usage": {"completion_tokens": 1}}, headers={"content-type": "application/json"})
+
+    real = client.app.state.client
+    client.app.state.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    try:
+        r = client.post("/v1/chat/completions", json={
+            "model": "some-model/vllm", "stream": False, "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+        assert seen.get("sent") == "some-model", "the suffix must not reach the engine"
+        assert r.json().get("model") == "some-model/vllm", \
+            "the client asked for the qualified id and must see it back"
+    finally:
+        client.app.state.client = real
+
+
+def test_a_model_too_large_for_this_box_is_not_offered(client, monkeypatch):
+    """Offering it invites a sweep to select it, and with eviction on that stops the serving
+    container to attempt a load that cannot succeed. qwen3:235b-a22b is 132 GB on a 122 GB box."""
+    data = client.get("/v1/models").json().get("data") or []
+    total_mb = (P._mem_snapshot() or {}).get("total_mb") or 0
+    if not total_mb:
+        return
+    ceiling = total_mb - P._BENCH_FIT_RESERVE_MB
+    for e in data:
+        if e.get("size_mb"):
+            assert e["size_mb"] <= ceiling, "%s is larger than the box" % e["id"]
